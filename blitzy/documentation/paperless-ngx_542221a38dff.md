@@ -621,15 +621,17 @@ a page boundary (around position 25 in the sorted result set):
 | Query 1 (page 1: OFFSET 0, LIMIT 25) | Doc 42 | Doc 57 | — |
 | Query 2 (page 2: OFFSET 25, LIMIT 25) | — | Doc 42 | Doc 63 |
 
-In Query 1, the database placed Doc 57 at position 25 (last item on page 1).
-In Query 2 (a separate query execution), the database happened to place Doc 42
-at position 25 instead. Now:
+In Query 1, the database placed Doc 57 at position 25 — just past page 1's
+boundary (page 1 covers 0-indexed positions 0–24; page 2 covers positions
+25–49). In Query 2 (a separate query execution), the database happened to
+place Doc 42 at position 25 instead. Now:
 
-- **Doc 42** appeared on page 1 (position 24) *and* page 2 (position 25) →
-  **duplicate across pages**
-- **Doc 57** was at position 25 in Query 1 but shifted to position 24 in
-  Query 2 → it is now on page 1 in both executions but **absent from page 2**
-  → **missing document**
+- **Doc 42** appeared on page 1 (position 24 in Query 1) *and* page 2
+  (position 25 in Query 2) → **duplicate across pages**
+- **Doc 57** was at position 25 in Query 1 (in page 2's range, but page 1 was
+  being requested) and shifted to position 24 in Query 2 (in page 1's range,
+  but page 2 was being requested) → it is never returned by either query →
+  **missing document**
 - **Doc 63** may shift similarly depending on execution order
 
 This is exactly the "haunted pagination" behaviour reported by users.
@@ -851,7 +853,7 @@ confirms:
 
 The most likely explanation is that different users have different **saved
 views** with different filter configurations. The `SavedView` model exists at
-`src/documents/models.py:316-339`, and `SavedViewFilterRule` at lines 342-376.
+`src/documents/models.py:316-339`, and `SavedViewFilterRule` at lines 342-382.
 `SavedViewViewSet.get_queryset()` (Source: `src/documents/views.py:461-463`)
 filters saved views by user:
 
