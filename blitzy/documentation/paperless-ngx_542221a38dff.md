@@ -363,7 +363,7 @@ thumbnail = document_parser.get_optimised_thumbnail(self.path, mime_type, self.f
 ```
 
 For **PDF documents**, `make_thumbnail_from_pdf()` (parsers.py, line 187) uses **ImageMagick `convert`** to render the first page at 300 DPI, scaled to 500px width:
-```
+```bash
 convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient input.pdf[0] output.png
 ```
 If ImageMagick fails (e.g., due to security policy restrictions), the function falls back to **Ghostscript** via `make_thumbnail_from_pdf_gs_fallback()` (line 153).
@@ -624,13 +624,13 @@ These `@property` methods compute values from stored fields and settings:
 
 | Property | Return Type | Computation | Source |
 |----------|------------|-------------|--------|
-| `source_path` | `str` | `os.path.join(settings.ORIGINALS_DIR, self.filename)` or fallback `{pk:07}{file_type}` | line 222 |
+| `source_path` | `str` | `os.path.join(settings.ORIGINALS_DIR, self.filename)` or fallback `{pk:07}{file_type}` | line 223 |
 | `source_file` | file handle | `open(self.source_path, "rb")` | line 234 |
 | `has_archive_version` | `bool` | `self.archive_filename is not None` | line 238 |
 | `archive_path` | `str` or `None` | `os.path.join(settings.ARCHIVE_DIR, self.archive_filename)` if archive exists | line 242 |
 | `archive_file` | file handle | `open(self.archive_path, "rb")` | line 249 |
-| `file_type` | `str` | File extension from MIME type via `get_default_file_extension(self.mime_type)` | line 268 |
-| `thumbnail_path` | `str` | `os.path.join(settings.THUMBNAIL_DIR, "{pk:07}.png")` | line 272 |
+| `file_type` | `str` | File extension from MIME type via `get_default_file_extension(self.mime_type)` | line 269 |
+| `thumbnail_path` | `str` | `os.path.join(settings.THUMBNAIL_DIR, "{pk:07}.png")` | line 273 |
 
 ### 4.4 Runtime Example
 
