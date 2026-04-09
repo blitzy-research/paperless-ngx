@@ -237,7 +237,7 @@ Q_CLUSTER = {
     "retry": PAPERLESS_WORKER_RETRY,   # default: PAPERLESS_WORKER_TIMEOUT + 10
     "timeout": PAPERLESS_WORKER_TIMEOUT, # default: 1800 seconds
     "workers": TASK_WORKERS,            # default: CPU-dependent
-    "redis": "redis://localhost:6379",
+    "redis": os.getenv("PAPERLESS_REDIS", "redis://localhost:6379"),  # configurable via PAPERLESS_REDIS env var
 }
 ```
 > **Source:** `src/paperless/settings.py:449-457`
@@ -720,6 +720,8 @@ The original source file is deleted: `os.unlink(self.path)` (line 350).
 
 macOS shadow files (`._*`) are also cleaned up if present (lines 352-360).
 
+> **Rationale:** The atomic persistence design is observable at `src/documents/consumer.py:298` where `transaction.atomic()` wraps the entire store-and-signal chain. This ensures that if any step fails — database write, signal handler execution, or file copy — the entire operation is rolled back, leaving no orphan records or partial state. The `FileLock` on `settings.MEDIA_LOCK` (line 315) serializes file operations across concurrent Django-Q workers, preventing race conditions on the filesystem. This two-layer protection (database transaction + filesystem lock) is the reason operators never observe partially-consumed documents in production: either the full Document record, all files, and all signal side-effects are committed, or nothing is.
+
 ---
 
 ## Stage 7: Progress and Completion Reporting
@@ -816,8 +818,8 @@ Observable log:
 The script receives 8 positional arguments (lines 160-172):
 1. `document.pk` — Document primary key
 2. `document.get_public_filename()` — Public filename
-3. `document.source_path` — Path to original file in managed storage
-4. `document.thumbnail_path` — Path to thumbnail
+3. `os.path.normpath(document.source_path)` — Normalized path to original file in managed storage
+4. `os.path.normpath(document.thumbnail_path)` — Normalized path to thumbnail
 5. Download URL (reverse of `document-download`)
 6. Thumbnail URL (reverse of `document-thumb`)
 7. `document.correspondent` — Correspondent name (or `"None"`)
@@ -836,6 +838,8 @@ self._send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)
 > **Source:** `src/documents/consumer.py:375`
 
 Note: `document.id` is included only in this final `SUCCESS` message — it allows the frontend to link directly to the newly created document.
+
+> **Rationale:** The WebSocket progress protocol is observable in the `_send_progress()` method at `src/documents/consumer.py:56-76`, which sends structured JSON payloads to the `"status_updates"` channel group. The deliberate design of withholding `document_id` until the final `SUCCESS` message (line 375) ensures the frontend never receives a document ID for a record that might be rolled back by a subsequent failure. The post-consume script execution (line 371) occurs outside the atomic transaction, meaning it runs only after the document is fully committed — this ordering is visible in the code structure where `run_post_consume_script(document)` follows `document.save()` and the signal handlers, all of which complete before the transaction exits.
 
 ---
 
@@ -958,7 +962,7 @@ After successful consumption, a `Document` record exists with the following fiel
 | `created` | DateTimeField | Document creation date (parsed from filename/content or file mtime) |
 | `modified` | DateTimeField(auto_now) | Last modification timestamp |
 | `storage_type` | CharField(11) | `"unencrypted"` (default) or `"gpg"` |
-| `added` | DateTimeField(auto_now_add) | Timestamp when added to the system |
+| `added` | DateTimeField(default=timezone.now) | Timestamp when added to the system (overridable at creation time) |
 | `filename` | FilePathField(1024, unique, nullable) | Relative path in originals storage |
 | `archive_filename` | FilePathField(1024, unique, nullable) | Relative path in archive storage |
 | `archive_serial_number` | IntegerField(unique, nullable) | Physical archive position number |
@@ -973,7 +977,7 @@ After successful consumption, a `Document` record exists with the following fiel
 │   ├── archive/             ← OCR'd/archive PDF versions
 │   │   └── <filename>.pdf   ← Document.archive_path = ARCHIVE_DIR + Document.archive_filename
 │   └── thumbnails/          ← Generated thumbnail images
-│       └── <id>.png         ← Document.thumbnail_path = THUMBNAIL_DIR/<id>000000007.png
+│       └── 0000007.png      ← Document.thumbnail_path = THUMBNAIL_DIR/{pk:07d}.png (e.g., pk=7 → 0000007.png)
 ├── media.lock               ← FileLock for synchronized access
 ```
 
