@@ -70,7 +70,7 @@ Paperless-ngx runs three long-lived processes under `supervisord`, as defined in
 
 | Process | supervisord Name | Command | Purpose |
 |---------|-----------------|---------|---------|
-| Web Server | `gunicorn` | `gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application` | Serves the REST API and web UI | 
+| Web Server | `gunicorn` | `gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application` | Serves the REST API and web UI |
 | Document Consumer | `consumer` | `python3 manage.py document_consumer` | Watches filesystem for new documents |
 | Task Scheduler + Workers | `scheduler` | `python3 manage.py qcluster` | Runs django-q scheduler and worker pool |
 
