@@ -37,8 +37,8 @@ citations. **No modifications to the existing repository are proposed or made.**
 
 Users report the following anomalies in the document list view:
 
-1. **Cross-page duplication** — the same document appears on both page *N* and
-   page *N+1*.
+1. **Cross-page duplication** — the same document appears on both page _N_ and
+   page _N+1_.
 2. **Disappearing documents** — a document visible on one page vanishes when
    the user navigates away and returns, or appears on a different page than
    before.
@@ -48,14 +48,14 @@ Users report the following anomalies in the document list view:
 
 These symptoms raise six concrete questions that this investigation answers:
 
-| # | Question |
-|---|----------|
-| 1 | Is the backend producing duplicate rows that are collapsed elsewhere? |
-| 2 | Is pagination (`OFFSET`/`LIMIT`) applied before or after deduplication (`.distinct()`)? |
-| 3 | Is the ordering quietly unstable when multiple rows tie on the primary sort key? |
-| 4 | Does the glitch depend on what the user is allowed to see (sharing rules)? |
-| 5 | What does the API actually return across consecutive page requests? |
-| 6 | What does the frontend think pagination means? |
+| #   | Question                                                                                |
+| --- | --------------------------------------------------------------------------------------- |
+| 1   | Is the backend producing duplicate rows that are collapsed elsewhere?                   |
+| 2   | Is pagination (`OFFSET`/`LIMIT`) applied before or after deduplication (`.distinct()`)? |
+| 3   | Is the ordering quietly unstable when multiple rows tie on the primary sort key?        |
+| 4   | Does the glitch depend on what the user is allowed to see (sharing rules)?              |
+| 5   | What does the API actually return across consecutive page requests?                     |
+| 6   | What does the frontend think pagination means?                                          |
 
 The remainder of this document traces through the codebase to answer each
 question with code-level evidence.
@@ -125,7 +125,7 @@ Key observations:
   `DjangoObjectPermissions`, and no `has_object_permission` override.
 - **`ordering_fields`** lists eight fields. None of these include a secondary
   tiebreaker. When the user sorts by `created`, the SQL `ORDER BY` clause
-  contains *only* `created` — no fallback column.
+  contains _only_ `created` — no fallback column.
 
 #### get_queryset() — Unconditional DISTINCT
 
@@ -139,7 +139,7 @@ def get_queryset(self):
 Every document list query issues `SELECT DISTINCT ...` unconditionally. This
 exists to prevent duplicate result rows that can arise from many-to-many (M2M)
 JOINs when tag filters are applied (see §3.3). The `DISTINCT` is not
-conditional on the filter set — it applies to *every* request.
+conditional on the filter set — it applies to _every_ request.
 
 #### StandardPagination
 
@@ -220,15 +220,15 @@ class DocumentFilterSet(FilterSet):
 The `TagsFilter` class (Source: `src/documents/filters.py:36-60`) has three
 operating modes:
 
-| Mode | Trigger | Behaviour | Explicit `.distinct()`? |
-|------|---------|-----------|------------------------|
-| `in_list=True` | `tags__id__in` query param | `qs.filter(tags__id__in=tag_ids).distinct()` (line 52) — single JOIN | Yes |
-| `exclude=False, in_list=False` | `tags__id__all` query param | Loops: `qs.filter(tags__id=tag_id)` per tag (lines 54-58) — **one JOIN per tag** | No (relies on queryset-level `.distinct()`) |
-| `exclude=True, in_list=False` | `tags__id__none` query param | Loops: `qs.exclude(tags__id=tag_id)` per tag (lines 55-56) | No |
+| Mode                           | Trigger                      | Behaviour                                                                        | Explicit `.distinct()`?                     |
+| ------------------------------ | ---------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------- |
+| `in_list=True`                 | `tags__id__in` query param   | `qs.filter(tags__id__in=tag_ids).distinct()` (line 52) — single JOIN             | Yes                                         |
+| `exclude=False, in_list=False` | `tags__id__all` query param  | Loops: `qs.filter(tags__id=tag_id)` per tag (lines 54-58) — **one JOIN per tag** | No (relies on queryset-level `.distinct()`) |
+| `exclude=True, in_list=False`  | `tags__id__none` query param | Loops: `qs.exclude(tags__id=tag_id)` per tag (lines 55-56)                       | No                                          |
 
 The `tags__id__all` mode is critical: each chained `.filter(tags__id=X)` call
 generates a **separate SQL JOIN** on the `documents_document_tags` M2M table.
-This does not produce duplicate result *rows* (thanks to the queryset-level
+This does not produce duplicate result _rows_ (thanks to the queryset-level
 `.distinct()`), but it creates more complex queries that can influence the
 database query planner's behaviour. See §3.3 for details.
 
@@ -368,8 +368,8 @@ getNext(currentDocId: number): Observable<number> {
 > Source: `src-ui/src/app/services/document-list-view.service.ts:298-318`
 
 **Critical assumption:** These methods assume that pages are **stable and
-contiguous** — that the last document on page *N* is immediately followed by
-the first document on page *N+1* in the sorted result set. If the backend's
+contiguous** — that the last document on page _N_ is immediately followed by
+the first document on page _N+1_ in the sorted result set. If the backend's
 ordering is non-deterministic, this assumption breaks, leading to the observed
 symptoms of duplicate or missing documents during cross-page navigation.
 
@@ -616,17 +616,17 @@ Suppose documents with IDs 42, 57, and 63 all have
 `created = 2024-01-15 10:30:00`, and these three documents happen to fall near
 a page boundary (around position 25 in the sorted result set):
 
-| Execution | Position 24 | Position 25 | Position 26 |
-|-----------|-------------|-------------|-------------|
-| Query 1 (page 1: OFFSET 0, LIMIT 25) | Doc 42 | Doc 57 | — |
-| Query 2 (page 2: OFFSET 25, LIMIT 25) | — | Doc 42 | Doc 63 |
+| Execution                             | Position 24 | Position 25 | Position 26 |
+| ------------------------------------- | ----------- | ----------- | ----------- |
+| Query 1 (page 1: OFFSET 0, LIMIT 25)  | Doc 42      | Doc 57      | —           |
+| Query 2 (page 2: OFFSET 25, LIMIT 25) | —           | Doc 42      | Doc 63      |
 
 In Query 1, the database placed Doc 57 at position 25 — just past page 1's
 boundary (page 1 covers 0-indexed positions 0–24; page 2 covers positions
 25–49). In Query 2 (a separate query execution), the database happened to
 place Doc 42 at position 25 instead. Now:
 
-- **Doc 42** appeared on page 1 (position 24 in Query 1) *and* page 2
+- **Doc 42** appeared on page 1 (position 24 in Query 1) _and_ page 2
   (position 25 in Query 2) → **duplicate across pages**
 - **Doc 57** was at position 25 in Query 1 (in page 2's range, but page 1 was
   being requested) and shifted to position 24 in Query 2 (in page 1's range,
@@ -656,6 +656,7 @@ LIMIT 25 OFFSET 25
 ```
 
 In SQL's logical execution model:
+
 1. `FROM` + `JOIN` — assemble the row set
 2. `WHERE` — filter rows
 3. `SELECT DISTINCT` — deduplicate rows
@@ -780,7 +781,7 @@ qs = qs.filter(tags__id__in=tag_ids).distinct()
 
 > Source: `src/documents/filters.py:51-52`
 
-This is an **OR** filter (documents matching *any* of the listed tags), not an
+This is an **OR** filter (documents matching _any_ of the listed tags), not an
 **AND** filter. It uses a single JOIN and adds an explicit `.distinct()` call
 (which is redundant with the queryset-level `.distinct()` from `get_queryset()`
 but serves as a safety measure).
@@ -813,20 +814,20 @@ code**.
 
 Every viewset in `src/documents/views.py` uses `permission_classes = (IsAuthenticated,)`:
 
-| Viewset / View | Line |
-|----------------|------|
-| `CorrespondentViewSet` | 125 |
-| `TagViewSet` | 151 |
-| `DocumentTypeViewSet` | 166 |
-| `DocumentViewSet` | 183 |
-| `LogViewSet` | 431 |
-| `SavedViewViewSet` | 459 |
-| `BulkEditView` | 471 |
-| `PostDocumentView` | 493 |
-| `SelectionDataView` | 540 |
-| `SearchAutoCompleteView` | 588 |
-| `StatisticsView` | 612 |
-| `BulkDownloadView` | 633 |
+| Viewset / View           | Line |
+| ------------------------ | ---- |
+| `CorrespondentViewSet`   | 125  |
+| `TagViewSet`             | 151  |
+| `DocumentTypeViewSet`    | 166  |
+| `DocumentViewSet`        | 183  |
+| `LogViewSet`             | 431  |
+| `SavedViewViewSet`       | 459  |
+| `BulkEditView`           | 471  |
+| `PostDocumentView`       | 493  |
+| `SelectionDataView`      | 540  |
+| `SearchAutoCompleteView` | 588  |
+| `StatisticsView`         | 612  |
+| `BulkDownloadView`       | 633  |
 
 > Source: `src/documents/views.py` — lines listed above
 
@@ -885,11 +886,11 @@ there is no mechanism for document-level visibility filtering.
 The pagination instability occurs when **all three** of the following conditions
 are met simultaneously:
 
-| # | Condition | Why |
-|---|-----------|-----|
-| 1 | **Two or more documents share the same value in the active sort field** | Creates tied rows where ordering is non-deterministic |
-| 2 | **The tied documents span a page boundary** | They fall around position *N* × `page_size` in the sorted result | 
-| 3 | **The user navigates between pages** | Each navigation triggers a separate SQL query execution, which may return tied rows in a different order |
+| #   | Condition                                                               | Why                                                                                                      |
+| --- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| 1   | **Two or more documents share the same value in the active sort field** | Creates tied rows where ordering is non-deterministic                                                    |
+| 2   | **The tied documents span a page boundary**                             | They fall around position _N_ × `page_size` in the sorted result                                         |
+| 3   | **The user navigates between pages**                                    | Each navigation triggers a separate SQL query execution, which may return tied rows in a different order |
 
 #### When is condition #1 common?
 
@@ -1092,47 +1093,47 @@ have been modified.**
 
 ## 6. Source References
 
-| File | Lines | What Was Referenced |
-|------|-------|---------------------|
-| `src/documents/views.py` | 172-196 | `DocumentViewSet` class definition and configuration |
-| `src/documents/views.py` | 198-199 | `get_queryset()` returning `Document.objects.distinct()` |
-| `src/documents/views.py` | 183 | `permission_classes = (IsAuthenticated,)` on `DocumentViewSet` |
-| `src/documents/views.py` | 187-196 | `ordering_fields` tuple |
-| `src/documents/views.py` | 377-426 | `UnifiedSearchViewSet` class definition |
-| `src/documents/views.py` | 394-411 | `UnifiedSearchViewSet.filter_queryset()` |
-| `src/documents/views.py` | 413-426 | `UnifiedSearchViewSet.list()` |
-| `src/documents/views.py` | 410-411, 425-426 | Delegation to parent for non-search requests |
-| `src/documents/views.py` | 461-463 | `SavedViewViewSet.get_queryset()` filtering by user |
-| `src/documents/views.py` | 125, 151, 166, 183, 431, 459, 471, 493, 540, 588, 612, 633 | All `permission_classes = (IsAuthenticated,)` declarations |
-| `src/documents/filters.py` | 36-60 | `TagsFilter` class and `filter()` method |
-| `src/documents/filters.py` | 51-52 | `tags__id__in` filter with single JOIN and `.distinct()` |
-| `src/documents/filters.py` | 54-58 | `tags__id__all` filter with chained `.filter()` calls |
-| `src/documents/filters.py` | 81-118 | `DocumentFilterSet` class with all filter declarations |
-| `src/documents/filters.py` | 90-94 | `tags__id__all`, `tags__id__none`, `tags__id__in` filter instances |
-| `src/documents/models.py` | 128-133 | `tags` ManyToManyField definition |
-| `src/documents/models.py` | 152 | `created = models.DateTimeField(default=timezone.now, db_index=True)` |
-| `src/documents/models.py` | 207-208 | `class Meta: ordering = ("-created",)` |
-| `src/documents/models.py` | 316-339 | `SavedView` model |
-| `src/documents/models.py` | 342-382 | `SavedViewFilterRule` model |
-| `src/paperless/views.py` | 8-11 | `StandardPagination` class definition |
-| `src/paperless/urls.py` | 32 | `api_router.register(r"documents", UnifiedSearchViewSet)` |
-| `src/paperless/settings.py` | 116-127 | `REST_FRAMEWORK` configuration dict |
-| `src/documents/index.py` | 165-190 | `_get_query_sortedby()` Whoosh field mapping |
-| `src/documents/index.py` | 203-237 | `DelayedQuery.__getitem__` with Whoosh `search_page()` |
-| `src/documents/index.py` | 210-218 | `searcher.search_page()` call with pagination params |
-| `src/documents/serialisers.py` | 201-235 | `DocumentSerializer` class and fields |
-| `src-ui/src/app/services/document-list-view.service.ts` | 18-55 | `ListViewState` interface |
-| `src-ui/src/app/services/document-list-view.service.ts` | 87-98 | `defaultListViewState()` |
-| `src-ui/src/app/services/document-list-view.service.ts` | 133-184 | `reload()` method |
-| `src-ui/src/app/services/document-list-view.service.ts` | 231-235 | `set currentPage()` setter |
-| `src-ui/src/app/services/document-list-view.service.ts` | 298-320 | `getNext()` method |
-| `src-ui/src/app/services/document-list-view.service.ts` | 322-342 | `getPrevious()` method |
-| `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 24-29 | `getOrderingQueryParam()` |
-| `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 32-58 | `list()` HTTP method |
-| `src-ui/src/app/services/rest/document.service.ts` | 16-24 | `DOCUMENT_SORT_FIELDS` constant |
-| `src-ui/src/app/services/rest/document.service.ts` | 60-79 | `filterRulesToQueryParams()` method |
-| `src-ui/src/app/services/rest/document.service.ts` | 96-116 | `listFiltered()` method |
-| `src-ui/src/app/data/filter-rule-type.ts` | 29+ | `FILTER_RULE_TYPES` array with filter variable mappings |
-| `src-ui/src/app/data/filter-rule.ts` | 6-16 | `cloneFilterRules()` function |
-| `src-ui/src/app/data/filter-rule.ts` | 18-26 | `isFullTextFilterRule()` function |
-| `src-ui/src/app/data/filter-rule.ts` | 28-31 | `FilterRule` interface |
+| File                                                         | Lines                                                      | What Was Referenced                                                   |
+| ------------------------------------------------------------ | ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| `src/documents/views.py`                                     | 172-196                                                    | `DocumentViewSet` class definition and configuration                  |
+| `src/documents/views.py`                                     | 198-199                                                    | `get_queryset()` returning `Document.objects.distinct()`              |
+| `src/documents/views.py`                                     | 183                                                        | `permission_classes = (IsAuthenticated,)` on `DocumentViewSet`        |
+| `src/documents/views.py`                                     | 187-196                                                    | `ordering_fields` tuple                                               |
+| `src/documents/views.py`                                     | 377-426                                                    | `UnifiedSearchViewSet` class definition                               |
+| `src/documents/views.py`                                     | 394-411                                                    | `UnifiedSearchViewSet.filter_queryset()`                              |
+| `src/documents/views.py`                                     | 413-426                                                    | `UnifiedSearchViewSet.list()`                                         |
+| `src/documents/views.py`                                     | 410-411, 425-426                                           | Delegation to parent for non-search requests                          |
+| `src/documents/views.py`                                     | 461-463                                                    | `SavedViewViewSet.get_queryset()` filtering by user                   |
+| `src/documents/views.py`                                     | 125, 151, 166, 183, 431, 459, 471, 493, 540, 588, 612, 633 | All `permission_classes = (IsAuthenticated,)` declarations            |
+| `src/documents/filters.py`                                   | 36-60                                                      | `TagsFilter` class and `filter()` method                              |
+| `src/documents/filters.py`                                   | 51-52                                                      | `tags__id__in` filter with single JOIN and `.distinct()`              |
+| `src/documents/filters.py`                                   | 54-58                                                      | `tags__id__all` filter with chained `.filter()` calls                 |
+| `src/documents/filters.py`                                   | 81-118                                                     | `DocumentFilterSet` class with all filter declarations                |
+| `src/documents/filters.py`                                   | 90-94                                                      | `tags__id__all`, `tags__id__none`, `tags__id__in` filter instances    |
+| `src/documents/models.py`                                    | 128-133                                                    | `tags` ManyToManyField definition                                     |
+| `src/documents/models.py`                                    | 152                                                        | `created = models.DateTimeField(default=timezone.now, db_index=True)` |
+| `src/documents/models.py`                                    | 207-208                                                    | `class Meta: ordering = ("-created",)`                                |
+| `src/documents/models.py`                                    | 316-339                                                    | `SavedView` model                                                     |
+| `src/documents/models.py`                                    | 342-382                                                    | `SavedViewFilterRule` model                                           |
+| `src/paperless/views.py`                                     | 8-11                                                       | `StandardPagination` class definition                                 |
+| `src/paperless/urls.py`                                      | 32                                                         | `api_router.register(r"documents", UnifiedSearchViewSet)`             |
+| `src/paperless/settings.py`                                  | 116-127                                                    | `REST_FRAMEWORK` configuration dict                                   |
+| `src/documents/index.py`                                     | 165-190                                                    | `_get_query_sortedby()` Whoosh field mapping                          |
+| `src/documents/index.py`                                     | 203-237                                                    | `DelayedQuery.__getitem__` with Whoosh `search_page()`                |
+| `src/documents/index.py`                                     | 210-218                                                    | `searcher.search_page()` call with pagination params                  |
+| `src/documents/serialisers.py`                               | 201-235                                                    | `DocumentSerializer` class and fields                                 |
+| `src-ui/src/app/services/document-list-view.service.ts`      | 18-55                                                      | `ListViewState` interface                                             |
+| `src-ui/src/app/services/document-list-view.service.ts`      | 87-98                                                      | `defaultListViewState()`                                              |
+| `src-ui/src/app/services/document-list-view.service.ts`      | 133-184                                                    | `reload()` method                                                     |
+| `src-ui/src/app/services/document-list-view.service.ts`      | 231-235                                                    | `set currentPage()` setter                                            |
+| `src-ui/src/app/services/document-list-view.service.ts`      | 298-320                                                    | `getNext()` method                                                    |
+| `src-ui/src/app/services/document-list-view.service.ts`      | 322-342                                                    | `getPrevious()` method                                                |
+| `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 24-29                                                      | `getOrderingQueryParam()`                                             |
+| `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 32-58                                                      | `list()` HTTP method                                                  |
+| `src-ui/src/app/services/rest/document.service.ts`           | 16-24                                                      | `DOCUMENT_SORT_FIELDS` constant                                       |
+| `src-ui/src/app/services/rest/document.service.ts`           | 60-79                                                      | `filterRulesToQueryParams()` method                                   |
+| `src-ui/src/app/services/rest/document.service.ts`           | 96-116                                                     | `listFiltered()` method                                               |
+| `src-ui/src/app/data/filter-rule-type.ts`                    | 29+                                                        | `FILTER_RULE_TYPES` array with filter variable mappings               |
+| `src-ui/src/app/data/filter-rule.ts`                         | 6-16                                                       | `cloneFilterRules()` function                                         |
+| `src-ui/src/app/data/filter-rule.ts`                         | 18-26                                                      | `isFullTextFilterRule()` function                                     |
+| `src-ui/src/app/data/filter-rule.ts`                         | 28-31                                                      | `FilterRule` interface                                                |
