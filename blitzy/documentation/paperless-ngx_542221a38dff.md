@@ -562,7 +562,7 @@ def bulk_update_documents(document_ids):
             index.update_document(writer, doc)
 ```
 
-**Important double-trigger note:** When `add_tag()` calls `bulk_create()` on `Document.tags.through`, this directly fires the `m2m_changed` signal, which triggers `update_filename_and_move_files()`. Then, `bulk_update_documents()` fires `post_save.send()`, which triggers `update_filename_and_move_files()` **again**. The second invocation is harmless because the filename was already updated — `generate_unique_filename()` will return the same filename, and the handler will return at the `if not move_original and not move_archive: return` guard (line 347-349). But it does mean the filename generation logic runs twice per bulk tag operation.
+**Important signal dispatch note:** `bulk_create()` on the through model (`Document.tags.through`) does **not** fire the `m2m_changed` signal. In Django, `m2m_changed` only fires when using the M2M manager methods (`.add()`, `.remove()`, `.set()`, `.clear()`), not when directly calling `bulk_create()` or `QuerySet.delete()` on the through model's own manager. The same applies to `remove_tag()` and `modify_tags()`, which use `QuerySet.delete()` on the through model — neither fires `m2m_changed`. Therefore, the file relocation handler `update_filename_and_move_files()` is triggered **exactly once** per document during bulk tag operations, via the explicit `post_save.send(Document, instance=doc, created=False)` call in `bulk_update_documents()` at `src/documents/tasks.py:276`. This is the sole trigger for file relocation in the bulk edit path.
 
 *Source: src/documents/bulk_edit.py:36-49, src/documents/tasks.py:270-280*
 
@@ -1414,7 +1414,9 @@ elif messages.has_warning():
 
 If orphans are the ONLY issue (no ERRORs), the sanity check does not raise an exception — it returns a warning string. If there are also ERRORs (e.g., checksum mismatches), the `SanityCheckFailedException` is raised regardless.
 
-*Source: src/documents/sanity_checker.py:130-131; src/documents/tasks.py:262-263*
+**The "no orphans" path:** If no orphaned files exist, `present_files` is empty after all documents have been checked, and the orphan reporting loop at lines 130-131 simply does not execute — no warning messages are generated for orphans. In this scenario, if all other checks also pass (no missing files, no checksum mismatches, no content gaps), the `SanityCheckMessages` object contains zero messages, and `log_messages()` emits `"Sanity checker detected no issues."` (line 27). The task wrapper returns `"No issues detected."` (`src/documents/tasks.py:267`). See Section 4.2 for the complete healthy-archive output.
+
+*Source: src/documents/sanity_checker.py:26-27, 130-131; src/documents/tasks.py:262-267*
 
 ---
 
