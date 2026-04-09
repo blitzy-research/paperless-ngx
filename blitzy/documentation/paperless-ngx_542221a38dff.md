@@ -335,17 +335,17 @@ Log (info): f"Consuming {self.filename}"
 
 #### Stage 6: Thumbnail Generation (lines 263-269)
 
-- WebSocket progress update:
-  ```
-  self._send_progress(70, 100, "WORKING", MESSAGE_GENERATING_THUMBNAIL)
-  ```
-  > Source: `src/documents/consumer.py:264`
-
 - Log message:
   ```
   Log (debug): f"Generating thumbnail for {self.filename}..."
   ```
   > Source: `src/documents/consumer.py:263`
+
+- WebSocket progress update:
+  ```
+  self._send_progress(70, 100, "WORKING", MESSAGE_GENERATING_THUMBNAIL)
+  ```
+  > Source: `src/documents/consumer.py:264`
 
 - Generates optimized thumbnail:
   ```python
@@ -570,7 +570,7 @@ flowchart TD
 
     G["<b>Stage 5: Parsing</b><br/>📡 WebSocket: WORKING 20%<br/>📝 Log: 'Parsing {filename}...'<br/>parser.parse() — OCR/text extraction"] --> H
 
-    H["<b>Stage 6: Thumbnail</b><br/>📡 WebSocket: WORKING 70%<br/>📝 Log: 'Generating thumbnail...'<br/>parser.get_optimised_thumbnail()"] --> I
+    H["<b>Stage 6: Thumbnail</b><br/>📝 Log: 'Generating thumbnail for {filename}...'<br/>📡 WebSocket: WORKING 70%<br/>parser.get_optimised_thumbnail()"] --> I
 
     I["<b>Stage 7: Date Parsing</b><br/>📡 WebSocket: WORKING 90%<br/>get_date() → fallback: parse_date()<br/>get_archive_path()"] --> J
 
@@ -822,7 +822,7 @@ The `load_classifier()` function (lines 30-57 of `classifier.py`):
 
 3. The loaded classifier is passed to the `document_consumption_finished` signal, where the signal handlers (`set_correspondent`, `set_document_type`, `set_tags`) use prediction methods:
    - `classifier.predict_correspondent(content)` — Source: `src/documents/classifier.py` (lines 251-260)
-   - `classifier.predict_document_type(content)` — Source: `src/documents/classifier.py` (lines 262-270)
+   - `classifier.predict_document_type(content)` — Source: `src/documents/classifier.py` (lines 262-271)
    - `classifier.predict_tags(content)` — Source: `src/documents/classifier.py` (lines 273-292)
 
 ### 4.6 Log Messages: Training vs. Idle
@@ -1143,9 +1143,12 @@ LogEntry.objects.create(
 
 The user is retrieved as `User.objects.get(username="consumer")` (line 416).
 
-#### `documents_log` (Django model: `Log`)
+#### `documents_log` (Django model: `Log`) — Legacy / NOT Written During Ingestion
 
-The `Log` model at `src/documents/models.py` (lines 285-313) stores application log entries with fields: `group` (UUID), `message` (text), `level` (integer), `created` (datetime). This table is written to by the database log handler when configured.
+The `Log` model at `src/documents/models.py` (lines 285-313) defines a table with fields: `group` (UUID), `message` (text), `level` (integer), `created` (datetime). However, **this table is NOT written during standard document ingestion**. The logging configuration at `src/paperless/settings.py` (lines 373-412) defines only three handlers — `console`, `file_paperless`, and `file_mail` — none of which write to the database. No `Log.objects.create()` call exists anywhere in the ingestion pipeline. This model is a legacy artifact that remains in the codebase but receives no INSERTs during document consumption.
+
+> Source: `src/paperless/settings.py` (lines 373-412) — no database log handler defined
+> Source: `src/documents/models.py` (lines 285-313) — model definition exists but is unused by ingestion
 
 #### Whoosh Search Index (file-based)
 
@@ -1337,13 +1340,14 @@ The `Consumer` class sets `logging_name = "paperless.consumer"` (line 54 of `con
 
 ### Answer 5: Database Tables
 
-**Six data stores are written during ingestion:**
+**Five data stores are written during ingestion:**
 1. `documents_document` — INSERT then multiple UPDATEs
 2. `documents_document_tags` — M2M INSERTs for inbox tags, matched tags, override tags
 3. `django_admin_log` — Audit trail entry
-4. `documents_log` — Application log entries (if database logging configured)
-5. Whoosh search index — File-based full-text index update
-6. `django_q_task` — Task execution record
+4. Whoosh search index — File-based full-text index update
+5. `django_q_task` — Task execution record
+
+**Note:** The `documents_log` table (`Log` model at `src/documents/models.py:285-313`) exists in the schema but is **not** written during ingestion — no database log handler is configured in `settings.py` and no `Log.objects.create()` call exists in the ingestion pipeline.
 
 ### Key Architectural Insights
 
