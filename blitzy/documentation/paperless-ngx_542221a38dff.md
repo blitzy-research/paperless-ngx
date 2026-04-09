@@ -644,7 +644,7 @@ This is exactly the "haunted pagination" behaviour reported by users.
 
 The SQL execution order is:
 
-```
+```sql
 SELECT DISTINCT ...
 FROM documents_document ...
 [JOINs from tag filters]
@@ -1111,7 +1111,7 @@ have been modified.**
 | `src/documents/models.py` | 152 | `created = models.DateTimeField(default=timezone.now, db_index=True)` |
 | `src/documents/models.py` | 207-208 | `class Meta: ordering = ("-created",)` |
 | `src/documents/models.py` | 316-339 | `SavedView` model |
-| `src/documents/models.py` | 342-376 | `SavedViewFilterRule` model |
+| `src/documents/models.py` | 342-382 | `SavedViewFilterRule` model |
 | `src/paperless/views.py` | 8-11 | `StandardPagination` class definition |
 | `src/paperless/urls.py` | 32 | `api_router.register(r"documents", UnifiedSearchViewSet)` |
 | `src/paperless/settings.py` | 116-127 | `REST_FRAMEWORK` configuration dict |
@@ -1123,8 +1123,8 @@ have been modified.**
 | `src-ui/src/app/services/document-list-view.service.ts` | 87-98 | `defaultListViewState()` |
 | `src-ui/src/app/services/document-list-view.service.ts` | 133-184 | `reload()` method |
 | `src-ui/src/app/services/document-list-view.service.ts` | 231-235 | `set currentPage()` setter |
-| `src-ui/src/app/services/document-list-view.service.ts` | 298-318 | `getNext()` method |
-| `src-ui/src/app/services/document-list-view.service.ts` | 321-341 | `getPrevious()` method |
+| `src-ui/src/app/services/document-list-view.service.ts` | 298-320 | `getNext()` method |
+| `src-ui/src/app/services/document-list-view.service.ts` | 322-342 | `getPrevious()` method |
 | `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 24-29 | `getOrderingQueryParam()` |
 | `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 32-58 | `list()` HTTP method |
 | `src-ui/src/app/services/rest/document.service.ts` | 16-24 | `DOCUMENT_SORT_FIELDS` constant |
