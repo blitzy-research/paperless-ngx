@@ -118,7 +118,7 @@ and Channels requires an ASGI server — a plain WSGI server like the default Gu
 would not support WebSocket connections. The ASGI application itself is defined in
 `src/paperless/asgi.py` and uses a `ProtocolTypeRouter` to multiplex HTTP and WebSocket traffic:
 
-```
+```python
 application = ProtocolTypeRouter({
     "http": get_asgi_application(),
     "websocket": AuthMiddlewareStack(URLRouter(websocket_urlpatterns)),
@@ -175,9 +175,11 @@ CHANNEL_LAYERS = {
 
 The `capacity: 2000` setting means the channel layer can buffer up to 2,000 messages before
 dropping the oldest ones. The `expiry: 15` setting means messages older than 15 seconds are
-automatically discarded. These values are deliberately set higher than the Channels defaults
-(100 capacity, 60 second expiry) because document ingestion generates frequent progress updates
-that need to be delivered promptly, and the short expiry ensures stale messages don't accumulate.
+automatically discarded. These values are deliberately adjusted from the Channels defaults
+(100 capacity, 60 second expiry) — capacity is raised to 2,000 for higher throughput, and expiry
+is shortened to 15 seconds to reduce stale message retention. This tuning reflects the nature of
+document ingestion: frequent progress updates demand a larger buffer, while the short expiry
+ensures outdated status messages don't accumulate in the channel layer.
 
 **Why a single Redis instance for both roles?** This is a pragmatic design choice: both the task
 broker and the channel layer require a fast, in-memory message transport, and using a single
