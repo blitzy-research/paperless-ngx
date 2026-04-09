@@ -95,7 +95,7 @@ Per the investigation rules, no existing source repository files are modified. T
 The Paperless-NGX runtime is defined by two dependency manifests:
 
 - **`Pipfile`** — range-specified dependencies for development
-- **`requirements.txt`** — 113 pinned production packages
+- **`requirements.txt`** — 104 pinned production packages
 
 #### Critical Runtime Packages
 
@@ -1550,8 +1550,8 @@ erDiagram
         boolean success
     }
     
-    documents_document ||--o| documents_correspondent : "correspondent_id"
-    documents_document ||--o| documents_documenttype : "document_type_id"
+    documents_document }o--o| documents_correspondent : "correspondent_id"
+    documents_document }o--o| documents_documenttype : "document_type_id"
     documents_document ||--o{ documents_document_tags : "document_id"
     documents_tag ||--o{ documents_document_tags : "tag_id"
 ```
@@ -1625,27 +1625,28 @@ During this investigation, the following temporary artifacts were noted:
 | File | Lines | Primary Content |
 |------|-------|-----------------|
 | `src/paperless/version.py` | 1 | Version: `(1, 7, 0)` |
-| `src/documents/management/commands/document_consumer.py` | 241 | File detection, `_consume()`, `async_task()` |
-| `src/documents/tasks.py` | 281 | `consume_file()` entry point, barcode splitting |
-| `src/documents/consumer.py` | 433 | `Consumer.try_consume_file()`, `_store()`, `_send_progress()` |
+| `src/documents/management/commands/document_consumer.py` | 240 | File detection, `_consume()`, `async_task()` |
+| `src/documents/tasks.py` | 280 | `consume_file()` entry point, barcode splitting |
+| `src/documents/consumer.py` | 432 | `Consumer.try_consume_file()`, `_store()`, `_send_progress()` |
 | `src/documents/signals/__init__.py` | 5 | Three signals: started, finished, declaration |
 | `src/documents/signals/handlers.py` | 431 | Six consumption handlers + post_save/post_delete |
 | `src/documents/apps.py` | 29 | Signal handler registration in `ready()` |
-| `src/documents/models.py` | 467 | Document, Log, Correspondent, Tag, DocumentType, FileInfo |
-| `src/documents/index.py` | 288 | Whoosh schema, update_document, add_or_update_document |
-| `src/documents/classifier.py` | 293 | DocumentClassifier, load_classifier, FORMAT_VERSION=7 |
+| `src/documents/models.py` | 466 | Document, Log, Correspondent, Tag, DocumentType, FileInfo |
+| `src/documents/index.py` | 287 | Whoosh schema, update_document, add_or_update_document |
+| `src/documents/classifier.py` | 292 | DocumentClassifier, load_classifier, FORMAT_VERSION=7 |
 | `src/documents/matching.py` | 57+ | match_correspondents, match_document_types, match_tags |
 | `src/documents/parsers.py` | 110+ | get_parser_class_for_mime_type, signal dispatch |
-| `src/documents/loggers.py` | 22 | LoggingMixin: renew_logging_group(), log() |
+| `src/documents/loggers.py` | 21 | LoggingMixin: renew_logging_group(), log() |
 | `src/documents/file_handling.py` | 53+ | create_source_path_directory, delete_empty_directories |
 | `src/documents/views.py` | 535+ | PostDocumentView.post() — API upload path |
 | `src/paperless_tesseract/signals.py` | 19 | Tesseract parser declaration: weight=0 |
 | `src/paperless_text/signals.py` | 15 | Text parser declaration: weight=10 |
 | `src/paperless_tika/signals.py` | 24 | Tika parser declaration: weight=10 (feature-flagged) |
-| `src/paperless/settings.py` | 616 | Q_CLUSTER, directories, logging, consumer settings |
+| `src/paperless/settings.py` | 615 | Q_CLUSTER, directories, logging, consumer settings |
 | `src/paperless_mail/mail.py` | 350+ | Email ingestion entry point |
-| `docker/supervisord.conf` | 36 | Three supervised processes |
-| `docker/docker-prepare.sh` | 82 | Startup sequence |
+| `docker/supervisord.conf` | 35 | Three supervised processes |
+| `docker/docker-prepare.sh` | 81 | Startup sequence |
+| `docker/docker-entrypoint.sh` | 92 | Container entrypoint: UID/GID mapping, invokes `docker-prepare.sh` |
 
 ---
 
