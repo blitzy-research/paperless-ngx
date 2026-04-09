@@ -114,7 +114,7 @@ Source: `src/documents/apps.py:11-27`
 
 **KEY FINDING:** The `add_to_index` handler is connected **ONLY** to `document_consumption_finished` (line 27). It is **NOT** connected to Django's built-in `post_save` signal. This means `add_to_index` only fires during initial document ingestion — not during API-driven updates.
 
-The `update_filename_and_move_files` handler IS connected to `post_save` via decorator (`src/documents/signals/handlers.py` line 311: `@receiver(models.signals.post_save, sender=Document)`), but this handler only manages file renaming and moving — it does **NOT** update the Whoosh index.
+The `update_filename_and_move_files` handler IS connected to both `m2m_changed` (line 310: `@receiver(models.signals.m2m_changed, sender=Document.tags.through)`) and `post_save` (line 311: `@receiver(models.signals.post_save, sender=Document)`) via decorators in `src/documents/signals/handlers.py`, but this handler only manages file renaming and moving — it does **NOT** update the Whoosh index.
 
 Source: `src/documents/signals/handlers.py:310-312`
 
@@ -285,7 +285,7 @@ Source: `src/documents/signals/handlers.py:428-431`, `src/documents/apps.py:27`
 
 #### Path D — Django Admin (CONTRAST)
 
-`DocumentAdmin.save_model()` (`src/documents/admin.py:85-89`) directly calls `index.add_or_update_document(obj)` synchronously — similar to the API path. `DocumentAdmin.delete_model()` (`src/documents/admin.py:79-83`) calls `index.remove_document_from_index(obj)` synchronously. `DocumentAdmin.delete_queryset()` (`src/documents/admin.py:70-77`) opens a writer and removes all documents from the index in a batch.
+`DocumentAdmin.save_model()` (`src/documents/admin.py:85-89`) directly calls `index.add_or_update_document(obj)` synchronously, but with a notable ordering difference from the API path: the index update occurs **before** the database save (`super().save_model()` at line 89), whereas in the API path (`views.py:212-217`) the database save (`super().update()`) happens **first** and the index update follows. This means that if the database save fails in the admin path, the Whoosh index would temporarily contain data that was never persisted. `DocumentAdmin.delete_model()` (`src/documents/admin.py:79-83`) calls `index.remove_document_from_index(obj)` synchronously. `DocumentAdmin.delete_queryset()` (`src/documents/admin.py:70-77`) opens a writer and removes all documents from the index in a batch.
 
 Source: `src/documents/admin.py:70-89`
 
@@ -483,7 +483,7 @@ This opens the existing index and commits with `optimize=True` to merge Whoosh s
 
 #### Mechanism 2 — Startup Reconciliation
 
-The `search_index()` function in `docker/docker-prepare.sh` lines 49–57 provides automatic reconciliation on container startup:
+The `search_index()` function in `docker/docker-prepare.sh` lines 49–58 provides automatic reconciliation on container startup:
 
 ```bash
 search_index() {
@@ -497,7 +497,7 @@ search_index() {
 }
 ```
 
-Source: `docker/docker-prepare.sh:49-57`
+Source: `docker/docker-prepare.sh:49-58`
 
 On every container start:
 1. Checks if the `.index_version` sentinel file exists and matches the expected version (currently `1`).
@@ -515,7 +515,7 @@ Source: `docker/docker-prepare.sh:66-81`
 - `src/documents/tasks.py:32-35` — `index_optimize()` function
 - `src/documents/index.py:52-61` — `open_index(recreate=True)` behavior
 - `src/documents/index.py:57` — Exception logging during index open
-- `docker/docker-prepare.sh:49-57` — Startup index version check
+- `docker/docker-prepare.sh:49-58` — Startup index version check
 - `docker/docker-prepare.sh:66-81` — `do_work()` execution flow
 
 ---
@@ -566,9 +566,9 @@ Source: `src/documents/index.py:52-61`
 
 #### Mechanism 2 — Startup Recovery (`docker-prepare.sh`)
 
-The `search_index()` function in `docker/docker-prepare.sh` lines 49–57 (detailed in Q4) checks the `.index_version` sentinel file on every container start.
+The `search_index()` function in `docker/docker-prepare.sh` lines 49–58 (detailed in Q4) checks the `.index_version` sentinel file on every container start.
 
-Source: `docker/docker-prepare.sh:49-57`
+Source: `docker/docker-prepare.sh:49-58`
 
 If the sentinel file is missing — which happens if the data volume is cleaned or the index directory is deleted — the version check fails (`(! -f "$index_version_file")` evaluates to true). This triggers `python3 manage.py document_index reindex`, which performs a **FULL rebuild** of the index from all database records via `index_reindex()` (`src/documents/tasks.py:38-45`).
 
@@ -607,7 +607,7 @@ The primary bottleneck is disk I/O (writing to the Whoosh index files) and datab
 - `src/documents/index.py:59-60` — Directory recreation for deleted index
 - `src/documents/index.py:87-107` — `update_document()` with tag/correspondent queries
 - `src/documents/tasks.py:38-45` — `index_reindex()` full rebuild
-- `docker/docker-prepare.sh:49-57` — Startup index version check
+- `docker/docker-prepare.sh:49-58` — Startup index version check
 - `src/documents/signals/handlers.py:428-431` — `add_to_index` for new consumption
 - `src/documents/views.py:212-217` — API update re-adds individual documents
 
@@ -639,7 +639,7 @@ The primary bottleneck is disk I/O (writing to the Whoosh index files) and datab
 | Django Admin Delete (batch) | Admin panel batch delete | Synchronous | `src/documents/admin.py` | 70–77 |
 | CLI Full Reindex | `manage.py document_index reindex` | Synchronous (batch) | `src/documents/tasks.py` | 38–45 |
 | CLI Optimize | `manage.py document_index optimize` | Synchronous | `src/documents/tasks.py` | 32–35 |
-| Container Startup Check | Docker container start | Synchronous (batch, conditional) | `docker/docker-prepare.sh` | 49–57 |
+| Container Startup Check | Docker container start | Synchronous (batch, conditional) | `docker/docker-prepare.sh` | 49–58 |
 
 ### API Update Sequence Diagram
 
