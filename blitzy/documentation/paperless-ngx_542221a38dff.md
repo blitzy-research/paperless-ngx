@@ -219,8 +219,34 @@ Every response from `/api/documents/` is wrapped in a pagination envelope:
   "next": "http://localhost:8000/api/documents/?page=2",
   "previous": null,
   "results": [
-    { "...document object..." },
-    { "...document object..." }
+    {
+      "id": 1,
+      "correspondent": 3,
+      "document_type": 2,
+      "title": "Invoice from ACME Corp",
+      "content": "Invoice #1042 dated 2022-01-15 ...",
+      "tags": [1, 4, 7],
+      "created": "2022-01-15T00:00:00Z",
+      "modified": "2022-01-15T10:30:00Z",
+      "added": "2022-01-15T10:35:22.481Z",
+      "archive_serial_number": null,
+      "original_file_name": "invoice_acme.pdf",
+      "archived_file_name": null
+    },
+    {
+      "id": 2,
+      "correspondent": 1,
+      "document_type": null,
+      "title": "Bank Statement January 2022",
+      "content": "Account summary for January ...",
+      "tags": [2],
+      "created": "2022-01-31T00:00:00Z",
+      "modified": "2022-02-01T08:15:00Z",
+      "added": "2022-02-01T08:20:11.329Z",
+      "archive_serial_number": 5,
+      "original_file_name": "bank_statement_jan2022.pdf",
+      "archived_file_name": "0000005.pdf"
+    }
   ]
 }
 ```
@@ -675,6 +701,12 @@ If you are running against a persistent database (not `/tmp/`), remember to:
    >>> Token.objects.filter(user__username='testuser').delete()
    ```
 
+### Thinking/Rationale
+
+- **Why clean up temporary directories?** The directories created in Section 1 (`/tmp/paperless_data`, `/tmp/paperless_media`, `/tmp/paperless_consume`, `/tmp/paperless_log`) contain the SQLite database, search index, document files, and log files. These are test artifacts that should not persist beyond the investigation session. The user's explicit requirement states: "clean up any additional files or changes when you're done" — so removing these directories fulfils that contract.
+- **Why offer two cleanup paths (delete user vs. revoke token)?** In a temporary `/tmp/` setup, removing the directories is sufficient since the entire database is discarded. However, if an integration developer runs these commands against a persistent Paperless-ngx instance (e.g., a staging server), they need fine-grained cleanup options. Deleting the user cascades to the token because the `Token.user` field is a `OneToOneField` with Django's default `CASCADE` delete behavior (`Source: rest_framework/authtoken/models.py`). Revoking just the token preserves the user account, which may be preferable if the user serves other purposes.
+- **Why not mention database cleanup separately?** The `authtoken_token` row is automatically removed when the user is deleted (CASCADE FK), and the `auth_user` row is removed by `User.objects.filter(...).delete()`. No orphaned rows remain — Django's ORM handles referential integrity for both operations.
+
 ---
 
 ## 10. Quick Reference Summary
@@ -736,3 +768,9 @@ If you are running against a persistent database (not `/tmp/`), remember to:
 | 20 | DocumentSerializer fields | `src/documents/serialisers.py:201-235` |
 | 21 | Custom Auth Classes | `src/paperless/auth.py:9-15,18-33,36-41` |
 | 22 | MIDDLEWARE stack | `src/paperless/settings.py:134-146` |
+
+### Thinking/Rationale
+
+- **Why include a quick reference summary?** This section serves as a lookup table for integration developers who have already read the investigative sections and need to quickly retrieve specific values (header format, endpoint path, status codes) during implementation. Every answer in this table was derived from the detailed analysis in Sections 1–8 — it consolidates findings rather than introducing new claims.
+- **Why include live test results here?** The live test results table provides independent verification that the code-traced answers are correct at runtime, not just in theory. Including them in the summary gives developers confidence that the documented behavior matches actual server responses.
+- **Why include the source code reference table?** The 22-row reference table provides a complete citation index for the entire document. If the Paperless-ngx codebase is updated in the future, a developer can use this table to quickly identify which source files and line numbers to re-verify — making this document maintainable over time. Each entry traces directly to the code analysis performed in Sections 1–8.
