@@ -38,11 +38,16 @@
   - [parsers.py Deep Dive](#parserspy-deep-dive)
   - [signals/handlers.py Deep Dive](#signalshandlerspy-deep-dive)
   - [matching.py Deep Dive](#matchingpy-deep-dive)
+  - [mail.py Deep Dive](#mailpy-deep-dive)
 - [Evidence and Measurements](#evidence-and-measurements)
   - [Code Path Memory Estimates](#code-path-memory-estimates)
   - [Configuration Impact Analysis](#configuration-impact-analysis)
   - [Critical Code Excerpts](#critical-code-excerpts)
 - [Conclusions and Recommendations](#conclusions-and-recommendations)
+- [Appendix: Mermaid Diagrams](#appendix-mermaid-diagrams)
+  - [Diagram 2: Classifier Loading Sequence](#diagram-2-classifier-loading-sequence)
+  - [Diagram 3: Signal Handler Cascade](#diagram-3-signal-handler-cascade)
+  - [Diagram 4: Memory Timeline](#diagram-4-memory-timeline)
 
 ---
 
@@ -50,7 +55,7 @@
 
 This investigation analyzes the root causes of memory usage spikes observed during document import operations in the Paperless-ngx v1.7.0 system. All findings are derived from direct source code inspection; no assumptions are made beyond what the code explicitly demonstrates.
 
-**What causes memory spikes during document import?** The primary causes are: (1) the consumer pipeline reads each file fully into memory at least three to four separate times through independent `open(path, "rb") → f.read()` calls in `src/documents/consumer.py`, without reusing previously computed data; (2) the machine learning classifier model — containing three scikit-learn `MLPClassifier` neural networks, a `CountVectorizer`, and label binarizers — is deserialized from a pickle file for every single document consumed due to the `Q_CLUSTER recycle: 1` setting; (3) when barcode processing is enabled, `pdf2image.convert_from_path()` rasterizes every PDF page into an in-memory PIL Image simultaneously; and (4) the post-consumption signal cascade holds references to the classifier and document objects across seven separate handler invocations that each perform matching and database operations.
+**What causes memory spikes during document import?** The primary causes are: (1) the consumer pipeline reads each file fully into memory at least three to four separate times through independent `open(path, "rb") → f.read()` calls in `src/documents/consumer.py`, without reusing previously computed data; (2) the machine learning classifier model — containing three scikit-learn `MLPClassifier` neural networks, a `CountVectorizer`, and a label binarizer — is deserialized from a pickle file for every single document consumed due to the `Q_CLUSTER recycle: 1` setting; (3) when barcode processing is enabled, `pdf2image.convert_from_path()` rasterizes every PDF page into an in-memory PIL Image simultaneously; (4) the post-consumption signal cascade holds references to the classifier and document objects across six `document_consumption_finished` handler invocations that each perform matching and database operations; and (5) email ingestion via `src/paperless_mail/mail.py` holds entire attachment payloads in memory as `att.payload` bytes objects before writing them to temporary files.
 
 **Is metadata handling creating unnecessary copies or holding references?** Yes. The matching engine in `src/documents/matching.py` creates full copies of the entire document content string via `re.sub()` and `.lower()` calls for every matching model that uses fuzzy matching. The consumer computes MD5 checksums of the same file twice (lines 103 and 397 of `consumer.py`) without reusing the first result. The `_write()` method (line 429) reads entire files into memory to copy them, rather than using streaming I/O.
 
@@ -104,13 +109,13 @@ The pipeline stages, in execution order, are:
 10. **`parse_date()`** (line 275) — Iterates a complex regular expression (`DATE_REGEX`) over the full text content via `re.finditer()`. Memory impact: the regex engine processes the full text string, but `finditer()` yields matches lazily without creating a copy of the content.  
     Source: `src/documents/parsers.py:261`
 
-11. **`load_classifier()`** (line 292) — Deserializes the classifier model from a pickle file. Six `pickle.load()` calls create a `CountVectorizer`, `MultiLabelBinarizer`, three `MLPClassifier` objects, and a data hash. Memory impact: 50-200MB+ depending on corpus size.  
+11. **`load_classifier()`** (line 292) — Deserializes the classifier model from a pickle file. Seven `pickle.load()` calls create a schema version, data hash, `CountVectorizer`, `MultiLabelBinarizer`, and three `MLPClassifier` objects. Memory impact: 50-200MB+ depending on corpus size.  
     Source: `src/documents/consumer.py:292`, `src/documents/classifier.py:76-94`
 
 12. **`self._store()`** (line 301) — **FULL FILE READ #2**. Creates the `Document` database record with a freshly computed MD5 checksum from another full file read. The checksum from step 2 is not reused.  
     Source: `src/documents/consumer.py:397-406`
 
-13. **`document_consumption_finished.send()`** (line 306) — **Signal cascade**. Triggers 7 registered handlers, passing both the `document` object and `classifier` object to each. All handlers execute within the same `transaction.atomic()` block.  
+13. **`document_consumption_finished.send()`** (line 306) — **Signal cascade**. Triggers 6 registered handlers, passing both the `document` object and `classifier` object to each. All handlers execute within the same `transaction.atomic()` block. (Note: `update_filename_and_move_files()` also fires during this phase, but via Django's `post_save`/`m2m_changed` model signals, not via `document_consumption_finished` directly.)  
     Source: `src/documents/consumer.py:306-311`
 
 14. **`self._write()` for source file** (line 319) — **FULL FILE READ #3**. The `_write()` method reads the entire source file into memory and writes it to the target location.  
@@ -143,7 +148,7 @@ For a representative 10MB PDF document that produces an 11MB archive PDF, the fo
 | Thumbnail generation | `parsers.py:319-340` | 5-15MB (PNG image + optipng subprocess) | Extended — until file is written |
 | Classifier loading | `classifier.py:76-94` | 50-200MB (pickle deserialization) | Extended — until function returns at line 377 |
 | Storage checksum (full-file read #2) | `consumer.py:397-402` | ~10MB (bytes object) | Brief — freed after Document.create |
-| Signal cascade + matching | `handlers.py` + `matching.py` | 10-50MB (DB querysets, regex ops, content copies) | Medium — all 7 handlers |
+| Signal cascade + matching | `handlers.py` + `matching.py` | 10-50MB (DB querysets, regex ops, content copies) | Medium — all 6 `document_consumption_finished` handlers |
 | `_write()` source (full-file read #3) | `consumer.py:429-432` | ~10MB (bytes object) | Brief — freed after write |
 | `_write()` archive | `consumer.py:333-337` | ~11MB (bytes object) | Brief — freed after write |
 | Archive checksum (full-file read #4) | `consumer.py:339-342` | ~11MB (bytes object) | Brief — freed after checksum |
@@ -164,10 +169,10 @@ flowchart TD
     G --> H["🟠 document_parser.parse()<br/>Parser-dependent memory<br/>OCR: +50-200MB / Text: +FileSize"]
     H --> I["get_optimised_thumbnail()<br/>Memory: +5-15MB (PIL image)"]
     I --> J["get_text() / parse_date()<br/>Returns existing self.text reference"]
-    J --> K["🔴 load_classifier()<br/>6× pickle.load()<br/>Memory: +50-200MB"]
+    J --> K["🔴 load_classifier()<br/>7× pickle.load()<br/>Memory: +50-200MB"]
     K --> L["transaction.atomic() begins"]
     L --> M["🔴 _store() — FULL FILE READ #2<br/>open(path,'rb') → f.read() → MD5<br/>Memory: +FileSize"]
-    M --> N["🟠 document_consumption_finished.send()<br/>7 signal handlers execute<br/>classifier + document in scope<br/>Memory: +10-50MB (matching)"]
+    M --> N["🟠 document_consumption_finished.send()<br/>6 signal handlers execute<br/>classifier + document in scope<br/>Memory: +10-50MB (matching)"]
     N --> O["🔴 _write(source) — FULL FILE READ #3<br/>read_file.read() → write_file.write()<br/>Memory: +FileSize"]
     O --> P["_write(thumbnail)<br/>Memory: +ThumbnailSize"]
     P --> Q["🔴 _write(archive) — FULL FILE READ<br/>Memory: +ArchiveSize"]
@@ -270,7 +275,7 @@ Total: **~260MB in sequential file reads** — plus the parser's own memory usag
 
 ### 2. Classifier Model Deserialization
 
-**Summary**: The document classification model is deserialized from a pickle file for every single document consumed. The model contains three neural network classifiers, a text vectorizer, and label binarizers, all of which grow proportionally with the document corpus.
+**Summary**: The document classification model is deserialized from a pickle file for every single document consumed. The model contains three neural network classifiers, a text vectorizer, and a label binarizer, all of which grow proportionally with the document corpus.
 
 **Thinking/Rationale**: The `load_classifier()` function (Source: `src/documents/classifier.py:30-57`) is called at line 292 of `consumer.py`, after parsing completes but before the database transaction begins. The classifier is needed by the signal handlers to automatically assign correspondents, document types, and tags. Because `Q_CLUSTER recycle: 1` (Source: `src/paperless/settings.py:452`) forces each Django-Q worker to terminate after processing exactly one task, there is no opportunity to cache the classifier across documents. Every document import triggers a fresh deserialization.
 
@@ -307,7 +312,7 @@ def load(self):
 
 Source: `src/documents/classifier.py:76-94`
 
-Six `pickle.load()` calls deserialize the following objects:
+Seven `pickle.load()` calls deserialize the following objects:
 
 | Object | Type | Memory Scaling |
 |--------|------|---------------|
@@ -465,9 +470,9 @@ Source: `src/paperless_tika/parsers.py:80-97`
 
 ### 5. Signal Handler Cascade
 
-**Summary**: After a document is successfully stored in the database, the `document_consumption_finished` signal triggers seven registered handlers. All handlers receive references to both the `document` and `classifier` objects, and all execute within the same `transaction.atomic()` block, keeping these large objects in scope throughout the entire cascade.
+**Summary**: After a document is successfully stored in the database, the `document_consumption_finished` signal triggers six registered handlers. All handlers receive references to both the `document` and `classifier` objects, and all execute within the same `transaction.atomic()` block, keeping these large objects in scope throughout the entire cascade. Additionally, `update_filename_and_move_files()` fires indirectly during this phase via Django's `post_save` and `m2m_changed` model signals when the document is saved and tags are modified.
 
-**Thinking/Rationale**: Django signals are synchronous — each handler executes in sequence before the next handler begins. The `classifier` object (50-200MB) is passed as a keyword argument to all handlers via `document_consumption_finished.send()`. Even handlers that don't use the classifier (like `set_log_entry` or `add_inbox_tags`) still receive a reference to it, preventing garbage collection until the entire cascade completes.
+**Thinking/Rationale**: Django signals are synchronous — each handler executes in sequence before the next handler begins. The `classifier` object (50-200MB) is passed as a keyword argument to all handlers via `document_consumption_finished.send()`. Even handlers that don't use the classifier (like `set_log_entry` or `add_inbox_tags`) still receive a reference to it via `**kwargs`, preventing garbage collection until the entire cascade completes.
 
 ---
 
@@ -484,21 +489,22 @@ document_consumption_finished.send(
 
 Source: `src/documents/consumer.py:306-311`
 
-Seven registered handlers execute in sequence (Source: `src/documents/signals/handlers.py`):
+Six registered handlers for `document_consumption_finished` execute in sequence (Source: `src/documents/signals/handlers.py`, registered in `src/documents/apps.py:22-27`):
 
 | Handler | Line | Memory Impact |
 |---------|------|---------------|
+| `add_inbox_tags()` | 30 | Queries `Tag.objects.filter(is_inbox_tag=True)` — small queryset |
 | `set_correspondent()` | 35 | Loads ALL `Correspondent` objects from DB, calls `matching.match_correspondents(document, classifier)` which runs matching against full document content |
 | `set_document_type()` | 101 | Loads ALL `DocumentType` objects from DB, calls `matching.match_document_types(document, classifier)` which runs matching against full document content |
 | `set_tags()` | 168 | Loads ALL `Tag` objects from DB, calls `matching.match_tags(document, classifier)` which runs matching against full document content |
-| `add_inbox_tags()` | 30 | Queries `Tag.objects.filter(is_inbox_tag=True)` — small queryset |
-| `set_log_entry` | N/A | Creates a `LogEntry` in the database — minimal memory |
-| `add_to_index` | N/A | Calls `index.add_or_update_document()` which opens a Whoosh `AsyncWriter` and indexes the document |
-| `update_filename_and_move_files()` | 312 | Generates filename via `generate_unique_filename()`, may rename/move files |
+| `set_log_entry()` | 413 | Creates a `LogEntry` in the database — minimal memory |
+| `add_to_index()` | 428 | Calls `index.add_or_update_document()` which opens a Whoosh `AsyncWriter` and indexes the document |
 
-The first three handlers are the most memory-intensive because each calls into the matching engine (`src/documents/matching.py`) which processes the full document content for every matching model. The classifier's `predict_*()` methods also vectorize the document content using the `CountVectorizer`, creating additional temporary objects.
+Additionally, `update_filename_and_move_files()` (line 312) fires indirectly during consumption via Django's `@receiver(models.signals.post_save, sender=Document)` and `@receiver(models.signals.m2m_changed, sender=Document.tags.through)` decorators — NOT via the `document_consumption_finished` signal. It triggers when the document is saved and when tags are modified by `set_tags()`. It generates filenames via `generate_unique_filename()` and may rename/move files. Memory impact: minimal (file path string operations).
 
-Source: `src/documents/signals/handlers.py:30-370`
+The first three matching handlers (`set_correspondent`, `set_document_type`, `set_tags`) are the most memory-intensive because each calls into the matching engine (`src/documents/matching.py`) which processes the full document content for every matching model. The classifier's `predict_*()` methods also vectorize the document content using the `CountVectorizer`, creating additional temporary objects.
+
+Source: `src/documents/signals/handlers.py:30-431`, `src/documents/apps.py:22-27`
 
 ### 6. Matching Engine Overhead
 
@@ -570,7 +576,14 @@ The memory profile varies dramatically based on document type because different 
 - Both response bodies held in memory
 - Archive PDF generated via Gotenberg
 
-**Thinking/Rationale**: Scanned multi-page PDFs are the worst case because they combine the heaviest parser (OCR), potential barcode processing, archive generation (which adds an extra `_write()` and checksum call in the consumer), and typically the largest file sizes. A 20-page scanned PDF might be 15-30MB, which is read 3-4 times by the consumer, while the parser spawns OCR processes and the archive (which can be larger than the original) adds more reads.
+**Email attachments** — Ingested via `MailAccountHandler` (Source: `src/paperless_mail/mail.py:272-361`):
+- Before any parsing begins, the entire email attachment payload is held in memory as `att.payload` (bytes object)
+- `magic.from_buffer(att.payload)` at line 317 performs MIME detection from the in-memory buffer
+- The payload is written to a temp file at line 327, then dispatched for consumption via `async_task`
+- For emails with multiple attachments, ALL attachment payloads are in memory simultaneously as part of `message.attachments`
+- The subsequent consumer pipeline reads from the temp file on disk — identical to filesystem ingestion from that point forward
+
+**Thinking/Rationale**: Scanned multi-page PDFs are the worst case because they combine the heaviest parser (OCR), potential barcode processing, archive generation (which adds an extra `_write()` and checksum call in the consumer), and typically the largest file sizes. A 20-page scanned PDF might be 15-30MB, which is read 3-4 times by the consumer, while the parser spawns OCR processes and the archive (which can be larger than the original) adds more reads. Email ingestion adds an additional pre-consumer memory overhead: the attachment payload is materialized in memory by the `imap_tools` library before being written to disk, unlike filesystem ingestion where the file already exists on disk.
 
 ### By Processing Stage
 
@@ -642,7 +655,7 @@ Within `Consumer.try_consume_file()`, several large objects are held in scope si
 
 6. **`archive_path`** — File path to the generated archive PDF. Assigned at line 276.
 
-During the signal cascade (lines 306-311), ALL of these objects are simultaneously in scope. The `document_consumption_finished.send()` call passes `document` and `classifier` to all 7 handlers. Each matching handler also accesses `document.content` (the full text), creating additional temporary objects during matching operations.
+During the signal cascade (lines 306-311), ALL of these objects are simultaneously in scope. The `document_consumption_finished.send()` call passes `document` and `classifier` to all 6 handlers. Each matching handler also accesses `document.content` (the full text), creating additional temporary objects during matching operations.
 
 **Thinking/Rationale**: The peak memory occurs during the signal cascade when the classifier (50-200MB), parser text output (proportional to document), document model (with content), and any matching-related temporary strings are all simultaneously referenced. Even though individual file reads from `_write()` and checksum operations create temporary allocations, those are brief. The classifier + parser output + document content represent the sustained memory floor during the entire `transaction.atomic()` block.
 
@@ -694,7 +707,7 @@ This is set at module import time and applies globally to all PIL operations in 
 
 3. **Concurrent references are the real problem**: Within the `transaction.atomic()` block, the `classifier` (50-200MB) and `text` (document content) remain referenced throughout. Each `_write()` call adds a temporary `FileSize` allocation on top of these. The peak is: `classifier_size + text_size + file_size_of_current_write + overhead`.
 
-4. **Signal handler cascade extends reference lifetime**: The 7 signal handlers at lines 306-311 of `consumer.py` all execute within the `transaction.atomic()` block. Even though individual handlers complete and their local variables are freed, the `classifier` and `document` arguments remain alive throughout the entire cascade.
+4. **Signal handler cascade extends reference lifetime**: The 6 `document_consumption_finished` signal handlers at lines 306-311 of `consumer.py` all execute within the `transaction.atomic()` block. Even though individual handlers complete and their local variables are freed, the `classifier` and `document` arguments remain alive throughout the entire cascade.
 
 5. **Python's generational GC handles cycles**: Python's `gc` module handles reference cycles (e.g., objects that reference each other). The objects in question (bytes strings, classifier model, Document model) do NOT form reference cycles — they are simple tree structures. CPython's reference counting handles them without needing the generational GC.
 
@@ -745,7 +758,7 @@ Source: `src/paperless/settings.py:449-457`
 |---------|-----------|---------------|-------------|
 | 103-104 | `pre_check_duplicate()` — `f.read()` for MD5 | Full file loaded into bytes object | **Yes** — uses non-streaming hashlib pattern |
 | 292 | `load_classifier()` | Full classifier deserialized from pickle | **Yes** — loaded per-task due to recycle:1 |
-| 306-311 | `document_consumption_finished.send()` | Classifier + document passed to 7 handlers | **Yes** — extends classifier lifetime |
+| 306-311 | `document_consumption_finished.send()` | Classifier + document passed to 6 handlers | **Yes** — extends classifier lifetime |
 | 397-402 | `_store()` — `f.read()` for MD5 | Full file loaded again (same as line 103) | **Yes** — redundant; checksum from line 103 not reused |
 | 429-432 | `_write()` — `read_file.read()` for copy | Full file loaded into bytes for copy | **Yes** — should use `shutil.copyfile()` |
 | 339-342 | Archive checksum — `f.read()` for MD5 | Full archive file loaded into bytes | **Yes** — uses non-streaming hashlib pattern |
@@ -767,7 +780,7 @@ Source: `src/paperless/settings.py:449-457`
 
 | Line(s) | Operation | Memory Pattern | Problematic? |
 |---------|-----------|---------------|-------------|
-| 76-94 | `load()` — 6 `pickle.load()` calls | Full model deserialized into memory | Inherently necessary, but size is unbounded |
+| 76-94 | `load()` — 7 `pickle.load()` calls | Full model deserialized into memory | Inherently necessary, but size is unbounded |
 | 86-92 | Vectorizer + 3 MLPClassifiers deserialized | Each classifier holds weight matrices | Scales with vocabulary × hidden layer size |
 | 115-156 | `train()` — loads ALL document content | `Document.objects.order_by("pk")` iterated | All document content loaded into `data` list |
 | 188-199 | `CountVectorizer.fit_transform(data)` | Sparse matrix from all document content | Memory scales with corpus size |
@@ -826,19 +839,21 @@ The `consume_file()` function at lines 184-250 is the entry point for document c
 ### signals/handlers.py Deep Dive
 
 **File**: `src/documents/signals/handlers.py`  
-**Key Functions**: `set_correspondent()`, `set_document_type()`, `set_tags()`, `add_inbox_tags()`, `cleanup_document_deletion()`, `update_filename_and_move_files()`
+**Key Functions**: `set_correspondent()`, `set_document_type()`, `set_tags()`, `add_inbox_tags()`, `set_log_entry()`, `add_to_index()`, `update_filename_and_move_files()`
 
 **Memory-critical code paths:**
 
-| Line(s) | Operation | Memory Pattern | Problematic? |
-|---------|-----------|---------------|-------------|
-| 35-98 | `set_correspondent()` | Loads ALL correspondents, calls `matching.match_correspondents(document, classifier)` | Each call processes full document content |
-| 101-165 | `set_document_type()` | Loads ALL document types, calls `matching.match_document_types(document, classifier)` | Same pattern as above |
-| 168-230 | `set_tags()` | Loads ALL tags, calls `matching.match_tags(document, classifier)` | Same pattern as above |
-| 30-32 | `add_inbox_tags()` | `Tag.objects.filter(is_inbox_tag=True)` | Small queryset — minimal impact |
-| 310-370 | `update_filename_and_move_files()` | Calls `generate_unique_filename()` which may call `many_to_dictionary()` loading all tags | References document and file paths |
+| Line(s) | Operation | Signal | Memory Pattern | Problematic? |
+|---------|-----------|--------|---------------|-------------|
+| 30-32 | `add_inbox_tags()` | `document_consumption_finished` | `Tag.objects.filter(is_inbox_tag=True)` | Small queryset — minimal impact |
+| 35-98 | `set_correspondent()` | `document_consumption_finished` | Loads ALL correspondents, calls `matching.match_correspondents(document, classifier)` | Each call processes full document content |
+| 101-165 | `set_document_type()` | `document_consumption_finished` | Loads ALL document types, calls `matching.match_document_types(document, classifier)` | Same pattern as above |
+| 168-230 | `set_tags()` | `document_consumption_finished` | Loads ALL tags, calls `matching.match_tags(document, classifier)` | Same pattern as above |
+| 413-425 | `set_log_entry()` | `document_consumption_finished` | Creates `LogEntry` in database | Minimal — single DB write |
+| 428-431 | `add_to_index()` | `document_consumption_finished` | Calls `index.add_or_update_document()` — opens Whoosh `AsyncWriter` | Moderate — index writer memory |
+| 310-410 | `update_filename_and_move_files()` | `post_save` / `m2m_changed` (NOT `document_consumption_finished`) | Calls `generate_unique_filename()` which may call `many_to_dictionary()` loading all tags | References document and file paths |
 
-**Thinking/Rationale**: The three matching handlers (`set_correspondent`, `set_document_type`, `set_tags`) are the primary memory consumers in the signal cascade. Each loads the ENTIRE queryset for its model type (`Correspondent.objects.all()`, `DocumentType.objects.all()`, `Tag.objects.all()`) and runs matching against the document content. The `classifier` argument is passed to all handlers but only used by the matching functions. All handlers execute within the `transaction.atomic()` block, keeping `document` and `classifier` in scope.
+**Thinking/Rationale**: The three matching handlers (`set_correspondent`, `set_document_type`, `set_tags`) are the primary memory consumers in the signal cascade. Each loads the ENTIRE queryset for its model type (`Correspondent.objects.all()`, `DocumentType.objects.all()`, `Tag.objects.all()`) and runs matching against the document content. The `classifier` argument is passed to all 6 `document_consumption_finished` handlers but only used by the matching functions. All handlers execute within the `transaction.atomic()` block, keeping `document` and `classifier` in scope. Note that `update_filename_and_move_files()` is triggered separately by Django's `post_save` and `m2m_changed` model signals (decorated at lines 310-311 of `handlers.py`), not by `document_consumption_finished`.
 
 **Verdict**: **Problematic** — the cascade multiplies memory holding time for the classifier and document objects. Each matching handler processes the full document content, and the three matching handlers together create numerous temporary string copies.
 
@@ -864,6 +879,60 @@ The `consume_file()` function at lines 184-250 is the entry point for document c
 
 **Verdict**: **Problematic for fuzzy matching** — each fuzzy-match model creates 2× content-sized string copies. Systems with many fuzzy-match rules on large documents will see significant matching memory.
 
+### mail.py Deep Dive
+
+**File**: `src/paperless_mail/mail.py`  
+**Key Class**: `MailAccountHandler(LoggingMixin)`  
+**Key Methods**: `handle_mail_account()`, `handle_mail_rule()`, `handle_message()`
+
+Email ingestion via `src/paperless_mail/mail.py` represents a distinct document ingestion vector with unique memory characteristics compared to filesystem or API upload ingestion. The key difference is that email attachments are held entirely in memory as `att.payload` bytes objects before being written to temporary files and dispatched for consumption.
+
+**Memory-critical code paths:**
+
+| Line(s) | Operation | Memory Pattern | Problematic? |
+|---------|-----------|---------------|-------------|
+| 289 | `for att in message.attachments:` | Iterates over all attachments; the `message` object holds all attachment payloads in memory simultaneously | Depends on total attachment size |
+| 317 | `magic.from_buffer(att.payload, mime=True)` | Passes the entire attachment payload to libmagic for MIME type detection | No copy — `from_buffer` reads from existing bytes object — but payload must be in memory |
+| 322-325 | `tempfile.mkstemp(prefix="paperless-mail-", dir=settings.SCRATCH_DIR)` | Creates a temporary file in SCRATCH_DIR | Minimal — file handle creation |
+| 326-327 | `f.write(att.payload)` | Writes the entire attachment payload from memory to the temporary file | The payload bytes object remains in memory during and after the write |
+| 336-349 | `async_task("documents.tasks.consume_file", path=temp_filename, ...)` | Dispatches the temporary file for consumption via Django-Q | The temp file path is passed, not the payload — but `att.payload` remains in scope until the loop iteration ends |
+
+**Thinking/Rationale**: The email ingestion pathway has a fundamentally different memory profile from filesystem ingestion:
+
+1. **Filesystem ingestion** (`document_consumer.py`): The file exists on disk. The consumer reads it from disk when needed. Memory is allocated only when `f.read()` is called.
+
+2. **API upload ingestion** (`serialisers.py:451`): The uploaded file content is read via `document.read()` for checksum validation, similar to filesystem ingestion.
+
+3. **Email ingestion** (`mail.py`): The entire attachment payload is materialized in memory by the `imap_tools` library as part of the `MailMessage` object. The `att.payload` attribute holds the raw bytes of the attachment. This means:
+   - The attachment is in memory BEFORE any processing begins
+   - `magic.from_buffer(att.payload)` at line 317 reads from the in-memory buffer (no disk I/O needed, but the payload must already be fully loaded)
+   - `f.write(att.payload)` at line 327 writes the in-memory payload to a temp file
+   - The `att.payload` bytes object remains referenced by the `att` variable and the parent `message.attachments` list until the loop moves to the next attachment or the message goes out of scope
+
+For a single large email with a 20MB PDF attachment, the payload is held in memory throughout the `handle_message()` call. For an email with multiple attachments (e.g., 5 × 10MB files), ALL attachment payloads are in memory simultaneously as part of the `message.attachments` list, even though they are processed sequentially.
+
+Source: `src/paperless_mail/mail.py:272-361`
+
+```python
+def handle_message(self, message, rule) -> int:
+    ...
+    for att in message.attachments:
+        ...
+        mime_type = magic.from_buffer(att.payload, mime=True)
+        if is_mime_type_supported(mime_type):
+            ...
+            with open(temp_filename, "wb") as f:
+                f.write(att.payload)
+            ...
+            async_task("documents.tasks.consume_file", path=temp_filename, ...)
+```
+
+Source: `src/paperless_mail/mail.py:272-349`
+
+**Key difference from other ingestion vectors**: After the temp file is written and the `async_task` is dispatched, the actual document consumption pipeline (`Consumer.try_consume_file()`) reads from the temp file on disk — the same as filesystem ingestion. The email-specific memory overhead is limited to the `handle_message()` call, which holds attachment payloads in memory while writing them to temp files. Once `handle_message()` returns and the `message` object goes out of scope, the attachment payload memory is freed.
+
+**Verdict**: **Moderately problematic** for emails with large or numerous attachments. The `message.attachments` list holds all attachment payloads in memory simultaneously. For a single small attachment, this is negligible. For multiple large attachments, this creates a memory spike proportional to the total attachment size. Unlike the consumer pipeline's redundant multi-read pattern, this is inherent to how IMAP attachment retrieval works — the payload must be downloaded before it can be written to disk.
+
 ---
 
 ## Evidence and Measurements
@@ -879,7 +948,7 @@ Memory estimates for a 10MB PDF document processed via the OCR parser path, prod
 | Parser `parse()` — OCR | `tesseract/parsers.py:230+` | 50-200MB | Extended | PIL images + pdfminer + ocrmypdf |
 | Parser `parse()` — Text | `text/parsers.py:40-42` | ~10MB | Extended | Simple `f.read()` |
 | Thumbnail generation | `parsers.py:319-340` | 5-15MB | Extended | PIL image + optipng subprocess |
-| Classifier loading | `classifier.py:76-94` | ~100MB | Extended | 6 pickle.load() calls; stays in scope until function end |
+| Classifier loading | `classifier.py:76-94` | ~100MB | Extended | 7 pickle.load() calls; stays in scope until function end |
 | Storage checksum (Read #2) | `consumer.py:397-402` | ~10MB | Brief | Redundant re-read of same file |
 | Signal cascade — matching | `handlers.py` + `matching.py` | 20-60MB | Medium | 3× predict calls + 5× fuzzy copies |
 | `_write()` source (Read #3) | `consumer.py:429-432` | ~10MB | Brief | Full file buffered for copy |
@@ -972,7 +1041,7 @@ Source: `src/paperless_tesseract/parsers.py:198-199` — two full-resolution ima
 | **1. Highest** | Barcode processing — `convert_from_path()` rasterizes all pages | `src/documents/tasks.py:105` | 100-3000MB+ | ALL PDF pages held as PIL images in a list simultaneously |
 | **2. High** | Multiple full-file reads in consumer.py (4 separate reads) | `src/documents/consumer.py:103,397,430,339` | 4× FileSize sequential | Same file read 3-4 times without reuse or streaming |
 | **3. High** | Classifier model deserialization per task | `src/documents/classifier.py:76-94`, `src/paperless/settings.py:452` | 50-200MB per document | `recycle: 1` forces fresh deserialization for every import |
-| **4. Medium** | Signal handler cascade holding classifier + document references | `src/documents/signals/handlers.py` | Extends peak lifetime | 7 handlers execute with classifier in scope |
+| **4. Medium** | Signal handler cascade holding classifier + document references | `src/documents/signals/handlers.py` | Extends peak lifetime | 6 `document_consumption_finished` handlers execute with classifier in scope |
 | **5. Medium** | Fuzzy matching full-content copies | `src/documents/matching.py:130-134` | 2× content_size × N_fuzzy_models | `re.sub()` + `.lower()` per fuzzy model |
 | **6. Lower** | Parser-specific patterns (OCR highest) | `src/paperless_tesseract/parsers.py:197-201` | 50-500MB for OCR | PIL alpha processing, pdfminer, subprocess |
 
@@ -1028,8 +1097,8 @@ sequenceDiagram
     C->>CL: load_classifier()
     CL->>FS: open(MODEL_FILE, "rb")
     FS-->>CL: pickle data stream
-    CL->>CL: pickle.load() × 6
-    Note over CL: CountVectorizer<br/>MultiLabelBinarizer<br/>3× MLPClassifier<br/>(50-200MB total)
+    CL->>CL: pickle.load() × 7
+    Note over CL: schema_version + data_hash<br/>CountVectorizer<br/>MultiLabelBinarizer<br/>3× MLPClassifier<br/>(50-200MB total)
     CL-->>C: classifier object
     Note over C: Signal cascade uses classifier
     Note over C: _write(), checksums, cleanup
@@ -1044,7 +1113,7 @@ sequenceDiagram
     C->>CL: load_classifier()
     CL->>FS: open(MODEL_FILE, "rb")
     FS-->>CL: pickle data stream (AGAIN)
-    CL->>CL: pickle.load() × 6 (AGAIN)
+    CL->>CL: pickle.load() × 7 (AGAIN)
     Note over CL: Same 50-200MB<br/>deserialized again
     CL-->>C: NEW classifier object
 ```
@@ -1053,18 +1122,20 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    A["document_consumption_finished.send()<br/>Passes: document + classifier"] --> B["add_inbox_tags()<br/>Tag.objects.filter(is_inbox_tag=True)<br/>Memory: ~minimal"]
+    A["document_consumption_finished.send()<br/>Passes: document + classifier<br/>(6 registered handlers)"] --> B["add_inbox_tags()<br/>Tag.objects.filter(is_inbox_tag=True)<br/>Memory: ~minimal"]
     B --> C["set_correspondent()<br/>Correspondent.objects.all()<br/>+ matching.match_correspondents()<br/>+ classifier.predict_correspondent()<br/>Memory: +10-20MB<br/>(DB queryset + content preprocessing)"]
     C --> D["set_document_type()<br/>DocumentType.objects.all()<br/>+ matching.match_document_types()<br/>+ classifier.predict_document_type()<br/>Memory: +10-20MB"]
     D --> E["set_tags()<br/>Tag.objects.all()<br/>+ matching.match_tags()<br/>+ classifier.predict_tags()<br/>Memory: +10-20MB"]
-    E --> F["set_log_entry<br/>LogEntry.objects.create()<br/>Memory: ~minimal"]
-    F --> G["add_to_index<br/>index.add_or_update_document()<br/>Whoosh AsyncWriter<br/>Memory: ~5MB"]
-    G --> H["update_filename_and_move_files<br/>generate_unique_filename()<br/>Possible file rename<br/>Memory: ~minimal"]
+    E --> F["set_log_entry()<br/>LogEntry.objects.create()<br/>Memory: ~minimal"]
+    F --> G["add_to_index()<br/>index.add_or_update_document()<br/>Whoosh AsyncWriter<br/>Memory: ~5MB"]
+
+    E -.->|"Document.save() triggers<br/>post_save signal"| H["update_filename_and_move_files()<br/>(via post_save / m2m_changed)<br/>generate_unique_filename()<br/>Possible file rename<br/>Memory: ~minimal"]
 
     style A fill:#ff6b6b,color:#000
     style C fill:#ffa94d,color:#000
     style D fill:#ffa94d,color:#000
     style E fill:#ffa94d,color:#000
+    style H fill:#e8e8e8,color:#000
 ```
 
 ### Diagram 4: Memory Timeline
