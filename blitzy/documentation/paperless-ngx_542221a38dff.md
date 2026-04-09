@@ -69,7 +69,7 @@ The progress state machine proceeds through these stages:
 | 3 | 20/100 | `WORKING` | `MESSAGE_PARSING_DOCUMENT` | OCR parsing begins (line 259) |
 | 4 | 20-70/100 | `WORKING` | (none) | OCR progress updates via callback (lines 237-240) |
 | 5 | 70/100 | `WORKING` | `MESSAGE_GENERATING_THUMBNAIL` | Thumbnail generation (line 264) |
-| 6 | 90/100 | `WORKING` | `MESSAGE_PARSE_DATE` | Date extraction from text (line 274) |
+| 6 | 90/100 | `WORKING` | `MESSAGE_PARSE_DATE` | Date extraction from text (line 274) — conditional: only fires when parser returns no date (line 273: `if not date`) |
 | 7 | 95/100 | `WORKING` | `MESSAGE_SAVE_DOCUMENT` | Saving to database (line 294) |
 | 8 | 100/100 | `SUCCESS` | `MESSAGE_FINISHED` | Consumption complete (line 375) |
 | — | 100/100 | `FAILED` | (error message) | On any failure (line 79) |
@@ -798,10 +798,10 @@ The consumption pipeline proceeds through all remaining stages after parsing:
 
 3. **SUCCESS progress** (line 375): `self._send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)` — the document gets a valid `document.id`.
 
-The **only** path to a `FAILED` status is a `ParseError` exception, which is raised only when:
-- Tier 2 fallback OCR fails catastrophically (line 310).
-- A generic unhandled exception occurs (lines 312-314).
-- Other consumer failures (file not found, duplicate, unsupported type, etc.).
+Within the parser's scope, `ParseError` is the primary failure mechanism that prevents document creation. However, `FAILED` status can also result from consumer-level exceptions:
+
+- **Parser-level**: Tier 2 fallback OCR fails catastrophically, raising `ParseError` (line 310); or a generic unhandled exception in the parser raises `ParseError` (lines 312-314).
+- **Consumer-level**: File not found (`_fail()` at lines 96-100), duplicate document detected (`pre_check_duplicate()`), unsupported MIME type (`_fail()` at line 225), database or file I/O errors (`_fail()` at lines 362-367).
 
 ### Sanity Checker Behavior for Empty-Content Documents
 
@@ -830,7 +830,7 @@ After processing, the document's metadata reflects the OCR outcome:
 |----------|-----------|----------------------|--------------------|-----------------------|
 | Tier 1 success, strong text | Full text | `True` | Present | Normal processing |
 | Tier 1 success, weak text | Sparse/partial text | `True` | Present | Short `content` field |
-| Tier 2 fallback used | Text from fallback OCR | `True` (from Tier 1 archive, not fallback) | Present | Warning in logs: "Encountered an error while running OCR" |
+| Tier 2 fallback used | Text from fallback OCR | Depends: `True` if triggered by `NoTextFoundException` (Tier 1 set `self.archive_path` at line 263 before raising); `False` if triggered by `InputFileError` (line 261 raises before line 263 executes, so `self.archive_path` remains `None`) | Present (from Tier 1 archive if available) | Warning in logs: "Encountered an error while running OCR" |
 | Tier 3: original text used | Original pdfminer text | Depends on Tier 1/2 | Depends | Warning in logs |
 | Tier 3: empty content | `""` (empty string) | Depends on Tier 1/2 | Depends | Warning: "No text was found...content will be empty"; sanity checker info message |
 | ParseError (fatal) | N/A — document not created | N/A | N/A | `FAILED` status, `ConsumerError` raised |
