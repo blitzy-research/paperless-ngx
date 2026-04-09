@@ -93,7 +93,7 @@ document_consumer_declaration = Signal()
 
 Source: `src/documents/signals/__init__.py:1-5`
 
-Signal handler registration happens in `src/documents/apps.py`, method `DocumentsConfig.ready()` (lines 11–29):
+Signal handler registration happens in `src/documents/apps.py`, method `DocumentsConfig.ready()` (lines 11–27):
 
 ```python
 def ready(self):
@@ -553,7 +553,7 @@ Source: `src/documents/index.py:52-61`
 **How it works:**
 - If `exists_in()` or `open_dir()` throws ANY exception (corrupted segment files, missing metadata, I/O errors, etc.), the exception is caught and logged via `logger.exception()`.
 - The code falls through to `create_in()`, which creates a brand new empty index with the correct schema.
-- If the index directory itself has been deleted, `os.makedirs()` on line 59 recreates the directory before `create_in()` is called.
+- If the index directory itself has been deleted, `os.makedirs()` on line 60 recreates the directory before `create_in()` is called.
 
 **CRITICAL LIMITATION:** This creates an **EMPTY** index. Existing documents in the database will NOT appear in search results until they are individually re-indexed. The system gracefully degrades (no crash, no 500 error) but search results will be incomplete or empty.
 
