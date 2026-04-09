@@ -21,7 +21,7 @@ To test the API, you first need a running Paperless-ngx instance. The following 
 | `PAPERLESS_MEDIA_ROOT` | Document file storage | `<BASE_DIR>/../media` (`Source: src/paperless/settings.py:61`) |
 | `PAPERLESS_CONSUMPTION_DIR` | Consumption intake directory | `<BASE_DIR>/../consume` (`Source: src/paperless/settings.py:78-81`) |
 | `PAPERLESS_LOGGING_DIR` | Application log directory | `<DATA_DIR>/log` (`Source: src/paperless/settings.py:76`) |
-| `PAPERLESS_SECRET_KEY` | Django secret key (required) | None — must be set |
+| `PAPERLESS_SECRET_KEY` | Django secret key for cryptographic signing | Built-in fallback (insecure — should be overridden) (`Source: src/paperless/settings.py:260-263`) |
 | `PAPERLESS_DEBUG` | Enable debug mode (optional) | `"NO"` (`Source: src/paperless/settings.py:50`) |
 
 ### Step-by-Step Commands
@@ -55,7 +55,7 @@ The environment variables above are derived directly from `src/paperless/setting
 - **`PAPERLESS_MEDIA_ROOT`** is read at line 61: `MEDIA_ROOT = os.getenv("PAPERLESS_MEDIA_ROOT", os.path.join(BASE_DIR, "..", "media"))`. This stores document originals, archive versions, and thumbnails.
 - **`PAPERLESS_CONSUMPTION_DIR`** is read at lines 78–81: `CONSUMPTION_DIR = os.getenv("PAPERLESS_CONSUMPTION_DIR", os.path.join(BASE_DIR, "..", "consume"))`. This is the directory Paperless watches for new documents to ingest.
 - **`PAPERLESS_LOGGING_DIR`** is read at line 76: `LOGGING_DIR = os.getenv("PAPERLESS_LOGGING_DIR", os.path.join(DATA_DIR, "log"))`. Application log files are written here.
-- **`PAPERLESS_SECRET_KEY`** is Django's `SECRET_KEY`, required for cryptographic signing (session cookies, CSRF tokens, password hashing).
+- **`PAPERLESS_SECRET_KEY`** is Django's `SECRET_KEY`, used for cryptographic signing (session cookies, CSRF tokens, password hashing). The codebase provides a built-in fallback default (`"e11fl1oa-*ytql8p)(06fbj4ukrlo+n7k&q5+$1md7i+mge=ee"` at `src/paperless/settings.py:260-263`), so the key is technically not required. However, this default is **insecure for production** — any deployment accessible beyond a closed network should override it with a unique, random value.
 - **`PAPERLESS_DEBUG`** is read at line 50: `DEBUG = __get_boolean("PAPERLESS_DEBUG", "NO")`. Setting this to `"yes"` enables Django debug mode, which also conditionally adds the `AngularApiAuthenticationOverride` class (`Source: src/paperless/settings.py:129-132`).
 
 The **`--skip-checks`** flag on the `migrate` command is recommended because Django system checks (in `src/paperless/checks.py`) validate OCR binaries (`tesseract`, `optipng`, etc.) and other optional dependencies that are not needed for API testing. Without this flag, migration may fail if these binaries are not installed.
@@ -174,7 +174,7 @@ An authenticated response includes two custom version headers injected by the `A
 
 ### Thinking/Rationale
 
-- **URL routing chain**: `src/paperless/urls.py` line 40 wraps all API routes under `r"^api/"` using `re_path`. The `DefaultRouter` instance at line 29 registers the `documents` viewset at line 32, making the full path `/api/documents/`. The router automatically generates list (GET), create (POST), retrieve (GET /:id/), update (PUT /:id/), and destroy (DELETE /:id/) routes for the viewset.
+- **URL routing chain**: `src/paperless/urls.py` line 40 wraps all API routes under `r"^api/"` using `re_path`. The `DefaultRouter` instance at line 29 registers the `documents` viewset at line 32, making the full path `/api/documents/`. The router automatically generates list (GET), retrieve (GET /:id/), update (PUT /:id/), and destroy (DELETE /:id/) routes for the viewset. Note: `DocumentViewSet` does **not** include `CreateModelMixin` (`src/documents/views.py:172-178`), so there is no POST (create) route on `/api/documents/` — document uploads use the separate `/api/documents/post_document/` endpoint.
   `Source: src/paperless/urls.py:29-35,40`
 
 - **`ApiVersionMiddleware`** at `src/paperless/middleware.py` lines 5–16 adds version headers **only when the user is authenticated** (line 11: `if request.user.is_authenticated`). For unauthenticated requests, these headers are absent.
@@ -508,6 +508,8 @@ flowchart TD
     AUTH --> G[Process Request → 200 OK]
 ```
 
+> **Note:** This diagram is a simplified representation. In practice, DRF evaluates **all** authentication classes sequentially — each class independently examines the request and returns either a `(user, auth)` tuple or `None`. The decision nodes above illustrate the *effective* behavior, not the literal control flow within DRF's authentication loop.
+
 ### Thinking/Rationale
 
 - The **`DEFAULT_AUTHENTICATION_CLASSES`** list at `src/paperless/settings.py` lines 117–121 defines the exact order in which DRF evaluates authentication. This is the definitive configuration — DRF reads this list at startup and creates authentication class instances for each viewset.
@@ -543,7 +545,7 @@ class AutoLoginMiddleware(MiddlewareMixin):
 `Source: src/paperless/auth.py:9-15`
 
 - **Purpose:** Automatically logs in a preconfigured user for every request
-- **Activation:** Only added to the `MIDDLEWARE` stack when `PAPERLESS_AUTO_LOGIN_USERNAME` is set (`Source: src/paperless/settings.py:193-199`)
+- **Activation:** Only added to the `MIDDLEWARE` stack when `PAPERLESS_AUTO_LOGIN_USERNAME` is set (`Source: src/paperless/settings.py:193-200`)
 - **Use case:** Single-user deployments where authentication is not needed (e.g., home NAS setups behind a VPN)
 
 ### `AngularApiAuthenticationOverride` (lines 18–33)
@@ -581,9 +583,12 @@ class HttpRemoteUserMiddleware(RemoteUserMiddleware):
 - **Activation:** Only added to `MIDDLEWARE` when `PAPERLESS_ENABLE_HTTP_REMOTE_USER=true` (`Source: src/paperless/settings.py:207-208`)
 - **Use case:** Reverse proxy authentication (e.g., Authelia, Authentik, or Apache `mod_auth`)
 
-### Important Note
+### Thinking/Rationale
 
 These custom classes are **supplementary** to the three main DRF authentication classes (`BasicAuthentication`, `SessionAuthentication`, `TokenAuthentication`). They are conditionally activated based on environment variables and are not part of the default authentication chain.
+
+- **Why document these?** Integration developers may encounter unexpected authentication behavior if these middleware classes are enabled in their target Paperless-ngx instance. Understanding that `AutoLoginMiddleware` bypasses all authentication (when configured) and that `AngularApiAuthenticationOverride` only applies in debug mode prevents confusion during API integration testing.
+- **Code as truth:** Each class's activation condition was traced directly to the `if` guards in `src/paperless/settings.py` (lines 193–200 for AutoLogin, lines 129–132 for AngularOverride, lines 207–208 for HttpRemoteUser). These are the only code paths that add extra authentication classes or middleware to the stack.
 
 ---
 
@@ -627,6 +632,12 @@ Session authentication works via Django's session framework. When you log in thr
 3. No CSRF token handling required
 4. The token is long-lived and can be stored securely in configuration files
 
+### Thinking/Rationale
+
+- **Why cover alternative methods?** The `DEFAULT_AUTHENTICATION_CLASSES` list at `src/paperless/settings.py:117-121` configures all three methods as active simultaneously. An integration developer's HTTP client might inadvertently use Basic or Session auth (e.g., browser-based testing with cookies), so understanding the full authentication surface helps avoid subtle bugs.
+- **Why recommend Token auth specifically?** Basic Authentication transmits credentials with every request (base64 encoding is reversible, not encryption). Session Authentication requires CSRF token management for state-changing requests (`POST`, `PUT`, `DELETE`), making it impractical for headless scripts. Token Authentication avoids both issues — a single `Authorization: Token <key>` header is stateless, revocable, and does not expose the user's password.
+- **Code as truth:** The class paths `rest_framework.authentication.BasicAuthentication` (line 118) and `rest_framework.authentication.SessionAuthentication` (line 119) are verified directly from the DRF configuration in `src/paperless/settings.py`.
+
 ---
 
 ## 9. Cleanup
@@ -641,16 +652,25 @@ rm -rf /tmp/paperless_data /tmp/paperless_media /tmp/paperless_consume /tmp/pape
 If you are running against a persistent database (not `/tmp/`), remember to:
 
 1. **Delete the test user:**
-   ```python
+
+   ```bash
    python3 manage.py shell
+   ```
+
+   ```python
    >>> from django.contrib.auth.models import User
    >>> User.objects.filter(username='testuser').delete()
    ```
+
    (Deleting the user automatically deletes the associated token due to the `CASCADE` foreign key.)
 
 2. **Or revoke just the token:**
-   ```python
+
+   ```bash
    python3 manage.py shell
+   ```
+
+   ```python
    >>> from rest_framework.authtoken.models import Token
    >>> Token.objects.filter(user__username='testuser').delete()
    ```
