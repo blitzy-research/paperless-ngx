@@ -631,6 +631,7 @@ These `@property` methods compute values from stored fields and settings:
 | `archive_file` | file handle | `open(self.archive_path, "rb")` | line 249 |
 | `file_type` | `str` | File extension from MIME type via `get_default_file_extension(self.mime_type)` | line 269 |
 | `thumbnail_path` | `str` | `os.path.join(settings.THUMBNAIL_DIR, "{pk:07}.png")` | line 273 |
+| `thumbnail_file` | file handle | `open(self.thumbnail_path, "rb")` | line 281 |
 
 ### 4.4 Runtime Example
 
