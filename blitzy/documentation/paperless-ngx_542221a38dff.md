@@ -125,7 +125,7 @@ The Paperless-NGX runtime is defined by two dependency manifests:
 
 ### 2.2 Service Startup
 
-Paperless-NGX runs as three supervised processes, defined in `docker/supervisord.conf` (lines 1–36):
+Paperless-NGX runs as three supervised processes, defined in `docker/supervisord.conf` (lines 1–35):
 
 #### 2.2.1 The Three Supervised Processes
 
@@ -141,7 +141,7 @@ All three processes run as user `paperless` and log to stdout/stderr for contain
 
 #### 2.2.2 Startup Sequence (docker-prepare.sh)
 
-Before the three processes start, the container runs `docker/docker-prepare.sh` (lines 1–82), which executes the `do_work()` function (lines 66–79) containing five sequential steps:
+Before the three processes start, the container runs `docker/docker-prepare.sh` (lines 1–81), which executes the `do_work()` function (lines 66–79) containing five sequential steps:
 
 1. **`wait_for_postgres()`** (lines 5–28) — If `PAPERLESS_DBHOST` is set, waits for PostgreSQL to accept connections using `pg_isready`, with up to 5 attempts at 5-second intervals. Skipped when using SQLite (the default).
 
@@ -296,7 +296,7 @@ if not is_file_ext_supported(os.path.splitext(filepath)[1]):
     return
 ```
 
-- Validates the file extension against all registered parsers using `is_file_ext_supported()` from `parsers.py:62-65` (line 54–56)
+- Validates the file extension against all registered parsers using `is_file_ext_supported()` from `parsers.py:62-66` (line 54–56)
 
 #### Step 2: File Readability Check (lines 58–75)
 
@@ -1086,7 +1086,7 @@ The `Document` model is defined in `src/documents/models.py` (lines 88–283). A
 | `content` | TEXT | blank | Extracted text content (used for search) | `models.py:117-124` |
 | `mime_type` | VARCHAR(256) | not editable | MIME type detected by libmagic | `models.py:126` |
 | `checksum` | VARCHAR(32) | UNIQUE, not editable | MD5 checksum of original file | `models.py:135-141` |
-| `archive_checksum` | VARCHAR(32) | UNIQUE, NULL, blank | MD5 checksum of archive file | `models.py:143-150` |
+| `archive_checksum` | VARCHAR(32) | NULL, blank, not editable | MD5 checksum of archive file | `models.py:143-150` |
 | `created` | DATETIME | default now(), db_index | Document creation date (parsed or file mtime) | `models.py:152` |
 | `modified` | DATETIME | auto_now, db_index | Last modification timestamp | `models.py:154-159` |
 | `storage_type` | VARCHAR(11) | choices, default "unencrypted" | `"unencrypted"` or `"gpg"` | `models.py:161-167` |
