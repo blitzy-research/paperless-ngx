@@ -15,14 +15,14 @@ To test the API, you first need a running Paperless-ngx instance. The following 
 
 ### Environment Variables
 
-| Variable | Purpose | Default (from settings.py) |
-|----------|---------|---------------------------|
-| `PAPERLESS_DATA_DIR` | Database and search index storage | `<BASE_DIR>/../data` (`Source: src/paperless/settings.py:66`) |
-| `PAPERLESS_MEDIA_ROOT` | Document file storage | `<BASE_DIR>/../media` (`Source: src/paperless/settings.py:61`) |
-| `PAPERLESS_CONSUMPTION_DIR` | Consumption intake directory | `<BASE_DIR>/../consume` (`Source: src/paperless/settings.py:78-81`) |
-| `PAPERLESS_LOGGING_DIR` | Application log directory | `<DATA_DIR>/log` (`Source: src/paperless/settings.py:76`) |
-| `PAPERLESS_SECRET_KEY` | Django secret key for cryptographic signing | Built-in fallback (insecure — should be overridden) (`Source: src/paperless/settings.py:260-263`) |
-| `PAPERLESS_DEBUG` | Enable debug mode (optional) | `"NO"` (`Source: src/paperless/settings.py:50`) |
+| Variable                    | Purpose                                     | Default (from settings.py)                                                                        |
+| --------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `PAPERLESS_DATA_DIR`        | Database and search index storage           | `<BASE_DIR>/../data` (`Source: src/paperless/settings.py:66`)                                     |
+| `PAPERLESS_MEDIA_ROOT`      | Document file storage                       | `<BASE_DIR>/../media` (`Source: src/paperless/settings.py:61`)                                    |
+| `PAPERLESS_CONSUMPTION_DIR` | Consumption intake directory                | `<BASE_DIR>/../consume` (`Source: src/paperless/settings.py:78-81`)                               |
+| `PAPERLESS_LOGGING_DIR`     | Application log directory                   | `<DATA_DIR>/log` (`Source: src/paperless/settings.py:76`)                                         |
+| `PAPERLESS_SECRET_KEY`      | Django secret key for cryptographic signing | Built-in fallback (insecure — should be overridden) (`Source: src/paperless/settings.py:260-263`) |
+| `PAPERLESS_DEBUG`           | Enable debug mode (optional)                | `"NO"` (`Source: src/paperless/settings.py:50`)                                                   |
 
 ### Step-by-Step Commands
 
@@ -97,7 +97,7 @@ curl -X POST http://localhost:8000/api/token/ \
 **Response (HTTP 200):**
 
 ```json
-{"token":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"}
+{ "token": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" }
 ```
 
 The token is a **40-character hexadecimal string**.
@@ -105,21 +105,27 @@ The token is a **40-character hexadecimal string**.
 ### Thinking/Rationale
 
 - The **token endpoint** is registered at `src/paperless/urls.py` line 81:
+
   ```python
   path("token/", views.obtain_auth_token)
   ```
+
   where `views` is imported from `rest_framework.authtoken` at line 26:
+
   ```python
   from rest_framework.authtoken import views
   ```
+
   `Source: src/paperless/urls.py:26,81`
 
 - **`obtain_auth_token`** is an instance of `rest_framework.authtoken.views.ObtainAuthToken`. This view accepts a POST request with `username` and `password` fields (as JSON or form data), validates the credentials against Django's authentication system, and returns `{"token": token.key}`. If the user does not yet have a token, one is created automatically.
 
 - The **`Token` model** is `rest_framework.authtoken.models.Token`. It is enabled in the application via `INSTALLED_APPS` at `src/paperless/settings.py` line 108:
+
   ```python
   "rest_framework.authtoken",
   ```
+
   `Source: src/paperless/settings.py:108`
 
   This entry registers the `authtoken` app, which provides the database migration for the `authtoken_token` table and the Django admin interface for managing tokens.
@@ -134,11 +140,11 @@ The token is a **40-character hexadecimal string**.
 
 ### Header Format
 
-| Component | Value |
-|-----------|-------|
-| **Header name** | `Authorization` |
-| **Header format** | `Token <key>` |
-| **Keyword** | `Token` (NOT `Bearer`) |
+| Component         | Value                  |
+| ----------------- | ---------------------- |
+| **Header name**   | `Authorization`        |
+| **Header format** | `Token <key>`          |
+| **Keyword**       | `Token` (NOT `Bearer`) |
 
 The keyword is literally the string `Token`. This is defined by the `rest_framework.authentication.TokenAuthentication` class, which sets the class attribute `keyword = 'Token'`.
 
@@ -159,17 +165,17 @@ curl -s http://localhost:8000/api/documents/ \
 
 An authenticated response includes two custom version headers injected by the `ApiVersionMiddleware`:
 
-| Header | Value | Source |
-|--------|-------|--------|
-| `X-Api-Version` | `2` | The last element of `ALLOWED_VERSIONS = ["1", "2"]` (`Source: src/paperless/settings.py:126`) |
-| `X-Version` | `1.7.0` | Formatted from `__version__ = (1, 7, 0)` (`Source: src/paperless/version.py:1`) |
+| Header          | Value   | Source                                                                                        |
+| --------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `X-Api-Version` | `2`     | The last element of `ALLOWED_VERSIONS = ["1", "2"]` (`Source: src/paperless/settings.py:126`) |
+| `X-Version`     | `1.7.0` | Formatted from `__version__ = (1, 7, 0)` (`Source: src/paperless/version.py:1`)               |
 
 `Source: src/paperless/middleware.py:12-14`
 
 ### Verified Live Test Result
 
-| Test | Result |
-|------|--------|
+| Test                                | Result                                                           |
+| ----------------------------------- | ---------------------------------------------------------------- |
 | Authenticated `GET /api/documents/` | HTTP 200, `{"count":0,"next":null,"previous":null,"results":[]}` |
 
 ### Thinking/Rationale
@@ -178,6 +184,7 @@ An authenticated response includes two custom version headers injected by the `A
   `Source: src/paperless/urls.py:29-35,40`
 
 - **`ApiVersionMiddleware`** at `src/paperless/middleware.py` lines 5–16 adds version headers **only when the user is authenticated** (line 11: `if request.user.is_authenticated`). For unauthenticated requests, these headers are absent.
+
   ```python
   class ApiVersionMiddleware:
       def __init__(self, get_response):
@@ -191,19 +198,22 @@ An authenticated response includes two custom version headers injected by the `A
               response["X-Version"] = ".".join([str(_) for _ in version.__version__])
           return response
   ```
+
   `Source: src/paperless/middleware.py:5-16`
 
 - The middleware is registered in the `MIDDLEWARE` stack at `src/paperless/settings.py` line 142:
+
   ```python
   "paperless.middleware.ApiVersionMiddleware",
   ```
+
   `Source: src/paperless/settings.py:142`
 
 - The **`UnifiedSearchViewSet`** at `src/documents/views.py` line 377 extends `DocumentViewSet` (line 172) which sets:
   - `serializer_class = DocumentSerializer` (line 181)
   - `pagination_class = StandardPagination` (line 182)
   - `permission_classes = (IsAuthenticated,)` (line 183)
-  `Source: src/documents/views.py:172-183,377`
+    `Source: src/documents/views.py:172-183,377`
 
 ---
 
@@ -251,12 +261,12 @@ Every response from `/api/documents/` is wrapped in a pagination envelope:
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `count` | integer | Total number of documents matching the query |
-| `next` | URL string or `null` | Link to the next page, `null` if on the last page |
+| Field      | Type                 | Description                                            |
+| ---------- | -------------------- | ------------------------------------------------------ |
+| `count`    | integer              | Total number of documents matching the query           |
+| `next`     | URL string or `null` | Link to the next page, `null` if on the last page      |
 | `previous` | URL string or `null` | Link to the previous page, `null` if on the first page |
-| `results` | array | Array of document objects for the current page |
+| `results`  | array                | Array of document objects for the current page         |
 
 `Source: src/paperless/views.py:8-11` — `StandardPagination` extends `PageNumberPagination` from DRF, which produces this envelope structure.
 
@@ -264,20 +274,20 @@ Every response from `/api/documents/` is wrapped in a pagination envelope:
 
 Each document object in the `results` array contains these fields, defined by `DocumentSerializer`:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | integer | Primary key |
-| `correspondent` | integer or `null` | Foreign key to correspondent |
-| `document_type` | integer or `null` | Foreign key to document type |
-| `title` | string | Document title |
-| `content` | string | Extracted text content (OCR or parsed) |
-| `tags` | array of integers | Array of tag IDs associated with this document |
-| `created` | datetime string | Document creation date (ISO 8601 format) |
-| `modified` | datetime string | Last modified date (ISO 8601 format) |
-| `added` | datetime string | Date the document was added to Paperless (ISO 8601 format) |
-| `archive_serial_number` | integer or `null` | Archive serial number (ASN) |
-| `original_file_name` | string | Original uploaded filename |
-| `archived_file_name` | string or `null` | Archived version filename (`null` if no archive version exists) |
+| Field                   | Type              | Description                                                     |
+| ----------------------- | ----------------- | --------------------------------------------------------------- |
+| `id`                    | integer           | Primary key                                                     |
+| `correspondent`         | integer or `null` | Foreign key to correspondent                                    |
+| `document_type`         | integer or `null` | Foreign key to document type                                    |
+| `title`                 | string            | Document title                                                  |
+| `content`               | string            | Extracted text content (OCR or parsed)                          |
+| `tags`                  | array of integers | Array of tag IDs associated with this document                  |
+| `created`               | datetime string   | Document creation date (ISO 8601 format)                        |
+| `modified`              | datetime string   | Last modified date (ISO 8601 format)                            |
+| `added`                 | datetime string   | Date the document was added to Paperless (ISO 8601 format)      |
+| `archive_serial_number` | integer or `null` | Archive serial number (ASN)                                     |
+| `original_file_name`    | string            | Original uploaded filename                                      |
+| `archived_file_name`    | string or `null`  | Archived version filename (`null` if no archive version exists) |
 
 `Source: src/documents/serialisers.py:201-235` — `DocumentSerializer` class with `Meta.fields` tuple at lines 222–235.
 
@@ -285,11 +295,11 @@ Each document object in the `results` array contains these fields, defined by `D
 
 **The response is ALWAYS paginated** — it never returns all results at once in a flat array, even if all results fit on a single page.
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| Default `page_size` | `25` | `src/paperless/views.py:9` |
+| Parameter            | Value       | Source                                                              |
+| -------------------- | ----------- | ------------------------------------------------------------------- |
+| Default `page_size`  | `25`        | `src/paperless/views.py:9`                                          |
 | Query parameter name | `page_size` | `src/paperless/views.py:10` — `page_size_query_param = "page_size"` |
-| Maximum page size | `100000` | `src/paperless/views.py:11` — `max_page_size = 100000` |
+| Maximum page size    | `100000`    | `src/paperless/views.py:11` — `max_page_size = 100000`              |
 
 **Navigation examples:**
 
@@ -313,6 +323,7 @@ Even with zero documents, the pagination envelope (`count`, `next`, `previous`, 
 ### Thinking/Rationale
 
 - **`StandardPagination`** inherits from `rest_framework.pagination.PageNumberPagination` (`Source: src/paperless/views.py:5` — import, line 8 — class definition):
+
   ```python
   from rest_framework.pagination import PageNumberPagination
 
@@ -321,6 +332,7 @@ Even with zero documents, the pagination envelope (`count`, `next`, `previous`, 
       page_size_query_param = "page_size"
       max_page_size = 100000
   ```
+
   `Source: src/paperless/views.py:5,8-11`
 
 - **`DocumentViewSet`** at `src/documents/views.py` line 182 sets `pagination_class = StandardPagination`, importing it from `paperless.views` at line 32.
@@ -347,7 +359,7 @@ curl -s http://localhost:8000/api/documents/
 - **Response Body:**
 
 ```json
-{"detail":"Authentication credentials were not provided."}
+{ "detail": "Authentication credentials were not provided." }
 ```
 
 ### Scenario 2: Invalid Token
@@ -363,7 +375,7 @@ curl -s http://localhost:8000/api/documents/ \
 - **Response Body:**
 
 ```json
-{"detail":"Invalid token."}
+{ "detail": "Invalid token." }
 ```
 
 ### Scenario 3: Wrong Header Keyword (`Bearer` Instead of `Token`)
@@ -379,22 +391,23 @@ curl -s http://localhost:8000/api/documents/ \
 - **Response Body:**
 
 ```json
-{"detail":"Authentication credentials were not provided."}
+{ "detail": "Authentication credentials were not provided." }
 ```
 
 `TokenAuthentication` only recognizes the keyword `Token`. When `Bearer` is used, the token authentication class returns `None` (no match), and since no other authentication class matches either, DRF treats the request as unauthenticated.
 
 ### Verified Live Test Results
 
-| Test | Result |
-|------|--------|
-| No auth header | HTTP 401, `{"detail":"Authentication credentials were not provided."}` |
-| Invalid token | HTTP 401, `{"detail":"Invalid token."}` |
+| Test                     | Result                                                                 |
+| ------------------------ | ---------------------------------------------------------------------- |
+| No auth header           | HTTP 401, `{"detail":"Authentication credentials were not provided."}` |
+| Invalid token            | HTTP 401, `{"detail":"Invalid token."}`                                |
 | Wrong keyword (`Bearer`) | HTTP 401, `{"detail":"Authentication credentials were not provided."}` |
 
 ### Thinking/Rationale
 
 - **All viewsets enforce `permission_classes = (IsAuthenticated,)`**. The `IsAuthenticated` permission class from DRF checks that `request.user` is authenticated. Every API viewset in Paperless-ngx sets this permission:
+
   - `DocumentViewSet` at `src/documents/views.py` line 183
   - `CorrespondentViewSet` at `src/documents/views.py` line 125
   - `TagViewSet` at `src/documents/views.py` line 151
@@ -435,11 +448,11 @@ REST_FRAMEWORK = {
 
 DRF evaluates these classes **in order** for each incoming request:
 
-| Order | Class | Mechanism | Header Format |
-|-------|-------|-----------|---------------|
-| 1 | `rest_framework.authentication.BasicAuthentication` | HTTP Basic Auth | `Authorization: Basic <base64(username:password)>` |
-| 2 | `rest_framework.authentication.SessionAuthentication` | Django session cookie | `Cookie: sessionid=<session_key>` |
-| 3 | `rest_framework.authentication.TokenAuthentication` | Token-based auth | `Authorization: Token <key>` |
+| Order | Class                                                 | Mechanism             | Header Format                                      |
+| ----- | ----------------------------------------------------- | --------------------- | -------------------------------------------------- |
+| 1     | `rest_framework.authentication.BasicAuthentication`   | HTTP Basic Auth       | `Authorization: Basic <base64(username:password)>` |
+| 2     | `rest_framework.authentication.SessionAuthentication` | Django session cookie | `Cookie: sessionid=<session_key>`                  |
+| 3     | `rest_framework.authentication.TokenAuthentication`   | Token-based auth      | `Authorization: Token <key>`                       |
 
 DRF tries each class in sequence. The first class to return a `(user, auth)` tuple "wins" and the user is authenticated. If a class returns `None`, DRF moves to the next class. If all classes return `None`, the request is treated as unauthenticated.
 
@@ -496,10 +509,10 @@ This class attribute is what determines that the header must be `Authorization: 
 
 **Database table:** `authtoken_token`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `key` | `CharField(max_length=40)` | Primary key — the token string itself |
-| `user` | `OneToOneField(AUTH_USER_MODEL)` | The user this token belongs to |
+| Field     | Type                               | Description                             |
+| --------- | ---------------------------------- | --------------------------------------- |
+| `key`     | `CharField(max_length=40)`         | Primary key — the token string itself   |
+| `user`    | `OneToOneField(AUTH_USER_MODEL)`   | The user this token belongs to          |
 | `created` | `DateTimeField(auto_now_add=True)` | Timestamp of when the token was created |
 
 **Key facts:**
@@ -534,7 +547,7 @@ flowchart TD
     AUTH --> G[Process Request → 200 OK]
 ```
 
-> **Note:** This diagram is a simplified representation. In practice, DRF evaluates **all** authentication classes sequentially — each class independently examines the request and returns either a `(user, auth)` tuple or `None`. The decision nodes above illustrate the *effective* behavior, not the literal control flow within DRF's authentication loop.
+> **Note:** This diagram is a simplified representation. In practice, DRF evaluates **all** authentication classes sequentially — each class independently examines the request and returns either a `(user, auth)` tuple or `None`. The decision nodes above illustrate the _effective_ behavior, not the literal control flow within DRF's authentication loop.
 
 ### Thinking/Rationale
 
@@ -653,6 +666,7 @@ Session authentication works via Django's session framework. When you log in thr
 ### Recommendation
 
 **Token authentication is the recommended method for external tool integration** because:
+
 1. The token is sent via a standard HTTP header — no cookie management needed
 2. Tokens can be revoked independently without changing the user's password
 3. No CSRF token handling required
@@ -711,66 +725,66 @@ If you are running against a persistent database (not `/tmp/`), remember to:
 
 ## 10. Quick Reference Summary
 
-| Question | Answer |
-|----------|--------|
-| HTTP header name | `Authorization` |
-| Header format | `Token <40-char-hex-key>` |
-| Document listing endpoint | `GET /api/documents/` |
-| Token acquisition endpoint | `POST /api/token/` |
-| Response format | Paginated: `{count, next, previous, results}` |
-| Default page size | `25` |
-| Max page size | `100000` |
-| Page size query parameter | `page_size` |
-| Unauthenticated status code | HTTP `401` |
+| Question                      | Answer                                                       |
+| ----------------------------- | ------------------------------------------------------------ |
+| HTTP header name              | `Authorization`                                              |
+| Header format                 | `Token <40-char-hex-key>`                                    |
+| Document listing endpoint     | `GET /api/documents/`                                        |
+| Token acquisition endpoint    | `POST /api/token/`                                           |
+| Response format               | Paginated: `{count, next, previous, results}`                |
+| Default page size             | `25`                                                         |
+| Max page size                 | `100000`                                                     |
+| Page size query parameter     | `page_size`                                                  |
+| Unauthenticated status code   | HTTP `401`                                                   |
 | Unauthenticated error message | `{"detail":"Authentication credentials were not provided."}` |
-| Invalid token error message | `{"detail":"Invalid token."}` |
-| DRF authentication class | `rest_framework.authentication.TokenAuthentication` |
-| Token ORM model | `rest_framework.authtoken.models.Token` |
-| Token database table | `authtoken_token` |
-| Token length | 40 characters (hex-encoded 20 bytes) |
-| Token generation | `binascii.hexlify(os.urandom(20)).decode()` |
-| Version header (API) | `X-Api-Version: 2` |
-| Version header (App) | `X-Version: 1.7.0` |
+| Invalid token error message   | `{"detail":"Invalid token."}`                                |
+| DRF authentication class      | `rest_framework.authentication.TokenAuthentication`          |
+| Token ORM model               | `rest_framework.authtoken.models.Token`                      |
+| Token database table          | `authtoken_token`                                            |
+| Token length                  | 40 characters (hex-encoded 20 bytes)                         |
+| Token generation              | `binascii.hexlify(os.urandom(20)).decode()`                  |
+| Version header (API)          | `X-Api-Version: 2`                                           |
+| Version header (App)          | `X-Version: 1.7.0`                                           |
 
 ### All Verified Live Test Results
 
-| Test | Result |
-|------|--------|
-| Authenticated `GET /api/documents/` | HTTP 200, `{"count":0,"next":null,"previous":null,"results":[]}` |
-| Unauthenticated `GET /api/documents/` | HTTP 401, `{"detail":"Authentication credentials were not provided."}` |
-| Invalid token `GET /api/documents/` | HTTP 401, `{"detail":"Invalid token."}` |
-| `POST /api/token/` with valid credentials | HTTP 200, `{"token":"<40-char-hex>"}` |
+| Test                                              | Result                                                                 |
+| ------------------------------------------------- | ---------------------------------------------------------------------- |
+| Authenticated `GET /api/documents/`               | HTTP 200, `{"count":0,"next":null,"previous":null,"results":[]}`       |
+| Unauthenticated `GET /api/documents/`             | HTTP 401, `{"detail":"Authentication credentials were not provided."}` |
+| Invalid token `GET /api/documents/`               | HTTP 401, `{"detail":"Invalid token."}`                                |
+| `POST /api/token/` with valid credentials         | HTTP 200, `{"token":"<40-char-hex>"}`                                  |
 | Wrong header format (`Bearer` instead of `Token`) | HTTP 401, `{"detail":"Authentication credentials were not provided."}` |
 
 ### Key Source Code References
 
-| # | Reference | File and Lines |
-|---|-----------|----------------|
-| 1 | DRF Auth Config | `src/paperless/settings.py:116-121` |
-| 2 | Debug Auth Addition | `src/paperless/settings.py:129-132` |
-| 3 | INSTALLED_APPS authtoken | `src/paperless/settings.py:108` |
-| 4 | API Router | `src/paperless/urls.py:29-35` |
-| 5 | Documents Endpoint | `src/paperless/urls.py:32` |
-| 6 | API URL Prefix | `src/paperless/urls.py:40` |
-| 7 | Token Endpoint | `src/paperless/urls.py:81` |
-| 8 | StandardPagination | `src/paperless/views.py:8-11` |
-| 9 | ApiVersionMiddleware | `src/paperless/middleware.py:5-16` |
-| 10 | Version | `src/paperless/version.py:1` |
-| 11 | DocumentViewSet | `src/documents/views.py:172-200` |
-| 12 | UnifiedSearchViewSet | `src/documents/views.py:377-426` |
-| 13 | CorrespondentViewSet permissions | `src/documents/views.py:125` |
-| 14 | TagViewSet permissions | `src/documents/views.py:151` |
-| 15 | DocumentTypeViewSet permissions | `src/documents/views.py:166` |
-| 16 | LogViewSet permissions | `src/documents/views.py:431` |
-| 17 | SavedViewViewSet permissions | `src/documents/views.py:459` |
-| 18 | BulkEditView permissions | `src/documents/views.py:471` |
-| 19 | PostDocumentView permissions | `src/documents/views.py:493` |
-| 20 | DocumentSerializer fields | `src/documents/serialisers.py:201-235` |
-| 21 | Custom Auth Classes | `src/paperless/auth.py:9-15,18-33,36-41` |
-| 22 | MIDDLEWARE stack | `src/paperless/settings.py:134-146` |
-| 23 | Django version pin | `requirements.txt:38` — `django==4.0.4` |
-| 24 | DRF version pin | `requirements.txt:39` — `djangorestframework==3.13.1` |
-| 25 | RemoteVersionView (no auth) | `src/documents/views.py:675` |
+| #   | Reference                        | File and Lines                                        |
+| --- | -------------------------------- | ----------------------------------------------------- |
+| 1   | DRF Auth Config                  | `src/paperless/settings.py:116-121`                   |
+| 2   | Debug Auth Addition              | `src/paperless/settings.py:129-132`                   |
+| 3   | INSTALLED_APPS authtoken         | `src/paperless/settings.py:108`                       |
+| 4   | API Router                       | `src/paperless/urls.py:29-35`                         |
+| 5   | Documents Endpoint               | `src/paperless/urls.py:32`                            |
+| 6   | API URL Prefix                   | `src/paperless/urls.py:40`                            |
+| 7   | Token Endpoint                   | `src/paperless/urls.py:81`                            |
+| 8   | StandardPagination               | `src/paperless/views.py:8-11`                         |
+| 9   | ApiVersionMiddleware             | `src/paperless/middleware.py:5-16`                    |
+| 10  | Version                          | `src/paperless/version.py:1`                          |
+| 11  | DocumentViewSet                  | `src/documents/views.py:172-200`                      |
+| 12  | UnifiedSearchViewSet             | `src/documents/views.py:377-426`                      |
+| 13  | CorrespondentViewSet permissions | `src/documents/views.py:125`                          |
+| 14  | TagViewSet permissions           | `src/documents/views.py:151`                          |
+| 15  | DocumentTypeViewSet permissions  | `src/documents/views.py:166`                          |
+| 16  | LogViewSet permissions           | `src/documents/views.py:431`                          |
+| 17  | SavedViewViewSet permissions     | `src/documents/views.py:459`                          |
+| 18  | BulkEditView permissions         | `src/documents/views.py:471`                          |
+| 19  | PostDocumentView permissions     | `src/documents/views.py:493`                          |
+| 20  | DocumentSerializer fields        | `src/documents/serialisers.py:201-235`                |
+| 21  | Custom Auth Classes              | `src/paperless/auth.py:9-15,18-33,36-41`              |
+| 22  | MIDDLEWARE stack                 | `src/paperless/settings.py:134-146`                   |
+| 23  | Django version pin               | `requirements.txt:38` — `django==4.0.4`               |
+| 24  | DRF version pin                  | `requirements.txt:39` — `djangorestframework==3.13.1` |
+| 25  | RemoteVersionView (no auth)      | `src/documents/views.py:675`                          |
 
 ### Thinking/Rationale
 
@@ -792,14 +806,14 @@ If you are running against a persistent database (not `/tmp/`), remember to:
 
 Django 4.0.x is **end-of-life** and no longer receives security patches. The pinned version 4.0.4 is affected by 45+ CVEs spanning multiple critical categories:
 
-| Category | Severity | Key CVEs | Auth System Relevance |
-|----------|----------|----------|----------------------|
-| **SQL Injection** | CRITICAL | CVE-2022-34265 (Trunc/Extract functions, fixed in 4.0.6), plus multiple injection vectors in annotate/aggregate/extra and FilteredRelation | Django's ORM underpins all data queries including the `Token.objects.get(key=key)` lookup used by `TokenAuthentication.authenticate_credentials()`. SQL injection vulnerabilities could allow bypassing token validation or extracting token values from the `authtoken_token` table. |
-| **Denial of Service** | HIGH | 15+ DoS CVEs in template filters (urlize, truncatechars_html, wordwrap, strip_tags), URL processing, Accept-Language headers, IPv6 validation | DoS attacks could disable the authentication service entirely, preventing legitimate token-based API access. |
-| **User Enumeration** | MEDIUM | CVE-2024-45231 — timing attack via password reset | Could allow attackers to enumerate valid usernames, which are also used for the `POST /api/token/` endpoint documented in Section 2. |
-| **Log Injection** | MEDIUM | PYSEC-2025-47 — `request.path` not escaped in internal HTTP response logging | Attackers could inject misleading entries into logs, obscuring authentication-related security events. |
-| **Directory Traversal** | MEDIUM | CVE-2025-59682 — `django.utils.archive.extract` | Could allow access to files outside intended directories. |
-| **File Upload Bypass** | MEDIUM | PYSEC-2023-61 — file upload validation bypass | Could allow bypassing file type restrictions on the `POST /api/documents/post_document/` endpoint. |
+| Category                | Severity | Key CVEs                                                                                                                                      | Auth System Relevance                                                                                                                                                                                                                                                                 |
+| ----------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **SQL Injection**       | CRITICAL | CVE-2022-34265 (Trunc/Extract functions, fixed in 4.0.6), plus multiple injection vectors in annotate/aggregate/extra and FilteredRelation    | Django's ORM underpins all data queries including the `Token.objects.get(key=key)` lookup used by `TokenAuthentication.authenticate_credentials()`. SQL injection vulnerabilities could allow bypassing token validation or extracting token values from the `authtoken_token` table. |
+| **Denial of Service**   | HIGH     | 15+ DoS CVEs in template filters (urlize, truncatechars_html, wordwrap, strip_tags), URL processing, Accept-Language headers, IPv6 validation | DoS attacks could disable the authentication service entirely, preventing legitimate token-based API access.                                                                                                                                                                          |
+| **User Enumeration**    | MEDIUM   | CVE-2024-45231 — timing attack via password reset                                                                                             | Could allow attackers to enumerate valid usernames, which are also used for the `POST /api/token/` endpoint documented in Section 2.                                                                                                                                                  |
+| **Log Injection**       | MEDIUM   | PYSEC-2025-47 — `request.path` not escaped in internal HTTP response logging                                                                  | Attackers could inject misleading entries into logs, obscuring authentication-related security events.                                                                                                                                                                                |
+| **Directory Traversal** | MEDIUM   | CVE-2025-59682 — `django.utils.archive.extract`                                                                                               | Could allow access to files outside intended directories.                                                                                                                                                                                                                             |
+| **File Upload Bypass**  | MEDIUM   | PYSEC-2023-61 — file upload validation bypass                                                                                                 | Could allow bypassing file type restrictions on the `POST /api/documents/post_document/` endpoint.                                                                                                                                                                                    |
 
 **Recommended action:** Upgrade Django to **>=4.2.28** (latest LTS patch) or the newest supported LTS release.
 
@@ -809,14 +823,14 @@ Django 4.0.x is **end-of-life** and no longer receives security patches. The pin
 
 `Source: requirements.txt:39`
 
-| Field | Value |
-|-------|-------|
-| **CVE** | CVE-2024-21520 |
-| **Type** | Cross-Site Scripting (XSS) |
-| **CVSS Score** | 6.1 (Medium) |
-| **Affected Versions** | All versions before 3.15.2 |
-| **Component** | `break_long_headers` template filter in the browsable API viewer |
-| **Description** | Improper input sanitization in the browsable API viewer allows XSS attacks when viewing API responses with crafted header values |
+| Field                 | Value                                                                                                                            |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| **CVE**               | CVE-2024-21520                                                                                                                   |
+| **Type**              | Cross-Site Scripting (XSS)                                                                                                       |
+| **CVSS Score**        | 6.1 (Medium)                                                                                                                     |
+| **Affected Versions** | All versions before 3.15.2                                                                                                       |
+| **Component**         | `break_long_headers` template filter in the browsable API viewer                                                                 |
+| **Description**       | Improper input sanitization in the browsable API viewer allows XSS attacks when viewing API responses with crafted header values |
 
 **Auth system relevance:** DRF provides the `rest_framework.authentication.TokenAuthentication` class documented in Section 6, the `ObtainAuthToken` view powering the `POST /api/token/` endpoint documented in Section 2, and the browsable API viewer. If the browsable API is enabled in production (the default), an attacker could exploit this XSS vulnerability to steal authentication tokens from an admin's browser session.
 
@@ -824,7 +838,7 @@ Django 4.0.x is **end-of-life** and no longer receives security patches. The pin
 
 ### Thinking/Rationale
 
-- **Why include dependency vulnerabilities in an authentication investigation?** The authentication system documented in this investigation runs on top of Django and DRF. Vulnerabilities in these frameworks directly undermine the security guarantees of the token authentication mechanism. An integration developer needs to know that while the authentication *logic* is correctly implemented (as verified in Sections 1–8), the *foundation* has known flaws that could be exploited. This is analogous to correctly locking a door but having a window left open — the lock works, but the building is still insecure.
+- **Why include dependency vulnerabilities in an authentication investigation?** The authentication system documented in this investigation runs on top of Django and DRF. Vulnerabilities in these frameworks directly undermine the security guarantees of the token authentication mechanism. An integration developer needs to know that while the authentication _logic_ is correctly implemented (as verified in Sections 1–8), the _foundation_ has known flaws that could be exploited. This is analogous to correctly locking a door but having a window left open — the lock works, but the building is still insecure.
 - **Why not fix the versions directly?** Per the project's read-only codebase policy, `requirements.txt` is a reference file and must not be modified as part of this documentation investigation. The responsibility for upgrading dependencies falls on the project maintainers or deployment operators, not on documentation authors. This section serves as an evidence-based advisory to inform that decision.
 - **Code as truth:** The exact pinned versions (`django==4.0.4` at `requirements.txt` line 38, `djangorestframework==3.13.1` at line 39) were verified directly from the repository. CVE details were cross-referenced against public vulnerability databases (NVD, Snyk, pip-audit).
 
@@ -841,8 +855,9 @@ The following observations were identified during authentication boundary testin
 `Source: src/documents/views.py:675`
 
 **Response when accessed without auth:**
+
 ```json
-{"version":"0.0.0","update_available":false,"feature_is_set":false}
+{ "version": "0.0.0", "update_available": false, "feature_is_set": false }
 ```
 
 **Risk assessment:** LOW — The endpoint returns minimal metadata (version check information). It does not expose documents, user data, or configuration secrets. The lack of authentication appears intentional — the endpoint is not listed among the auth-protected viewsets documented in Section 5.
@@ -872,6 +887,7 @@ The following observations were identified during authentication boundary testin
 **Risk assessment:** MEDIUM — Without explicit cache control, browsers or intermediate proxies may cache authenticated API responses containing sensitive document data (titles, content, correspondents).
 
 **Recommendation:** Add `Cache-Control: no-store` to authenticated API responses. This can be achieved via:
+
 - A custom DRF renderer or middleware that sets the header for authenticated responses
 - Reverse proxy configuration (e.g., nginx: `add_header Cache-Control "no-store" always;` for the `/api/` location block)
 
