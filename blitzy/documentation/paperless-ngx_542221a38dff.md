@@ -51,7 +51,7 @@ def ready(self):
 
 These handlers run sequentially every time a document finishes being consumed. They assign inbox tags, match correspondents/document types/tags (via rule-based or ML classifier matching), create an admin log entry, and update the search index.
 
-*Source: src/documents/apps.py:11-27*
+_Source: src/documents/apps.py:11-27_
 
 Three custom signals are defined in the signals package:
 
@@ -62,7 +62,7 @@ document_consumption_finished = Signal()
 document_consumer_declaration = Signal()
 ```
 
-*Source: src/documents/signals/__init__.py:1-5*
+_Source: src/documents/signals/**init**.py:1-5_
 
 ### The `FileLock` Concurrency Gate
 
@@ -81,22 +81,22 @@ MEDIA_LOCK = os.path.join(MEDIA_ROOT, "media.lock")
 
 This means the lock file lives at `<MEDIA_ROOT>/media.lock` (e.g., `/opt/paperless/media/media.lock`). All filesystem mutations are serialized through this single lock — if file relocation is running, document consumption waits, and vice versa.
 
-*Source: src/paperless/settings.py:70-72*
+_Source: src/paperless/settings.py:70-72_
 
 ### Key Directory Layout
 
 The following directories are central to the runtime behaviors documented below:
 
-| Setting | Definition | Default Path |
-|---|---|---|
-| `MEDIA_ROOT` | Root of all media files | `<BASE_DIR>/../media` |
-| `ORIGINALS_DIR` | Original uploaded files | `<MEDIA_ROOT>/documents/originals` |
-| `ARCHIVE_DIR` | OCR'd/processed archive PDFs | `<MEDIA_ROOT>/documents/archive` |
-| `THUMBNAIL_DIR` | Document thumbnail images | `<MEDIA_ROOT>/documents/thumbnails` |
-| `DATA_DIR` | Application data directory | `<BASE_DIR>/../data` |
-| `MODEL_FILE` | Classifier pickle model | `<DATA_DIR>/classification_model.pickle` |
+| Setting         | Definition                   | Default Path                             |
+| --------------- | ---------------------------- | ---------------------------------------- |
+| `MEDIA_ROOT`    | Root of all media files      | `<BASE_DIR>/../media`                    |
+| `ORIGINALS_DIR` | Original uploaded files      | `<MEDIA_ROOT>/documents/originals`       |
+| `ARCHIVE_DIR`   | OCR'd/processed archive PDFs | `<MEDIA_ROOT>/documents/archive`         |
+| `THUMBNAIL_DIR` | Document thumbnail images    | `<MEDIA_ROOT>/documents/thumbnails`      |
+| `DATA_DIR`      | Application data directory   | `<BASE_DIR>/../data`                     |
+| `MODEL_FILE`    | Classifier pickle model      | `<DATA_DIR>/classification_model.pickle` |
 
-*Source: src/paperless/settings.py:61-66, 74*
+_Source: src/paperless/settings.py:61-66, 74_
 
 ---
 
@@ -125,7 +125,7 @@ The logger used throughout this handler is:
 logger = logging.getLogger("paperless.handlers")
 ```
 
-*Source: src/documents/signals/handlers.py:27, 310-312*
+_Source: src/documents/signals/handlers.py:27, 310-312_
 
 **Thinking:** Why two signals? Because a document's filename can change for two reasons: (1) tag modifications change the `{tags}` or `{tag_list}` component, triggering `m2m_changed`; (2) other field changes (title, correspondent, document type) are saved via `post_save`. Both must trigger filename recalculation.
 
@@ -166,7 +166,7 @@ if not instance.filename:
 
 **Rationale:** When the consumer creates a new document, it saves the `Document` model multiple times before `filename` is set. Without this guard, the handler would attempt moves on a file that doesn't exist yet.
 
-*Source: src/documents/signals/handlers.py:314-323*
+_Source: src/documents/signals/handlers.py:314-323_
 
 #### FileLock Acquisition
 
@@ -177,7 +177,7 @@ After the guard, the handler acquires the filesystem lock:
 with FileLock(settings.MEDIA_LOCK):
 ```
 
-*Source: src/documents/signals/handlers.py:325*
+_Source: src/documents/signals/handlers.py:325_
 
 ### 1.2 Filename Generation and Path Computation
 
@@ -192,7 +192,7 @@ PAPERLESS_FILENAME_FORMAT = os.getenv("PAPERLESS_FILENAME_FORMAT")
 
 If unset, `generate_filename()` falls through to the default naming pattern: `{doc.pk:07}{counter_str}{filetype_str}` (e.g., `0000042.pdf`).
 
-*Source: src/paperless/settings.py:584, src/documents/file_handling.py:192-193*
+_Source: src/paperless/settings.py:584, src/documents/file_handling.py:192-193_
 
 #### `generate_unique_filename()`
 
@@ -210,7 +210,7 @@ Key logic:
 - **Archive filename mirroring:** If generating an archive filename and the document has an original filename, it first tries the original filename with `.pdf` extension (lines 103-108)
 - **Collision avoidance:** If the computed filename already exists on disk, a counter is appended: `_01`, `_02`, etc., via the `generate_filename()` function (lines 110-125)
 
-*Source: src/documents/file_handling.py:81-125*
+_Source: src/documents/file_handling.py:81-125_
 
 #### `generate_filename()` — The Format Engine
 
@@ -227,22 +227,22 @@ The function only applies the custom format when `PAPERLESS_FILENAME_FORMAT` is 
 
 3. Applies the format string with all available placeholders:
 
-| Placeholder | Value | Source |
-|---|---|---|
-| `{title}` | Sanitized document title | line 162 |
-| `{correspondent}` | Sanitized correspondent name, or `"none"` | lines 140-146 |
-| `{document_type}` | Sanitized document type name, or `"none"` | lines 148-154 |
-| `{created}` | ISO date of creation | line 165 |
-| `{created_year}` | Year of creation | line 166 |
-| `{created_month}` | Zero-padded month of creation | line 167 |
-| `{created_day}` | Zero-padded day of creation | line 168 |
-| `{added}` | ISO date of addition | line 169 |
-| `{added_year}` | Year of addition | line 170 |
-| `{added_month}` | Zero-padded month of addition | line 171 |
-| `{added_day}` | Zero-padded day of addition | line 172 |
-| `{asn}` | Archive serial number, or `"none"` | lines 156-159, 173 |
-| `{tags}` | Tag dictionary (use `{tags[key]}`) | line 174 |
-| `{tag_list}` | Comma-separated sorted tag names | line 175 |
+| Placeholder       | Value                                     | Source             |
+| ----------------- | ----------------------------------------- | ------------------ |
+| `{title}`         | Sanitized document title                  | line 162           |
+| `{correspondent}` | Sanitized correspondent name, or `"none"` | lines 140-146      |
+| `{document_type}` | Sanitized document type name, or `"none"` | lines 148-154      |
+| `{created}`       | ISO date of creation                      | line 165           |
+| `{created_year}`  | Year of creation                          | line 166           |
+| `{created_month}` | Zero-padded month of creation             | line 167           |
+| `{created_day}`   | Zero-padded day of creation               | line 168           |
+| `{added}`         | ISO date of addition                      | line 169           |
+| `{added_year}`    | Year of addition                          | line 170           |
+| `{added_month}`   | Zero-padded month of addition             | line 171           |
+| `{added_day}`     | Zero-padded day of addition               | line 172           |
+| `{asn}`           | Archive serial number, or `"none"`        | lines 156-159, 173 |
+| `{tags}`          | Tag dictionary (use `{tags[key]}`)        | line 174           |
+| `{tag_list}`      | Comma-separated sorted tag names          | line 175           |
 
 4. On format error (`ValueError`, `KeyError`, `IndexError`), falls back to default with a warning:
 
@@ -262,13 +262,14 @@ Logger: `paperless.filehandling` (line 11).
    - If no format or error fallback: `f"{doc.pk:07}{counter_str}{filetype_str}"` (line 193)
    - Counter string: `f"_{counter:02}"` if counter > 0, else `""` (line 186)
 
-*Source: src/documents/file_handling.py:128-199*
+_Source: src/documents/file_handling.py:128-199_
 
 ### 1.3 The Move Dance: Before and After Paths
 
 Here is a concrete, realistic example of what happens when a tag is added to a document.
 
 **Setup:**
+
 - `PAPERLESS_FILENAME_FORMAT = "{correspondent}/{tag_list}/{title}"`
 - Document PK: 42
 - Title: "quarterly-report"
@@ -276,6 +277,7 @@ Here is a concrete, realistic example of what happens when a tag is added to a d
 - Before: no tags assigned
 
 **Before (default naming, no format path):**
+
 ```
 Original: <MEDIA_ROOT>/documents/originals/0000042.pdf
 Archive:  <MEDIA_ROOT>/documents/archive/0000042.pdf
@@ -284,6 +286,7 @@ Archive:  <MEDIA_ROOT>/documents/archive/0000042.pdf
 **Tag "Invoice" is added. The signal fires.**
 
 **After:**
+
 ```
 Original: <MEDIA_ROOT>/documents/originals/Acme Corp/Invoice/quarterly-report.pdf
 Archive:  <MEDIA_ROOT>/documents/archive/Acme Corp/Invoice/quarterly-report.pdf
@@ -365,7 +368,7 @@ def archive_path(self):
         return None
 ```
 
-*Source: src/documents/models.py:222-231, 241-246*
+_Source: src/documents/models.py:222-231, 241-246_
 
 ### 1.4 Log Messages During File Relocation
 
@@ -389,16 +392,18 @@ def validate_move(instance, old_path, new_path):
 **Example log messages from the `paperless.handlers` logger:**
 
 When the source file has disappeared:
+
 ```
 CRITICAL paperless.handlers Document 2022-04-15 Acme Corp quarterly-report: File /opt/paperless/media/documents/originals/0000042.pdf has gone.
 ```
 
 When the target already exists:
+
 ```
 WARNING paperless.handlers Document 2022-04-15 Acme Corp quarterly-report: Cannot rename file since target path /opt/paperless/media/documents/originals/Acme Corp/Invoice/quarterly-report.pdf already exists.
 ```
 
-*Source: src/documents/signals/handlers.py:295-307*
+_Source: src/documents/signals/handlers.py:295-307_
 
 #### Invalid Format String Fallback
 
@@ -408,7 +413,7 @@ When the `PAPERLESS_FILENAME_FORMAT` string contains invalid placeholders:
 WARNING paperless.filehandling Invalid PAPERLESS_FILENAME_FORMAT: {nonexistent_field}/{title}, falling back to default
 ```
 
-*Source: src/documents/file_handling.py:181-184*
+_Source: src/documents/file_handling.py:181-184_
 
 ### 1.5 Rollback Safety Net: What Actually Happens on Failure
 
@@ -461,7 +466,7 @@ except (OSError, DatabaseError, CannotMoveFilesException):
 
 **Thinking:** This is a "best-effort" rollback. The code acknowledges that a truly atomic file-move-plus-DB-update is impossible across two different systems (filesystem and database). Instead, it relies on the sanity checker as the last line of defense. If the rollback fails, the physical files may be in a new location while the database still points to the old location — a mismatch that the sanity checker is specifically designed to detect (see Section 4).
 
-*Source: src/documents/signals/handlers.py:367-394*
+_Source: src/documents/signals/handlers.py:367-394_
 
 ### 1.6 Directory Cleanup After Moves
 
@@ -513,6 +518,7 @@ def delete_empty_directories(directory, root):
 ```
 
 **Safety guards:**
+
 - Won't act outside the `root` directory (line 31 — checks `directory.startswith(root + os.path.sep)`)
 - Stops ascending if a directory is not empty (line 47-48)
 - Silently catches `OSError` on `rmdir()` failures (line 44-46) — the comment says "empty directories aren't that bad anyway"
@@ -520,7 +526,7 @@ def delete_empty_directories(directory, root):
 
 **Example:** After moving `originals/Acme-Corp/Invoice/quarterly-report.pdf` to `originals/Acme-Corp/Tax/quarterly-report.pdf`, if `originals/Acme-Corp/Invoice/` is now empty, it gets removed. If `originals/Acme-Corp/` is also empty (unlikely in this case), it would also be removed. The function never removes `originals/` itself.
 
-*Source: src/documents/file_handling.py:23-52, src/documents/signals/handlers.py:396-410*
+_Source: src/documents/file_handling.py:23-52, src/documents/signals/handlers.py:396-410_
 
 ### 1.7 Bulk Edit Trigger Path
 
@@ -564,7 +570,7 @@ def bulk_update_documents(document_ids):
 
 **Important signal dispatch note:** `bulk_create()` on the through model (`Document.tags.through`) does **not** fire the `m2m_changed` signal. In Django, `m2m_changed` only fires when using the M2M manager methods (`.add()`, `.remove()`, `.set()`, `.clear()`), not when directly calling `bulk_create()` or `QuerySet.delete()` on the through model's own manager. The same applies to `remove_tag()` and `modify_tags()`, which use `QuerySet.delete()` on the through model — neither fires `m2m_changed`. Therefore, the file relocation handler `update_filename_and_move_files()` is triggered **exactly once** per document during bulk tag operations, via the explicit `post_save.send(Document, instance=doc, created=False)` call in `bulk_update_documents()` at `src/documents/tasks.py:276`. This is the sole trigger for file relocation in the bulk edit path.
 
-*Source: src/documents/bulk_edit.py:36-49, src/documents/tasks.py:270-280*
+_Source: src/documents/bulk_edit.py:36-49, src/documents/tasks.py:270-280_
 
 ---
 
@@ -593,7 +599,7 @@ def train_classifier():
 
 Logger: `paperless.tasks` (line 29).
 
-*Source: src/documents/tasks.py:29, 48-55; src/documents/models.py:26*
+_Source: src/documents/tasks.py:29, 48-55; src/documents/models.py:26_
 
 #### Classifier Loading
 
@@ -632,7 +638,7 @@ if schema_version != self.FORMAT_VERSION:
     )
 ```
 
-*Source: src/documents/classifier.py:30-57, 60-63, 76-94*
+_Source: src/documents/classifier.py:30-57, 60-63, 76-94_
 
 ### 2.2 The SHA-1 Change-Detection Hash
 
@@ -699,6 +705,7 @@ new_data_hash = m.digest()
 This produces a **20-byte raw SHA-1 digest** (not a hex string — `digest()` returns bytes, not `hexdigest()`). This hash is stored in the pickled model file and loaded back via `self.data_hash = pickle.load(f)` (line 86).
 
 **What goes into the hash:**
+
 1. The preprocessed text content of every non-inbox document
 2. The PK of each document's document type (if it uses `MATCH_AUTO`), or -1
 3. The PK of each document's correspondent (if it uses `MATCH_AUTO`), or -1
@@ -706,7 +713,7 @@ This produces a **20-byte raw SHA-1 digest** (not a hex string — `digest()` re
 
 **What this means:** ANY change to the training data — a new document added, existing document content modified, a tag added/removed, a correspondent changed, or a matching algorithm switched to/from `MATCH_AUTO` — will change the hash and trigger retraining.
 
-*Source: src/documents/classifier.py:115-161*
+_Source: src/documents/classifier.py:115-161_
 
 ### 2.3 Training Skipped: The Fast Path
 
@@ -741,7 +748,7 @@ DEBUG paperless.tasks Training data unchanged.
 
 The entire process — loading the model, iterating all documents, computing the SHA-1 hash, and comparing — takes milliseconds to a few seconds depending on the number of documents. No vectorization, no neural network training occurs.
 
-*Source: src/documents/classifier.py:163-164; src/documents/tasks.py:62-69*
+_Source: src/documents/classifier.py:163-164; src/documents/tasks.py:62-69_
 
 ### 2.4 Full Retraining: The Slow Path
 
@@ -785,11 +792,11 @@ Uses scikit-learn's `CountVectorizer` with word-level unigrams and bigrams, mini
 
 Three separate `MLPClassifier(tol=0.01)` neural networks are trained:
 
-| Sub-classifier | Log Message | Condition |
-|---|---|---|
-| Tags | `"Training tags classifier..."` (line 203) | `num_tags > 0` |
-| Correspondent | `"Training correspondent classifier..."` (line 226) | `num_correspondents > 0` |
-| Document Type | `"Training document type classifier..."` (line 237) | `num_document_types > 0` |
+| Sub-classifier | Log Message                                         | Condition                |
+| -------------- | --------------------------------------------------- | ------------------------ |
+| Tags           | `"Training tags classifier..."` (line 203)          | `num_tags > 0`           |
+| Correspondent  | `"Training correspondent classifier..."` (line 226) | `num_correspondents > 0` |
+| Document Type  | `"Training document type classifier..."` (line 237) | `num_document_types > 0` |
 
 If a category has zero items, a skip message is logged instead:
 
@@ -862,7 +869,7 @@ except Exception as e:
 
 Example: `WARNING paperless.tasks Classifier error: No training data available.`
 
-*Source: src/documents/classifier.py:166-249; src/documents/tasks.py:62-72*
+_Source: src/documents/classifier.py:166-249; src/documents/tasks.py:62-72_
 
 ### 2.5 Classifier Decision Flowchart
 
@@ -907,16 +914,18 @@ def pre_check_duplicate(self):
 ```
 
 The function:
+
 1. Opens the incoming file in binary mode
 2. Reads the **entire file** into memory
 3. Computes the MD5 hash
 4. Calls `.hexdigest()` to get a **32-character lowercase hexadecimal string**
 
 Example MD5 checksums (32-character hex format):
+
 - Empty file: `d41d8cd98f00b204e9800998ecf8427e`
 - Typical PDF: `7b3f9a2c1d4e5f6a8b9c0d1e2f3a4b5c`
 
-*Source: src/documents/consumer.py:102-104*
+_Source: src/documents/consumer.py:102-104_
 
 ### 3.2 The Dual-Field Query
 
@@ -929,12 +938,12 @@ if Document.objects.filter(
 
 This query checks the incoming file's MD5 against **two** database fields:
 
-| Field | Model Definition | Purpose |
-|---|---|---|
-| `checksum` | `CharField(max_length=32, unique=True)` | MD5 of the **original** uploaded file |
-| `archive_checksum` | `CharField(max_length=32, null=True)` | MD5 of the **archive** (OCR'd PDF) version |
+| Field              | Model Definition                        | Purpose                                    |
+| ------------------ | --------------------------------------- | ------------------------------------------ |
+| `checksum`         | `CharField(max_length=32, unique=True)` | MD5 of the **original** uploaded file      |
+| `archive_checksum` | `CharField(max_length=32, null=True)`   | MD5 of the **archive** (OCR'd PDF) version |
 
-*Source: src/documents/models.py:135-150*
+_Source: src/documents/models.py:135-150_
 
 The `Q(checksum=checksum) | Q(archive_checksum=checksum)` is an OR query — if the incoming file's MD5 matches **either** field of **any** existing document, the file is considered a duplicate.
 
@@ -990,7 +999,7 @@ ERROR paperless.consumer Not consuming invoice_2024.pdf: It is a duplicate.
 
 The `MESSAGE_DOCUMENT_ALREADY_EXISTS` constant is `"document_already_exists"` (line 37) — this is sent to the frontend via WebSocket as a progress status message, separate from the log.
 
-*Source: src/documents/consumer.py:37, 54, 78-81, 102-113; src/paperless/settings.py:486*
+_Source: src/documents/consumer.py:37, 54, 78-81, 102-113; src/paperless/settings.py:486_
 
 ### 3.5 Duplicate Detection Flow
 
@@ -1033,17 +1042,17 @@ The sanity checker is implemented in `check_sanity()` at `src/documents/sanity_c
 
 The checker performs these categories of checks for **every document** in the database:
 
-| Category | Lines | Checks Performed |
-|---|---|---|
-| **Thumbnail** | 62-72 | Existence, readability |
-| **Original file** | 74-91 | Existence, readability, MD5 checksum verification |
-| **Archive file** | 93-124 | Metadata consistency, existence, readability, MD5 checksum verification |
-| **Content** | 127-128 | Non-empty content |
-| **Orphaned files** | 130-131 | Files in media dir not owned by any document |
+| Category           | Lines   | Checks Performed                                                        |
+| ------------------ | ------- | ----------------------------------------------------------------------- |
+| **Thumbnail**      | 62-72   | Existence, readability                                                  |
+| **Original file**  | 74-91   | Existence, readability, MD5 checksum verification                       |
+| **Archive file**   | 93-124  | Metadata consistency, existence, readability, MD5 checksum verification |
+| **Content**        | 127-128 | Non-empty content                                                       |
+| **Orphaned files** | 130-131 | Files in media dir not owned by any document                            |
 
 Logger: `paperless.sanity_checker` (line 24).
 
-*Source: src/documents/sanity_checker.py:10-43, 49-133*
+_Source: src/documents/sanity_checker.py:10-43, 49-133_
 
 ### 4.2 Healthy Archive Output
 
@@ -1074,7 +1083,7 @@ INFO  paperless.sanity_checker Sanity checker detected no issues.
 
 That's it. A completely clean archive produces a single INFO line. The task returns the string `"No issues detected."`.
 
-*Source: src/documents/sanity_checker.py:23-27; src/documents/tasks.py:266-267*
+_Source: src/documents/sanity_checker.py:23-27; src/documents/tasks.py:266-267_
 
 ### 4.3 Unhealthy Archive Output with Hash Values
 
@@ -1083,36 +1092,45 @@ Here is the complete catalog of error messages, with exact format strings from t
 #### Thumbnail Errors
 
 **Missing thumbnail:**
+
 ```python
 # Source: src/documents/sanity_checker.py:64
 messages.error(f"Thumbnail of document {doc.pk} does not exist.")
 ```
+
 Example: `ERROR Thumbnail of document 42 does not exist.`
 
 **Unreadable thumbnail:**
+
 ```python
 # Source: src/documents/sanity_checker.py:72
 messages.error(f"Cannot read thumbnail file of document {doc.pk}: {e}")
 ```
+
 Example: `ERROR Cannot read thumbnail file of document 42: [Errno 13] Permission denied: '/opt/paperless/media/documents/thumbnails/0000042.png'`
 
 #### Original File Errors
 
 **Missing original:**
+
 ```python
 # Source: src/documents/sanity_checker.py:77
 messages.error(f"Original of document {doc.pk} does not exist.")
 ```
+
 Example: `ERROR Original of document 42 does not exist.`
 
 **Unreadable original:**
+
 ```python
 # Source: src/documents/sanity_checker.py:85
 messages.error(f"Cannot read original file of document {doc.pk}: {e}")
 ```
+
 Example: `ERROR Cannot read original file of document 42: [Errno 13] Permission denied: '/opt/paperless/media/documents/originals/0000042.pdf'`
 
 **Original checksum mismatch (THE KEY ERROR):**
+
 ```python
 # Source: src/documents/sanity_checker.py:88-91
 if not checksum == doc.checksum:
@@ -1123,6 +1141,7 @@ if not checksum == doc.checksum:
 ```
 
 The MD5 is computed as:
+
 ```python
 # Source: src/documents/sanity_checker.py:82-83
 with doc.source_file as f:
@@ -1130,6 +1149,7 @@ with doc.source_file as f:
 ```
 
 **Example with realistic hash values:**
+
 ```
 ERROR Checksum mismatch of document 42. Stored: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4, actual: f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3.
 ```
@@ -1139,6 +1159,7 @@ Both values are 32-character MD5 hex digests. The `Stored` value comes from the 
 #### Archive File Errors
 
 **Archive checksum without filename (metadata inconsistency):**
+
 ```python
 # Source: src/documents/sanity_checker.py:94-97
 if doc.archive_checksum and not doc.archive_filename:
@@ -1149,6 +1170,7 @@ if doc.archive_checksum and not doc.archive_filename:
 ```
 
 **Archive filename without checksum (metadata inconsistency):**
+
 ```python
 # Source: src/documents/sanity_checker.py:99-102
 elif not doc.archive_checksum and doc.archive_filename:
@@ -1159,6 +1181,7 @@ elif not doc.archive_checksum and doc.archive_filename:
 ```
 
 **Missing archive:**
+
 ```python
 # Source: src/documents/sanity_checker.py:105-106
 if not os.path.isfile(doc.archive_path):
@@ -1166,6 +1189,7 @@ if not os.path.isfile(doc.archive_path):
 ```
 
 **Unreadable archive:**
+
 ```python
 # Source: src/documents/sanity_checker.py:113-115
 except OSError as e:
@@ -1175,6 +1199,7 @@ except OSError as e:
 ```
 
 **Archive checksum mismatch:**
+
 ```python
 # Source: src/documents/sanity_checker.py:117-124
 else:
@@ -1188,6 +1213,7 @@ else:
 ```
 
 The archive MD5 is computed identically to the original:
+
 ```python
 # Source: src/documents/sanity_checker.py:111-112
 with doc.archive_file as f:
@@ -1195,6 +1221,7 @@ with doc.archive_file as f:
 ```
 
 **Example:**
+
 ```
 ERROR Checksum mismatch of archived document 42. Stored: b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5, actual: c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6.
 ```
@@ -1206,9 +1233,10 @@ ERROR Checksum mismatch of archived document 42. Stored: b2c3d4e5f6a1b2c3d4e5f6a
 if not doc.content:
     messages.info(f"Document {doc.pk} has no content.")
 ```
+
 Example: `INFO  Document 42 has no content.`
 
-*Source: src/documents/sanity_checker.py:62-128*
+_Source: src/documents/sanity_checker.py:62-128_
 
 ### 4.4 Severity Levels and Task Outcomes
 
@@ -1244,14 +1272,14 @@ def sanity_check():
         return "No issues detected."
 ```
 
-| Highest Severity Present | Outcome | Return Value / Exception |
-|---|---|---|
-| ERROR | Exception raised | `SanityCheckFailedException("Sanity check failed with errors. See log.")` |
-| WARNING (no errors) | Warning string returned | `"Sanity check exited with warnings. See log."` |
-| INFO only | Info string returned | `"Sanity check exited with infos. See log."` |
-| No messages | Clean string returned | `"No issues detected."` |
+| Highest Severity Present | Outcome                 | Return Value / Exception                                                  |
+| ------------------------ | ----------------------- | ------------------------------------------------------------------------- |
+| ERROR                    | Exception raised        | `SanityCheckFailedException("Sanity check failed with errors. See log.")` |
+| WARNING (no errors)      | Warning string returned | `"Sanity check exited with warnings. See log."`                           |
+| INFO only                | Info string returned    | `"Sanity check exited with infos. See log."`                              |
+| No messages              | Clean string returned   | `"No issues detected."`                                                   |
 
-*Source: src/documents/tasks.py:255-267*
+_Source: src/documents/tasks.py:255-267_
 
 ### 4.5 Sanity Checker Flow
 
@@ -1339,7 +1367,7 @@ if lockfile in present_files:
     present_files.remove(lockfile)
 ```
 
-*Source: src/documents/signals/handlers.py:264-277; src/documents/sanity_checker.py:57-59*
+_Source: src/documents/signals/handlers.py:264-277; src/documents/sanity_checker.py:57-59_
 
 ### 5.2 The Media Directory Walk
 
@@ -1376,7 +1404,7 @@ if os.path.normpath(doc.archive_path) in present_files:
 
 After all documents have been checked, any files still remaining in `present_files` are orphans — they exist on disk but no document record claims them.
 
-*Source: src/documents/sanity_checker.py:52-55, 66-67, 79-80, 108-109*
+_Source: src/documents/sanity_checker.py:52-55, 66-67, 79-80, 108-109_
 
 ### 5.3 What the System Reports
 
@@ -1416,7 +1444,7 @@ If orphans are the ONLY issue (no ERRORs), the sanity check does not raise an ex
 
 **The "no orphans" path:** If no orphaned files exist, `present_files` is empty after all documents have been checked, and the orphan reporting loop at lines 130-131 simply does not execute — no warning messages are generated for orphans. In this scenario, if all other checks also pass (no missing files, no checksum mismatches, no content gaps), the `SanityCheckMessages` object contains zero messages, and `log_messages()` emits `"Sanity checker detected no issues."` (line 27). The task wrapper returns `"No issues detected."` (`src/documents/tasks.py:267`). See Section 4.2 for the complete healthy-archive output.
 
-*Source: src/documents/sanity_checker.py:26-27, 130-131; src/documents/tasks.py:262-267*
+_Source: src/documents/sanity_checker.py:26-27, 130-131; src/documents/tasks.py:262-267_
 
 ---
 
@@ -1424,27 +1452,27 @@ If orphans are the ONLY issue (no ERRORs), the sanity check does not raise an ex
 
 ### Logger Names
 
-| Logger | Used By | File |
-|---|---|---|
-| `paperless.handlers` | Signal handlers (file move, deletion) | `src/documents/signals/handlers.py:27` |
-| `paperless.filehandling` | Filename generation | `src/documents/file_handling.py:11` |
-| `paperless.classifier` | ML classifier training | `src/documents/classifier.py:21` |
-| `paperless.tasks` | Task wrappers | `src/documents/tasks.py:29` |
-| `paperless.consumer` | Document consumption | `src/documents/consumer.py:54` (via LoggingMixin) |
-| `paperless.sanity_checker` | Sanity checker | `src/documents/sanity_checker.py:24` |
+| Logger                     | Used By                               | File                                              |
+| -------------------------- | ------------------------------------- | ------------------------------------------------- |
+| `paperless.handlers`       | Signal handlers (file move, deletion) | `src/documents/signals/handlers.py:27`            |
+| `paperless.filehandling`   | Filename generation                   | `src/documents/file_handling.py:11`               |
+| `paperless.classifier`     | ML classifier training                | `src/documents/classifier.py:21`                  |
+| `paperless.tasks`          | Task wrappers                         | `src/documents/tasks.py:29`                       |
+| `paperless.consumer`       | Document consumption                  | `src/documents/consumer.py:54` (via LoggingMixin) |
+| `paperless.sanity_checker` | Sanity checker                        | `src/documents/sanity_checker.py:24`              |
 
 ### Hash Algorithms Used
 
-| Algorithm | Format | Used In | Purpose |
-|---|---|---|---|
-| MD5 | 32-char hex string (`hexdigest()`) | Consumer duplicate check, Sanity checker | File identity comparison |
-| SHA-1 | 20-byte raw bytes (`digest()`) | Classifier training | Training data change detection |
+| Algorithm | Format                             | Used In                                  | Purpose                        |
+| --------- | ---------------------------------- | ---------------------------------------- | ------------------------------ |
+| MD5       | 32-char hex string (`hexdigest()`) | Consumer duplicate check, Sanity checker | File identity comparison       |
+| SHA-1     | 20-byte raw bytes (`digest()`)     | Classifier training                      | Training data change detection |
 
 ### Configuration Variables
 
-| Variable | Setting | Default | Effect |
-|---|---|---|---|
-| `PAPERLESS_FILENAME_FORMAT` | `settings.py:584` | `None` (disabled) | Enables file relocation on metadata change |
-| `PAPERLESS_CONSUMER_DELETE_DUPLICATES` | `settings.py:486` | `False` | Deletes incoming duplicate files |
-| `PAPERLESS_MEDIA_ROOT` | `settings.py:61` | `<BASE_DIR>/../media` | Root of all media storage |
-| `PAPERLESS_DATA_DIR` | `settings.py:66` | `<BASE_DIR>/../data` | Application data directory |
+| Variable                               | Setting           | Default               | Effect                                     |
+| -------------------------------------- | ----------------- | --------------------- | ------------------------------------------ |
+| `PAPERLESS_FILENAME_FORMAT`            | `settings.py:584` | `None` (disabled)     | Enables file relocation on metadata change |
+| `PAPERLESS_CONSUMER_DELETE_DUPLICATES` | `settings.py:486` | `False`               | Deletes incoming duplicate files           |
+| `PAPERLESS_MEDIA_ROOT`                 | `settings.py:61`  | `<BASE_DIR>/../media` | Root of all media storage                  |
+| `PAPERLESS_DATA_DIR`                   | `settings.py:66`  | `<BASE_DIR>/../data`  | Application data directory                 |
