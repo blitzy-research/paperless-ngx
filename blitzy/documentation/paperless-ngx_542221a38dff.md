@@ -768,9 +768,115 @@ If you are running against a persistent database (not `/tmp/`), remember to:
 | 20 | DocumentSerializer fields | `src/documents/serialisers.py:201-235` |
 | 21 | Custom Auth Classes | `src/paperless/auth.py:9-15,18-33,36-41` |
 | 22 | MIDDLEWARE stack | `src/paperless/settings.py:134-146` |
+| 23 | Django version pin | `requirements.txt:38` — `django==4.0.4` |
+| 24 | DRF version pin | `requirements.txt:39` — `djangorestframework==3.13.1` |
+| 25 | RemoteVersionView (no auth) | `src/documents/views.py:675` |
 
 ### Thinking/Rationale
 
 - **Why include a quick reference summary?** This section serves as a lookup table for integration developers who have already read the investigative sections and need to quickly retrieve specific values (header format, endpoint path, status codes) during implementation. Every answer in this table was derived from the detailed analysis in Sections 1–8 — it consolidates findings rather than introducing new claims.
 - **Why include live test results here?** The live test results table provides independent verification that the code-traced answers are correct at runtime, not just in theory. Including them in the summary gives developers confidence that the documented behavior matches actual server responses.
 - **Why include the source code reference table?** The 22-row reference table provides a complete citation index for the entire document. If the Paperless-ngx codebase is updated in the future, a developer can use this table to quickly identify which source files and line numbers to re-verify — making this document maintainable over time. Each entry traces directly to the code analysis performed in Sections 1–8.
+
+---
+
+## 11. Security Advisory: Known Dependency Vulnerabilities
+
+> **Important for integration developers:** The dependency versions pinned in this version of Paperless-ngx contain known security vulnerabilities that directly impact the authentication system documented above. Before deploying or integrating with a Paperless-ngx instance, ensure the operator has upgraded these dependencies to patched versions.
+
+### Django 4.0.4 — CRITICAL: 45+ Known CVEs (End-of-Life)
+
+**Affected file:** `requirements.txt` — `django==4.0.4`
+
+`Source: requirements.txt:38`
+
+Django 4.0.x is **end-of-life** and no longer receives security patches. The pinned version 4.0.4 is affected by 45+ CVEs spanning multiple critical categories:
+
+| Category | Severity | Key CVEs | Auth System Relevance |
+|----------|----------|----------|----------------------|
+| **SQL Injection** | CRITICAL | CVE-2022-34265 (Trunc/Extract functions, fixed in 4.0.6), plus multiple injection vectors in annotate/aggregate/extra and FilteredRelation | Django's ORM underpins all data queries including the `Token.objects.get(key=key)` lookup used by `TokenAuthentication.authenticate_credentials()`. SQL injection vulnerabilities could allow bypassing token validation or extracting token values from the `authtoken_token` table. |
+| **Denial of Service** | HIGH | 15+ DoS CVEs in template filters (urlize, truncatechars_html, wordwrap, strip_tags), URL processing, Accept-Language headers, IPv6 validation | DoS attacks could disable the authentication service entirely, preventing legitimate token-based API access. |
+| **User Enumeration** | MEDIUM | CVE-2024-45231 — timing attack via password reset | Could allow attackers to enumerate valid usernames, which are also used for the `POST /api/token/` endpoint documented in Section 2. |
+| **Log Injection** | MEDIUM | PYSEC-2025-47 — `request.path` not escaped in internal HTTP response logging | Attackers could inject misleading entries into logs, obscuring authentication-related security events. |
+| **Directory Traversal** | MEDIUM | CVE-2025-59682 — `django.utils.archive.extract` | Could allow access to files outside intended directories. |
+| **File Upload Bypass** | MEDIUM | PYSEC-2023-61 — file upload validation bypass | Could allow bypassing file type restrictions on the `POST /api/documents/post_document/` endpoint. |
+
+**Recommended action:** Upgrade Django to **>=4.2.28** (latest LTS patch) or the newest supported LTS release.
+
+### djangorestframework 3.13.1 — MAJOR: CVE-2024-21520 (XSS)
+
+**Affected file:** `requirements.txt` — `djangorestframework==3.13.1`
+
+`Source: requirements.txt:39`
+
+| Field | Value |
+|-------|-------|
+| **CVE** | CVE-2024-21520 |
+| **Type** | Cross-Site Scripting (XSS) |
+| **CVSS Score** | 6.1 (Medium) |
+| **Affected Versions** | All versions before 3.15.2 |
+| **Component** | `break_long_headers` template filter in the browsable API viewer |
+| **Description** | Improper input sanitization in the browsable API viewer allows XSS attacks when viewing API responses with crafted header values |
+
+**Auth system relevance:** DRF provides the `rest_framework.authentication.TokenAuthentication` class documented in Section 6, the `ObtainAuthToken` view powering the `POST /api/token/` endpoint documented in Section 2, and the browsable API viewer. If the browsable API is enabled in production (the default), an attacker could exploit this XSS vulnerability to steal authentication tokens from an admin's browser session.
+
+**Recommended action:** Upgrade djangorestframework to **>=3.15.2**.
+
+### Thinking/Rationale
+
+- **Why include dependency vulnerabilities in an authentication investigation?** The authentication system documented in this investigation runs on top of Django and DRF. Vulnerabilities in these frameworks directly undermine the security guarantees of the token authentication mechanism. An integration developer needs to know that while the authentication *logic* is correctly implemented (as verified in Sections 1–8), the *foundation* has known flaws that could be exploited. This is analogous to correctly locking a door but having a window left open — the lock works, but the building is still insecure.
+- **Why not fix the versions directly?** Per the project's read-only codebase policy, `requirements.txt` is a reference file and must not be modified as part of this documentation investigation. The responsibility for upgrading dependencies falls on the project maintainers or deployment operators, not on documentation authors. This section serves as an evidence-based advisory to inform that decision.
+- **Code as truth:** The exact pinned versions (`django==4.0.4` at `requirements.txt` line 38, `djangorestframework==3.13.1` at line 39) were verified directly from the repository. CVE details were cross-referenced against public vulnerability databases (NVD, Snyk, pip-audit).
+
+---
+
+## 12. Security Hardening Recommendations
+
+The following observations were identified during authentication boundary testing. They do not represent vulnerabilities in the application logic but are **security hardening opportunities** for production deployments.
+
+### 12.1 `/api/remote_version/` Accessible Without Authentication
+
+**Observation:** The `RemoteVersionView` at `src/documents/views.py` line 675 does not set `permission_classes`, making it accessible without authentication.
+
+`Source: src/documents/views.py:675`
+
+**Response when accessed without auth:**
+```json
+{"version":"0.0.0","update_available":false,"feature_is_set":false}
+```
+
+**Risk assessment:** LOW — The endpoint returns minimal metadata (version check information). It does not expose documents, user data, or configuration secrets. The lack of authentication appears intentional — the endpoint is not listed among the auth-protected viewsets documented in Section 5.
+
+**Recommendation:** If information disclosure is a concern in your deployment, consider adding `permission_classes = (IsAuthenticated,)` to the `RemoteVersionView` class. However, this may break the frontend's ability to check for updates before login.
+
+### 12.2 Server Header Discloses Software Version
+
+**Observation:** The `Server` response header shows `WSGIServer/0.2 CPython/3.x.x` in development mode.
+
+**Risk assessment:** LOW — This header is set by Django's development server (`runserver`), not by the application code. In production deployments using gunicorn or nginx, this header is overridden with the production server's own identifier.
+
+**Recommendation:** For production, use gunicorn (already included in `requirements.txt` as `gunicorn==20.1.0`) behind a reverse proxy (nginx, Traefik) that can strip or override the `Server` header.
+
+### 12.3 No Strict-Transport-Security (HSTS) Header
+
+**Observation:** The `Strict-Transport-Security` header is absent from API responses.
+
+**Risk assessment:** MEDIUM — HSTS prevents protocol downgrade attacks by instructing browsers to always use HTTPS. Its absence is expected in HTTP development mode, but production deployments should enable it.
+
+**Recommendation:** Configure HSTS at the reverse proxy level (e.g., nginx: `add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;`) or enable Django's `SECURE_HSTS_SECONDS` setting.
+
+### 12.4 No Cache-Control Header on Authenticated Responses
+
+**Observation:** Authenticated API responses do not include a `Cache-Control: no-store` header.
+
+**Risk assessment:** MEDIUM — Without explicit cache control, browsers or intermediate proxies may cache authenticated API responses containing sensitive document data (titles, content, correspondents).
+
+**Recommendation:** Add `Cache-Control: no-store` to authenticated API responses. This can be achieved via:
+- A custom DRF renderer or middleware that sets the header for authenticated responses
+- Reverse proxy configuration (e.g., nginx: `add_header Cache-Control "no-store" always;` for the `/api/` location block)
+
+### Thinking/Rationale
+
+- **Why document these as "hardening recommendations" rather than "issues"?** These observations were all confirmed to be either by-design behavior (the `/api/remote_version/` endpoint), development-mode expected behavior (server header, HSTS), or best-practice gaps (Cache-Control). None represent bugs in the authentication logic itself. Labeling them as "hardening recommendations" correctly conveys their nature — they are improvements for production environments, not defects in the codebase.
+- **Why include them in an authentication investigation document?** Integration developers deploying against a production Paperless-ngx instance need to understand the security posture of the API beyond just "how do I authenticate." These recommendations help operators configure their deployment to fully protect the authentication tokens and authenticated data that flow through the API.
+- **Code as truth:** The `RemoteVersionView` class location (`src/documents/views.py:675`) and its lack of `permission_classes` were verified directly from the source code. The header observations were confirmed through live HTTP response inspection during testing.
