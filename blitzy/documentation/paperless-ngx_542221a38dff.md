@@ -41,11 +41,16 @@ The investigation was conducted using the following approach:
    - Django-Q `Schedule` table queried at runtime to confirm task frequencies and `next_run` timestamps
    - `CONSUMER_POLLING` value confirmed as `0` (inotify mode) from `src/paperless/settings.py` line 478
 
-6. **Log format**: All log output follows the verbose formatter defined at `src/paperless/settings.py` line 378:
+6. **Log format**: Paperless-NGX's Django `LOGGING` configuration (`src/paperless/settings.py` line 378) defines a verbose formatter:
    ```
    [{asctime}] [{levelname}] [{name}] {message}
    ```
-   Example: `[2026-04-09 12:00:00,000] [INFO] [django_q.cluster] Q Cluster-paperless running.`
+   This format applies to all Django-managed loggers (e.g., `paperless.*`, `uvicorn.error`, `gunicorn.error`). However, **Django-Q uses its own independent logging configuration** (`django_q/conf.py` lines 207–218): the logger name is `"django-q"` (with hyphen), `propagate` is set to `False`, and it uses a custom formatter:
+   ```
+   %(asctime)s [Q] %(levelname)s %(message)s    (datefmt: %H:%M:%S)
+   ```
+   Example Django-Q message: `12:00:01 [Q] INFO Q Cluster earth-double-snake-equal running.`
+   Example Django/Gunicorn message: `[2026-04-09 12:00:00,000] [INFO] [gunicorn.error] Starting gunicorn 20.1.0`
 
 ---
 
@@ -115,7 +120,7 @@ graph TD
         MON["Monitor<br/>(watches results)"]
         W1["Worker 1<br/>(executes tasks)"]
         W2["Worker 2<br/>(executes tasks)"]
-        SCHED["Scheduler<br/>(checks Schedule objects)"]
+        SCHED["Scheduler<br/>(checks Schedule objects ~every 30s)"]
         SENT --> PUSH
         SENT --> MON
         SENT --> W1
@@ -249,7 +254,7 @@ Q_CLUSTER = {
 
 | Parameter | Value | Effect | Source |
 |-----------|-------|--------|--------|
-| `name` | `"paperless"` | Used as cluster identification prefix in log messages | Line 450 |
+| `name` | `"paperless"` | Used as the Redis key namespace prefix (e.g., `django_q:paperless:cluster`); **not** used in log messages — see `django_q/conf.py` line 80: `PREFIX = conf.get("name", "default")` | Line 450 |
 | `catch_up` | `False` | Missed scheduled tasks during downtime are **NOT** retroactively executed; only the next occurrence fires | Line 451 |
 | `recycle` | `1` | Each worker process is terminated and replaced after processing exactly **one** task | Line 452 |
 | `retry` | `PAPERLESS_WORKER_TIMEOUT + 10` (default: 1810s) | Time before a timed-out task is retried | Line 453 |
@@ -284,9 +289,9 @@ The `qcluster` management command spawns a **sentinel** process, which in turn m
 | **Pusher** | Reads tasks from the Redis queue and assigns them to available workers | Polls Redis periodically; silent when queue is empty |
 | **Monitor** | Watches for completed task results and processes them | Polls for results; silent when no tasks are running |
 | **Workers** (×N) | Execute the actual task functions | Idle between tasks; after processing one task, the worker is killed and replaced due to `recycle: 1` |
-| **Scheduler** | Checks Django-Q `Schedule` objects and enqueues tasks when `next_run <= now()` | Runs within the guard cycle; fires tasks at their configured intervals |
+| **Scheduler** | Checks Django-Q `Schedule` objects and enqueues tasks when `next_run <= now()` | Called approximately every **30 seconds** (not every guard cycle); fires tasks at their configured intervals |
 
-> **Note**: The scheduler is not a separate OS-level process — it runs as part of the sentinel's guard loop. The sentinel calls the scheduler function on each guard cycle iteration to check for due schedules.
+> **Note**: The scheduler is not a separate OS-level process — it runs as a function called within the sentinel's guard loop. However, it is NOT called on every guard cycle. The sentinel accumulates a counter by `GUARD_CYCLE` (0.5s) each iteration and calls the scheduler only when the counter reaches 30, then resets — meaning the scheduler runs approximately every 30 seconds. Source: `django_q/cluster.py` lines 283–286: `counter += cycle; if counter >= 30 and Conf.SCHEDULER: counter = 0; scheduler(broker=self.broker)`. The code comment reads: "Call scheduler once a minute (or so)".
 
 ---
 
@@ -487,30 +492,32 @@ After this single startup message, the consumer enters its blocking event loop a
 
 ### Django-Q Cluster Startup
 
-The `qcluster` management command starts the Django-Q sentinel, which spawns all sub-processes. The startup sequence produces **7 INFO-level messages**:
+The `qcluster` management command starts the Django-Q sentinel, which spawns all sub-processes. The startup sequence produces **7 INFO-level messages** using Django-Q's own log format (`HH:MM:SS [Q] LEVEL message`):
 
 ```text
-[2026-04-09 12:00:01,000] [INFO] [django_q.cluster] Q Cluster-paperless starting.
-[2026-04-09 12:00:01,100] [INFO] [django_q.cluster] Q Cluster-paperless ready for work at PID1
-[2026-04-09 12:00:01,200] [INFO] [django_q.cluster] Q Cluster-paperless ready for work at PID2
-[2026-04-09 12:00:01,300] [INFO] [django_q.cluster] Q Cluster-paperless monitoring at PID3
-[2026-04-09 12:00:01,400] [INFO] [django_q.cluster] Q Cluster-paperless guarding cluster at PID4
-[2026-04-09 12:00:01,500] [INFO] [django_q.cluster] Q Cluster-paperless pushing tasks at PID5
-[2026-04-09 12:00:02,000] [INFO] [django_q.cluster] Q Cluster-paperless running.
+12:00:01 [Q] INFO Q Cluster <humanized-name> starting.
+12:00:01 [Q] INFO Process-2 ready for work at PID1
+12:00:01 [Q] INFO Process-3 ready for work at PID2
+12:00:01 [Q] INFO Process-4 monitoring at PID3
+12:00:01 [Q] INFO Process-1 guarding cluster <humanized-name>
+12:00:01 [Q] INFO Process-5 pushing tasks at PID5
+12:00:02 [Q] INFO Q Cluster <humanized-name> running.
 ```
+
+> **Note on `<humanized-name>`**: The cluster name in log messages is a **random human-readable string** generated from a UUID, such as `"earth-double-snake-equal"`. It is generated by `humanize(self.cluster_id.hex)` at `django_q/cluster.py` line 110, where `cluster_id = uuid.uuid4()` (line 59). This name is **unique per cluster instance** and changes on every restart. It is NOT the `Q_CLUSTER["name"]` config value (`"paperless"`) — that value is used only as a Redis key namespace prefix (`django_q/conf.py` line 80: `PREFIX = conf.get("name", "default")`).
+>
+> **Note on process names**: All Django-Q sub-processes are spawned via `Process(target=target, args=args)` (line 191) without an explicit `name=` parameter. Python's `multiprocessing` module auto-assigns sequential names: `"Process-1"`, `"Process-2"`, etc. These names appear in log messages wherever `current_process().name` is used.
 
 **Message-by-message breakdown:**
 
-| # | Message | Meaning |
-|---|---------|---------|
-| 1 | `Q Cluster-paperless starting.` | Sentinel initialization begins |
-| 2–3 | `Q Cluster-paperless ready for work at PID` | Each worker process has spawned and is ready (one message per `TASK_WORKERS` count; default 2) |
-| 4 | `Q Cluster-paperless monitoring at PID` | Monitor sub-process started |
-| 5 | `Q Cluster-paperless guarding cluster at PID` | Sentinel guard loop activated |
-| 6 | `Q Cluster-paperless pushing tasks at PID` | Pusher sub-process started |
-| 7 | `Q Cluster-paperless running.` | Cluster is fully operational |
-
-> **Note**: The cluster name (`paperless`) comes from `Q_CLUSTER["name"]` at `src/paperless/settings.py` line 450. In live observation, the name format is `Q Cluster-paperless`, not a random string — the `"name"` config parameter is used directly.
+| # | Message | Source | Meaning |
+|---|---------|--------|---------|
+| 1 | `Q Cluster <humanized-name> starting.` | `cluster.py` line 76: `f"Q Cluster {self.name} starting."` | Sentinel process spawned; cluster initialization begins |
+| 2–3 | `Process-N ready for work at PID` | `cluster.py` line 411: `f"{name} ready for work at {current_process().pid}"` | Each worker process has spawned and is ready (one message per `TASK_WORKERS` count; default 2) |
+| 4 | `Process-N monitoring at PID` | `cluster.py` line 381: `f"{name} monitoring at {current_process().pid}"` | Monitor sub-process started |
+| 5 | `Process-N guarding cluster <humanized-name>` | `cluster.py` line 257: `f"{current_process().name} guarding cluster {humanize(self.cluster_id.hex)}"` | Sentinel guard loop activated |
+| 6 | `Process-N pushing tasks at PID` | `cluster.py` line 345: `f"{current_process().name} pushing tasks at {current_process().pid}"` | Pusher sub-process started |
+| 7 | `Q Cluster <humanized-name> running.` | `cluster.py` line 263: `f"Q Cluster {humanize(self.cluster_id.hex)} running."` | Cluster is fully operational |
 
 ---
 
@@ -569,7 +576,7 @@ def add_schedules(apps, schema_editor):
 
 ### Initial Burst Behavior
 
-**Critical behavior**: On first startup (or after extended downtime where `next_run` timestamps are in the past), **all four scheduled tasks fire within approximately 30 seconds**. This occurs because the Django-Q scheduler function checks all `Schedule` objects on each guard cycle and enqueues any task where `next_run <= datetime.now()`.
+**Critical behavior**: On first startup (or after extended downtime where `next_run` timestamps are in the past), **all four scheduled tasks fire within approximately 30 seconds**. This occurs because the Django-Q sentinel's guard loop accumulates a counter by `GUARD_CYCLE` (0.5s) each iteration and calls the scheduler function when the counter reaches 30 (approximately every 30 seconds). The scheduler then checks all `Schedule` objects and enqueues any task where `next_run <= datetime.now()`. Source: `django_q/cluster.py` lines 283–286.
 
 **Why only one execution per schedule** (not a backfill): The `catch_up: False` setting in `Q_CLUSTER` (`src/paperless/settings.py` line 451) means Django-Q will:
 - Fire the task **once** to bring it current
@@ -581,11 +588,17 @@ def add_schedules(apps, schema_editor):
 **Example initial burst log output (observed ~30 seconds after cluster startup):**
 
 ```text
-[2026-04-09 12:00:32,100] [INFO] [django_q.cluster] Q Cluster-paperless processing [Check all e-mail accounts]
-[2026-04-09 12:00:32,200] [INFO] [django_q.cluster] Q Cluster-paperless processing [Train the classifier]
-[2026-04-09 12:00:32,300] [INFO] [django_q.cluster] Q Cluster-paperless processing [Optimize the index]
-[2026-04-09 12:00:32,400] [INFO] [django_q.cluster] Q Cluster-paperless processing [Perform sanity check]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Optimize the index]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
+12:00:32 [Q] INFO Process-2 processing [Check all e-mail accounts]
+12:00:32 [Q] INFO Process-3 processing [Train the classifier]
+12:00:32 [Q] INFO Process-2 processing [Optimize the index]
+12:00:32 [Q] INFO Process-3 processing [Perform sanity check]
 ```
+
+> **Note**: The scheduler first creates tasks from schedules (logged by the sentinel process, e.g., `Process-1`), then workers pick them up for processing. The "created a task from schedule" message (`cluster.py` line 670) precedes the "processing" message (`cluster.py` line 420) for each task.
 
 After this initial burst, tasks settle into their regular periodic schedules.
 
@@ -692,35 +705,36 @@ def process_mail_accounts():
 
 The Django-Q sentinel's guard loop runs every `GUARD_CYCLE` seconds (default: 0.5 seconds in `django_q.conf`).
 
-**What it does on each cycle:**
-1. Checks if the pusher process is alive → if dead, reincarnates it
+**What it does on each cycle (every 0.5 seconds):**
+1. Checks if each worker is alive → if dead or timed out, reincarnates it
 2. Checks if the monitor process is alive → if dead, reincarnates it
-3. Checks if each worker is alive → if dead, spawns replacement
-4. Calls the scheduler function to check for due `Schedule` objects
-5. Checks for the stop signal
+3. Checks if the pusher process is alive → if dead, reincarnates it
+4. Increments a counter by `GUARD_CYCLE` (0.5s); when the counter reaches **30**, calls the scheduler function and resets the counter — meaning the scheduler runs approximately every **30 seconds** (Source: `cluster.py` lines 283–286, code comment: "Call scheduler once a minute (or so)")
+5. Saves current cluster status
+6. Sleeps for `GUARD_CYCLE` (0.5s)
 
 **At idle**: The guard cycle produces **absolutely no log output** during normal operation. It only logs when a sub-process has died and needs reincarnation (which is a fault-recovery scenario, not idle behavior).
 
-> **Rationale**: The 0.5-second guard cycle is a balance between responsiveness (detecting sub-process failures quickly) and CPU overhead (minimal, as each cycle is just a few process status checks).
+> **Rationale**: The 0.5-second guard cycle is a balance between responsiveness (detecting sub-process failures quickly) and CPU overhead (minimal, as each cycle is just a few process status checks). The scheduler check every ~30 seconds (not every 0.5s) avoids excessive database queries for Schedule objects while maintaining reasonable schedule precision.
 
 ### Worker Recycling
 
 **Critical behavioral detail**: Because `Q_CLUSTER["recycle"] = 1` (`src/paperless/settings.py` line 452), each Django-Q worker process is terminated and replaced after processing **exactly one** task.
 
-This produces a distinctive three-line log pattern **after every single task completion**:
+This produces a distinctive three-line log pattern **after every single task completion** (using Django-Q's own log format):
 
 ```text
-[2026-04-09 12:00:33,500] [INFO] [django_q.worker] Worker-1 stopped doing work
-[2026-04-09 12:00:33,600] [INFO] [django_q.cluster] recycled worker Worker-1
-[2026-04-09 12:00:33,700] [INFO] [django_q.cluster] Worker-3 ready for work at PID
+12:00:33 [Q] INFO Process-2 stopped doing work
+12:00:33 [Q] INFO recycled worker Process-2
+12:00:33 [Q] INFO Process-5 ready for work at PID
 ```
 
 **The pattern:**
-1. **`Worker-N stopped doing work`** — The worker process has finished its single task and is shutting down
-2. **`recycled worker Worker-N`** — The sentinel has detected the stopped worker and is creating a replacement
-3. **`Worker-M ready for work at PID`** — The new replacement worker is ready to accept tasks
+1. **`Process-N stopped doing work`** — The worker process has finished its single task and is shutting down. Source: `cluster.py` line 451: `f"{name} stopped doing work"` where `name = current_process().name`.
+2. **`recycled worker Process-N`** — The sentinel has detected the stopped worker (via `timer.value == -2`) and is creating a replacement. Source: `cluster.py` line 233: `f"recycled worker {process.name}"`.
+3. **`Process-M ready for work at PID`** — The new replacement worker is ready to accept tasks. Source: `cluster.py` line 411: `f"{name} ready for work at {current_process().pid}"`.
 
-> **Note**: Worker numbers increment — `Worker-1` is replaced by `Worker-3` (not `Worker-1` again). This is because Django-Q assigns monotonically increasing worker IDs.
+> **Note**: Worker process numbers increment — `Process-2` is replaced by `Process-5` (not `Process-2` again). This is because Python's `multiprocessing` module assigns monotonically increasing auto-generated names to new `Process` instances.
 
 > **Rationale**: `recycle: 1` is a conservative memory management strategy. Paperless-NGX workers handle OCR processing (via `ocrmypdf`), ML classification (via `scikit-learn`), full-text indexing (via `whoosh`), and PDF parsing (via `pikepdf`). These operations can allocate significant memory that may not be fully released back to the OS. By recycling after every task, each task gets a fresh process with a clean memory state, preventing gradual memory growth over time. The trade-off is a small per-task overhead (~50ms) for process creation.
 
@@ -734,31 +748,35 @@ This section directly answers **Q2** (Periodic Health Log Entries).
 
 The following table catalogs all log messages that appear periodically in an idle Paperless-NGX system:
 
-| Log Message | Logger Name | Level | Frequency | Source / Trigger | Meaning |
-|-------------|-------------|-------|-----------|-----------------|---------|
-| `Q Cluster-paperless processing [Check all e-mail accounts]` | `django_q.cluster` | INFO | Every 10 minutes | Django-Q scheduler enqueues mail check task | Mail check task has been picked up by a worker |
-| `Q Cluster-paperless processed [Check all e-mail accounts]` | `django_q.cluster` | INFO | Every 10 minutes | Django-Q monitor detects task completion | Mail check task completed successfully |
-| `Q Cluster-paperless processing [Train the classifier]` | `django_q.cluster` | INFO | Every hour | Django-Q scheduler enqueues classifier task | Classifier training task has been picked up |
-| `Q Cluster-paperless processed [Train the classifier]` | `django_q.cluster` | INFO | Every hour | Django-Q monitor detects task completion | Classifier training completed |
-| `Q Cluster-paperless processing [Optimize the index]` | `django_q.cluster` | INFO | Every day | Django-Q scheduler enqueues index task | Index optimization task has been picked up |
-| `Q Cluster-paperless processed [Optimize the index]` | `django_q.cluster` | INFO | Every day | Django-Q monitor detects task completion | Index optimization completed |
-| `Q Cluster-paperless processing [Perform sanity check]` | `django_q.cluster` | INFO | Every week | Django-Q scheduler enqueues sanity task | Sanity check task has been picked up |
-| `Q Cluster-paperless processed [Perform sanity check]` | `django_q.cluster` | INFO | Every week | Django-Q monitor detects task completion | Sanity check completed |
-| `Sanity checker detected no issues.` | `paperless.sanity_checker` | INFO | Every week | `sanity_checker.py` line 27 — `log_messages()` | Sanity check found zero problems (healthy) |
-| `Worker-N stopped doing work` | `django_q.worker` | INFO | After each task | Worker process exiting after single task (recycle=1) | Worker finished its one allowed task |
-| `recycled worker Worker-N` | `django_q.cluster` | INFO | After each task | Sentinel detects stopped worker | Sentinel is replacing the recycled worker |
-| `Worker-M ready for work at PID` | `django_q.cluster` | INFO | After each task | New worker process spawned | Replacement worker is operational |
+| Log Message | Logger | Format | Level | Frequency | Source (cluster.py line) | Meaning |
+|-------------|--------|--------|-------|-----------|--------------------------|---------|
+| `Process-N created a task from schedule [Check all e-mail accounts]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every 10 minutes | Line 670: `f"{current_process().name} created a task from schedule [{s.name or s.id}]"` | Scheduler has enqueued the mail check task |
+| `Process-N processing [Check all e-mail accounts]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every 10 minutes | Line 420: `f'{name} processing [{task["name"]}]'` | A worker has picked up the mail check task |
+| `Processed [Check all e-mail accounts]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every 10 minutes | Line 392: `f"Processed [{task['name']}]"` | Monitor confirms mail check completed successfully |
+| `Process-N created a task from schedule [Train the classifier]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every hour | Line 670 | Scheduler has enqueued the classifier training task |
+| `Process-N processing [Train the classifier]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every hour | Line 420 | A worker has picked up classifier training |
+| `Processed [Train the classifier]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every hour | Line 392 | Classifier training completed |
+| `Process-N created a task from schedule [Optimize the index]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every day | Line 670 | Scheduler has enqueued the index optimization task |
+| `Process-N processing [Optimize the index]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every day | Line 420 | A worker has picked up index optimization |
+| `Processed [Optimize the index]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every day | Line 392 | Index optimization completed |
+| `Process-N created a task from schedule [Perform sanity check]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every week | Line 670 | Scheduler has enqueued the sanity check task |
+| `Process-N processing [Perform sanity check]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every week | Line 420 | A worker has picked up the sanity check |
+| `Processed [Perform sanity check]` | `django-q` | `HH:MM:SS [Q]` | INFO | Every week | Line 392 | Sanity check completed |
+| `Sanity checker detected no issues.` | `paperless.sanity_checker` | Django verbose | INFO | Every week | `sanity_checker.py` line 27 — `log_messages()` | Sanity check found zero problems (healthy) |
+| `Process-N stopped doing work` | `django-q` | `HH:MM:SS [Q]` | INFO | After each task | Line 451: `f"{name} stopped doing work"` | Worker finished its one allowed task and is exiting |
+| `recycled worker Process-N` | `django-q` | `HH:MM:SS [Q]` | INFO | After each task | Line 233: `f"recycled worker {process.name}"` | Sentinel is replacing the recycled worker |
+| `Process-M ready for work at PID` | `django-q` | `HH:MM:SS [Q]` | INFO | After each task | Line 411: `f"{name} ready for work at {current_process().pid}"` | Replacement worker is operational |
 
 **Timing summary for a fresh idle system:**
 
 | Time After Startup | Expected Log Activity |
 |--------------------|-----------------------|
-| 0–2 seconds | Gunicorn startup (8–10 messages), Consumer startup (1 message), QCluster startup (7 messages) |
-| ~30 seconds | Initial burst: all 4 scheduled tasks enqueued and processed, with worker recycling for each |
-| Every 10 minutes | Mail check task: processing → processed → worker recycled (3–5 messages per cycle) |
-| Every hour | Classifier training task: processing → processed → worker recycled (3–5 messages per cycle) |
-| Every day | Index optimization task: processing → processed → worker recycled (3–5 messages per cycle) |
-| Every week | Sanity check task: processing → "Sanity checker detected no issues." → processed → worker recycled (4–6 messages per cycle) |
+| 0–2 seconds | Gunicorn startup (8–10 messages, Django verbose format), Consumer startup (1 message, Django verbose format), QCluster startup (7 messages, Django-Q format) |
+| ~30 seconds | Initial burst: scheduler creates tasks from all 4 schedules, all processed with worker recycling for each (Django-Q format) |
+| Every 10 minutes | Mail check task: created a task from schedule → processing → Processed → worker recycled (4–6 messages per cycle, Django-Q format) |
+| Every hour | Classifier training task: created a task from schedule → processing → Processed → worker recycled (4–6 messages per cycle, Django-Q format) |
+| Every day | Index optimization task: created a task from schedule → processing → Processed → worker recycled (4–6 messages per cycle, Django-Q format) |
+| Every week | Sanity check task: created a task from schedule → processing → "Sanity checker detected no issues." (Django verbose format) → Processed → worker recycled (5–7 messages per cycle, mixed formats) |
 | Between tasks | **Complete silence** — no log output from any process |
 
 ### Annotated Log Output Samples
@@ -768,44 +786,51 @@ The following table catalogs all log messages that appear periodically in an idl
 This shows all four scheduled tasks firing for the first time:
 
 ```text
-[2026-04-09 12:00:32,105] [INFO] [django_q.cluster] Q Cluster-paperless processing [Check all e-mail accounts]
-[2026-04-09 12:00:32,150] [INFO] [django_q.cluster] Q Cluster-paperless processing [Train the classifier]
-[2026-04-09 12:00:32,312] [INFO] [django_q.worker] Worker-1 stopped doing work
-[2026-04-09 12:00:32,350] [INFO] [django_q.cluster] Q Cluster-paperless processed [Check all e-mail accounts]
-[2026-04-09 12:00:32,380] [INFO] [django_q.cluster] recycled worker Worker-1
-[2026-04-09 12:00:32,412] [INFO] [django_q.worker] Worker-2 stopped doing work
-[2026-04-09 12:00:32,450] [INFO] [django_q.cluster] Q Cluster-paperless processed [Train the classifier]
-[2026-04-09 12:00:32,480] [INFO] [django_q.cluster] recycled worker Worker-2
-[2026-04-09 12:00:32,510] [INFO] [django_q.cluster] Worker-3 ready for work at 12345
-[2026-04-09 12:00:32,550] [INFO] [django_q.cluster] Worker-4 ready for work at 12346
-[2026-04-09 12:00:32,600] [INFO] [django_q.cluster] Q Cluster-paperless processing [Optimize the index]
-[2026-04-09 12:00:32,700] [INFO] [django_q.cluster] Q Cluster-paperless processing [Perform sanity check]
-[2026-04-09 12:00:32,750] [INFO] [django_q.worker] Worker-3 stopped doing work
-[2026-04-09 12:00:32,800] [INFO] [django_q.cluster] Q Cluster-paperless processed [Optimize the index]
-[2026-04-09 12:00:32,850] [INFO] [django_q.cluster] recycled worker Worker-3
+12:00:32 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Optimize the index]
+12:00:32 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
+12:00:32 [Q] INFO Process-2 processing [Check all e-mail accounts]
+12:00:32 [Q] INFO Process-3 processing [Train the classifier]
+12:00:32 [Q] INFO Process-2 stopped doing work
+12:00:32 [Q] INFO Processed [Check all e-mail accounts]
+12:00:32 [Q] INFO recycled worker Process-2
+12:00:32 [Q] INFO Process-3 stopped doing work
+12:00:32 [Q] INFO Processed [Train the classifier]
+12:00:32 [Q] INFO recycled worker Process-3
+12:00:32 [Q] INFO Process-5 ready for work at 12345
+12:00:32 [Q] INFO Process-6 ready for work at 12346
+12:00:32 [Q] INFO Process-5 processing [Optimize the index]
+12:00:32 [Q] INFO Process-6 processing [Perform sanity check]
+12:00:32 [Q] INFO Process-5 stopped doing work
+12:00:32 [Q] INFO Processed [Optimize the index]
+12:00:32 [Q] INFO recycled worker Process-5
 [2026-04-09 12:00:32,900] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
-[2026-04-09 12:00:32,950] [INFO] [django_q.worker] Worker-4 stopped doing work
-[2026-04-09 12:00:33,000] [INFO] [django_q.cluster] Q Cluster-paperless processed [Perform sanity check]
-[2026-04-09 12:00:33,050] [INFO] [django_q.cluster] recycled worker Worker-4
-[2026-04-09 12:00:33,100] [INFO] [django_q.cluster] Worker-5 ready for work at 12347
-[2026-04-09 12:00:33,150] [INFO] [django_q.cluster] Worker-6 ready for work at 12348
+12:00:33 [Q] INFO Process-6 stopped doing work
+12:00:33 [Q] INFO Processed [Perform sanity check]
+12:00:33 [Q] INFO recycled worker Process-6
+12:00:33 [Q] INFO Process-7 ready for work at 12347
+12:00:33 [Q] INFO Process-8 ready for work at 12348
 ```
 
-**Explanation**: Two workers process the first two tasks in parallel, then both are recycled. Two new workers spawn, process the remaining two tasks, get recycled, and two fresh workers spawn. The system is now in steady state.
+> **Note on mixed log formats**: The `Sanity checker detected no issues.` line uses the Django verbose format (`[asctime] [LEVEL] [logger] message`) because it comes from the `paperless.sanity_checker` logger, which propagates to Django's root logger. All other lines use Django-Q's own format (`HH:MM:SS [Q] LEVEL message`) because Django-Q sets `propagate=False` on its `"django-q"` logger.
+
+**Explanation**: The scheduler creates all four tasks from their schedules (the "created a task" messages come from the sentinel process). Two workers then process the first two tasks in parallel — the "Processed [...]" message comes from the monitor (no process prefix) while "... processing [...]" and "... stopped doing work" come from the worker processes. After each task, the worker is recycled. Two new workers spawn, process the remaining two tasks, get recycled, and two fresh workers spawn. The system is now in steady state.
 
 #### Sample 2: Typical 10-Minute Mail Check Cycle
 
 This is the most frequently recurring log pattern during idle operation:
 
 ```text
-[2026-04-09 12:10:32,100] [INFO] [django_q.cluster] Q Cluster-paperless processing [Check all e-mail accounts]
-[2026-04-09 12:10:32,200] [INFO] [django_q.worker] Worker-5 stopped doing work
-[2026-04-09 12:10:32,250] [INFO] [django_q.cluster] Q Cluster-paperless processed [Check all e-mail accounts]
-[2026-04-09 12:10:32,300] [INFO] [django_q.cluster] recycled worker Worker-5
-[2026-04-09 12:10:32,350] [INFO] [django_q.cluster] Worker-7 ready for work at 12349
+12:10:32 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+12:10:32 [Q] INFO Process-7 processing [Check all e-mail accounts]
+12:10:32 [Q] INFO Process-7 stopped doing work
+12:10:32 [Q] INFO Processed [Check all e-mail accounts]
+12:10:32 [Q] INFO recycled worker Process-7
+12:10:32 [Q] INFO Process-9 ready for work at 12349
 ```
 
-**Explanation**: Every 10 minutes, the mail check task fires. With no mail accounts configured, it completes near-instantly. The worker that executed it is recycled (due to `recycle: 1`), and a new worker takes its place.
+**Explanation**: Every ~10 minutes, the scheduler (running within the sentinel, `Process-1`) creates a task from the "Check all e-mail accounts" schedule. A worker picks it up, processes it, and exits. The monitor confirms completion with the "Processed [...]" message. With no mail accounts configured, the task completes near-instantly. The worker that executed it is recycled (due to `recycle: 1`), and a new worker takes its place.
 
 #### Sample 3: Silence Between Tasks
 
@@ -813,7 +838,7 @@ Between scheduled task firings, the system produces **no log output whatsoever**
 
 - Gunicorn master and Uvicorn workers: waiting for HTTP connections
 - Document consumer: blocking on `inotify.read(timeout=1000)` in a loop
-- Django-Q sentinel: cycling every 0.5s but finding all sub-processes healthy
+- Django-Q sentinel: cycling every 0.5s checking sub-process health, calling scheduler every ~30s (but finding no due schedules)
 - Django-Q pusher: polling Redis but finding an empty queue
 - Django-Q monitor: polling for results but finding none
 
@@ -916,49 +941,49 @@ The `pre_exec` hook (`gunicorn.conf.py` line 14) may also produce `"Forked child
 
 ### Django-Q Cluster Restart
 
-#### Stop Sequence (7 messages)
+#### Stop Sequence (6 messages)
 
-When the `qcluster` process receives a termination signal:
+When the `qcluster` process receives a termination signal (SIGTERM/SIGINT), the `Cluster.stop()` and `Sentinel.stop()` methods execute an orderly shutdown. The stop sequence produces **6 INFO-level messages**:
 
 ```text
-[2026-04-09 12:15:00,000] [INFO] [django_q.cluster] Q Cluster-paperless stopping.
-[2026-04-09 12:15:00,100] [INFO] [django_q.cluster] Q Cluster-paperless stopping cluster processes
-[2026-04-09 12:15:00,500] [INFO] [django_q.cluster] Q Cluster-paperless monitor stopped.
-[2026-04-09 12:15:00,600] [INFO] [django_q.cluster] Q Cluster-paperless pusher stopped.
-[2026-04-09 12:15:01,000] [INFO] [django_q.cluster] Q Cluster-paperless workers have been terminated.
-[2026-04-09 12:15:01,100] [INFO] [django_q.cluster] Q Cluster-paperless guard stopped.
-[2026-04-09 12:15:01,200] [INFO] [django_q.cluster] Q Cluster-paperless has stopped.
+12:15:00 [Q] INFO Q Cluster <humanized-name> stopping.
+12:15:00 [Q] INFO Process-1 stopping cluster processes
+12:15:00 [Q] INFO Process-5 stopped pushing tasks
+12:15:01 [Q] INFO Process-1 waiting for the monitor.
+12:15:01 [Q] INFO Process-4 stopped monitoring results
+12:15:01 [Q] INFO Q Cluster <humanized-name> has stopped.
 ```
 
 **Stop sequence breakdown:**
 
-| # | Message | Meaning |
-|---|---------|---------|
-| 1 | `Q Cluster-paperless stopping.` | Stop signal received by sentinel |
-| 2 | `Q Cluster-paperless stopping cluster processes` | Sentinel begins terminating sub-processes |
-| 3 | `Q Cluster-paperless monitor stopped.` | Monitor sub-process terminated |
-| 4 | `Q Cluster-paperless pusher stopped.` | Pusher sub-process terminated |
-| 5 | `Q Cluster-paperless workers have been terminated.` | All worker processes terminated |
-| 6 | `Q Cluster-paperless guard stopped.` | Guard loop exited |
-| 7 | `Q Cluster-paperless has stopped.` | Cluster fully shut down |
+| # | Message | Source | Meaning |
+|---|---------|--------|---------|
+| 1 | `Q Cluster <humanized-name> stopping.` | `cluster.py` line 86: `Cluster.stop()` | Stop signal received; cluster begins shutdown |
+| 2 | `Process-N stopping cluster processes` | `cluster.py` line 293: `Sentinel.stop()` | Sentinel begins terminating sub-processes (pusher first via `event_out.set()`, then workers via poison pills, then monitor) |
+| 3 | `Process-N stopped pushing tasks` | `cluster.py` line 366: `pusher()` function exit | Pusher process has exited cleanly |
+| 4 | `Process-N waiting for the monitor.` | `cluster.py` line 325: `Sentinel.stop()` | Sentinel has stopped all workers and is waiting for the monitor to finish |
+| 5 | `Process-N stopped monitoring results` | `cluster.py` line 396: `monitor()` function exit | Monitor process has exited cleanly |
+| 6 | `Q Cluster <humanized-name> has stopped.` | `cluster.py` line 88: `Cluster.stop()` | Cluster fully shut down |
+
+> **Note**: The stop sequence does NOT produce "workers have been terminated" or "guard stopped" messages — those messages do not exist in the Django-Q source code. Workers are terminated via poison pills (`"STOP"` messages in the task queue), and the guard loop simply exits when all sub-processes have stopped.
 
 #### Start Sequence (7 messages)
 
-Upon restart, a fresh 7-message startup sequence appears (identical format to initial boot):
+Upon restart, a fresh 7-message startup sequence appears (identical structure to initial boot, but with a **new randomized cluster name**):
 
 ```text
-[2026-04-09 12:15:03,000] [INFO] [django_q.cluster] Q Cluster-paperless starting.
-[2026-04-09 12:15:03,100] [INFO] [django_q.cluster] Q Cluster-paperless ready for work at PID1
-[2026-04-09 12:15:03,200] [INFO] [django_q.cluster] Q Cluster-paperless ready for work at PID2
-[2026-04-09 12:15:03,300] [INFO] [django_q.cluster] Q Cluster-paperless monitoring at PID3
-[2026-04-09 12:15:03,400] [INFO] [django_q.cluster] Q Cluster-paperless guarding cluster at PID4
-[2026-04-09 12:15:03,500] [INFO] [django_q.cluster] Q Cluster-paperless pushing tasks at PID5
-[2026-04-09 12:15:04,000] [INFO] [django_q.cluster] Q Cluster-paperless running.
+12:15:03 [Q] INFO Q Cluster <new-humanized-name> starting.
+12:15:03 [Q] INFO Process-2 ready for work at PID1
+12:15:03 [Q] INFO Process-3 ready for work at PID2
+12:15:03 [Q] INFO Process-4 monitoring at PID3
+12:15:03 [Q] INFO Process-1 guarding cluster <new-humanized-name>
+12:15:03 [Q] INFO Process-5 pushing tasks at PID5
+12:15:04 [Q] INFO Q Cluster <new-humanized-name> running.
 ```
 
-**Key confirmation message**: `"Q Cluster-paperless running."` — This is the definitive signal that the cluster is fully operational and ready to accept and process tasks.
+**Key confirmation message**: `"Q Cluster <humanized-name> running."` — This is the definitive signal that the cluster is fully operational and ready to accept and process tasks. The `<humanized-name>` will be a new random string (e.g., `"triple-lake-wisconsin-eleven"`) different from the previous instance.
 
-> **Important `catch_up: False` note**: After a cluster restart, any scheduled tasks that were missed during the downtime are **NOT** retroactively executed. Only the next occurrence of each schedule will fire at its appointed time. Source: `Q_CLUSTER["catch_up"] = False` at `src/paperless/settings.py` line 451.
+> **Important `catch_up: False` note**: After a cluster restart, any scheduled tasks that were missed during the downtime are **NOT** retroactively executed. Only the next occurrence of each schedule will fire (within ~30 seconds of the scheduler's next check cycle). Source: `Q_CLUSTER["catch_up"] = False` at `src/paperless/settings.py` line 451.
 
 ### Document Consumer Restart
 
@@ -1010,7 +1035,7 @@ sequenceDiagram
     Note over PU: Pusher process crashes from repeated errors
 
     SE->>SE: Guard cycle detects pusher is dead
-    SE->>SE: Log: "reincarnated pusher after death"
+    SE->>SE: Log ERROR: "reincarnated pusher Process-N after sudden death"
     SE->>PU2: Spawn new pusher process
 
     Note over RD: Redis comes back up
@@ -1027,14 +1052,14 @@ sequenceDiagram
 When Redis becomes unavailable, the Django-Q pusher (which continuously polls Redis for tasks) fails rapidly:
 
 ```text
-[2026-04-09 12:15:05,000] [ERROR] [django_q.cluster] Error 111 connecting to localhost:6379. Connection refused.
-[2026-04-09 12:15:06,000] [ERROR] [django_q.cluster] Error 111 connecting to localhost:6379. Connection refused.
-[2026-04-09 12:15:07,000] [ERROR] [django_q.cluster] Error 111 connecting to localhost:6379. Connection refused.
+12:15:05 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+12:15:06 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+12:15:07 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
 ```
 
-These error messages repeat at approximately **1 per second** from the pusher process. The `Error 111` is the Linux kernel error code `ECONNREFUSED`, confirming the TCP connection to Redis port 6379 is being actively refused.
+These error messages repeat at approximately **1 per second** from the pusher process, using Django-Q's own log format. The `Error 111` is the Linux kernel error code `ECONNREFUSED`, confirming the TCP connection to Redis port 6379 is being actively refused. Source: `cluster.py` line 351: `logger.error(e, traceback.format_exc())` in the pusher's exception handler.
 
-**Additional errors from Channels layer**: The Uvicorn workers may also log errors when attempting WebSocket broadcasts via the Redis-backed channel layer:
+**Additional errors from Channels layer**: The Uvicorn workers may also log errors when attempting WebSocket broadcasts via the Redis-backed channel layer. These use the Django verbose format since they come from the `channels` logger:
 
 ```text
 [2026-04-09 12:15:05,500] [ERROR] [django.channels.server] Error 111 connecting to localhost:6379. Connection refused.
@@ -1045,13 +1070,13 @@ These error messages repeat at approximately **1 per second** from the pusher pr
 When the pusher process crashes due to repeated Redis connection failures, the sentinel guard loop detects the death and reincarnates it:
 
 ```text
-[2026-04-09 12:15:10,000] [WARNING] [django_q.cluster] reincarnated pusher after death
-[2026-04-09 12:15:10,100] [INFO] [django_q.cluster] Q Cluster-paperless pushing tasks at NEW_PID
+12:15:10 [Q] ERROR reincarnated pusher Process-5 after sudden death
+12:15:10 [Q] INFO Process-6 pushing tasks at NEW_PID
 ```
 
 **Key confirmation messages:**
-1. `"reincarnated pusher after death"` — Sentinel has detected and replaced the failed pusher
-2. `"Q Cluster-paperless pushing tasks at NEW_PID"` — New pusher is operational
+1. `"reincarnated pusher Process-N after sudden death"` — Sentinel has detected and replaced the failed pusher. Source: `cluster.py` line 223: `logger.error(_(f"reincarnated pusher {process.name} after sudden death"))`. Note this is logged at **ERROR** level (not WARNING), reflecting the severity of an unexpected process death.
+2. `"Process-N pushing tasks at NEW_PID"` — New pusher is operational. Source: `cluster.py` line 345.
 
 If Redis is back up when the new pusher starts, the system is fully recovered. If Redis is still down, the cycle of errors and reincarnation repeats until Redis becomes available.
 
@@ -1082,7 +1107,7 @@ The following components run continuously to maintain Paperless-NGX in a ready s
 | 7 | **Django-Q Pusher** | Sub-process of Sentinel | Sentinel | Polls Redis for tasks; silent when queue empty | Django-Q `cluster.py` |
 | 8 | **Django-Q Monitor** | Sub-process of Sentinel | Sentinel | Polls for task results; silent when no tasks running | Django-Q `cluster.py` |
 | 9 | **Django-Q Workers** (×N) | Sub-processes of Sentinel | Sentinel | Idle between tasks; killed and replaced after each task (`recycle: 1`) | `src/paperless/settings.py` line 452 |
-| 10 | **Django-Q Scheduler** | Logical component within Sentinel | Sentinel guard loop | Checks `Schedule` objects each cycle; fires tasks at configured intervals | Django-Q `cluster.py` |
+| 10 | **Django-Q Scheduler** | Logical component within Sentinel | Sentinel guard loop | Checks `Schedule` objects approximately every **30 seconds** (every 60th guard cycle); fires tasks at configured intervals | Django-Q `cluster.py` lines 283–286 |
 | 11 | **Redis Server** | External service | System/Docker Compose | Provides message broker for Django-Q and Channels; runs independently | `src/paperless/settings.py` lines 182, 456 |
 
 **Detailed component descriptions:**
@@ -1113,11 +1138,11 @@ The document consumer runs as a Django management command (`document_consumer`) 
 
 The Django-Q cluster is a multi-process system managed by a central sentinel:
 
-- **Sentinel/Guard (6)**: The main control loop. Every 0.5 seconds, it checks the health of all sub-processes and runs the scheduler. At idle, it produces no log output.
+- **Sentinel/Guard (6)**: The main control loop. Every 0.5 seconds, it checks the health of all sub-processes (workers, monitor, pusher). Approximately every **30 seconds** (when its internal counter reaches 30), it calls the scheduler function. At idle, it produces no log output.
 - **Pusher (7)**: Reads tasks from the Redis task queue and distributes them to available workers. At idle (empty queue), it polls silently.
 - **Monitor (8)**: Watches for completed task results. At idle, it polls silently.
-- **Workers (9)**: Execute task functions. Due to `recycle: 1`, each worker is terminated after processing one task and replaced by a fresh process. Between tasks, workers sit idle waiting for work.
-- **Scheduler (10)**: Not a separate OS process — it's a function called within the sentinel guard loop. It checks all `Schedule` objects and enqueues any with `next_run <= now()`.
+- **Workers (9)**: Execute task functions. Due to `recycle: 1`, each worker is terminated after processing one task and replaced by a fresh process. Between tasks, workers sit idle waiting for work. Worker processes are auto-named by Python (`Process-N`).
+- **Scheduler (10)**: Not a separate OS process — it's a function called within the sentinel guard loop approximately every 30 seconds (controlled by a counter that accumulates `GUARD_CYCLE` and fires when `>= 30`; source: `cluster.py` lines 283–286). It checks all `Schedule` objects and enqueues any with `next_run <= now()`.
 
 > **Source**: `src/paperless/settings.py` lines 449–457 (Q_CLUSTER configuration)
 
