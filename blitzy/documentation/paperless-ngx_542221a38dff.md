@@ -1036,7 +1036,7 @@ self._send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)
 | `content` | TextField | Full extracted text (used for search) |
 | `mime_type` | CharField(max_length=256) | Detected MIME type |
 | `checksum` | CharField(max_length=32, unique) | MD5 hex digest of original file |
-| `archive_checksum` | CharField(max_length=32, unique, nullable) | MD5 hex digest of archive PDF |
+| `archive_checksum` | CharField(max_length=32, nullable) | MD5 hex digest of archive PDF |
 | `created` | DateTimeField | Document date (from parser, filename, or file mtime) |
 | `modified` | DateTimeField (auto_now) | Last modification timestamp |
 | `added` | DateTimeField (default=timezone.now) | When the document was added to Paperless |
@@ -1195,7 +1195,7 @@ Before queueing a file for consumption, the filesystem consumer waits for the fi
 | `paperless.parsing.tesseract` | `src/paperless_tesseract/parsers.py` | *(top-level)* | OCRmyPDF parameters, text extraction, DPI detection |
 | `paperless.index` | `src/documents/index.py` | 28 | Index open/write/error events |
 | `paperless.tasks` | `src/documents/tasks.py` | 29 | Task-level events, classifier training, barcode detection |
-| `paperless.sanity_checker` | `src/documents/sanity_checker.py` | *(top-level)* | Post-processing integrity verification |
+| `paperless.sanity_checker` | `src/documents/sanity_checker.py` | `log_messages()` (line 24) | Post-processing integrity verification |
 | `paperless.filehandling` | `src/documents/file_handling.py` | 11 | Filename generation warnings |
 
 ### 5.2 Logging Configuration
