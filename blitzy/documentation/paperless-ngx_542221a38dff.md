@@ -31,11 +31,11 @@ All conclusions are derived exclusively from reading the source code files in th
 
 The paperless-ngx container runs three long-lived processes under Supervisord, as defined in `docker/supervisord.conf`:
 
-| Process Name | Command | User | Lines |
-|---|---|---|---|
-| **gunicorn** | `gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application` | `paperless` | 10–12 |
-| **consumer** | `python3 manage.py document_consumer` | `paperless` | 19–21 |
-| **scheduler** | `python3 manage.py qcluster` | `paperless` | 28–30 |
+| Process Name  | Command                                                                      | User        | Lines |
+| ------------- | ---------------------------------------------------------------------------- | ----------- | ----- |
+| **gunicorn**  | `gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application` | `paperless` | 10–12 |
+| **consumer**  | `python3 manage.py document_consumer`                                        | `paperless` | 19–21 |
+| **scheduler** | `python3 manage.py qcluster`                                                 | `paperless` | 28–30 |
 
 **Evidence** — `docker/supervisord.conf`:
 
@@ -44,21 +44,24 @@ The paperless-ngx container runs three long-lived processes under Supervisord, a
 command=gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application
 user=paperless
 ```
-*(lines 10–12)*
+
+_(lines 10–12)_
 
 ```ini
 [program:consumer]
 command=python3 manage.py document_consumer
 user=paperless
 ```
-*(lines 19–21)*
+
+_(lines 19–21)_
 
 ```ini
 [program:scheduler]
 command=python3 manage.py qcluster
 user=paperless
 ```
-*(lines 28–30)*
+
+_(lines 28–30)_
 
 Supervisord is configured to run in the foreground (`nodaemon=true`, line 2) as PID 1 inside the container, with log rotation at 50 MB and 10 backups (lines 3–6).
 
@@ -68,12 +71,12 @@ Supervisord is configured to run in the foreground (`nodaemon=true`, line 2) as 
 
 The web server is configured in `gunicorn.conf.py`:
 
-| Setting | Value | Source |
-|---|---|---|
-| Bind address | `0.0.0.0:{PAPERLESS_PORT}` (default `8000`) | line 3 |
-| Worker count | `PAPERLESS_WEBSERVER_WORKERS` (default `2`) | line 4 |
-| Worker class | `paperless.workers.ConfigurableWorker` | line 5 |
-| Request timeout | `120` seconds | line 6 |
+| Setting         | Value                                       | Source |
+| --------------- | ------------------------------------------- | ------ |
+| Bind address    | `0.0.0.0:{PAPERLESS_PORT}` (default `8000`) | line 3 |
+| Worker count    | `PAPERLESS_WEBSERVER_WORKERS` (default `2`) | line 4 |
+| Worker class    | `paperless.workers.ConfigurableWorker`      | line 5 |
+| Request timeout | `120` seconds                               | line 6 |
 
 **Evidence** — `gunicorn.conf.py`:
 
@@ -83,7 +86,8 @@ workers = int(os.getenv("PAPERLESS_WEBSERVER_WORKERS", 2))
 worker_class = "paperless.workers.ConfigurableWorker"
 timeout = 120
 ```
-*(lines 3–6)*
+
+_(lines 3–6)_
 
 The `ConfigurableWorker` class is defined in `src/paperless/workers.py` (lines 9–12):
 
@@ -100,22 +104,23 @@ class ConfigurableWorker(UvicornWorker):
 
 The PostgreSQL deployment topology is defined in `docker/compose/docker-compose.postgres.yml`:
 
-| Service | Image | Role | Lines |
-|---|---|---|---|
-| `broker` | `redis:6.0` | Task queue broker + WebSocket channel layer backend | 31–35 |
-| `db` | `postgres:13` | Relational database | 37–45 |
+| Service     | Image                                        | Role                                                | Lines |
+| ----------- | -------------------------------------------- | --------------------------------------------------- | ----- |
+| `broker`    | `redis:6.0`                                  | Task queue broker + WebSocket channel layer backend | 31–35 |
+| `db`        | `postgres:13`                                | Relational database                                 | 37–45 |
 | `webserver` | `ghcr.io/paperless-ngx/paperless-ngx:latest` | Application container (all 3 Supervisord processes) | 47–68 |
 
 **Evidence** — `docker/compose/docker-compose.postgres.yml`:
 
 ```yaml
 broker:
-    image: redis:6.0
-    restart: unless-stopped
-    volumes:
-      - redisdata:/data
+  image: redis:6.0
+  restart: unless-stopped
+  volumes:
+    - redisdata:/data
 ```
-*(lines 31–35)*
+
+_(lines 31–35)_
 
 ```yaml
 webserver:
@@ -129,7 +134,8 @@ webserver:
       PAPERLESS_REDIS: redis://broker:6379
       PAPERLESS_DBHOST: db
 ```
-*(lines 47–68)*
+
+_(lines 47–68)_
 
 **Rationale**: The `webserver` container depends on both `db` and `broker`, ensuring Docker Compose starts them first. However, Docker Compose's `depends_on` only waits for container creation, not service readiness — which is why the startup script (`docker-prepare.sh`) includes its own readiness probes.
 
@@ -137,13 +143,13 @@ webserver:
 
 The container startup sequence is orchestrated by `docker/docker-prepare.sh`, which gates application startup on infrastructure readiness:
 
-| Step | Function | Lines | Description |
-|---|---|---|---|
-| 1 | `wait_for_postgres()` | 5–28 | Polls `pg_isready` with 5 retries × 5s delay (only if `PAPERLESS_DBHOST` is set) |
-| 2 | `wait_for_redis()` | 30–36 | Delegates to `docker/wait-for-redis.py` |
-| 3 | `migrations()` | 38–47 | `flock`-protected `python3 manage.py migrate` to prevent concurrent migration from multiple containers |
-| 4 | `search_index()` | 49–58 | Conditional `document_index reindex` if the stored index version doesn't match the expected version |
-| 5 | `superuser()` | 60–64 | Optional admin user creation via `manage_superuser` if `PAPERLESS_ADMIN_USER` is set |
+| Step | Function              | Lines | Description                                                                                            |
+| ---- | --------------------- | ----- | ------------------------------------------------------------------------------------------------------ |
+| 1    | `wait_for_postgres()` | 5–28  | Polls `pg_isready` with 5 retries × 5s delay (only if `PAPERLESS_DBHOST` is set)                       |
+| 2    | `wait_for_redis()`    | 30–36 | Delegates to `docker/wait-for-redis.py`                                                                |
+| 3    | `migrations()`        | 38–47 | `flock`-protected `python3 manage.py migrate` to prevent concurrent migration from multiple containers |
+| 4    | `search_index()`      | 49–58 | Conditional `document_index reindex` if the stored index version doesn't match the expected version    |
+| 5    | `superuser()`         | 60–64 | Optional admin user creation via `manage_superuser` if `PAPERLESS_ADMIN_USER` is set                   |
 
 The execution order is defined in `do_work()` (lines 66–81):
 
@@ -165,7 +171,8 @@ do_work() {
 MAX_RETRY_COUNT: Final[int] = 5
 RETRY_SLEEP_SECONDS: Final[int] = 5
 ```
-*(lines 16–17)*
+
+_(lines 16–17)_
 
 The probe uses `Redis.from_url()` with the `PAPERLESS_REDIS` environment variable (line 19, 24), calls `client.ping()` (line 27), and exits with `os.EX_UNAVAILABLE` on failure (line 39) or `os.EX_OK` on success (line 42).
 
@@ -191,15 +198,15 @@ Q_CLUSTER = {
 }
 ```
 
-| Parameter | Value | Source | Explanation |
-|---|---|---|---|
-| `name` | `"paperless"` | line 450 | Cluster identifier for Django-Q internal tracking |
-| `catch_up` | `False` | line 451 | Skipped scheduled tasks will NOT retroactively fire — prevents a burst of mail checks after downtime |
-| `recycle` | `1` | line 452 | Each worker subprocess handles exactly **one** task before being terminated and replaced |
-| `retry` | `PAPERLESS_WORKER_RETRY` (default: `1810` seconds) | line 453, defined at lines 444–447 | Time after which a timed-out task is re-enqueued. Must be > `timeout` |
-| `timeout` | `PAPERLESS_WORKER_TIMEOUT` (default: `1800` seconds / 30 minutes) | line 454, defined at line 440 | Maximum execution time per task before the worker is killed |
-| `workers` | `TASK_WORKERS` (dynamically computed) | line 455, defined at line 438 | Number of concurrent worker subprocesses |
-| `redis` | `PAPERLESS_REDIS` env var (default `redis://localhost:6379`) | line 456 | Redis broker connection URL |
+| Parameter  | Value                                                             | Source                             | Explanation                                                                                          |
+| ---------- | ----------------------------------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `name`     | `"paperless"`                                                     | line 450                           | Cluster identifier for Django-Q internal tracking                                                    |
+| `catch_up` | `False`                                                           | line 451                           | Skipped scheduled tasks will NOT retroactively fire — prevents a burst of mail checks after downtime |
+| `recycle`  | `1`                                                               | line 452                           | Each worker subprocess handles exactly **one** task before being terminated and replaced             |
+| `retry`    | `PAPERLESS_WORKER_RETRY` (default: `1810` seconds)                | line 453, defined at lines 444–447 | Time after which a timed-out task is re-enqueued. Must be > `timeout`                                |
+| `timeout`  | `PAPERLESS_WORKER_TIMEOUT` (default: `1800` seconds / 30 minutes) | line 454, defined at line 440      | Maximum execution time per task before the worker is killed                                          |
+| `workers`  | `TASK_WORKERS` (dynamically computed)                             | line 455, defined at line 438      | Number of concurrent worker subprocesses                                                             |
+| `redis`    | `PAPERLESS_REDIS` env var (default `redis://localhost:6379`)      | line 456                           | Redis broker connection URL                                                                          |
 
 ### 3.2 Worker Scaling Logic
 
@@ -216,14 +223,14 @@ def default_task_workers() -> int:
         return 1
 ```
 
-| CPU Cores | Default Workers | Rationale |
-|---|---|---|
-| 1 | 1 | Single core: one worker |
-| 2 | 2 | Low core count: use all |
-| 3 | 3 | Low core count: use all |
-| 4 | 2 | `floor(sqrt(4)) = 2` |
-| 8 | 2 | `floor(sqrt(8)) = 2` |
-| 16 | 4 | `floor(sqrt(16)) = 4` |
+| CPU Cores | Default Workers | Rationale               |
+| --------- | --------------- | ----------------------- |
+| 1         | 1               | Single core: one worker |
+| 2         | 2               | Low core count: use all |
+| 3         | 3               | Low core count: use all |
+| 4         | 2               | `floor(sqrt(4)) = 2`    |
+| 8         | 2               | `floor(sqrt(8)) = 2`    |
+| 16        | 4               | `floor(sqrt(16)) = 4`   |
 
 The actual value can be overridden via `PAPERLESS_TASK_WORKERS` environment variable (line 438).
 
@@ -299,17 +306,17 @@ A background task in paperless-ngx follows this lifecycle:
 
 The `Task` model (from Django-Q library, version `1.3.9` per `requirements.txt` line 37) stores completed task records with these key fields:
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | CharField | Human-readable task name, set via `task_name` parameter in `async_task()` |
-| `func` | CharField | Dotted path string (e.g., `"documents.tasks.consume_file"`) |
-| `args` | TextField | Pickled positional arguments |
-| `kwargs` | TextField | Pickled keyword arguments |
-| `result` | TextField | Pickled return value (e.g., `"Success. New document id 42 created"`) or exception |
-| `success` | BooleanField | `True` if the task completed without exception, `False` otherwise |
-| `started` | DateTimeField | Timestamp when execution began |
-| `stopped` | DateTimeField | Timestamp when execution ended |
-| `attempt_count` | IntegerField | Number of execution attempts (added in `django_q.0013_task_attempt_count` migration, referenced at `src/paperless_mail/migrations/0002_auto_20201117_1334.py` line 26) |
+| Field           | Type          | Description                                                                                                                                                            |
+| --------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`          | CharField     | Human-readable task name, set via `task_name` parameter in `async_task()`                                                                                              |
+| `func`          | CharField     | Dotted path string (e.g., `"documents.tasks.consume_file"`)                                                                                                            |
+| `args`          | TextField     | Pickled positional arguments                                                                                                                                           |
+| `kwargs`        | TextField     | Pickled keyword arguments                                                                                                                                              |
+| `result`        | TextField     | Pickled return value (e.g., `"Success. New document id 42 created"`) or exception                                                                                      |
+| `success`       | BooleanField  | `True` if the task completed without exception, `False` otherwise                                                                                                      |
+| `started`       | DateTimeField | Timestamp when execution began                                                                                                                                         |
+| `stopped`       | DateTimeField | Timestamp when execution ended                                                                                                                                         |
+| `attempt_count` | IntegerField  | Number of execution attempts (added in `django_q.0013_task_attempt_count` migration, referenced at `src/paperless_mail/migrations/0002_auto_20201117_1334.py` line 26) |
 
 ---
 
@@ -368,10 +375,10 @@ schedule(
 
 Configured in `src/paperless/settings.py` lines 373–412:
 
-| Log File | Handler Name | Logger Namespace | Level | Lines |
-|---|---|---|---|---|
-| `{LOGGING_DIR}/paperless.log` | `file_paperless` | `paperless` (and children) | DEBUG | 392–398, 409 |
-| `{LOGGING_DIR}/mail.log` | `file_mail` | `paperless_mail` (and children) | DEBUG | 399–405, 410 |
+| Log File                      | Handler Name     | Logger Namespace                | Level | Lines        |
+| ----------------------------- | ---------------- | ------------------------------- | ----- | ------------ |
+| `{LOGGING_DIR}/paperless.log` | `file_paperless` | `paperless` (and children)      | DEBUG | 392–398, 409 |
+| `{LOGGING_DIR}/mail.log`      | `file_mail`      | `paperless_mail` (and children) | DEBUG | 399–405, 410 |
 
 Both handlers use `ConcurrentRotatingFileHandler` (from `concurrent-log-handler==0.9.20`, `requirements.txt` line 28) for safe multi-process log writes:
 
@@ -390,7 +397,8 @@ Both handlers use `ConcurrentRotatingFileHandler` (from `concurrent-log-handler=
     "backupCount": LOGROTATE_MAX_BACKUPS,
 },
 ```
-*(lines 392–398)*
+
+_(lines 392–398)_
 
 ### 5.6 WebSocket Channel Layer (Real-Time, Ephemeral)
 
@@ -409,10 +417,10 @@ CHANNEL_LAYERS = {
 }
 ```
 
-| Setting | Value | Default | Rationale |
-|---|---|---|---|
-| `capacity` | `2000` | `100` | Allows many concurrent document processing progress updates without dropping messages (line 183) |
-| `expiry` | `15` seconds | `60` | Status updates are ephemeral — stale progress messages should not be delivered to clients connecting after processing is complete (line 184) |
+| Setting    | Value        | Default | Rationale                                                                                                                                    |
+| ---------- | ------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `capacity` | `2000`       | `100`   | Allows many concurrent document processing progress updates without dropping messages (line 183)                                             |
+| `expiry`   | `15` seconds | `60`    | Status updates are ephemeral — stale progress messages should not be delivered to clients connecting after processing is complete (line 184) |
 
 **Critical limitation**: Messages are NOT persisted. They expire after 15 seconds if not consumed by a connected WebSocket client. This means real-time status is available **only** to currently connected browser clients.
 
@@ -450,11 +458,11 @@ Django-Q's `qcluster` management command (the `scheduler` Supervisord process) u
 
 ### 6.2 State Distinction
 
-| State | Location | Mechanism |
-|---|---|---|
-| **Queued (Waiting)** | Redis broker list + optionally `django_q_ormq` table | Task exists in the Redis list. No worker has been assigned. The pusher has not yet dequeued it. |
-| **Active (Executing)** | Worker subprocess memory | Task has been dequeued by the pusher and assigned to a specific worker subprocess. The sentinel tracks which worker is busy. The task no longer exists in the Redis list. |
-| **Completed** | `django_q_task` table | Task has finished execution. Result, timing, and success/failure status are persisted in the database. |
+| State                  | Location                                             | Mechanism                                                                                                                                                                 |
+| ---------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Queued (Waiting)**   | Redis broker list + optionally `django_q_ormq` table | Task exists in the Redis list. No worker has been assigned. The pusher has not yet dequeued it.                                                                           |
+| **Active (Executing)** | Worker subprocess memory                             | Task has been dequeued by the pusher and assigned to a specific worker subprocess. The sentinel tracks which worker is busy. The task no longer exists in the Redis list. |
+| **Completed**          | `django_q_task` table                                | Task has finished execution. Result, timing, and success/failure status are persisted in the database.                                                                    |
 
 ### 6.3 Impact of `recycle: 1`
 
@@ -467,6 +475,7 @@ With `recycle: 1` (line 452 of `settings.py`), each worker subprocess is termina
 ### 6.4 Monitoring
 
 Django-Q provides `Stat` objects per cluster that expose the current worker pool state. The `qinfo` management command can report:
+
 - Current queue depth (number of tasks waiting in Redis)
 - Number of active workers (currently executing tasks)
 - Number of idle workers
@@ -502,6 +511,7 @@ async_task(
 ```
 
 **Flow**:
+
 1. The `PostDocumentSerializer` validates the upload data (lines 499–500)
 2. The file is written to a temporary file in `SCRATCH_DIR` with prefix `paperless-upload-` (lines 512–519)
 3. A UUID task ID is generated: `task_id = str(uuid.uuid4())` (line 521)
@@ -509,6 +519,7 @@ async_task(
 5. The view returns `Response("OK")` immediately (line 535), without waiting for processing
 
 **Arguments**:
+
 - `temp_filename` — positional argument: path to the temporary file
 - `override_filename=doc_name` — original upload filename from the serializer (line 502)
 - `override_title=title` — optional user-specified title (line 506)
@@ -537,6 +548,7 @@ async_task(
 ```
 
 **Flow**:
+
 1. Supervisord starts the `document_consumer` management command (line 20 of `supervisord.conf`)
 2. Initial scan: `Command.handle()` walks `CONSUMPTION_DIR` and calls `_consume()` for each file found (lines 166–173)
 3. Continuous monitoring: Either inotify (line 178–179) or polling (lines 180–181) watches for new files
@@ -544,12 +556,14 @@ async_task(
 5. For inotify: Events are debounced with a 0.5s delay (line 211) before calling `_consume()`
 
 **Pre-validation in `_consume()`** (lines 46–75):
+
 - Skips directories and files matching `CONSUMER_IGNORE_PATTERNS` (line 47)
 - Verifies the file still exists (lines 50–52)
 - Checks file extension support via `is_file_ext_supported()` (lines 54–56)
 - Retries file open up to 50 times × 10ms if the OS reports the file as busy (lines 59–75)
 
 **Subdirectory tag extraction** (lines 77–82):
+
 - If `CONSUMER_SUBDIRS_AS_TAGS` is enabled, `_tags_from_path()` (lines 27–38) walks up from the file to `CONSUMPTION_DIR` and creates/gets `Tag` objects for each intermediate directory name
 
 ### 7.3 Email Ingestion
@@ -579,6 +593,7 @@ async_task(
 ```
 
 **Flow**:
+
 1. The scheduled `process_mail_accounts()` task triggers (see Section 8)
 2. `MailAccountHandler.handle_mail_account()` opens an IMAP connection and iterates matching messages
 3. For each qualifying attachment: MIME type is validated via `magic.from_buffer()` (line 317) and `is_mime_type_supported()` (line 319)
@@ -586,6 +601,7 @@ async_task(
 5. `async_task` dispatches the file for consumption (lines 336–349)
 
 **Arguments**:
+
 - `path=temp_filename` — keyword argument: path to the temp file containing the attachment
 - `override_filename=pathvalidate.sanitize_filename(att.filename)` — sanitized attachment filename
 - `override_title=title` — derived from message subject per rule configuration (line 313)
@@ -603,15 +619,16 @@ async_task(
 
 Five separate callsites, all following the same pattern:
 
-| Function | Line | Callsite |
-|---|---|---|
-| `set_correspondent(doc_ids, correspondent)` | 18 | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
-| `set_document_type(doc_ids, document_type)` | 31 | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
-| `add_tag(doc_ids, tag)` | 47 | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
-| `remove_tag(doc_ids, tag)` | 63 | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
-| `modify_tags(doc_ids, add_tags, remove_tags)` | 87 | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
+| Function                                      | Line | Callsite                                                                          |
+| --------------------------------------------- | ---- | --------------------------------------------------------------------------------- |
+| `set_correspondent(doc_ids, correspondent)`   | 18   | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
+| `set_document_type(doc_ids, document_type)`   | 31   | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
+| `add_tag(doc_ids, tag)`                       | 47   | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
+| `remove_tag(doc_ids, tag)`                    | 63   | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
+| `modify_tags(doc_ids, add_tags, remove_tags)` | 87   | `async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs)` |
 
 **Flow** (identical for all five):
+
 1. Filter documents that would actually be affected by the change (e.g., documents whose correspondent differs from the new value)
 2. Perform the ORM update immediately (synchronous)
 3. Dispatch `bulk_update_documents` with the list of affected document IDs to handle secondary effects asynchronously
@@ -633,16 +650,16 @@ This fires `post_save` signals for each document (triggering file rename logic i
 
 ### 7.5 Complete Callsite Summary
 
-| # | File | Line(s) | Target Task | Trigger |
-|---|---|---|---|---|
-| 1 | `src/documents/views.py` | 523–533 | `documents.tasks.consume_file` | API document upload |
-| 2 | `src/documents/management/commands/document_consumer.py` | 86–91 | `documents.tasks.consume_file` | Filesystem watcher |
-| 3 | `src/paperless_mail/mail.py` | 336–349 | `documents.tasks.consume_file` | Email attachment extraction |
-| 4 | `src/documents/bulk_edit.py` | 18 | `documents.tasks.bulk_update_documents` | Bulk set correspondent |
-| 5 | `src/documents/bulk_edit.py` | 31 | `documents.tasks.bulk_update_documents` | Bulk set document type |
-| 6 | `src/documents/bulk_edit.py` | 47 | `documents.tasks.bulk_update_documents` | Bulk add tag |
-| 7 | `src/documents/bulk_edit.py` | 63 | `documents.tasks.bulk_update_documents` | Bulk remove tag |
-| 8 | `src/documents/bulk_edit.py` | 87 | `documents.tasks.bulk_update_documents` | Bulk modify tags |
+| #   | File                                                     | Line(s) | Target Task                             | Trigger                     |
+| --- | -------------------------------------------------------- | ------- | --------------------------------------- | --------------------------- |
+| 1   | `src/documents/views.py`                                 | 523–533 | `documents.tasks.consume_file`          | API document upload         |
+| 2   | `src/documents/management/commands/document_consumer.py` | 86–91   | `documents.tasks.consume_file`          | Filesystem watcher          |
+| 3   | `src/paperless_mail/mail.py`                             | 336–349 | `documents.tasks.consume_file`          | Email attachment extraction |
+| 4   | `src/documents/bulk_edit.py`                             | 18      | `documents.tasks.bulk_update_documents` | Bulk set correspondent      |
+| 5   | `src/documents/bulk_edit.py`                             | 31      | `documents.tasks.bulk_update_documents` | Bulk set document type      |
+| 6   | `src/documents/bulk_edit.py`                             | 47      | `documents.tasks.bulk_update_documents` | Bulk add tag                |
+| 7   | `src/documents/bulk_edit.py`                             | 63      | `documents.tasks.bulk_update_documents` | Bulk remove tag             |
+| 8   | `src/documents/bulk_edit.py`                             | 87      | `documents.tasks.bulk_update_documents` | Bulk modify tags            |
 
 ---
 
@@ -664,14 +681,14 @@ def add_schedules(apps, schema_editor):
     )
 ```
 
-| Property | Value | Source |
-|---|---|---|
-| Function | `"paperless_mail.tasks.process_mail_accounts"` | line 11 |
-| Name | `"Check all e-mail accounts"` | line 12 |
-| Schedule type | `Schedule.MINUTES` | line 13 |
-| Interval | 10 minutes | line 14 |
-| Migration dependency | `django_q.0013_task_attempt_count` | line 26 |
-| Reverse operation | `Schedule.objects.filter(func="...").delete()` | lines 18–19 |
+| Property             | Value                                          | Source      |
+| -------------------- | ---------------------------------------------- | ----------- |
+| Function             | `"paperless_mail.tasks.process_mail_accounts"` | line 11     |
+| Name                 | `"Check all e-mail accounts"`                  | line 12     |
+| Schedule type        | `Schedule.MINUTES`                             | line 13     |
+| Interval             | 10 minutes                                     | line 14     |
+| Migration dependency | `django_q.0013_task_attempt_count`             | line 26     |
+| Reverse operation    | `Schedule.objects.filter(func="...").delete()` | lines 18–19 |
 
 **Rationale**: The schedule is registered as a Django migration (not in application code), ensuring it is created exactly once during database setup and persists across deployments. The `qcluster` process reads the `django_q_schedule` table at its configured interval and fires scheduled tasks automatically.
 
@@ -768,12 +785,12 @@ class StatusConsumer(WebsocketConsumer):
             self.send(json.dumps(event["data"]))
 ```
 
-| Method | Lines | Behavior |
-|---|---|---|
-| `_authenticated()` | 10–11 | Checks if `self.scope["user"]` exists and is authenticated |
-| `connect()` | 13–21 | Authenticated users join the `"status_updates"` channel group; unauthenticated users get `DenyConnection()` |
-| `disconnect()` | 23–27 | Leaves the `"status_updates"` channel group |
-| `status_update()` | 29–33 | Receives a channel layer message, re-checks authentication, and sends `json.dumps(event["data"])` to the WebSocket client |
+| Method             | Lines | Behavior                                                                                                                  |
+| ------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------- |
+| `_authenticated()` | 10–11 | Checks if `self.scope["user"]` exists and is authenticated                                                                |
+| `connect()`        | 13–21 | Authenticated users join the `"status_updates"` channel group; unauthenticated users get `DenyConnection()`               |
+| `disconnect()`     | 23–27 | Leaves the `"status_updates"` channel group                                                                               |
+| `status_update()`  | 29–33 | Receives a channel layer message, re-checks authentication, and sends `json.dumps(event["data"])` to the WebSocket client |
 
 ### 9.3 Channel Layer Configuration
 
@@ -814,36 +831,36 @@ def _send_progress(self, current_progress, max_progress, status, message=None, d
 
 ```json
 {
-    "filename": "invoice_2024.pdf",
-    "task_id": "a1b2c3d4-...",
-    "current_progress": 50,
-    "max_progress": 100,
-    "status": "WORKING",
-    "message": "parsing_document",
-    "document_id": null
+  "filename": "invoice_2024.pdf",
+  "task_id": "a1b2c3d4-...",
+  "current_progress": 50,
+  "max_progress": 100,
+  "status": "WORKING",
+  "message": "parsing_document",
+  "document_id": null
 }
 ```
 
 **Status Vocabulary**:
 
-| Status | Meaning | When Used |
-|---|---|---|
-| `STARTING` | Task has begun | Line 202: `_send_progress(0, 100, "STARTING", MESSAGE_NEW_FILE)` |
-| `WORKING` | Task is actively processing | Lines 259, 264, 274, 294 and parser callback (lines 237–240) |
-| `SUCCESS` | Task completed successfully | Line 375: `_send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)` |
-| `FAILED` | Task encountered an error | Line 79 in `_fail()`: `_send_progress(100, 100, "FAILED", message)` |
+| Status     | Meaning                     | When Used                                                                      |
+| ---------- | --------------------------- | ------------------------------------------------------------------------------ |
+| `STARTING` | Task has begun              | Line 202: `_send_progress(0, 100, "STARTING", MESSAGE_NEW_FILE)`               |
+| `WORKING`  | Task is actively processing | Lines 259, 264, 274, 294 and parser callback (lines 237–240)                   |
+| `SUCCESS`  | Task completed successfully | Line 375: `_send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)` |
+| `FAILED`   | Task encountered an error   | Line 79 in `_fail()`: `_send_progress(100, 100, "FAILED", message)`            |
 
 **Progress milestones in `try_consume_file()`**:
 
-| Line | Progress | Status | Message Constant | Pipeline Stage |
-|---|---|---|---|---|
-| 202 | 0% | STARTING | `MESSAGE_NEW_FILE` | Initial announcement |
-| 237–240 | 20–70% | WORKING | *(dynamic)* | Parser progress callback |
-| 259 | 20% | WORKING | `MESSAGE_PARSING_DOCUMENT` | Parsing begins |
-| 264 | 70% | WORKING | `MESSAGE_GENERATING_THUMBNAIL` | Thumbnail generation |
-| 274 | 90% | WORKING | `MESSAGE_PARSE_DATE` | Date parsing |
-| 294 | 95% | WORKING | `MESSAGE_SAVE_DOCUMENT` | Database save |
-| 375 | 100% | SUCCESS | `MESSAGE_FINISHED` | Completion (includes `document.id`) |
+| Line    | Progress | Status   | Message Constant               | Pipeline Stage                      |
+| ------- | -------- | -------- | ------------------------------ | ----------------------------------- |
+| 202     | 0%       | STARTING | `MESSAGE_NEW_FILE`             | Initial announcement                |
+| 237–240 | 20–70%   | WORKING  | _(dynamic)_                    | Parser progress callback            |
+| 259     | 20%      | WORKING  | `MESSAGE_PARSING_DOCUMENT`     | Parsing begins                      |
+| 264     | 70%      | WORKING  | `MESSAGE_GENERATING_THUMBNAIL` | Thumbnail generation                |
+| 274     | 90%      | WORKING  | `MESSAGE_PARSE_DATE`           | Date parsing                        |
+| 294     | 95%      | WORKING  | `MESSAGE_SAVE_DOCUMENT`        | Database save                       |
+| 375     | 100%     | SUCCESS  | `MESSAGE_FINISHED`             | Completion (includes `document.id`) |
 
 **Parser Progress Callback** (lines 237–240):
 
@@ -881,7 +898,7 @@ except OSError as e:
     logger.warning(str(e))
 ```
 
-**Rationale**: The barcode split path (lines 195–233 of `tasks.py`) runs *before* the `Consumer` object is created, so it cannot use `Consumer._send_progress()`. The `OSError` catch (lines 230–232) handles the case where Redis is unreachable, preventing the task from failing due to a notification issue.
+**Rationale**: The barcode split path (lines 195–233 of `tasks.py`) runs _before_ the `Consumer` object is created, so it cannot use `Consumer._send_progress()`. The `OSError` catch (lines 230–232) handles the case where Redis is unreachable, preventing the task from failing due to a notification issue.
 
 ---
 
@@ -891,18 +908,18 @@ except OSError as e:
 
 The core ingestion logic lives in `src/documents/consumer.py`, class `Consumer`, method `try_consume_file()` (lines 180–377).
 
-| Stage | Method/Operation | Lines | Description |
-|---|---|---|---|
-| 1 | `pre_check_file_exists()` | 95–100 | Verifies the file at `self.path` exists on disk |
-| 2 | `pre_check_directories()` | 115–119 | Creates `SCRATCH_DIR`, `THUMBNAIL_DIR`, `ORIGINALS_DIR`, `ARCHIVE_DIR` if they don't exist |
-| 3 | `pre_check_duplicate()` | 102–113 | Computes MD5 checksum and checks against existing documents' `checksum` and `archive_checksum` fields |
-| 4 | MIME Detection | 219 | `magic.from_file(self.path, mime=True)` — determines the file's MIME type |
-| 5 | Parser Selection | 223 | `get_parser_class_for_mime_type(mime_type)` — selects the appropriate parser class |
-| 6 | `run_pre_consume_script()` | 121–141 | Executes an optional external pre-consumption script (`PRE_CONSUME_SCRIPT` setting) |
-| 7 | Parsing | 261 | `document_parser.parse(self.path, mime_type, self.filename)` — text extraction / OCR |
-| 8 | Thumbnail Generation | 265–269 | `document_parser.get_optimised_thumbnail(self.path, mime_type, self.filename)` |
-| 9 | Classification | 292 | `load_classifier()` — loads the ML classifier model for post-consume signal handlers |
-| 10 | Atomic Persist | 298–366 | `transaction.atomic()` block: stores Document record, fires `document_consumption_finished` signal, writes files to storage, deletes original |
+| Stage | Method/Operation           | Lines   | Description                                                                                                                                   |
+| ----- | -------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `pre_check_file_exists()`  | 95–100  | Verifies the file at `self.path` exists on disk                                                                                               |
+| 2     | `pre_check_directories()`  | 115–119 | Creates `SCRATCH_DIR`, `THUMBNAIL_DIR`, `ORIGINALS_DIR`, `ARCHIVE_DIR` if they don't exist                                                    |
+| 3     | `pre_check_duplicate()`    | 102–113 | Computes MD5 checksum and checks against existing documents' `checksum` and `archive_checksum` fields                                         |
+| 4     | MIME Detection             | 219     | `magic.from_file(self.path, mime=True)` — determines the file's MIME type                                                                     |
+| 5     | Parser Selection           | 223     | `get_parser_class_for_mime_type(mime_type)` — selects the appropriate parser class                                                            |
+| 6     | `run_pre_consume_script()` | 121–141 | Executes an optional external pre-consumption script (`PRE_CONSUME_SCRIPT` setting)                                                           |
+| 7     | Parsing                    | 261     | `document_parser.parse(self.path, mime_type, self.filename)` — text extraction / OCR                                                          |
+| 8     | Thumbnail Generation       | 265–269 | `document_parser.get_optimised_thumbnail(self.path, mime_type, self.filename)`                                                                |
+| 9     | Classification             | 292     | `load_classifier()` — loads the ML classifier model for post-consume signal handlers                                                          |
+| 10    | Atomic Persist             | 298–366 | `transaction.atomic()` block: stores Document record, fires `document_consumption_finished` signal, writes files to storage, deletes original |
 
 **Post-persist** (line 371): `run_post_consume_script(document)` — executes an optional external post-consumption script.
 
@@ -916,11 +933,11 @@ document_consumption_finished = Signal()
 document_consumer_declaration = Signal()
 ```
 
-| Signal | Fired At | Purpose |
-|---|---|---|
-| `document_consumption_started` | `consumer.py` lines 229–233 | Notifies listeners that a new document is about to be consumed |
+| Signal                          | Fired At                    | Purpose                                                                                                   |
+| ------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `document_consumption_started`  | `consumer.py` lines 229–233 | Notifies listeners that a new document is about to be consumed                                            |
 | `document_consumption_finished` | `consumer.py` lines 306–311 | Notifies listeners that a document has been successfully stored (inside the `transaction.atomic()` block) |
-| `document_consumer_declaration` | Parser registration | Used by parser apps to register themselves as available document parsers |
+| `document_consumer_declaration` | Parser registration         | Used by parser apps to register themselves as available document parsers                                  |
 
 ### 10.3 Post-Consumption Signal Handler Chain
 
@@ -935,14 +952,14 @@ document_consumption_finished.connect(set_log_entry)
 document_consumption_finished.connect(add_to_index)
 ```
 
-| Order | Handler | File:Lines | Action |
-|---|---|---|---|
-| 1 | `add_inbox_tags` | `handlers.py` lines 30–32 | Adds all tags marked `is_inbox_tag=True` to the document |
-| 2 | `set_correspondent` | `handlers.py` lines 35–98 | Matches and assigns a correspondent using the ML classifier and pattern matching |
-| 3 | `set_document_type` | `handlers.py` lines 101–165 | Matches and assigns a document type using the ML classifier and pattern matching |
-| 4 | `set_tags` | `handlers.py` lines 168–230 | Matches and assigns tags using the ML classifier and pattern matching |
-| 5 | `set_log_entry` | `handlers.py` lines 413–425 | Creates a Django admin `LogEntry` record (action=ADDITION) for the `consumer` user |
-| 6 | `add_to_index` | `handlers.py` lines 428–431 | Adds the document to the Whoosh full-text search index |
+| Order | Handler             | File:Lines                  | Action                                                                             |
+| ----- | ------------------- | --------------------------- | ---------------------------------------------------------------------------------- |
+| 1     | `add_inbox_tags`    | `handlers.py` lines 30–32   | Adds all tags marked `is_inbox_tag=True` to the document                           |
+| 2     | `set_correspondent` | `handlers.py` lines 35–98   | Matches and assigns a correspondent using the ML classifier and pattern matching   |
+| 3     | `set_document_type` | `handlers.py` lines 101–165 | Matches and assigns a document type using the ML classifier and pattern matching   |
+| 4     | `set_tags`          | `handlers.py` lines 168–230 | Matches and assigns tags using the ML classifier and pattern matching              |
+| 5     | `set_log_entry`     | `handlers.py` lines 413–425 | Creates a Django admin `LogEntry` record (action=ADDITION) for the `consumer` user |
+| 6     | `add_to_index`      | `handlers.py` lines 428–431 | Adds the document to the Whoosh full-text search index                             |
 
 **Critical detail**: All six handlers execute inside the `transaction.atomic()` block (line 298 of `consumer.py`). If any handler fails, the entire transaction — including the document record — is rolled back.
 
@@ -977,23 +994,25 @@ Task.objects.order_by('-stopped')[:10]
 
 **Key fields for post-mortem analysis**:
 
-| Field | Post-Mortem Value |
-|---|---|
-| `func` | Identifies which task function was executed |
-| `args` / `kwargs` | Shows exact inputs (file path, override parameters) |
-| `result` | Success: return value (e.g., `"Success. New document id 42 created"`). Failure: exception traceback |
-| `success` | Boolean — quick filter for successes vs. failures |
-| `started` / `stopped` | Execution timing — useful for identifying slow tasks or timeout issues |
-| `attempt_count` | Number of attempts — values > 1 indicate the task was retried (potentially due to timeout) |
+| Field                 | Post-Mortem Value                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------- |
+| `func`                | Identifies which task function was executed                                                         |
+| `args` / `kwargs`     | Shows exact inputs (file path, override parameters)                                                 |
+| `result`              | Success: return value (e.g., `"Success. New document id 42 created"`). Failure: exception traceback |
+| `success`             | Boolean — quick filter for successes vs. failures                                                   |
+| `started` / `stopped` | Execution timing — useful for identifying slow tasks or timeout issues                              |
+| `attempt_count`       | Number of attempts — values > 1 indicate the task was retried (potentially due to timeout)          |
 
 ### 11.2 Application Log Files
 
 **`paperless.log`** — captures all ingestion pipeline logging from `paperless.*` loggers (line 409 of `settings.py`):
+
 - Consumer pipeline progress messages from `paperless.consumer` (line 54 of `consumer.py`)
 - Task-level logging from `paperless.tasks` (line 29 of `tasks.py`)
 - Signal handler logging from `paperless.handlers` (line 27 of `handlers.py`)
 
 **`mail.log`** — captures all email processing logging from `paperless_mail.*` loggers (line 410 of `settings.py`):
+
 - Account-level processing from `paperless.mail.tasks` (line 8 of `paperless_mail/tasks.py`)
 - Message-level processing from `MailAccountHandler` (inherits `LoggingMixin`)
 
@@ -1044,12 +1063,14 @@ class LogViewSet(ViewSet):
 ```
 
 **Endpoints**:
+
 - `GET /api/logs/` — returns `["paperless", "mail"]` (line 449–450)
 - `GET /api/logs/paperless/` — returns all lines from `paperless.log` as a JSON array (lines 435–447)
 - `GET /api/logs/mail/` — returns all lines from `mail.log` as a JSON array
 - **Authentication required**: `permission_classes = (IsAuthenticated,)` (line 431)
 
 The `LogViewSet` is registered with the router at `src/paperless/urls.py` line 33:
+
 ```python
 api_router.register(r"logs", LogViewSet, basename="logs")
 ```
@@ -1083,6 +1104,7 @@ The `group` field (line 295) is a UUID that correlates with `LoggingMixin.loggin
 WebSocket broadcasts are **NOT persisted**. The channel layer's `expiry: 15` setting (line 184 of `settings.py`) means messages expire 15 seconds after being sent if no client has consumed them.
 
 **Implications for post-mortem analysis**:
+
 - Status updates are only available to clients connected at the moment of broadcast
 - No historical WebSocket message retrieval is possible after the 15-second window
 - For post-mortem analysis, operators must rely on the Django-Q `Task` model and log files instead
@@ -1095,14 +1117,14 @@ All background task functions are defined in `src/documents/tasks.py`:
 
 ### 12.1 Primary Task Functions
 
-| Function | Lines | Purpose |
-|---|---|---|
-| `consume_file()` | 184–252 | Main document ingestion task |
+| Function                  | Lines   | Purpose                             |
+| ------------------------- | ------- | ----------------------------------- |
+| `consume_file()`          | 184–252 | Main document ingestion task        |
 | `bulk_update_documents()` | 270–280 | Post-bulk-edit index/signal updates |
-| `index_optimize()` | 32–35 | Whoosh search index optimization |
-| `index_reindex()` | 38–45 | Full search index rebuild |
-| `train_classifier()` | 48–73 | ML document classifier training |
-| `sanity_check()` | 255–267 | System integrity verification |
+| `index_optimize()`        | 32–35   | Whoosh search index optimization    |
+| `index_reindex()`         | 38–45   | Full search index rebuild           |
+| `train_classifier()`      | 48–73   | ML document classifier training     |
+| `sanity_check()`          | 255–267 | System integrity verification       |
 
 ### 12.2 `consume_file()` — Detailed
 
@@ -1121,6 +1143,7 @@ def consume_file(
 ```
 
 **Behavior**:
+
 1. If `CONSUMER_ENABLE_BARCODES` is `True` (line 195), scans the file for barcode separators using `scan_file_for_separating_barcodes()` (line 198)
 2. If barcode separators are found, splits the PDF via `separate_pages()` (line 201), saves each segment to `CONSUMPTION_DIR` via `save_to_dir()` (line 210), deletes the original file (line 214), broadcasts a SUCCESS WebSocket notification (lines 217–232), and returns `"File successfully split"` (line 233)
 3. If no barcodes are found (or barcode scanning is disabled), delegates to `Consumer().try_consume_file()` (lines 236–244)
@@ -1129,12 +1152,12 @@ def consume_file(
 
 ### 12.3 Helper Functions (Barcode Processing)
 
-| Function | Lines | Purpose |
-|---|---|---|
-| `barcode_reader(image)` | 75–93 | Reads barcodes from an image using `pyzbar.decode()` |
-| `scan_file_for_separating_barcodes(filepath)` | 96–110 | Converts PDF to images and scans each page for the separator barcode (`CONSUMER_BARCODE_STRING`) |
-| `separate_pages(filepath, pages_to_split_on)` | 113–161 | Splits a PDF into multiple documents at the specified separator pages using `pikepdf` |
-| `save_to_dir(filepath, newname, target_dir)` | 164–181 | Copies a file to the target directory (default: `CONSUMPTION_DIR`), optionally renaming it |
+| Function                                      | Lines   | Purpose                                                                                          |
+| --------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `barcode_reader(image)`                       | 75–93   | Reads barcodes from an image using `pyzbar.decode()`                                             |
+| `scan_file_for_separating_barcodes(filepath)` | 96–110  | Converts PDF to images and scans each page for the separator barcode (`CONSUMER_BARCODE_STRING`) |
+| `separate_pages(filepath, pages_to_split_on)` | 113–161 | Splits a PDF into multiple documents at the specified separator pages using `pikepdf`            |
+| `save_to_dir(filepath, newname, target_dir)`  | 164–181 | Copies a file to the target directory (default: `CONSUMPTION_DIR`), optionally renaming it       |
 
 ---
 
@@ -1142,21 +1165,21 @@ def consume_file(
 
 The following package versions are directly relevant to background processing. All versions are extracted from `requirements.txt`:
 
-| Package | Version | Line | Role in Background Processing |
-|---|---|---|---|
-| `django-q` | `1.3.9` | 37 | Task queue framework: `async_task()`, `qcluster`, `Task`/`OrmQ`/`Schedule` models |
-| `redis` | `3.5.3` | 84 | Python Redis client for both Django-Q broker and Channels layer |
-| `channels` | `3.0.4` | 23 | Django Channels ASGI framework for WebSocket handling |
-| `channels-redis` | `3.4.0` | 22 | Redis-backed channel layer (`RedisChannelLayer`) |
-| `django` | `4.0.4` | 38 | Web framework: ORM, signals, management commands, ASGI |
-| `djangorestframework` | `3.13.1` | 39 | REST API: `PostDocumentView`, `LogViewSet` |
-| `gunicorn` | `20.1.0` | 42 | ASGI web server |
-| `uvicorn` | `0.17.6` | 104 | ASGI worker class for Gunicorn |
-| `asgiref` | `3.5.0` | 13 | `async_to_sync` adapter for channel layer calls |
-| `concurrent-log-handler` | `0.9.20` | 28 | Safe multi-process log rotation |
-| `watchdog` | `2.1.7` | 106 | Filesystem polling observer for `document_consumer` |
-| `inotifyrecursive` | `0.3.5` | 54 | Linux inotify for native filesystem events |
-| `imap-tools` | `0.54.0` | 49 | IMAP client for email scanning |
+| Package                  | Version  | Line | Role in Background Processing                                                     |
+| ------------------------ | -------- | ---- | --------------------------------------------------------------------------------- |
+| `django-q`               | `1.3.9`  | 37   | Task queue framework: `async_task()`, `qcluster`, `Task`/`OrmQ`/`Schedule` models |
+| `redis`                  | `3.5.3`  | 84   | Python Redis client for both Django-Q broker and Channels layer                   |
+| `channels`               | `3.0.4`  | 23   | Django Channels ASGI framework for WebSocket handling                             |
+| `channels-redis`         | `3.4.0`  | 22   | Redis-backed channel layer (`RedisChannelLayer`)                                  |
+| `django`                 | `4.0.4`  | 38   | Web framework: ORM, signals, management commands, ASGI                            |
+| `djangorestframework`    | `3.13.1` | 39   | REST API: `PostDocumentView`, `LogViewSet`                                        |
+| `gunicorn`               | `20.1.0` | 42   | ASGI web server                                                                   |
+| `uvicorn`                | `0.17.6` | 104  | ASGI worker class for Gunicorn                                                    |
+| `asgiref`                | `3.5.0`  | 13   | `async_to_sync` adapter for channel layer calls                                   |
+| `concurrent-log-handler` | `0.9.20` | 28   | Safe multi-process log rotation                                                   |
+| `watchdog`               | `2.1.7`  | 106  | Filesystem polling observer for `document_consumer`                               |
+| `inotifyrecursive`       | `0.3.5`  | 54   | Linux inotify for native filesystem events                                        |
+| `imap-tools`             | `0.54.0` | 49   | IMAP client for email scanning                                                    |
 
 ---
 
