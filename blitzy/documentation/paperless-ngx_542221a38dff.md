@@ -958,6 +958,10 @@ Defined at `src/documents/tests/utils.py`, line 72:
 
 ```python
 class DirectoriesMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dirs = None
+
     def setUp(self) -> None:
         self.dirs = setup_directories()
         super(DirectoriesMixin, self).setUp()
@@ -1032,7 +1036,7 @@ document_consumption_finished.send(
 )
 ```
 
-Since no `classifier=` keyword argument is passed, the signal handlers receive `classifier=None` via `**kwargs`, causing all ML predictions to return `None` and only rule-based matching to apply.
+Since no `classifier=` keyword argument is passed, the signal handlers receive `classifier=None` via the default parameter value in the function signature (e.g., `def set_correspondent(..., classifier=None, ...)`), causing all ML predictions to return `None` and only rule-based matching to apply.
 
 ---
 
@@ -1050,7 +1054,7 @@ The following dependency versions are pinned in `requirements.txt` and are direc
 | django | 4.0.4 | `requirements.txt` line 38 | Web framework: ORM, test runner, signals, settings, `TestCase` |
 | pillow | 9.1.0 | `requirements.txt` line 66 | Image handling in `RasterisedDocumentParser` for alpha detection, DPI extraction |
 | fuzzywuzzy | 0.18.0 | `requirements.txt` line 41 | Fuzzy matching in `matching.py` line 135 via `fuzz.partial_ratio()` with threshold 90 |
-| python-magic | 0.4.25 | `requirements.txt` | MIME type detection in `consumer.py` line 219 via `magic.from_file()` |
+| python-magic | 0.4.25 | `requirements.txt` line 79 | MIME type detection in `consumer.py` line 219 via `magic.from_file()` |
 | filelock | 3.6.0 | `requirements.txt` line 40 | Concurrency control in `consumer.py` and `signals/handlers.py` for media file operations |
 
 **Note on scikit-learn version pinning**: The exact version `1.0.2` is pinned because `DocumentClassifier.FORMAT_VERSION = 7` (classifier.py line 63) is tied to the scikit-learn version. Upgrading scikit-learn would require incrementing `FORMAT_VERSION` to invalidate existing pickled models, as the serialized `MLPClassifier` objects may not be compatible across versions.
