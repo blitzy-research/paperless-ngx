@@ -23,7 +23,7 @@ The system was **actually built and run** — not merely read. A live stack cons
             ▼
    ┌──────────────────┐   in one task,   ┌──────────────────────────┐   signal    ┌──────────────────────────────────────┐
    │ qcluster worker  │ ───────────────▶ │ consume_file →           │ ──────────▶ │ document_consumption_finished        │
-   │ runs consume_file│  one DB txn      │ Consumer.try_consume_file│  6 handlers │ correspondent/type/tags/inbox +      │
+   │ runs consume_file│ persist in 1 txn │ Consumer.try_consume_file│  6 handlers │ correspondent/type/tags/inbox +      │
    └──────────────────┘                  │ parse→thumb→_store→save  │             │ set_log_entry (admin) + add_to_index │
                                          └──────────────────────────┘             │ (Whoosh full-text index)             │
                                                                                   └──────────────────────────────────────┘
@@ -188,7 +188,9 @@ The separate recurring schedules were observed live in the `django_q_schedule` t
 
 ### Rationale
 
-`consume_file` instantiates a single `Consumer` and calls `try_consume_file` (`tasks.py:236`), which parses the file, generates a thumbnail, extracts the date, persists the `Document` row, and fires `document_consumption_finished`. That signal's handlers then perform classification, correspondent/type/tag matching, the admin-log entry, and the Whoosh index update — **all in-process, in one task, inside one database transaction** (`consumer.py:298`). Nothing in this path enqueues a second task. Only maintenance work (classifier training, index optimization, sanity checks) and explicit UI bulk operations are independently scheduled/queued, which is why those — and only those — appear as distinct Django-Q tasks/schedules.
+`consume_file` instantiates a single `Consumer` and calls `try_consume_file` (`tasks.py:236`), which parses the file, generates a thumbnail, extracts the date, persists the `Document` row, and fires `document_consumption_finished`. That signal's handlers then perform classification, correspondent/type/tag matching, the admin-log entry, and the Whoosh index update — **all in-process, within the single `consume_file` task** (no second task is enqueued).
+
+A precision note on the boundaries — *one synchronous task is not the same as one database transaction*: parsing, thumbnail generation, and date extraction run **before** the transaction (`consumer.py:258-276`); the `Document` row is then created inside `transaction.atomic()` (`consumer.py:298`) and the `document_consumption_finished` signal fires inside that block (`consumer.py:306`), so the **DB-backed** post-processing (correspondent / document-type / tags + the admin `LogEntry`) commits or rolls back atomically with the row. The **filesystem writes** (the originals/archive/thumbnail copy guarded by `FileLock`, `consumer.py:315-346`) and the **Whoosh index update** (`handlers.py:428-431` → `index.py:118-120`) are performed by the same task but are **not** themselves rolled back by the database transaction. Only maintenance work (classifier training, index optimization, sanity checks) and explicit UI bulk operations are independently scheduled/queued, which is why those — and only those — appear as distinct Django-Q tasks/schedules.
 
 ---
 
@@ -268,7 +270,7 @@ The document record is stored in the table **`documents_document`** (ORM model `
 
 ### Two corrections confirmed against the live schema
 
-- **C1 — there is NO `storage_path` field on `Document` at this commit.** A `grep` of `src/documents/models.py` for `storage_path` returns nothing, and at runtime `hasattr(document, "storage_path")` → `False`. The real field list **ends at `archive_serial_number`** (`models.py:196`). (`storage_path` was added in a *later* Paperless-ngx release.)
+- **C1 — there is NO `storage_path` field on `Document` at this commit.** A `grep` of `src/documents/models.py` for `storage_path` returns nothing, and at runtime `hasattr(document, "storage_path")` → `False`. The real field list **ends at `archive_serial_number`** (which starts at `models.py:196` and ends at `:205`). (`storage_path` was added in a *later* Paperless-ngx release.)
 - **C2 — there is NO custom `PaperlessTask` / `Task` model.** The only `Log`-like model in `src/documents/models.py` is `class Log` at `:285`. Task state is owned entirely by **Django-Q's own tables** (`django_q_task`, `django_q_schedule`, `django_q_ormq`). There is no `documents_paperlesstask` / `documents_task` table.
 
 ### Evidence (observed)
@@ -316,7 +318,7 @@ result  = 'Success. New document id 1 created'
 
 ### Code (`file:line`)
 
-- `src/documents/models.py:88` — `class Document(models.Model)`; the field set spans `:97-196` and **ends at `archive_serial_number` (`:196`)** — no `storage_path`. `class Meta` at `:207` declares `ordering = ("-created",)` with no custom `db_table`, so the table is `documents_document`; `__str__` at `:212`; `class Log` at `:285`.
+- `src/documents/models.py:88` — `class Document(models.Model)`; the field set spans `:97-205` and **ends at `archive_serial_number` (starts `:196`, ends `:205`)** — no `storage_path`. `class Meta` at `:207` declares `ordering = ("-created",)` with no custom `db_table`, so the table is `documents_document`; `__str__` at `:212`; `class Log` at `:285`.
 - `src/documents/consumer.py:379` — `def _store(self, text, date, mime_type)`; `:398` — `Document.objects.create(title=..., content=text, mime_type=mime_type, checksum=..., created=..., modified=..., storage_type=STORAGE_TYPE_UNENCRYPTED)`.
 - `src/documents/signals/handlers.py:413-425` — `set_log_entry`; `:416` `User.objects.get(username="consumer")`; `:418` `LogEntry.objects.create(...)`; `:419` `action_flag=ADDITION`.
 - `src/documents/tasks.py:247` — `return "Success. New document id {} created".format(document.pk)` (the exact string persisted to `django_q_task.result`).
@@ -324,7 +326,7 @@ result  = 'Success. New document id 1 created'
 
 ### Rationale
 
-`_store` creates the `Document` row inside `transaction.atomic()`, so the document and all of its signal-driven side effects either commit together or not at all. The `document_consumption_finished` signal then drives `set_log_entry`, which writes the admin `LogEntry` audit row. Separately and *after* the worker returns, Django-Q's result monitor persists the worker's return value (here, `"Success. New document id 1 created"`) into `django_q_task`. The transient Redis package (R5) and this persisted `django_q_task` row are therefore two stages of the same task's lifecycle — the *instruction* and the *receipt*.
+`_store` creates the `Document` row inside `transaction.atomic()` (`consumer.py:298`), so the row and its **DB-backed** post-processing — the correspondent/document-type/tag assignments and the admin `LogEntry` written by the `set_log_entry` handler that the `document_consumption_finished` signal drives — commit or roll back together. The task's **non-DB** side effects (the originals/archive/thumbnail file copies at `consumer.py:315-346`, and the Whoosh index write via `add_to_index` → `index.py:118-120`) execute inside the same task but are **not** undone by a database rollback. Separately and *after* the worker returns, Django-Q's result monitor persists the worker's return value (here, `"Success. New document id 1 created"`) into `django_q_task`. The transient Redis package (R5) and this persisted `django_q_task` row are therefore two stages of the same task's lifecycle — the *instruction* and the *receipt*.
 
 ---
 
@@ -364,6 +366,28 @@ flowchart TD
     N --> O["Task result saved to django_q_task table"]
 ```
 
+### Evidence (observed)
+
+R7 is the synthesis of the whole run, so its evidence is the union of the artifacts captured under R3, R5, R4, and R6 — each link in the chain produced a real, observable artifact:
+
+- **Detection (R3):** `[INFO] [paperless.management.consumer] Adding /usr/src/paperless/src/../consume/blitzy_probe.txt to the task queue.` — proves the `document_consumer` watcher created the task.
+- **Broker payload (R5):** immediately after enqueue, the **only** Redis key was the list `django_q:paperless:q` (`LLEN = 1`); decoding its single signed/pickled element yielded `{'func': 'documents.tasks.consume_file', 'args': ('…/blitzy_probe.txt',), 'kwargs': {'override_tag_ids': None}, 'id': …, 'name': …, 'started': …}` — proves Django-Q packaged and dispatched exactly one task over Redis.
+- **Synchronous pipeline (R4):** the single-task DEBUG trace (`Consuming…` → `Detected mime type` → `Parser` → `Parsing` → thumbnail → classifier → `Saving record to database` → `… consumption finished`) all ran inside **one** `consume_file` execution — proves the worker, not a chain of tasks, ran parse/classify/index.
+- **Persisted rows (R6):** the resulting `documents_document` (id=1) row, the `django_admin_log` row (user=`consumer`, action_flag=ADDITION), and the `django_q_task` row (`result = 'Success. New document id 1 created'`), alongside the `django_q_schedule` rows for the recurring tasks — proves where the executed task's record and document landed.
+
+Together these reproduce the full chain: **detection → signed payload on Redis → single-task pipeline → document + task-history rows.**
+
+### Code (`file:line`)
+
+- **Task creation — three entry points, same call** (`async_task("documents.tasks.consume_file", …)`):
+  - `src/documents/management/commands/document_consumer.py:85-91` — the directory watcher (the path exercised here).
+  - `src/documents/views.py:523-531` — the REST upload view.
+  - `src/paperless_mail/mail.py:336-337` — the mail fetcher.
+- **Queuing framework (Django-Q over Redis, not Celery):** `src/paperless/settings.py:110` (`"django_q"` in `INSTALLED_APPS`); `src/paperless/settings.py:449-457` (`Q_CLUSTER`, cluster name `paperless`, Redis broker URL).
+- **Worker task body:** `src/documents/tasks.py:184` — `def consume_file(...)`.
+- **Pipeline orchestration:** `src/documents/consumer.py:180` (`try_consume_file`), `:298` (`with transaction.atomic()`), `:306` (`document_consumption_finished.send(...)`), `:398` (`Document.objects.create(...)`).
+- **Post-consume handlers:** `src/documents/apps.py:22-27` (the six `document_consumption_finished` connections); `src/documents/signals/handlers.py:413-431` (`set_log_entry` → admin `LogEntry`, and `add_to_index` → Whoosh).
+
 ### Rationale
 
 This chain is corroborated end-to-end by the observed evidence: the detection log (R3), the single signed payload on `django_q:paperless:q` (R5), the synchronous DEBUG pipeline that runs entirely inside one task (R4), and the resulting `documents_document` + `django_q_task` + `django_admin_log` rows (R6). The task object is *created* by the watcher (or the REST view / mail fetcher) and *dispatched* by Django-Q; the worker is what actually runs the pipeline — which is why detection and processing are decoupled in time and why exactly one task represents the entire ingestion.
@@ -379,9 +403,9 @@ This chain is corroborated end-to-end by the observed evidence: the detection lo
 | **R4** | Parsing/classification/indexing run **in-process** inside the one `consume_file` task via 6 signal handlers — not separate tasks | single-task DEBUG trace (`Consuming…` → `Detected mime type` → `Parser` → `Parsing` → `thumbnail` → classifier → `Saving record` → `consumption finished`); Whoosh index files written | `consumer.py:180,215,221,298,306,373`; `apps.py:22-27`; `classifier.py:30,63`; `index.py:118`; `handlers.py:428-431` |
 | **R4** | Separate Django-Q tasks are recurring schedules + bulk-edit | `django_q_schedule`: `train_classifier`(H), `index_optimize`(D), `sanity_check`(W), `process_mail_accounts`(I) | `migrations/1001_…:10-19`; `migrations/1004_…:10-13`; `bulk_edit.py:18,31,47,63,87` |
 | **R5** | Queued payload = pickled+HMAC-signed dict on Redis list `django_q:paperless:q`; RPUSH/BLPOP; not compressed | only key `django_q:paperless:q` (LIST, LLEN=1), 453 bytes, 3 colon segments, pickle proto 5 `\x80\x05`; decoded keys `['args','func','id','kwargs','name','started']` | `settings.py:110,449-457`; `django_q/{tasks,signing,brokers/redis_broker,conf}.py` |
-| **R6** | Document row in `documents_document`; metadata fields; history in `django_q_task` / `django_q_schedule` / `django_admin_log` | `documents_document` id=1; `django_admin_log` user=`consumer`, flag=1; `django_q_task` result=`Success. New document id 1 created` | `models.py:88,196,285`; `consumer.py:379,398`; `handlers.py:413-425`; `tasks.py:247` |
+| **R6** | Document row in `documents_document`; metadata fields; history in `django_q_task` / `django_q_schedule` / `django_admin_log` | `documents_document` id=1; `django_admin_log` user=`consumer`, flag=1; `django_q_task` result=`Success. New document id 1 created` | `models.py:88,196-205,285`; `consumer.py:379,398`; `handlers.py:413-425`; `tasks.py:247` |
 | **R7** | Task created by `document_consumer` (+ REST view + mail fetcher); dispatched by **Django-Q over Redis (not Celery)** via `async_task` | full chain reproduced (detection → payload → pipeline → rows) | `document_consumer.py:86-91`; `views.py:523-531`; `mail.py:336-337`; `consumer.py:180,398`; `settings.py:110,449-457` |
-| **C1** | No `storage_path` field on `Document` at this commit | `hasattr(d,'storage_path') → False`; field list ends at `archive_serial_number` | `models.py:88-196` (grep `storage_path` → none) |
+| **C1** | No `storage_path` field on `Document` at this commit | `hasattr(d,'storage_path') → False`; field list ends at `archive_serial_number` | `models.py:88-205` (grep `storage_path` → none) |
 | **C2** | No custom `PaperlessTask`/`Task` model; task state owned by Django-Q tables | no `documents_paperlesstask`/`documents_task` table in DB | `models.py:285` (`class Log` only) |
 | **C3** | Live queue key is `django_q:paperless:q` (RPUSH/BLPOP), pickled+signed, not compressed | only key `django_q:paperless:q` present; no leading `.` compression marker | `settings.py:449-457` (no `compress`); `django_q/brokers/redis_broker.py` (`list_key = f"django_q:{name}:q"`) |
 
@@ -391,10 +415,14 @@ This chain is corroborated end-to-end by the observed evidence: the detection lo
 
 The investigation was performed against the official `paperless-ngx:1.7.0` image + `redis:6.0` with the default SQLite database. The exact observation steps were:
 
-1. **Bring up the stack** (Redis broker + the app container running the three Supervisord processes):
+1. **Bring up the stack** (Redis broker + the app container running the three Supervisord processes). **Pin the app image to the exact version under investigation — do not use `latest`.** The committed `docker/compose/docker-compose.postgres.yml` hardcodes `image: ghcr.io/paperless-ngx/paperless-ngx:latest` (`:48`), which would pull a *different* build than commit `542221a38dff`; override it with the matching **v1.7.0** tag (or use the provided commit-matched runtime image — which is what this investigation actually used):
    ```bash
-   docker compose -f docker/compose/docker-compose.postgres.yml up -d   # or the sqlite-default compose
-   docker logs -f <webserver-container>                                  # watch supervisord spawn consumer/gunicorn/scheduler
+   # Pin v1.7.0 via a throwaway compose override (this does NOT modify the committed compose file):
+   printf 'services:\n  webserver:\n    image: ghcr.io/paperless-ngx/paperless-ngx:1.7.0\n' > docker-compose.override.yml
+   docker compose -f docker/compose/docker-compose.postgres.yml -f docker-compose.override.yml up -d
+   # (Alternatively — and as done here — launch the provided commit-matched runtime image at 542221a38dff
+   #  directly; it reports __version__ = (1, 7, 0) and is not pulled via this compose file.)
+   docker logs -f <webserver-container>   # watch supervisord spawn consumer/gunicorn/scheduler
    ```
 2. **Confirm services are healthy:**
    ```bash
@@ -429,4 +457,8 @@ The investigation was performed against the official `paperless-ngx:1.7.0` image
    #   SELECT object_repr, action_flag FROM django_admin_log;
    ```
 
-**Cleanup.** All temporary artifacts created during the investigation — the dropped test document (`blitzy_probe.txt`), any standalone helper/PoC scripts, and the throwaway containers — were **removed afterward**. **No source file under `src/`, `docker/`, or `docs/` was modified, added, renamed, moved, or deleted.** The only change to the repository tree is this single deliverable, `blitzy/documentation/paperless-ngx_542221a38dff.md`.
+**Cleanup.** All **investigation-owned** temporary artifacts — the dropped test document (`blitzy_probe.txt`) and any standalone helper/PoC scripts — were **removed afterward**, leaving the repository working tree clean.
+
+One clarification on the running stack: the `paperless_setup-*` containers (`paperless_setup-webserver-1`, `paperless_setup-broker-1`, `paperless_setup-db-1`) that may still be observed via `docker ps` are **platform-provided setup infrastructure**, not throwaway containers created by this deliverable. They belong to the platform's `paperless_setup` Compose project (its assets live under `/tmp/paperless-setup/`, outside the repository) and are intentionally left running; the `webserver` image reports `__version__ = (1, 7, 0)`, matching the commit under investigation. They are deliberately *not* torn down here because they are owned by the environment's setup, not by this investigation.
+
+**No source file under `src/`, `docker/`, or `docs/` was modified, added, renamed, moved, or deleted.** The only change to the repository tree is this single deliverable, `blitzy/documentation/paperless-ngx_542221a38dff.md`.
