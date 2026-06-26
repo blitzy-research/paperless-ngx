@@ -34,7 +34,7 @@ The user observes three things: (1) memory **spikes disproportionately** during 
 - **The "spike" is not caused by any single document being large.** It is dominated by code paths whose cost scales with the **batch / source size** or with the **corpus**, not with the size of an individual file:
   - **Manifest‑driven import** parses the *entire* export into one dict held for the whole command (`document_importer.py:L72‑L73`) **and** re‑deserializes the same file a second time via `loaddata` (`document_importer.py:L87`). Measured: a 300‑document export produced a **23.59 MiB** `manifest.json`; `json.load` retained **+23.9 MiB** (proven by `gc.get_referrers` to be held by `self.manifest`), and `loaddata` re‑deserialized at a traced peak of **47.9 MiB** — two independent in‑memory copies of the same data.
   - **QuerySet result‑cache materialization of the `content` `TextField`.** Loops such as `index_reindex` iterate `Document.objects.all()` without `.iterator()`/`.only()`/`.defer()` (`tasks.py:L38‑L45`), so every row — *including its full text* — is cached for the loop's lifetime. Measured: materializing 300 rows held **+25.3 MiB** RSS / **23.5 MiB** of content; the same loop with `.defer("content")` cost **0.5 MiB** and `.iterator()` retained **0.0 MiB**.
-  - **Native (C‑extension) allocations that profilers under‑report.** A full `index_reindex` grew RSS by **+331 MiB** while `tracemalloc` saw only **166.7 MiB** — the Whoosh `AsyncWriter` postings buffer lives in native memory. The scikit‑learn classifier behaves similarly.
+  - **Process‑level memory that a Python‑heap profiler under‑reports.** A full `index_reindex` grew RSS by **+331 MiB** while `tracemalloc` saw only **166.7 MiB** (proc peak 595.3 MiB) — a ~164 MiB gap of process‑level memory that `tracemalloc`'s Python‑heap snapshots do not capture. That gap is **not** a single proven Whoosh native buffer: Whoosh 2.7.4 is pure Python (verified — see §7.1/§7.2), so it is best explained by allocator retention/fragmentation (§3.2–§3.4), the writer's in‑RAM posting‑pool buffering, and `mmap`/`zlib`/stdlib C‑backed internals in the write path. The scikit‑learn classifier, by contrast, shows a *genuinely* native divergence because its weight matrices are NumPy C arrays.
 
 - **"Especially during metadata processing"** is explained by three metadata‑adjacent costs: the **classifier** is **unpickled on every consume** and is **never cached** (`consumer.py:L292`, `classifier.py:L76‑L94`) — measured at **+263 MiB** on first load and **+330 MiB again** on the very next load (identical, because nothing is cached); **date extraction** runs a regex over the *entire* document text (`parsers.py:L261`) — **+151.8 MiB** for a 2 MiB document; and **rule matching** builds a punctuation‑stripped, lower‑cased **full‑content copy per fuzzy rule** (`matching.py:L131,L134`).
 
@@ -42,7 +42,7 @@ The user observes three things: (1) memory **spikes disproportionately** during 
 
 - **"Memory not released in a timely manner"** is **mostly normal allocator behavior, not a leak** — but layered on top of a few **genuine over‑retentions**. CPython's `pymalloc` only returns a 256 KiB arena to the OS when *every* pool in it is empty, and glibc's `malloc` keeps freed large blocks in per‑arena free lists. Measured: after allocating 300 000 distinct small objects and then **deleting all of them**, RSS fell only from 164.7 MiB to 122.4 MiB; keeping just **120 scattered survivors (~0.007 MiB live)** pinned **170.4 MiB** resident. That is expected fragmentation. The *genuine* problems — `self.manifest` and the QuerySet result cache held across long loops — are distinct live references the program holds longer than necessary.
 
-**One‑sentence answer to "where is the memory actually going":** into (i) **two whole‑export copies** during manifest import, (ii) the **`content` text of every row** cached by un‑streamed QuerySet loops, (iii) **repeated, un‑cached classifier unpickling** and per‑document text copies during metadata processing, and (iv) **native Whoosh/scikit‑learn buffers** — all parked in **long‑lived worker arenas** that the allocator legitimately does not hand back to the OS right away.
+**One‑sentence answer to "where is the memory actually going":** into (i) **two whole‑export copies** during manifest import, (ii) the **`content` text of every row** cached by un‑streamed QuerySet loops, (iii) **repeated, un‑cached classifier unpickling** (whose **NumPy weight matrices are genuinely native**) and per‑document text copies during metadata processing, and (iv) **the full‑text reindex path** — the Whoosh writer's in‑RAM posting‑pool buffering plus `mmap`/`zlib`/C‑backed write‑path internals — all parked in **long‑lived worker arenas** that the allocator legitimately does not hand back to the OS right away.
 
 The amplifier behind almost every item is the data model itself: <code>content = models.TextField(...)</code> (`models.py:L117‑L124`) means *every* loaded `Document` row inherently carries the full raw text.
 
@@ -135,7 +135,7 @@ classifier.py:L91   self.correspondent_classifier = pickle.load(f) # MLPClassifi
 | Cache | Accumulates? | Evidence | Measured |
 |---|---|---|---|
 | **Django QuerySet result cache** | **Yes — per loop** | `Document.objects.all()` iterated without `.iterator()` (`tasks.py:L39‑L45`, `sanity_checker.py:L61`, `document_archiver.py:L129`, `document_retagger.py:L74`) caches all rows incl. `content`. | S3a: +25.3 MiB / 23.5 MiB content for 300 rows; `.iterator()` → 0.0 MiB. |
-| **Whoosh `AsyncWriter` RAM buffer** | **Yes — until commit** | `AsyncWriter` buffers postings in RAM; `update_document` indexes the full `content` (`index.py:L64‑L66`, `L87‑L93`). Constructed with **no** `limitmb`/`procs` override anywhere. | S3e: `index_reindex` over 300 docs grew RSS **+331 MiB** while `tracemalloc` saw only **166.7 MiB** — the buffer is largely **native** memory. |
+| **Whoosh writer RAM buffer** | **Yes — until commit** | The writer buffers postings in RAM via the underlying `SegmentWriter`/`PostingPool` (`limitmb=128` default) until commit; `update_document` indexes the full `content` (`index.py:L64‑L66`, `L87‑L93`). Constructed with **no** `limitmb`/`procs` override anywhere, so the default applies. | S3e: `index_reindex` over 300 docs grew RSS **+331 MiB** while `tracemalloc` saw only **166.7 MiB** — i.e. process‑level RSS not fully attributable to Python‑heap snapshots (allocator residue, in‑RAM buffering, `mmap`/`zlib` write‑path internals). Whoosh 2.7.4 is itself pure Python. |
 | **scikit‑learn model** | **No caching — re‑loaded every time** (a *different* problem) | `load_classifier()` is called per consume (`consumer.py:L292`) and per suggestions request (`views.py:L319`); it always `pickle.load`s from disk (`classifier.py:L76‑L94`). There is **no** in‑memory model cache. | S6c first load +263 MiB; **S6d second load +330 MiB — identical**, confirming nothing is cached. |
 | **dateparser locale / `regex`** | **One‑time lazy load, then stable** | First date parse imports `regex` core modules and locale data; subsequent parses reuse them. | S6e first parse: one‑time init (traced 1.1 MiB of `regex` core); **S6f second parse: 0.0 MiB**. |
 | **Django SQL query cache (`connection.queries`)** | **Only if `DEBUG=True`** | When `DEBUG` is on, Django stores every executed query, growing without bound. `settings.py:L50` defaults it off (`PAPERLESS_DEBUG=NO`). | Confirmed `DEBUG=False` at measurement time so this is excluded; flagged because enabling it would dwarf everything else. |
@@ -176,7 +176,7 @@ Each growth term classified as **O(document size)**, **O(batch/source size)**, o
 | `loaddata` re‑deserialize | `document_importer.py:L87` | **O(batch/source size)** | S2d: traced peak 47.9 MiB |
 | `list(filter(...))` extra list | `document_importer.py:L137‑L139` | **O(batch/source size)** | S2c: 300‑element list of references |
 | QuerySet result cache | `tasks.py:L39‑L45` | **O(batch/source size)** | S3a: +25.3 MiB / 23.5 MiB for 300 rows |
-| `AsyncWriter` buffer (reindex) | `tasks.py:L43` + `index.py:L66` | **O(batch/source size)**, native | S3e: +331 MiB RSS for 300 docs |
+| Whoosh writer buffer (reindex) | `tasks.py:L43` + `index.py:L66` | **O(batch/source size)**, in‑RAM buffer (pure‑Python) | S3e: +331 MiB RSS for 300 docs |
 | Classifier training accumulation | `classifier.py:L115‑L130` | **O(corpus size)** | S6b: +1661 MiB (synthetic upper bound) |
 | Classifier unpickle | `classifier.py:L76‑L94` | **constant per call, but recurring** | S6c == S6d (~+263/+330 MiB each) |
 | dateparser locale/regex init | (dateparser) | **constant, one‑time** | S6e→S6f (init, then 0.0 MiB) |
@@ -188,7 +188,7 @@ Each growth term classified as **O(document size)**, **O(batch/source size)**, o
 
 **By batch shape:**
 - **Single upload / consume:** dominated by per‑document `O(document size)` terms + the (recurring) classifier load. Bounded per file.
-- **Bulk (`index_reindex`, `bulk_update_documents`, archiver, retagger, sanity check):** dominated by the **`O(batch/source size)`** QuerySet result cache + native index buffer. This is where "many small docs" become a large number.
+- **Bulk (`index_reindex`, `bulk_update_documents`, archiver, retagger, sanity check):** dominated by the **`O(batch/source size)`** QuerySet result cache + the in‑RAM index/writer buffer. This is where "many small docs" become a large number.
 - **Manifest‑driven import:** the worst case — **two** `O(batch/source size)` whole‑export copies (`self.manifest` + `loaddata`) that coexist, so peak ≈ 2× the export size regardless of individual document sizes.
 
 **Rationale.** The user's report that *small* documents still spike is fully consistent with this classification: the dominant spike terms are **batch/source/corpus**‑sized, so the spike grows with **count and total text**, not with any single file. Document *type* mainly changes the per‑file constant (OCR adds copies + native memory); batch *shape* selects whether the `O(batch)` terms fire at all (manifest import fires the largest ones).
@@ -259,12 +259,12 @@ The harness lived entirely **outside** the repository (`/tmp/profiling/`, mounte
 
 | Instrument | Sees | Blind to | Used for |
 |---|---|---|---|
-| **`tracemalloc`** (stdlib) | Python‑heap allocations, per file:line | C‑extension / native allocations (NumPy, pikepdf, Whoosh native buffers) | Attributing growth to a specific `path:line` via `snapshot2.compare_to(snapshot1, "lineno")`; traced peak via `get_traced_memory()` after `reset_peak()` |
+| **`tracemalloc`** (stdlib) | Python‑heap allocations, per file:line | C‑extension / native allocations (NumPy, pikepdf) and other non‑Python‑heap memory (`mmap`, `zlib`, allocator residue) | Attributing growth to a specific `path:line` via `snapshot2.compare_to(snapshot1, "lineno")`; traced peak via `get_traced_memory()` after `reset_peak()` |
 | **Process RSS** (`psutil`, else `/proc/self/status` `VmRSS`, else `resource.getrusage().ru_maxrss`) | **All** memory incl. native | (nothing — but it is process‑global, not per‑line) | Capturing the *true* footprint, including native allocations that `tracemalloc` cannot see |
 
-Pairing them is mandatory: where the two diverge, the gap **is** the native allocation. The clearest example is **S3e** (`index_reindex`): RSS **+331 MiB** vs. `tracemalloc` **166.7 MiB** — the ~164 MiB gap is the Whoosh `AsyncWriter`'s native postings buffer. The classifier (S6c) shows the same effect for scikit‑learn/NumPy weight matrices.
+Pairing them is mandatory: where the two diverge, the gap is **process‑level memory that `tracemalloc` does not trace** — which may be a genuine native allocation *or* allocator residue, `mmap`/`zlib` buffers, and similar non‑Python‑heap memory. The clearest *proven‑native* example is the classifier (S6c): its scikit‑learn/NumPy weight matrices are C arrays, so RSS rises far above traced bytes. **S3e** (`index_reindex`) shows the divergence too — RSS **+331 MiB** vs. `tracemalloc` **166.7 MiB**, a ~164 MiB gap — but here the untraced memory is **not** demonstrably a single Whoosh native buffer: Whoosh 2.7.4 is pure Python (verified, §7.1/§7.2), so the gap is best explained by allocator residue/fragmentation (§3.2–§3.4), the writer's in‑RAM posting‑pool buffering, and `mmap`/`zlib`/stdlib C‑backed internals in the write path. Further attribution would be needed before calling any of it a Whoosh native buffer.
 
-> **`tracemalloc` limitation, stated explicitly.** `tracemalloc` records only allocations made through CPython's allocators. C libraries that allocate with their own `malloc` (Whoosh's C parts, pikepdf, parts of NumPy) are invisible to it. Any term that is "RSS‑heavy but `tracemalloc`‑light" in this report is therefore a **native** allocation, and RSS is the authoritative figure for it.
+> **`tracemalloc` limitation, stated explicitly.** `tracemalloc` records only allocations made through CPython's allocators. Memory that lives outside the Python heap is invisible to it: C libraries that call their own `malloc` (pikepdf, parts of NumPy), `mmap` regions, `zlib` compression buffers, and freed‑but‑retained allocator arenas (`pymalloc`/glibc). A term that is "RSS‑heavy but `tracemalloc`‑light" in this report therefore reflects **process‑level memory outside the Python heap** — sometimes a genuine native allocation (e.g. NumPy weight matrices), sometimes `mmap`/`zlib` buffering or allocator residue — and RSS is the authoritative figure for the total footprint. (Spot‑check in §7.2: a direct `ctypes` `libc.malloc` of 80 MiB shows an 80 MiB RSS delta but ~0 traced bytes — confirming the *general* principle, not the provenance of any specific term.)
 
 ### 4.3 Distinguishing retention from allocator residue
 
@@ -306,7 +306,7 @@ Every line number below was confirmed line‑by‑line against the source at HEA
 | 12 | Classifier train accumulation | `documents/classifier.py` | **L115–L130** | `data = list()` then `data.append(preprocess_content(doc.content))` for every doc before `fit_transform` — O(corpus). | S6b: +1661 MiB (synthetic upper bound) |
 | 13 | Matching: per‑rule scans | `documents/matching.py` | **L21–L57** | `match_correspondents`/`_document_types`/`_tags` each load `*.objects.all()` and scan `document.content` per object. | part of S4 |
 | 14 | Matching: fuzzy copies | `documents/matching.py` | **L60–L135** (copies at **L131, L134**) | Fuzzy branch builds a punctuation‑stripped (`L131`) and lower‑cased (`L134`) **full‑content copy per rule**. *(L130/L133 act on the short match string.)* | S4: 0.078 MiB per copy per rule |
-| 15 | Whoosh writer buffer | `documents/index.py` | **L64–L66** (`AsyncWriter`), **L87–L93** (`update_document`) | `AsyncWriter` buffers postings in RAM until commit; indexes full `content=doc.content` (`L93`). No `limitmb`/`procs` set anywhere. | S3e: +331 MiB RSS vs 166.7 MiB traced |
+| 15 | Whoosh writer buffer | `documents/index.py` | **L64–L66** (`AsyncWriter`), **L87–L93** (`update_document`) | Writer buffers postings in RAM via the underlying `SegmentWriter`/`PostingPool` (`limitmb=128` default) until commit; indexes full `content=doc.content` (`L93`). No `limitmb`/`procs` override set anywhere, so the default applies. Whoosh 2.7.4 is pure Python. | S3e: +331 MiB RSS vs 166.7 MiB traced (gap is process‑level, not a proven native buffer) |
 | 16 | Data model amplifier | `documents/models.py` | **L117–L124** | `content = models.TextField(...)` — every loaded row carries full text. | underlies #5,#8,#9,#15 |
 | 17 | Date parse over full text | `documents/parsers.py` | **L212–L274** (`finditer` at **L261**, filename at **L247**) | `for m in re.finditer(DATE_REGEX, text)` scans the **entire** content. | S1c: +151.8 MiB on 2 MiB doc |
 | 18 | OCR post‑process copy chain | `paperless_tesseract/parsers.py` | **L330–L341** | Three chained `re.sub` + `strip().replace("\0"," ")` — multiple transient full‑text copies alive at once. | S4: 4 MiB→36.5 MiB peak |
@@ -331,7 +331,7 @@ Every line number below was confirmed line‑by‑line against the source at HEA
 2. **Stream file reads.** Replace `hashlib.md5(f.read())` (`consumer.py:L102‑L104`) with a chunked `update()` loop, and `_write`'s `read_file.read()` (`L429‑L432`) with `shutil.copyfileobj`. Measured: 2.0 MiB → 0.1 MiB transient for the 2 MiB fixture (S1a).
 3. **Cache the classifier in worker memory.** `load_classifier()` is invoked per consume (`consumer.py:L292`) and per request (`views.py:L319`) and re‑unpickles every time (S6c == S6d). Loading once per worker (with mtime/hash invalidation) would remove a recurring multi‑hundred‑MiB churn term.
 4. **Process the import manifest incrementally / drop it after use.** Avoid holding `self.manifest` for the command lifetime (`document_importer.py:L72‑L73`); stream records, and avoid the separate `loaddata` pass re‑reading the same file (`L87`) so the two whole‑export copies don't coexist.
-5. **Bound the Whoosh writer.** Pass `limitmb`/`procs` to `AsyncWriter` (`index.py:L66`, `tasks.py:L43`/`L278`) to cap the native postings buffer that drove S3e's +331 MiB.
+5. **Bound the Whoosh writer's RAM buffer.** Pass `limitmb`/`procs` to `AsyncWriter` (`index.py:L66`, `tasks.py:L43`/`L278`) to cap the in‑RAM posting‑pool buffer (default `limitmb=128`) that contributes to S3e's +331 MiB RSS.
 6. **Reduce per‑rule fuzzy copies.** Compute the punctuation‑stripped/lower‑cased content **once per document** rather than once per rule (`matching.py:L131,L134`).
 7. **OS‑level allocator tuning for long‑lived workers.** Set `MALLOC_ARENA_MAX` (e.g., `2`) or switch to `jemalloc`/`tcmalloc` to curb glibc arena retention/fragmentation (§3.3–§3.4). This addresses the "RSS won't drop" symptom directly, without code changes.
 8. **Keep `DEBUG=False` in production** (already the default, `settings.py:L50`) so `connection.queries` never accumulates.
@@ -347,6 +347,7 @@ Python            3.9.23            (Dockerfile:L18 -> python:3.9-slim-bullseye)
 Django            4.0.4   DEBUG=False   DB engine=django.db.backends.sqlite3
 scikit-learn      1.0.2   numpy 1.22.3   scipy 1.8.0   joblib 1.1.0
 whoosh            2.7.4   django-q 1.3.9  djangorestframework 3.13.1
+whoosh internals  PURE PYTHON: 0 native .so/.pyd extensions; AsyncWriter/SegmentWriter/PostingPool are Python (PostingPool limitmb=128 default)
 dateparser        1.1.1   psutil 7.2.2 (profiling only; never added to repo manifests)
 Image             paperless-ngx-mem:py39-ready  (HEAD 542221a38dff)
 ```
@@ -393,6 +394,14 @@ SCENARIO 6 — first-vs-subsequent / caching (300-doc corpus)
   S6d  SECOND load_classifier()          RSS +330.5 | peak 420.0 MiB (IDENTICAL -> NOT cached)
   S6e  dateparser FIRST parse            one-time init (regex core, ~1.1 MiB traced)
   S6f  dateparser SECOND parse           +0.0 MiB (locale already loaded)
+
+METHODOLOGY SPOT-CHECK — native / non-Python-heap memory is invisible to tracemalloc
+  direct ctypes libc.malloc(80 MiB) + memset:  RSS +80.0 MiB | tracemalloc current/peak 0.000 MiB
+      => "RSS-heavy / tracemalloc-light" means memory OUTSIDE the Python heap (GENERAL principle;
+         it does NOT by itself identify WHICH library produced the untraced bytes)
+  whoosh 2.7.4 provenance: 0 native .so/.pyd; AsyncWriter/SegmentWriter/PostingPool pure Python
+      => the S3e RSS/tracemalloc gap is process-level (allocator residue + in-RAM posting-pool
+         buffering + mmap/zlib write-path internals), NOT a proven Whoosh native buffer
 ```
 
 ### 7.3 Harness design (reference only — these scripts were external and have been deleted)
