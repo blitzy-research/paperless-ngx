@@ -19,7 +19,7 @@ This document answers six questions about how background work behaves at runtime
 - **Q5 — After-the-fact outcome.** After the fact, how can one tell what happened to a given job (final status / result)?
 - **Q6 — The enqueue/dispatch code.** From a code perspective, *where* are these background jobs triggered, and which code is responsible for sending them into the queue?
 
-**Ingestion-centric scope.** The narrative centers on the `consume_file` task — the unit of work created whenever a document enters the system via the REST upload API, the consumption (watch) folder, or an e-mail attachment. Adjacent background jobs that share the exact same machinery (`bulk_update_documents`, and the scheduled `train_classifier` / `index_optimize` / `sanity_check`) are included where they illuminate the producer side (Q6), but OCR/parser internals, the classifier's ML details, the Whoosh search-index internals, and the Angular frontend are out of scope except where they directly intersect the async ingestion story.
+**Ingestion-centric scope.** The narrative centers on the `consume_file` task — the unit of work created whenever a document enters the system via the REST upload API, the consumption (watch) folder, or an e-mail attachment. Adjacent background jobs that share the exact same machinery (`bulk_update_documents`, and the scheduled `train_classifier` / `index_optimize` / `sanity_check` / `process_mail_accounts`) are included where they illuminate the producer side (Q6), but OCR/parser internals, the classifier's ML details, the Whoosh search-index internals, and the Angular frontend are out of scope except where they directly intersect the async ingestion story.
 
 **A note on terminology.** This document uses the system's own vocabulary throughout — `async_task`, `Q_CLUSTER`, `qcluster`, `status_updates`, `consume_file`, and `django_q_task` — so the prose matches the code it explains.
 
@@ -34,7 +34,7 @@ Direct answers to all six questions (each elaborated, with citations, in the sec
 - **Q3 (→ §6).** A **waiting** task is simply an element still sitting in the Redis list `django_q:paperless:q`, counted by `queue_size()` → Redis `LLEN`, which per the docs "does not count tasks currently being processed." An **active** task has already been removed from that list by a worker via a blocking `BLPOP`; it now lives in cluster memory and is **not yet written to the database** (introspection-verified; corroborated by the Django-Q docs — see §6).
 - **Q4 (→ §7).** When a job finishes, the Django-Q **result monitor** persists it as a row in the Django ORM `Task` model → the database table **`django_q_task`** `[introspection-verified]`. `Success` and `Failure` are **proxy models** over the same table filtered by the `success` boolean. The ORM-broker queue model `OrmQ` is **inert** here because paperless uses the Redis broker. The live progress payload is **ephemeral** — it lives only transiently in the Redis channel layer and is **never persisted** `[src/documents/consumer.py:L56-L76]`.
 - **Q5 (→ §8).** After the fact, a job's outcome is read via Django-Q's `result(task_id)`, `fetch(task_id)`, and `fetch_group(group_id)` APIs, by inspecting `django_q_task` columns directly (`success`, `result`, `started`, `stopped`, `attempt_count`), or via the Django admin's **Successful tasks** / **Failed tasks** views (the `Success`/`Failure` proxies) `[introspection-verified]`.
-- **Q6 (→ §9).** Jobs are dispatched from four producer sites that all import `from django_q.tasks import async_task`: the **upload REST endpoint** `[src/documents/views.py:L523-L533]`, the **directory watcher** `[src/documents/management/commands/document_consumer.py:L86-L91]`, **mail ingestion** (one task per attachment) `[src/paperless_mail/mail.py:L336-L349]`, and **bulk operations** `[src/documents/bulk_edit.py:L18,L31,L47,L63,L87]`. Three more are **scheduled** producers registered by data migrations `[src/documents/migrations/1001_auto_20201109_1636.py:L10-L19, src/documents/migrations/1004_sanity_check_schedule.py:L10-L14]`.
+- **Q6 (→ §9).** Jobs are dispatched from four producer sites that all import `from django_q.tasks import async_task`: the **upload REST endpoint** `[src/documents/views.py:L523-L533]`, the **directory watcher** `[src/documents/management/commands/document_consumer.py:L86-L91]`, **mail ingestion** (one task per attachment) `[src/paperless_mail/mail.py:L336-L349]`, and **bulk operations** `[src/documents/bulk_edit.py:L18,L31,L47,L63,L87]`. **Four more** are **scheduled** producers registered by data migrations `[src/documents/migrations/1001_auto_20201109_1636.py:L10-L19, src/documents/migrations/1004_sanity_check_schedule.py:L10-L14, src/paperless_mail/migrations/0002_auto_20201117_1334.py:L10-L15]` — including `paperless_mail.tasks.process_mail_accounts`, which polls every configured mail account **every 10 minutes** and, for each qualifying attachment, itself enqueues a `consume_file` job `[src/paperless_mail/mail.py:L336-L349]`.
 
 > **Why / How verified (summary).** Each answer above was established by reading the cited source files at the stated locators, then — for facts about the queue mechanics that live inside the external Django-Q library — by introspecting the pinned **Django-Q 1.3.9** package and corroborating with the official Django-Q documentation (§12). The full methodology is in §11.
 
@@ -292,7 +292,12 @@ Django-Q registers admin views backed by the proxy models from §7.2:
 
 ## §9. Where Jobs Are Triggered — the Enqueue Code (Q6)
 
-Every background job in paperless-ngx is dispatched through Django-Q's `async_task(...)`, referencing the task function by **dotted-path string**. There are **four event-driven producer sites** and **three scheduled producers**. All event-driven sites `import from django_q.tasks import async_task`.
+Background work enters the queue in **two distinct ways**, and it is important not to conflate them:
+
+1. **Event-driven producers** call Django-Q's `async_task(...)` **directly** from application code, referencing the task function by **dotted-path string**. There are **four event-driven producer sites**, and every one of them `import`s `from django_q.tasks import async_task` (§9.1).
+2. **Scheduled producers** are *not* dispatched by an `async_task(...)` call in application code. They are registered **once** as `Schedule` rows via `schedule(...)`, and the `qcluster` process's **internal scheduler** is what later enqueues them onto the broker when they come due. There are **four scheduled producers** (§9.2).
+
+So the library function that performs the actual enqueue is the same in both cases (the broker's `enqueue()` → Redis `RPUSH`, §5); what differs is the *trigger* — a direct `async_task(...)` call versus a due `Schedule` row.
 
 ### 9.1 Event-driven producers (`async_task`)
 
@@ -307,19 +312,22 @@ The dispatched task functions are all defined in `src/documents/tasks.py`: `cons
 
 ### 9.2 Scheduled producers (`schedule` + `Schedule`)
 
-Three recurring jobs are registered once, via **data migrations** that import `from django_q.tasks import schedule` and `from django_q.models import Schedule`:
+Four recurring jobs are registered once, via **data migrations** that import `from django_q.tasks import schedule` and `from django_q.models import Schedule`:
 
 | Scheduled task | Cadence | File | Locator |
 |---|---|---|---|
 | `documents.tasks.train_classifier` | **HOURLY** | `src/documents/migrations/1001_auto_20201109_1636.py` | `[L10-L14]` |
 | `documents.tasks.index_optimize` | **DAILY** | `src/documents/migrations/1001_auto_20201109_1636.py` | `[L15-L19]` |
 | `documents.tasks.sanity_check` | **WEEKLY** | `src/documents/migrations/1004_sanity_check_schedule.py` | `[L10-L14]` |
+| `paperless_mail.tasks.process_mail_accounts` | **MINUTES** (every 10 min) | `src/paperless_mail/migrations/0002_auto_20201117_1334.py` | `[L10-L15]` |
 
-These rows persist in the `django_q_schedule` table (§7.2), and the `qcluster` process's internal scheduler enqueues them onto `django_q:paperless:q` when due (the docs note the scheduler checks for due tasks twice a minute). Both migrations depend on `("django_q", "0013_task_attempt_count")` `[src/documents/migrations/1001_auto_20201109_1636.py:L31, src/documents/migrations/1004_sanity_check_schedule.py:L25]`, i.e. they require Django-Q's own tables to exist first. The corresponding task functions are defined at `train_classifier` `[src/documents/tasks.py:L48]`, `index_optimize` `[src/documents/tasks.py:L32]`, and `sanity_check` `[src/documents/tasks.py:L255]`.
+These rows persist in the `django_q_schedule` table (§7.2), and the `qcluster` process's internal scheduler enqueues them onto `django_q:paperless:q` when due (the docs note the scheduler checks for due tasks twice a minute). All three migrations depend on `("django_q", "0013_task_attempt_count")` `[src/documents/migrations/1001_auto_20201109_1636.py:L31, src/documents/migrations/1004_sanity_check_schedule.py:L25, src/paperless_mail/migrations/0002_auto_20201117_1334.py:L26]`, i.e. they require Django-Q's own tables to exist first. The corresponding task functions are defined at `train_classifier` `[src/documents/tasks.py:L48]`, `index_optimize` `[src/documents/tasks.py:L32]`, `sanity_check` `[src/documents/tasks.py:L255]`, and `process_mail_accounts` `[src/paperless_mail/tasks.py:L11-L22]`.
 
-> **The library function responsible for the enqueue** is Django-Q's `async_task()` (`django_q/tasks.py`), which builds the signed package and calls the broker's `enqueue()` → Redis `RPUSH` (§5). The repository code never touches Redis directly; it only calls `async_task(...)`.
+**The scheduled mail producer is also an upstream producer of `consume_file`.** `process_mail_accounts` is the one scheduled job that, when it runs, *itself* enqueues further jobs. The cluster executes it on its 10-minute cadence; it iterates `MailAccount.objects.all()` and calls `MailAccountHandler().handle_mail_account(account)` `[src/paperless_mail/tasks.py:L13-L15]`. That handler walks each matching message via `handle_message(...)` `[src/paperless_mail/mail.py:L237, L272]` and, for **every qualifying attachment**, calls `async_task("documents.tasks.consume_file", …)` `[src/paperless_mail/mail.py:L336-L349]`. In other words, the **Mail ingestion** event-driven row in §9.1 is precisely the per-attachment enqueue that this **scheduled** producer drives — the same `mail.py` code path observed at two points in the timeline (scheduled poll → per-attachment `consume_file`). A mail attachment can therefore reach the ingestion queue without any direct user action, purely because the 10-minute schedule fired.
 
-> **Why / How verified.** Every producer call site, its import, and its dispatched dotted-path func were read directly at the cited locators. The "one task per attachment" claim is confirmed by the `async_task` call sitting inside the per-attachment loop in `src/paperless_mail/mail.py`. The scheduled producers were read from the two data migrations, and their cadence constants (`Schedule.HOURLY/DAILY/WEEKLY`) are taken verbatim from those files.
+> **The library function responsible for the enqueue.** For the **event-driven** sites, the repository calls Django-Q's `async_task()` (`django_q/tasks.py`), which builds the signed package and hands it to the broker's `enqueue()` → Redis `RPUSH` (§5). For the **scheduled** producers, the repository only *registers* a `Schedule` row via `schedule(...)`; the `qcluster` process's scheduler later invokes the same broker `enqueue()` when the row comes due. Either way, the repository code never touches Redis directly — it calls `async_task(...)` or `schedule(...)`, and Django-Q performs the actual `RPUSH`.
+
+> **Why / How verified.** Every producer call site, its import, and its dispatched dotted-path func were read directly at the cited locators. The "one task per attachment" claim is confirmed by the `async_task` call sitting inside the per-attachment loop in `src/paperless_mail/mail.py`. The scheduled producers were read from the three data migrations, and their cadence constants (`Schedule.HOURLY/DAILY/WEEKLY/MINUTES`) are taken verbatim from those files. The `process_mail_accounts → handle_mail_account → handle_message → async_task(consume_file)` chain was traced directly through `src/paperless_mail/tasks.py` and `src/paperless_mail/mail.py` at the cited locators.
 
 ---
 
@@ -392,7 +400,7 @@ The governing rule for this document is: **base every answer on the code as the 
 
 - `src/documents/views.py` — import `async_task` `[L28]`; temp file `[L512-L519]`; `task_id` `[L521]`; `async_task(consume_file)` `[L523-L533]`; `Response("OK")` `[L535]`
 - `src/documents/management/commands/document_consumer.py` — import `[L13]`; `_consume` `[L46]`; log `[L85]`; `async_task(consume_file)` `[L86-L91]`
-- `src/paperless_mail/mail.py` — import `[L11]`; `async_task(consume_file)` per attachment `[L336-L349]`
+- `src/paperless_mail/mail.py` — import `[L11]`; `handle_mail_account` `[L151]`; `handle_message` `[L272]` (called per message at `[L237]`); `async_task(consume_file)` per attachment `[L336-L349]` (this enqueue is driven on a timer by the scheduled `process_mail_accounts`)
 - `src/documents/bulk_edit.py` — import `[L4]`; `async_task(bulk_update_documents)` `[L18, L31, L47, L63, L87]`
 - `src/documents/tasks.py` — `async_to_sync` `[L8]`; `get_channel_layer` `[L9]`; `Consumer` `[L16]`; `ConsumerError` `[L17]`; `index_optimize` `[L32]`; `index_reindex` `[L38]`; `train_classifier` `[L48]`; `save_to_dir` `[L164]`; `consume_file` `[L184]`; `try_consume_file` call `[L236]`; `sanity_check` `[L255]`; `bulk_update_documents` `[L270]`
 - `src/documents/consumer.py` — `_send_progress` `[L56-L76]`; payload keys `[L64-L72]`; group send `[L73-L76]`; `_fail` `[L78-L81]`; status emissions `[L202, L240, L259, L264, L274, L294, L375]`
@@ -402,6 +410,8 @@ The governing rule for this document is: **base every answer on the code as the 
 - `src/paperless/settings.py` — `CHANNEL_LAYERS` `[L178-L184]`; worker timeout `[L440]`; worker retry `[L444-L447]`; `Q_CLUSTER` `[L449-L457]` (`name` `[L450]`, `catch_up` `[L451]`, `recycle` `[L452]`, `retry` `[L453]`, `timeout` `[L454]`, `workers` `[L455]`, `redis` `[L456]`)
 - `src/documents/migrations/1001_auto_20201109_1636.py` — `train_classifier` HOURLY `[L10-L14]`; `index_optimize` DAILY `[L15-L19]`; django_q dependency `[L31]`
 - `src/documents/migrations/1004_sanity_check_schedule.py` — `sanity_check` WEEKLY `[L10-L14]`; django_q dependency `[L25]`
+- `src/paperless_mail/migrations/0002_auto_20201117_1334.py` — `process_mail_accounts` scheduled via `schedule(...)` with `Schedule.MINUTES`, `minutes=10` `[L10-L15]`; django_q dependency `[L26]`
+- `src/paperless_mail/tasks.py` — `process_mail_accounts` `[L11-L22]` (iterates `MailAccount.objects.all()` → `MailAccountHandler().handle_mail_account`, which enqueues `consume_file` per attachment)
 - `docker/supervisord.conf` — `gunicorn` `[L10-L11]`; `consumer` `[L19-L20]`; `scheduler`/`qcluster` `[L28-L29]`
 - `Pipfile` — `django` `[L13]`; `django-q` `[L17]`; `redis` `[L34]`; `whoosh` `[L39]`; `channels` `[L46]`; `channels-redis` `[L47]`
 - `Pipfile.lock` — pinned versions (`django-q==1.3.9`, `redis==3.5.3`, `channels==3.0.4`, `channels-redis==3.4.0`, `django==4.0.4`, …)
