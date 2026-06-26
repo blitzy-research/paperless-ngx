@@ -90,7 +90,7 @@ The worker tunables feeding that block live just above it: `TASK_WORKERS` (L438)
 
 **Evidence (`file:line`):**
 
-- `check_sanity(progress=False)` — `src/documents/sanity_checker.py:49-133`. It builds the set of present files by walking `settings.MEDIA_ROOT` (L53‑55), removes the search‑index lock file from that set (L57‑59), then per `Document` validates:
+- `check_sanity(progress=False)` — `src/documents/sanity_checker.py:49-133`. It builds the set of present files by walking `settings.MEDIA_ROOT` (L53‑55), removes the media lock file (`media.lock`) from that set (L57‑59), then per `Document` validates:
   - **thumbnail** existence and readability (L62‑72),
   - **original file** existence and an **MD5 checksum** match (L74‑91),
   - **archive file** checksum/filename field pairing, archive‑file existence and readability, and an **archive MD5 checksum** match (L93‑124),
@@ -214,7 +214,7 @@ This is distinct from *event‑driven* dispatch — work that is enqueued on dem
 
 **Evidence (`file:line`):**
 
-- `train_classifier()` — `src/documents/tasks.py:48-72` — wraps its training body in `try/except` and at L70‑72 does `except Exception as e: logger.warning("Classifier error: " + str(e))`. It does **not** re‑raise, so a training failure is logged at WARNING but the Django‑Q task still completes "successfully."
+- `train_classifier()` — `src/documents/tasks.py:48-72` — wraps its training body in `try/except` and at L71‑72 does `except Exception as e: logger.warning("Classifier error: " + str(e))`. It does **not** re‑raise, so a training failure is logged at WARNING but the Django‑Q task still completes "successfully."
 - `sanity_check()` — `src/documents/tasks.py:255-267` — raises `SanityCheckFailedException("Sanity check failed with errors. See log.")` at L260‑261 when `messages.has_error()`, so genuine corruption surfaces as a failed task.
 - No alerting is configured: the `Q_CLUSTER` dict (`src/paperless/settings.py:449-457`) contains **no `error_reporter` key**. Failure information therefore goes only to the `django_q_task` table and the logs.
 
