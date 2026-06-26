@@ -235,7 +235,7 @@ Captured with a standalone proof-of-concept using the real `django-q==1.3.9` aga
       "name": "paperless",
       "catch_up": False,
       "recycle": 1,
-      "retry": 1800,
+      "retry": PAPERLESS_WORKER_RETRY,  # = PAPERLESS_WORKER_TIMEOUT + 10 = 1810 (default)
       "timeout": ...,
       "workers": ...,
       "redis": os.getenv("PAPERLESS_REDIS", "redis://localhost:6379"),
@@ -284,7 +284,7 @@ Live SQLite database at `DATA_DIR/db.sqlite3`:
 id           = 1
 title        = 'blitzy_probe'
 content      = 'Blitzy ingestion probe ...\nHello Paperless-ngx.\n'
-checksum     = 'ba2258394ae5467beef5e6742c17faf4'      # MD5 of the original
+checksum     = 'f74112be0d7ca563c6727c853f3dd7d5'      # MD5 of the original
 mime_type    = 'text/plain'
 created      = 2026-...
 added        = 2026-...
