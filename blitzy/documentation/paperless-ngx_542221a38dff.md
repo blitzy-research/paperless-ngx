@@ -294,7 +294,7 @@ The dict is assembled by `construct_ocrmypdf_parameters` (`src/paperless_tessera
 | `rotate_pages_threshold` | `12.0` | L177–L179 | `OCR_ROTATE_PAGES_THRESHOLD` (settings L532) |
 | `sidecar` | `<tempdir>/sidecar.txt` | L181–L185 | `OCR_PAGES == 0` (settings L510) |
 
-**The `jobs` value is environment-dependent.** It is `THREADS_PER_WORKER = max(floor(cpu_count / TASK_WORKERS), 1)` (settings L460–L472), where `TASK_WORKERS = floor(sqrt(cpu_count))` for ≥4 cores (settings L427–L435). On this 128-core host: `TASK_WORKERS = floor(sqrt(128)) = 11` and `jobs = floor(128 / 11) = 11` — confirmed live (`jobs: 11`). On a 4-core laptop it would be `2`; on an 8-core machine `2` as well. Report it as the **formula**, not a fixed integer.
+**The `jobs` value is environment-dependent.** It is `THREADS_PER_WORKER = max(floor(cpu_count / TASK_WORKERS), 1)` (settings L460–L472), where `TASK_WORKERS = floor(sqrt(cpu_count))` for ≥4 cores (settings L427–L435). On this 128-core host: `TASK_WORKERS = floor(sqrt(128)) = 11` and `jobs = floor(128 / 11) = 11` — confirmed live (`jobs: 11`). On a 4-core laptop it would be `2`; on an 8-core machine, `jobs = floor(8 / floor(sqrt(8))) = floor(8 / 2) = **4**` (whereas `TASK_WORKERS` is `2`). Report it as the **formula**, not a fixed integer.
 
 **Mode-dependent variations** (all in `construct_ocrmypdf_parameters`), for configurations other than the default:
 - `OCR_MODE='force'` (or the safe-fallback retry path) → `force_ocr=True` **instead of** `skip_text` (L155–L156).
