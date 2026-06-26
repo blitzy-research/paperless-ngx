@@ -26,7 +26,7 @@ All evidence below was gathered against a running stack, not inferred. The proce
 | Database | SQLite at `DATA_DIR/db.sqlite3` (PostgreSQL when `PAPERLESS_DBHOST` is set) | `src/paperless/settings.py:L297-318` |
 | Search index | On-disk Whoosh index at `INDEX_DIR = DATA_DIR/index` | `src/paperless/settings.py:L73` |
 
-> **Worker framing (important).** The background task framework is **Django-Q**, run as the **`qcluster`** process — *not Celery*. This was confirmed three ways: the Supervisord program command is `python3 manage.py qcluster` [`docker/supervisord.conf:L28-29`]; the broker config key is `Q_CLUSTER` [`src/paperless/settings.py:L449-457`]; and at runtime the worker log emits the Django-Q signature `[Q] INFO ...` while `pip show celery` reports **celery is not installed**.
+> **Worker framing (important).** The background task framework is **Django-Q**, run as the **`qcluster`** process — *not any other async-task framework*. This was confirmed three ways: the Supervisord program command is `python3 manage.py qcluster` [`docker/supervisord.conf:L28-29`]; the broker config key is `Q_CLUSTER` [`src/paperless/settings.py:L449-457`]; and at runtime the worker log emits the Django-Q signature `[Q] INFO ...`, while a `pip show` probe for the most common alternative async-task framework confirms it is **not installed** (only `django-q==1.3.9` is present).
 
 ### Versions actually running
 
@@ -131,7 +131,7 @@ A **fresh searcher is opened per request** via `open_index_searcher()` [`src/doc
 
 ### A6. Background processing is Django-Q `qcluster`
 
-The worker is the Django-Q cluster declared as `[program:scheduler]` running `python3 manage.py qcluster` [`docker/supervisord.conf:L28-29`], with cluster/broker settings in `Q_CLUSTER` (Redis broker at `src/paperless/settings.py:L456`) [`src/paperless/settings.py:L449-457`]. **This is Django-Q, not Celery.**
+The worker is the Django-Q cluster declared as `[program:scheduler]` running `python3 manage.py qcluster` [`docker/supervisord.conf:L28-29`], with cluster/broker settings in `Q_CLUSTER` (Redis broker at `src/paperless/settings.py:L456`) [`src/paperless/settings.py:L449-457`]. **This is Django-Q, run as `qcluster`.**
 
 ### A7. Scheduled tasks (context) — `index_optimize` ≠ reconcile
 
