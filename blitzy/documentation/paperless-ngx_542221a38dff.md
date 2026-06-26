@@ -27,7 +27,7 @@ A document moves through the system in two clearly separated regimes: a **transi
 1. **Upload.** A client POSTs a file to `POST /api/documents/post_document/`, handled by `PostDocumentView.post()` `[src/documents/views.py:L491,L497]`. The view requires authentication `[src/documents/views.py:L493]` and accepts multipart uploads `[src/documents/views.py:L495]`. It writes the upload to a temporary file under `SCRATCH_DIR` `[src/documents/views.py:L510-519]`, mints a task identifier `task_id = str(uuid.uuid4())` `[src/documents/views.py:L521]`, and enqueues the work.
 2. **Enqueue (Django-Q).** The view calls `async_task("documents.tasks.consume_file", temp_filename, …, task_id=task_id, …)` `[src/documents/views.py:L523-533]` and immediately returns `Response("OK")` `[src/documents/views.py:L535]`. The upload request does **not** wait for OCR; it returns as soon as the job is queued.
 3. **Dequeue and run.** A Django-Q `qcluster` worker picks up the job and executes `consume_file(...)` `[src/documents/tasks.py:L184]`, which (after an optional barcode-splitting step) delegates to `Consumer().try_consume_file(...)` `[src/documents/tasks.py:L236]`.
-4. **Consume.** `try_consume_file(...)` `[src/documents/consumer.py:L180]` detects the MIME type, selects a parser, and calls `document_parser.parse(self.path, mime_type, self.filename)` `[src/documents/consumer.py:L261]`. For images and PDFs the parser is `RasterisedDocumentParser`, whose `parse()` method `[src/paperless_tesseract/parsers.py:L230]` is the OCR core.
+4. **Consume.** `try_consume_file(...)` `[src/documents/consumer.py:L180]` detects the MIME type, selects a parser, and calls `document_parser.parse(self.path, mime_type, self.filename)` `[src/documents/consumer.py:L261]`. For images and PDFs the parser is `RasterisedDocumentParser` — registered for the `application/pdf` and `image/*` MIME types in the Tesseract parser declaration `[src/paperless_tesseract/signals.py:L7-18]` — whose `parse()` method `[src/paperless_tesseract/parsers.py:L230]` is the OCR core.
 5. **Persist (success only).** On success, `_store(text=text, …)` `[src/documents/consumer.py:L301,L379]` creates the row via `Document.objects.create(... content=text ...)` `[src/documents/consumer.py:L400]`, all inside `transaction.atomic()` `[src/documents/consumer.py:L298]`.
 
 ### 1.2 The progress stream that runs alongside
@@ -274,7 +274,9 @@ The question asks *"how can I tell the difference after processing finishes?"* T
 - Under default **`skip`**, OCRmyPDF runs and an archive is written, so the document **has** an archived version.
 - Under **`skip_noarchive`** with existing text, the bypass returns before OCR and **no** archive is produced.
 
-In the data model this surfaces as `archive_filename` `[src/documents/models.py:L186]` and the derived property `has_archive_version`, which is literally `return self.archive_filename is not None` `[src/documents/models.py:L237-239]`. Through the API this is the `archived_file_name` field (see Q3). So the operator-visible test is: **does the finished document have an archive?** If yes, OCRmyPDF was engaged; if no (for a text PDF), it was skipped. (The model also tracks `checksum` for the original `[src/documents/models.py:L135]` and `archive_checksum` for the archive `[src/documents/models.py:L143]`.)
+In the data model this surfaces as `archive_filename` `[src/documents/models.py:L186]` and the derived property `has_archive_version`, which is literally `return self.archive_filename is not None` `[src/documents/models.py:L237-239]`. Through the API this is the `archived_file_name` field (see Q3). So, **for the controlled comparison this section sets up — a normal, text-bearing born-digital PDF consumed under default `skip` versus `skip_noarchive`** — the operator-visible test is: **does the finished document have an archive?** Under default `skip` it does (OCRmyPDF ran); under `skip_noarchive` with existing text it does not (the bypass fired). (The model also tracks `checksum` for the original `[src/documents/models.py:L135]` and `archive_checksum` for the archive `[src/documents/models.py:L143]`.)
+
+> **Caveat — archive absence is not a *universal* "OCR was skipped" proof.** Outside this controlled comparison, a document can lack an archive under default `skip` for reasons unrelated to the skip-bypass. The parser tests `test_signed` and `test_encrypted`, both run under `OCR_MODE="skip"`, assert `parser.archive_path is None` for signed and encrypted PDFs `[src/paperless_tesseract/tests/test_parser.py:L162-187]`. So treat archive presence as the differentiator **only** for the normal text-PDF `skip`-vs-`skip_noarchive` case — not as a blanket signal across signed, encrypted, or error/fallback paths.
 
 ### 3.5 The sidecar nuance (why "skip" text doesn't end up in the sidecar)
 
@@ -284,16 +286,16 @@ When OCRmyPDF runs with `skip_text=True` on a page that already has text, it wri
 
 ### 3.6 Validation against OCRmyPDF's own documentation *(illustrative — the code remains authoritative)*
 
-For the OCRmyPDF generation that matches this commit (`ocrmypdf 13.4.3`, which exposes the boolean `skip_text`/`redo_ocr`/`force_ocr` parameters that paperless sets), the engine's documented behavior aligns with the code:
+For the OCRmyPDF generation that matches this commit (`ocrmypdf==13.4.3` `[requirements.txt:L60]`, which exposes the boolean `skip_text`/`redo_ocr`/`force_ocr` parameters that paperless sets), the engine's documented behavior aligns with the code:
 
 - `--skip-text` (paperless's `skip_text=True`): no OCR is performed on pages that already have text, and those pages are copied to the output.
 - `--redo-ocr` (`redo`): the invisible OCR layer is stripped and re-applied **without rasterizing** vector/born-digital content.
 - `--force-ocr` (`force`, and the safe-fallback): **all** pages are rasterized to images before OCR.
 - The **sidecar contains only text from pages that were actually OCR'd** — which is exactly why paperless treats the `"[OCR skipped on page"` marker as the signal to fall back to embedded-text extraction `[src/paperless_tesseract/parsers.py:L104,L112-120]`.
 
-The project's own configuration docs describe the same four modes: `skip` is the default and "always creates archived documents," while `skip_noarchive` additionally suppresses the archive when it finds text (`docs/configuration.rst`, the `PAPERLESS_OCR_MODE` section).
+The project's own configuration docs describe the same four modes — and confirm that `skip` is the default and "always creates archived documents," while `skip_noarchive` additionally suppresses the archive when it finds text `[docs/configuration.rst:L305-329]`.
 
-> **Version-fidelity note (important):** this commit's parser recognizes exactly four modes — `skip`, `skip_noarchive`, `redo`, `force` `[src/paperless_tesseract/parsers.py:L155-162]`. The later OCRmyPDF/paperless refactor to a `--mode` model (`AUTO`/`FORCE`/`REDO`/`OFF`/`strip`) postdates this commit and **does not apply here.** Also note the settings comment at `[src/paperless/settings.py:L520]` reads `# skip. redo, force` and omits `skip_noarchive`; the comment is stale — the *code* accepts all four modes, and the code is what governs behavior.
+> **Version-fidelity note (important):** this commit's parser recognizes exactly four OCR modes — `skip`, `skip_noarchive`, `redo`, and `force` — as enumerated in the mode-to-argument mapping `[src/paperless_tesseract/parsers.py:L155-162]`. These four are the only modes this document describes, because they are the only modes this commit's code accepts: any other value falls through to the `else` branch and raises `ParseError(f"Invalid ocr mode: …")` `[src/paperless_tesseract/parsers.py:L161-162]`. Note also that the settings comment at `[src/paperless/settings.py:L520]` reads `# skip. redo, force` and omits `skip_noarchive`; that comment is stale — the *code* accepts all four modes, and the code is what governs behavior.
 
 ### 3.7 Corroboration in the test suite
 
@@ -330,7 +332,7 @@ def get_archived_file_name(self, obj):
 
 It also exposes `original_file_name` `[src/documents/serialisers.py:L207,L210-211]`. Both are present in the `fields` tuple `[src/documents/serialisers.py:L233-234]`. As established in Q2, `has_archive_version` is `self.archive_filename is not None` `[src/documents/models.py:L237-239]`.
 
-**Therefore the practical differentiator between "OCR ran" and "text pre-existed / OCR was skipped" is `archived_file_name` (archive presence), not the text itself.** The `content` field alone is origin-agnostic and cannot tell you how the text was produced.
+**Therefore, for the controlled comparison of two normal text-bearing PDFs — one consumed under default `skip`, one under `skip_noarchive` — the practical differentiator between "OCR ran" and "text pre-existed / OCR was skipped" is `archived_file_name` (archive presence), not the text itself.** The `content` field alone is origin-agnostic and cannot tell you how the text was produced. (As noted in §3.4, archive absence is **not** a universal "OCR was skipped" proof — signed, encrypted, or error/fallback documents can also lack an archive under default `skip` `[src/paperless_tesseract/tests/test_parser.py:L162-187]`.)
 
 ### 4.3 Side-by-side comparison *(observed)*
 
@@ -359,11 +361,11 @@ The clearest contrast is **Doc 2 vs. Doc 3**, two born-digital PDFs that both en
   "archived_file_name": null }                                   // <-- NO archive
 ```
 
-Both have populated `content`; **only `archived_file_name` distinguishes the OCR'd case from the skipped case.** No field reveals that Doc 2's text passed through OCRmyPDF while Doc 3's text was read straight from the PDF — that origin distinction is simply not represented in the API.
+Both have populated `content`; **in this controlled Doc 2 (default `skip`) vs. Doc 3 (`skip_noarchive`) comparison, `archived_file_name` is what distinguishes the OCR'd case from the skipped case.** No field reveals that Doc 2's text passed through OCRmyPDF while Doc 3's text was read straight from the PDF — that origin distinction is simply not represented in the API.
 
 ### 4.4 Reasoning
 
-Because `content` is a single origin-agnostic column `[src/documents/models.py:L117]` populated identically on every path `[src/documents/consumer.py:L400]`, the API cannot and does not label text by provenance. The only provenance-adjacent signal the contract exposes is whether an archive was built (`archived_file_name` / `has_archive_version`), which is a reliable proxy for "did OCRmyPDF run" for text-bearing PDFs. Field exposure is corroborated by the API tests (e.g., the document-fields test `[src/documents/tests/test_api.py:L89]`).
+Because `content` is a single origin-agnostic column `[src/documents/models.py:L117]` populated identically on every path `[src/documents/consumer.py:L400]`, the API cannot and does not label text by provenance. The only provenance-adjacent signal the contract exposes is whether an archive was built (`archived_file_name` / `has_archive_version`). For the controlled comparison of two *normal* text-bearing PDFs under default `skip` vs. `skip_noarchive`, that is a reliable proxy for "did OCRmyPDF run"; it is **not** a universal one, because signed, encrypted, or error/fallback PDFs can also end up without an archive under default `skip` `[src/paperless_tesseract/tests/test_parser.py:L162-187]`. Field exposure is corroborated by the API tests (e.g., the document-fields test `[src/documents/tests/test_api.py:L89]`).
 
 
 ---
@@ -381,7 +383,7 @@ A weak or empty OCR result is **not** an error state. The document is still crea
 When OCR yields little or nothing, the parser runs a deliberate, multi-tier fallback:
 
 1. **Primary OCR.** After `ocrmypdf.ocr(**args)` `[src/paperless_tesseract/parsers.py:L261]`, the parser extracts text from the sidecar/archive: `self.text = self.extract_text(sidecar_file, archive_path)` `[src/paperless_tesseract/parsers.py:L264]`. If that is empty, it raises `NoTextFoundException(...)` `[src/paperless_tesseract/parsers.py:L266-267]` (the exception class is defined at `[src/paperless_tesseract/parsers.py:L14]`).
-2. **Safe-fallback force-OCR retry.** The handler `except (NoTextFoundException, InputFileError) as e:` `[src/paperless_tesseract/parsers.py:L276]` rebuilds the arguments with `safe_fallback=True` `[src/paperless_tesseract/parsers.py:L293]` (which forces `force_ocr=True` via the mapping at `L155-156`), logs `"Fallback: Calling OCRmyPDF with args: …"` `[src/paperless_tesseract/parsers.py:L297]`, calls `ocrmypdf.ocr(**args)` again `[src/paperless_tesseract/parsers.py:L298]`, and re-extracts the text `[src/paperless_tesseract/parsers.py:L303-306]`.
+2. **Safe-fallback force-OCR retry.** The handler `except (NoTextFoundException, InputFileError) as e:` `[src/paperless_tesseract/parsers.py:L276]` rebuilds the arguments with `safe_fallback=True` `[src/paperless_tesseract/parsers.py:L293]` (which forces `force_ocr=True` via the mapping at `[src/paperless_tesseract/parsers.py:L155-156]`), logs `"Fallback: Calling OCRmyPDF with args: …"` `[src/paperless_tesseract/parsers.py:L297]`, calls `ocrmypdf.ocr(**args)` again `[src/paperless_tesseract/parsers.py:L298]`, and re-extracts the text `[src/paperless_tesseract/parsers.py:L303-306]`.
 3. **Last resort — empty content.** If text is *still* absent:
 
 ```python
@@ -415,13 +417,13 @@ The resulting API response (Doc 4 in §4.3) had `content` of length `0`, an `arc
 
 ### 5.4 No metadata flag exists — the model audit
 
-The decisive evidence for "how is it reflected in metadata?" is what the `Document` model **does not** contain. Scanning the model body `[src/documents/models.py:L88-200]`, the fields are: `correspondent`, `storage_path`, `title`, `document_type`, `content` `[src/documents/models.py:L117]`, `mime_type`, `checksum` `[src/documents/models.py:L135]`, `archive_checksum` `[src/documents/models.py:L143]`, `created`, `modified`, `storage_type`, `added`, `filename`, `archive_filename` `[src/documents/models.py:L186]`, and `archive_serial_number`. **There is no `status`, `state`, `processed`, `ocr_confidence`, or `ocr_quality` column.** The only archive-related property is `has_archive_version` `[src/documents/models.py:L237-239]`, which speaks to archive presence, not OCR quality.
+The decisive evidence for "how is it reflected in metadata?" is what the `Document` model **does not** contain. Scanning the model body `[src/documents/models.py:L88-200]`, the fields are: `correspondent` `[src/documents/models.py:L97]`, `title` `[src/documents/models.py:L106]`, `document_type` `[src/documents/models.py:L108]`, `content` `[src/documents/models.py:L117]`, `mime_type` `[src/documents/models.py:L126]`, `tags` `[src/documents/models.py:L128]`, `checksum` `[src/documents/models.py:L135]`, `archive_checksum` `[src/documents/models.py:L143]`, `created` `[src/documents/models.py:L152]`, `modified` `[src/documents/models.py:L154]`, `storage_type` `[src/documents/models.py:L161]`, `added` `[src/documents/models.py:L169]`, `filename` `[src/documents/models.py:L176]`, `archive_filename` `[src/documents/models.py:L186]`, and `archive_serial_number` `[src/documents/models.py:L196]`. **There is no `status`, `state`, `processed`, `ocr_confidence`, or `ocr_quality` column.** The only archive-related property is `has_archive_version` `[src/documents/models.py:L237-239]`, which speaks to archive presence, not OCR quality.
 
 **Reasoning:** "fully processed" in paperless is simply *binary success of the consume pipeline*. It is entirely decoupled from how much text OCR recovered. Because the existence of the `Document` row is itself the success signal (the row is written only on the success path inside `transaction.atomic()` `[src/documents/consumer.py:L298]`), a document with empty `content` is exactly as "fully processed" as one with rich text. Nothing in the saved metadata distinguishes weak OCR from strong OCR — you would only notice by reading `content` and finding it empty or short.
 
 ### 5.5 Corroboration in the test suite
 
-Parser tests confirm that an empty final text is a valid, non-error outcome: cases where OCR cannot recover text assert `parser.get_text() == ""` (and `archive_path is None` for the relevant skip/encrypted scenarios) rather than expecting an exception to propagate `[src/paperless_tesseract/tests/test_parser.py]`. This matches the live near-blank result in §5.3.
+Parser tests confirm that an empty final text is a valid, non-error outcome: cases where OCR cannot recover text assert `parser.get_text() == ""` (and `archive_path is None` for the relevant skip/encrypted scenarios) rather than expecting an exception to propagate — e.g. `test_encrypted` under `OCR_MODE="skip"` asserts both `parser.archive_path is None` and `parser.get_text() == ""` `[src/paperless_tesseract/tests/test_parser.py:L177-187]`. This matches the live near-blank result in §5.3.
 
 
 ---
@@ -451,6 +453,6 @@ The source code is the source of truth. Every system claim in this document is a
 | Question | One-line answer | Primary code anchor |
 |----------|-----------------|---------------------|
 | **Q1** — Seeing active OCR on a text-free image | Watch the Django-Q task, the `ws/status/` `STARTING→WORKING→SUCCESS` stream, and the `"Calling OCRmyPDF with args"` debug log; processing state is **transient** (no in-progress DB row). | `[src/documents/consumer.py:L202,L375]`, `[src/paperless_tesseract/parsers.py:L260]` |
-| **Q2** — Skip vs. touch for a text-bearing input | Only `skip_noarchive` + existing text **bypasses** OCRmyPDF; the default `skip` **still invokes** it (and still archives). Images always OCR. Tell them apart by the **archive**. | `[src/paperless_tesseract/parsers.py:L241-244,L157-158,L260-261]` |
-| **Q3** — Comparing API responses | `content` carries text **regardless of origin**; no field labels OCR vs. pre-existing text. The differentiator is `archived_file_name`. | `[src/documents/serialisers.py:L227,L213-217]`, `[src/documents/models.py:L117]` |
+| **Q2** — Skip vs. touch for a text-bearing input | Only `skip_noarchive` + existing text **bypasses** OCRmyPDF; the default `skip` **still invokes** it (and still archives). Images always OCR. For the normal text-PDF `skip`-vs-`skip_noarchive` case, tell them apart by the **archive** (not a universal proof — signed/encrypted/error PDFs can also lack one `[src/paperless_tesseract/tests/test_parser.py:L162-187]`). | `[src/paperless_tesseract/parsers.py:L241-244,L157-158,L260-261]` |
+| **Q3** — Comparing API responses | `content` carries text **regardless of origin**; no field labels OCR vs. pre-existing text. In the controlled text-PDF comparison the differentiator is `archived_file_name`. | `[src/documents/serialisers.py:L227,L213-217]`, `[src/documents/models.py:L117]` |
 | **Q4** — Final state under weak OCR | Still **fully processed**: the row is created with possibly-empty `content`; there is **no** OCR-quality/status field in the model. | `[src/paperless_tesseract/parsers.py:L318-327]`, `[src/documents/consumer.py:L400]`, `[src/documents/models.py:L88-200]` |
