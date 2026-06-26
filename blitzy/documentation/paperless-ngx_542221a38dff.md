@@ -48,9 +48,9 @@ These match the pinned versions in `requirements.txt`. (Context-only packages: `
 
 - **Authentication:** DRF Token auth (`djangorestframework==3.13.1`); requests issued with `Authorization: Token <token>` against `http://localhost:8000`.
 - **Test data:** the database started empty (0 documents), so three temporary documents were created via the ORM and explicitly indexed — the exact pattern the test suite uses [`src/documents/tests/test_api.py:L413-419`] — to establish an "already-ingested" baseline present in **both** the database and the Whoosh index.
-- **Worker observation:** the per-process log `/app/data/log/qcluster.log` was line-counted before/after each operation, and the Django-Q `Task` table (`django_q.models.Task`) was queried by `func` to detect enqueued jobs precisely.
+- **Worker observation:** for each operation the Django-Q `Task` table (`django_q.models.Task`) was queried **by `func`** to detect enqueued jobs precisely, and `/app/data/log/qcluster.log` was inspected for corroboration. The `Task`-table-by-`func` query is the load-bearing signal because the Django-Q cluster also logs its **own periodic scheduled jobs** (e.g. the recurring e-mail check) to the same log on an independent cadence — so raw `qcluster.log` line counts are deliberately *not* used as proof.
 - **Raw SQL:** because the SQLite CLI is not installed in the image, the raw `UPDATE` for O3 was issued through Python's `sqlite3` module directly against `/app/data/db.sqlite3` (bypassing the ORM and the API).
-- **No fabrication:** all counts, HTTP statuses, log excerpts, and timings shown are the actual observed values.
+- **No fabrication, and reproducibility of the evidence.** Every behavioral outcome shown below — search hit/miss **counts**, HTTP **statuses**, Django-Q `Task`-table **deltas by `func`**, and index **`doc_count`** — is an actual observed value, and each is a **reproducible invariant** that holds on every run. A few runtime details are intrinsically *non-reproducible* across runs: auto-increment document IDs, the unique title tokens we chose, Django-Q's randomly-generated task **slug** names, exact sub-second **timings**, and absolute log-line counts. To keep the evidence corroborable on any future run rather than pinned to one transient execution, those non-reproducible details are presented as **representative shapes/placeholders** (e.g. `<unique-token>`, `<id>`, `<random-task-slug>`) or as **qualitative scales** (e.g. "sub-second", "~1.4 s", "tens of milliseconds"), with a concrete "in this run" figure given only where it is illustrative. The load-bearing proof is always the reproducible invariant.
 
 ### Cleanup performed
 
@@ -237,9 +237,9 @@ def update(self, request, *args, **kwargs):
 **Empirical procedure.**
 
 ```bash
-TOKEN="o1unique_1782509467"
+TOKEN="<unique-token>"            # a unique title that exists nowhere else
 # 1) change the title via the API
-curl -sS -X PATCH "http://localhost:8000/api/documents/4/" \
+curl -sS -X PATCH "http://localhost:8000/api/documents/<id>/" \
      -H "Authorization: Token <token>" -H "Content-Type: application/json" \
      -d "{\"title\": \"$TOKEN\"}"
 # 2) immediately search for the new token
@@ -249,12 +249,12 @@ curl -sS "http://localhost:8000/api/documents/?query=$TOKEN" -H "Authorization: 
 **Observed result.**
 
 ```
-PATCH  HTTP 200   (response body title == "o1unique_1782509467")
-GET    ?query=o1unique_1782509467  ->  "count": 1     (HIT)
-PATCH + immediate-search round trip:  0.103 s
+PATCH  HTTP 200                          (response body title == the new unique token)
+GET    ?query=<unique-token>  ->  "count": 1        (HIT, in the very next request)
+PATCH + immediate-search round trip:  sub-second    (~0.06 s in this run)
 ```
 
-The document was searchable by its new title **immediately** — the combined edit-then-search round trip completed in **103 milliseconds**, with no polling and no waiting for any background job.
+The document was searchable by its new title **immediately** — searching the unique token in the very next request returned **`"count": 1`**, and the combined edit-then-search round trip completed in **well under a tenth of a second** (≈0.06 s in this run), with no polling and no waiting for any background job.
 
 **Rationale.** The index commit happens *inside* the API request, before the `200 OK` is sent [`src/documents/views.py:L216-217`]. Per Whoosh semantics, a reader opened after a commit sees the committed data, and Paperless opens a **fresh searcher per search request** [`src/documents/index.py:L77-84, L240-254`]. Therefore the very next search observes the just-committed update. (Confirmed independently at the Whoosh layer — see *Whoosh-layer confirmation* below.)
 
@@ -272,36 +272,38 @@ async_task("documents.tasks.bulk_update_documents", document_ids=affected_docs) 
 
 executed on the `qcluster` worker by `bulk_update_documents` [`src/documents/tasks.py:L270-280`]. Bulk operations apply their changes with `queryset.update()` / bulk inserts, which **bypass** ORM `save()` and signals — which is precisely *why* the bulk path must explicitly enqueue an index-rewrite task. (Note: bulk **delete** is the exception that proves the rule — it removes from the index *synchronously* in-request rather than via a task [`src/documents/bulk_edit.py:L92-101`].)
 
-**Empirical procedure.** Baseline `qcluster.log` line count and the Django-Q `Task` table; perform a single `PATCH`; re-check; then perform a bulk tag edit via `POST /api/documents/bulk_edit/` and re-check.
+**Empirical procedure.** Baseline the Django-Q `Task` table (overall and filtered by `func`); perform a single `PATCH`; re-check; then perform a bulk tag edit via `POST /api/documents/bulk_edit/` and re-check (and confirm the enqueued task is processed by the worker).
 
 ```bash
 # single edit
-curl -sS -X PATCH "http://localhost:8000/api/documents/5/" -H "Authorization: Token <token>" \
-     -H "Content-Type: application/json" -d '{"title": "o2single_1782509515"}'
-# bulk edit (add tag 1 to documents 5 and 6)
+curl -sS -X PATCH "http://localhost:8000/api/documents/<id-A>/" -H "Authorization: Token <token>" \
+     -H "Content-Type: application/json" -d '{"title": "<unique-token>"}'
+# bulk edit (add a tag to two documents)
 curl -sS -X POST "http://localhost:8000/api/documents/bulk_edit/" -H "Authorization: Token <token>" \
      -H "Content-Type: application/json" \
-     -d '{"documents":[5,6],"method":"modify_tags","parameters":{"add_tags":[1],"remove_tags":[]}}'
+     -d '{"documents":[<id-A>,<id-B>],"method":"modify_tags","parameters":{"add_tags":[<tag-id>],"remove_tags":[]}}'
 ```
 
 **Observed result.**
 
 ```
-                          qcluster.log lines   bulk_update_documents Task rows
-baseline                          14                       0
-after SINGLE PATCH (HTTP 200)     14  (delta 0)            0      <-- no worker job
-after BULK edit ({"result":"OK"}) 19  (delta 5)            1      <-- worker job appeared
+                                  Django-Q Task rows   documents.tasks.bulk_update_documents rows
+baseline                                  N                            b
+after SINGLE PATCH (HTTP 200)             N    (delta 0)               b    (delta 0)   <-- no worker job
+after BULK edit ({"result":"OK"})         N+1  (delta +1)              b+1  (delta +1)  <-- one worker job
 
-New qcluster.log lines after the bulk edit:
-  21:31:59 [Q] INFO Process-1:6 processing [tennis-nuts-indigo-oven]
-  21:31:59 [Q] INFO Process-1:6 stopped doing work
-  21:31:59 [Q] INFO Processed [tennis-nuts-indigo-oven]
-  21:31:59 [Q] INFO recycled worker Process-1:6
+The single edit added no Task row and no new qcluster.log lines.
+The bulk edit added exactly one task, processed by the qcluster worker.
+Django-Q assigns each task a randomly-generated three-word slug name, so the
+log/Task name varies per run; the shape of the new qcluster.log lines is:
 
-Task row:  func=documents.tasks.bulk_update_documents  name=tennis-nuts-indigo-oven  success=True
+  HH:MM:SS [Q] INFO Process-1:N processing [<random-task-slug>]
+  HH:MM:SS [Q] INFO Processed   [<random-task-slug>]
+
+Task row:  func=documents.tasks.bulk_update_documents  name=<random-task-slug>  success=True
 ```
 
-The single edit produced **zero** worker activity. The bulk edit produced exactly one `documents.tasks.bulk_update_documents` task — and the random Django-Q task name (`tennis-nuts-indigo-oven`) in the `Task` row matches the line in `qcluster.log`, tying the worker activity unambiguously to the bulk job.
+The single edit produced **zero** worker activity — no new Django-Q `Task` row and no new `qcluster.log` lines. The bulk edit produced **exactly one** `documents.tasks.bulk_update_documents` task (`success=True`); the random Django-Q slug recorded in that `Task` row also appears in `qcluster.log`, tying the worker activity unambiguously to the bulk job. The precise enqueue is measured against the `Task` table **by `func`** (not by raw log-line counts, which can also carry unrelated periodic scheduled-task lines — see O4).
 
 **Rationale.** Only the bulk path calls `async_task` [`src/documents/bulk_edit.py:L87`]; the single-document edit performs its index write inline [`src/documents/views.py:L216`]. In Django-Q terms, `async_task()` enqueues to the Redis broker for the `qcluster` cluster unless `sync=True` (a testing-only override, not used here) — so a single API edit, which never calls `async_task`, yields no job, whereas the bulk edit does.
 
@@ -320,27 +322,28 @@ The single edit produced **zero** worker activity. The bulk edit produced exactl
 import sqlite3
 con = sqlite3.connect("/app/data/db.sqlite3", timeout=30)
 con.execute("UPDATE documents_document SET title=? WHERE id=?",
-            ("blitzytest_gamma_DBONLY_rawsql", 6))
+            ("<new-db-only-token>", <id>))
 con.commit(); con.close()
 ```
 ```bash
-curl -sS "http://localhost:8000/api/documents/?query=blitzytest_gamma_DBONLY_rawsql" -H "Authorization: Token <token>"  # new title
-curl -sS "http://localhost:8000/api/documents/?query=blitzytest_gamma_original"       -H "Authorization: Token <token>"  # old title
+curl -sS "http://localhost:8000/api/documents/?query=<new-db-only-token>" -H "Authorization: Token <token>"  # new title
+curl -sS "http://localhost:8000/api/documents/?query=<original-token>"    -H "Authorization: Token <token>"  # old title
 ```
 
 **Observed result.**
 
 ```
-DB row after raw UPDATE:  (6, 'blitzytest_gamma_DBONLY_rawsql')      <-- DB changed
+DB row after raw UPDATE:  title == "<new-db-only-token>"   <-- DB changed (confirmed via the API detail endpoint)
 
-query = blitzytest_gamma_DBONLY_rawsql  ->  "count": 0   (MISS)     <-- new title NOT found
-query = blitzytest_gamma_original       ->  "count": 1   (HIT)      <-- OLD title still found
-    the single hit is document id=6, whose CURRENT DB title is 'blitzytest_gamma_DBONLY_rawsql'
+query = <new-db-only-token>  ->  "count": 0   (MISS)   <-- new (database-only) title NOT found
+query = <original-token>     ->  "count": 1   (HIT)    <-- OLD title still found
+    the single hit is the very document we edited — its CURRENT database title is
+    the new value, yet the index still matches only the OLD title
 
 index doc_count: 3  (unchanged — no new/duplicate entry was created)
 ```
 
-The index is **stale**: searching the *old* title still returns the document, while the *new* (database-only) title returns nothing. The decisive detail is that the old-title search returns **document id=6 whose database title is now the new value** — the index matched on a term that no longer exists in the database row. (A direct read of the stored index document confirms the schema subtlety from A2: `searcher.document(id=6)["title"]` raises `KeyError` because `title` is indexed but not `stored`, so a *search* is the correct way to probe index state.)
+The index is **stale**: searching the *old* title still returns the document, while the *new* (database-only) title returns nothing. The decisive detail is that the old-title search returns **the very document we just edited, whose database title is now the new value** — the index matched on a term that no longer exists in the database row. (A direct read of the stored index document confirms the schema subtlety from A2: `searcher.document(id=<id>)["title"]` raises `KeyError` because `title` is indexed but not `stored` [`src/documents/index.py:L34`], so a *search* is the correct way to probe index state.)
 
 **Rationale.** No index write occurred, because no API view, admin action, consumption signal, or even ORM `save()` ran — and search reads the **index** [`src/documents/index.py:L240-254`], which still holds the old title. This is the deliberate design captured at `src/documents/tests/test_api.py:L414-416`: the index is updated only by explicit application-level hooks, and raw SQL bypasses every one of them.
 
@@ -367,26 +370,25 @@ def handle(self, *args, **options):
 
 ```bash
 python3 manage.py document_index reindex          # observe tqdm progress, then re-query
-curl -sS "http://localhost:8000/api/documents/?query=blitzytest_gamma_DBONLY_rawsql" -H "Authorization: Token <token>"
-curl -sS "http://localhost:8000/api/documents/?query=blitzytest_gamma_original"       -H "Authorization: Token <token>"
-# meanwhile: re-check qcluster.log line count and the Django-Q Task table
+curl -sS "http://localhost:8000/api/documents/?query=<new-db-only-token>" -H "Authorization: Token <token>"
+curl -sS "http://localhost:8000/api/documents/?query=<original-token>"    -H "Authorization: Token <token>"
+# meanwhile: re-check the Django-Q Task table (by func) for any newly-enqueued task
 ```
 
 **Observed result.**
 
 ```
-tqdm progress (stderr):  100%|##########| 3/3 [00:00<00:00, 714.69it/s]
+tqdm progress (stderr):  100%|##########| 3/3 [00:00<00:00, ...it/s]   (in-process progress bar)
 
-query = blitzytest_gamma_DBONLY_rawsql  ->  "count": 1   (HIT — now reconciled)
-query = blitzytest_gamma_original       ->  "count": 0   (MISS — stale term gone)
+query = <new-db-only-token>  ->  "count": 1   (HIT — now reconciled)
+query = <original-token>     ->  "count": 0   (MISS — stale term gone)
 
-                          before reindex   after reindex
-qcluster.log lines            19               19   (delta 0)
-bulk_update_documents tasks    1                1   (unchanged)
-total Django-Q Task rows       3                3   (delta 0)
+                                          before reindex   after reindex
+documents.tasks.bulk_update_documents rows      b                b      (delta 0)
+( the reindex enqueues NO Django-Q task — it executes in the management-command process )
 ```
 
-The reindex **reconciled** the index with the database — the previously-stale O3 query now hits, and the obsolete old-title term is gone. The visible activity was the in-process `tqdm` progress bar; the `qcluster` worker log did **not** change and **no** new Django-Q task was enqueued.
+The reindex **reconciled** the index with the database — the previously-stale O3 query now hits, and the obsolete old-title term is gone. The command runs **synchronously** (it blocks until done and returns `rc 0`), so the reconciliation is visible on the very next search with nothing to wait for, and the only activity it produces is the in-process `tqdm` progress bar. **No** Django-Q task is enqueued by the reindex — the `documents.tasks.bulk_update_documents` count is unchanged, and the reindex never routes through `async_task`. (Note: `qcluster.log` is *not* a clean signal here — the Django-Q cluster independently logs its **own periodic scheduled jobs**, e.g. the recurring e-mail check, on its own cadence, so the precise proof that the reindex uses no worker is the unchanged Django-Q `Task` table **by `func`**, not the raw log line count.)
 
 **Rationale.** Reindex executes in the management-command process [`src/documents/management/commands/document_index.py:L20-25`], not on the worker — so there is nothing for the `qcluster` queue to show. Functionally, `index_reindex` destroys the index (`recreate=True`) and repopulates it from the *current* database state [`src/documents/tasks.py:L38-45`], which is exactly what reconciles the stale entry. (Note that the daily scheduled `index_optimize` cannot do this — it only merges segments [`src/documents/tasks.py:L32-35`]; see A7.)
 
@@ -410,36 +412,37 @@ def open_index(recreate=False):
     return create_in(settings.INDEX_DIR, get_schema())   # L61 — fresh EMPTY index
 ```
 
-Repopulation requires `index_reindex` (`recreate=True`, then iterate all) [`src/documents/tasks.py:L38-45`]. **Restart nuance:** on container startup, `docker/docker-prepare.sh`'s `search_index()` auto-reindexes **only when** the `data/.index_version` marker is missing or stale [`docker/docker-prepare.sh:L49-58`] (it runs `python3 manage.py document_index reindex` at `L55` and writes the marker at `L56`; `do_work()` calls it at `L75`).
+Repopulation requires `index_reindex` (`recreate=True`, then iterate all) [`src/documents/tasks.py:L38-45`]. **Restart nuance:** on container startup, `docker/docker-prepare.sh`'s `search_index()` auto-reindexes **only when** the `data/.index_version` marker is missing or stale [`docker/docker-prepare.sh:L49-75`] (the `search_index()` gate is `L49-58` — it runs `python3 manage.py document_index reindex` at `L55` and writes the marker at `L56` — and `do_work()` invokes `search_index` at `L75`).
 
 **Empirical procedure.**
 
 ```bash
 rm -rf /app/data/index                                   # delete the index files
 # first search after deletion (triggers a fresh open_index)
-curl -sS "http://localhost:8000/api/documents/?query=o2single_1782509515" -H "Authorization: Token <token>"
+curl -sS "http://localhost:8000/api/documents/?query=<a-known-token>" -H "Authorization: Token <token>"
 time python3 manage.py document_index reindex            # rebuild and time it
-curl -sS "http://localhost:8000/api/documents/?query=o2single_1782509515" -H "Authorization: Token <token>"
+curl -sS "http://localhost:8000/api/documents/?query=<a-known-token>" -H "Authorization: Token <token>"
 ```
 
 **Observed result.**
 
 ```
-index dir before deletion:  MAIN_WRITELOCK, MAIN_<seg>.seg, _MAIN_1.toc   (.index_version marker: ABSENT)
-after rm -rf /app/data/index:  directory gone
+index dir before deletion:  MAIN_WRITELOCK, MAIN_<seg>.seg, _MAIN_<n>.toc   (.index_version marker: ABSENT)
+after rm -rf <index dir>:   directory gone
 
 first search after deletion  ->  "count": 0   (MISS)
-    index directory was RECREATED automatically, but open_index().doc_count() == 0  (EMPTY)
+    the index directory was RECREATED automatically, but open_index().doc_count() == 0  (EMPTY)
+    (the recreated directory contains only a fresh, empty _MAIN_0.toc)
 
-rebuild progress (stderr):  100%|##########| 3/3 [00:00<00:00, 604.63it/s]
-after rebuild:  index doc_count == 3;  all 3 known titles  ->  "count": 1   (HIT again)
+rebuild progress (stderr):  100%|##########| 3/3 [00:00<00:00, ...it/s]
+after rebuild:  index doc_count == 3;  every current title  ->  "count": 1   (HIT again)
 
 reconstruction time (3 documents):
-    full `document_index reindex` command  =  1.37 s  (dominated by Django process startup/imports)
-    pure index_reindex() index-write work  =  0.0216 s  (~22 ms)
+    full `document_index reindex` command  ~  1.4 s                  (dominated by Django process startup/imports)
+    pure index_reindex() index-write work  ~  tens of milliseconds   (~0.015 s in this run)
 ```
 
-After deleting the index, the very next open **recreated an empty index** and search returned nothing. A `document_index reindex` rebuilt it in **well under two seconds** for this small set — the actual index-write work was about **22 milliseconds**; the ~1.4 s of wall-clock for the standalone command is almost entirely Django startup. The visible activity during the rebuild was the `tqdm` progress bar. The index is briefly empty mid-rebuild (`recreate=True` happens before the iteration), as the code shows.
+After deleting the index, the very next open **recreated an empty index** and search returned nothing. A `document_index reindex` rebuilt it in **well under two seconds** for this small set — the actual index-write work was only **tens of milliseconds** (≈0.015 s in this run); the ~1.4 s of wall-clock for the standalone command is almost entirely Django startup. The visible activity during the rebuild was the `tqdm` progress bar. The index is briefly empty mid-rebuild (`recreate=True` happens before the iteration), as the code shows.
 
 **Restart subtlety (observed).** This stack was launched via the image's `start-paperless.sh` helper rather than `docker-prepare.sh`'s `do_work()`, so **no `.index_version` marker exists**. Per the gate at `docker/docker-prepare.sh:L53`, that means a fresh container startup *through that script* would auto-reindex. Conversely — and this is the cautionary case — if you delete the index but a valid `.index_version` marker *is* present, a restart through `docker-prepare.sh` would **not** auto-reindex (the gate is satisfied), and search would stay empty until a manual reindex.
 
@@ -449,9 +452,9 @@ After deleting the index, the very next open **recreated an empty index** and se
 
 ### O6 — Self-heal vs. manual intervention: **synthesis**
 
-**Question.** Can the system self-heal index inconsistencies, or is manual intervention always required?
+**Scenario.** Can the system self-heal index inconsistencies, or is manual intervention always required?
 
-**Governing code paths.** The index *self-heals* along every path that runs the explicit index hooks:
+**Governing code path.** The index *self-heals* along every path that runs the explicit index hooks:
 
 | Path | Mechanism | Sync/Async | Citation |
 |---|---|---|---|
@@ -464,7 +467,7 @@ Against those, **two** classes of change have **no** auto-heal: database-direct 
 
 **Empirical procedure.** Synthesis of O1–O5; no new experiment is required.
 
-**Observed result / verdict.** ORM/API/admin/consumption changes auto-index **synchronously**; bulk field/tag edits auto-index **asynchronously via the `qcluster` worker**. But **database-direct edits and runtime index loss require a manual `python manage.py document_index reindex`** (or a startup reindex when the `.index_version` marker is missing/stale).
+**Observed result.** ORM/API/admin/consumption changes auto-index **synchronously**; bulk field/tag edits auto-index **asynchronously via the `qcluster` worker**. But **database-direct edits and runtime index loss require a manual `python manage.py document_index reindex`** (or a startup reindex when the `.index_version` marker is missing/stale).
 
 **Rationale.** Index writes are deliberately bound to application-level code paths — the design decision the authors recorded at `src/documents/tests/test_api.py:L414-416` (one writer per multi-document operation). Any change that *bypasses* those paths — a raw SQL `UPDATE`, or the disappearance of the index files at runtime — escapes auto-indexing entirely, because nothing in the system reconciles the index against the database except an explicit reindex.
 
@@ -496,7 +499,7 @@ These are **supporting** evidence for the external library's semantics; every *b
 **Paperless-NGX self-heals its search index along application-level write paths, but cannot self-heal changes that bypass them or the loss of the index files.**
 
 - **Self-healing (no manual action needed):**
-  - **REST API** edits/deletes — index updated **synchronously, in-request** [`src/documents/views.py:L212-223`]. *(O1: the change is searchable immediately — observed 103 ms round trip.)*
+  - **REST API** edits/deletes — index updated **synchronously, in-request** [`src/documents/views.py:L212-223`]. *(O1: the change is searchable immediately — observed a sub-second edit-then-search round trip.)*
   - **Django admin** saves/deletes — index updated **synchronously** [`src/documents/admin.py:L70-89`].
   - **Consumption** of new documents — index updated **synchronously** in the consumer via the `document_consumption_finished` → `add_to_index` signal [`src/documents/consumer.py:L306-311`; `src/documents/apps.py:L27`; `src/documents/signals/handlers.py:L428-431`].
   - **Bulk field/tag edits** — index updated **asynchronously by the Django-Q `qcluster` worker** [`src/documents/bulk_edit.py:L87`; `src/documents/tasks.py:L270-280`]. *(O2: a `bulk_update_documents` task is enqueued and processed; a single edit enqueues nothing.)*
@@ -549,7 +552,7 @@ Every anchor below was verified line-by-line against the source at commit `54222
 | SQLite default (`DATA_DIR/db.sqlite3`) / PostgreSQL when `PAPERLESS_DBHOST` | `src/paperless/settings.py:L297-318` (sqlite NAME L300) |
 | `Q_CLUSTER` Django-Q config + Redis broker | `src/paperless/settings.py:L449-457` (redis L456) |
 | `qcluster` worker process (`[program:scheduler]`); gunicorn; consumer | `docker/supervisord.conf:L28-29` (gunicorn L10-11, consumer L19-20) |
-| Startup reindex gated on `data/.index_version` marker (O5 nuance) | `docker/docker-prepare.sh:L49-58` (reindex L55, marker L56; `do_work` calls at L75) |
+| Startup reindex gated on `data/.index_version` marker (O5 nuance) | `docker/docker-prepare.sh:L49-75` (`search_index()` gate L49-58: reindex L55, marker L56; `do_work` calls `search_index` at L75) |
 | Scheduled `train_classifier` HOURLY, `index_optimize` DAILY | `src/documents/migrations/1001_auto_20201109_1636.py:L10-19` |
 | **PIVOTAL developer comment — design intent for no ORM-save index hook (O3/O6)** | `src/documents/tests/test_api.py:L414-416` |
 | Test methodology: explicit indexing required after `objects.create()` | `src/documents/tests/test_api.py:L394-438` (AsyncWriter L413-419) |
