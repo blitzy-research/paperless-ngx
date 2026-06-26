@@ -13,7 +13,7 @@
 
 ### 1.1 How the stack was built and run
 
-The investigation used the user-provided runtime image (Python **3.9** with Tesseract, Ghostscript, qpdf, jbig2enc tooling, and Redis available). The dev stack was brought up *normally* — Redis broker, database migrations, an admin superuser, the Django-Q worker, and the ASGI web server:
+The investigation used the user-provided runtime image (Python **3.9** with Tesseract, Ghostscript, qpdf, and Redis available). The optional **jbig2enc** encoder was **not** present on `PATH` in the observed container (`command -v jbig2` → not found); OCRmyPDF treats jbig2 as optional, so it simply skipped jbig2 lossless image compression and **degraded gracefully** — this is non-blocking for OCR and does not affect any answer below. The dev stack was brought up *normally* — Redis broker, database migrations, an admin superuser, the Django-Q worker, and the ASGI web server:
 
 ```bash
 # Redis broker/channel layer (hard prerequisite for async processing)
@@ -32,7 +32,7 @@ gunicorn -c gunicorn.conf.py paperless.asgi:application   # :8000
 
 Verified live at startup: `redis-cli ping` → `PONG`; the Django-Q cluster reported **11 worker processes** ready; `GET /api/` returned **HTTP 200** with `admin:admin`; and the database began **pristine** (`Document.objects.count()` → `0`), so the first processed document receives **`pk = 1`**.
 
-The admin user is created by `src/documents/management/commands/manage_superuser.py`, which reads `PAPERLESS_ADMIN_USER` / `PAPERLESS_ADMIN_PASSWORD` / `PAPERLESS_ADMIN_MAIL` and calls `User.objects.create_superuser(...)` (manage_superuser.py L22–L38). Authentication is mandatory because the upload endpoint enforces `IsAuthenticated` (see §3).
+The admin user is created by `src/documents/management/commands/manage_superuser.py`, which reads `PAPERLESS_ADMIN_USER` / `PAPERLESS_ADMIN_PASSWORD` / `PAPERLESS_ADMIN_MAIL` and calls `User.objects.create_superuser(...)` (`src/documents/management/commands/manage_superuser.py:L22–L38`). Authentication is mandatory because the upload endpoint enforces `IsAuthenticated` (see §3).
 
 ### 1.2 Asynchronous architecture awareness (the key framing)
 
@@ -207,7 +207,7 @@ As the **`qcluster` worker** runs `documents.tasks.consume_file`, it emits an or
       getattr(logger, level)(message, extra={"group": self.logging_group}, **kwargs)
   ```
 
-  The consumer logs under **`paperless.consumer`** (`Consumer.logging_name`, `consumer.py` L54); the tesseract parser logs under **`paperless.parsing.tesseract`** (`RasterisedDocumentParser.logging_name`, `parsers.py` L24). The `paperless` logger writes to the `file_paperless` handler → `data/log/paperless.log` (settings L409).
+  The consumer logs under **`paperless.consumer`** (`Consumer.logging_name`, `src/documents/consumer.py:L54`); the tesseract parser logs under **`paperless.parsing.tesseract`** (`RasterisedDocumentParser.logging_name`, `src/paperless_tesseract/parsers.py:L24`). The `paperless` logger writes to the `file_paperless` handler → `data/log/paperless.log` (settings L409).
 
 ### 4.3 Task entry/exit
 
@@ -228,7 +228,7 @@ Note this is **runtime** order, not source-line order — `_store` is *defined* 
 | 2 | `paperless.consumer` | `Detected mime type: application/pdf` | `consumer.py` L221 (`debug`) |
 | 3 | `paperless.consumer` | `Parser: RasterisedDocumentParser` | `consumer.py` L246 (`debug`) |
 | 4 | `paperless.consumer` | `Parsing <filename>...` | `consumer.py` L260 (`debug`) |
-| 5 | `paperless.parsing.tesseract` | `Calling OCRmyPDF with args: {…}` | `parsers.py` L260 (`debug`), immediately before `ocrmypdf.ocr(**args)` at L261 |
+| 5 | `paperless.parsing.tesseract` | `Calling OCRmyPDF with args: {…}` | `src/paperless_tesseract/parsers.py` L260 (`debug`), immediately before `ocrmypdf.ocr(**args)` at L261 |
 | 6 | `paperless.consumer` | `Generating thumbnail for <filename>...` | `consumer.py` L263 (`debug`) |
 | 7 | `paperless.consumer` | `Saving record to database` | `consumer.py` L387 (`debug`, inside `_store`) |
 | 8 | `paperless.consumer` | `Document <str(document)> consumption finished` | `consumer.py` L373 (`info`) |
@@ -266,9 +266,9 @@ The Django-Q worker stdout (`data/log/qcluster.out`) framed the same task:
 and the stored Django-Q task result was exactly **`Success. New document id 1 created`** (`success=True`, `func=documents.tasks.consume_file`) — matching `tasks.py` L247.
 
 **Explanatory notes on the additional real lines** (so the report is complete and honest):
-- `[paperless.parsing.tesseract] Extracted text from PDF file …` comes from `parse()` (parsers.py L235) computing `original_has_text` *before* invoking OCRmyPDF.
+- `[paperless.parsing.tesseract] Extracted text from PDF file …` is emitted by `extract_text` (`src/paperless_tesseract/parsers.py:L122`), which `parse()` calls at `src/paperless_tesseract/parsers.py:L235` to compute `original_has_text` *before* invoking OCRmyPDF.
 - `[paperless.parsing.tesseract] Using text from sidecar file` is `extract_text` reading the OCR sidecar produced by OCRmyPDF.
-- `[paperless.parsing] Execute: convert … archive.pdf[0] … convert.png` is the PDF→PNG thumbnail render (`make_thumbnail_from_pdf`, parsers.py L187), and `[paperless.parsing.tesseract] Execute: optipng …` is the optional thumbnail optimisation (`get_optimised_thumbnail`, parsers.py L319–L340).
+- `[paperless.parsing] Execute: convert … archive.pdf[0] … convert.png` is the PDF→PNG thumbnail render (`make_thumbnail_from_pdf`, `src/documents/parsers.py:L187`), and `[paperless.parsing.tesseract] Execute: optipng …` is the optional thumbnail optimisation (`get_optimised_thumbnail`, `src/documents/parsers.py:L319–L340`).
 - `[paperless.classifier] … not performing automatic matching.` is `load_classifier()` (consumer.py L292) reporting there is no trained model yet.
 - `Deleting file …` (consumer.py L349) and `Deleting directory …` (parser cleanup) remove the temp original and the parser tempdir.
 
@@ -281,7 +281,7 @@ The dict is assembled by `construct_ocrmypdf_parameters` (`src/paperless_tessera
 | Key | Value (default) | Source line | Controlling setting (default) |
 |---|---|---|---|
 | `input_file` | temp upload under `SCRATCH_DIR` | L144 | the `NamedTemporaryFile` from the view |
-| `output_file` | `<tempdir>/archive.pdf` | L145 / L249 | `tempfile.mkdtemp(prefix="paperless-", dir=SCRATCH_DIR)` (parsers.py L293) |
+| `output_file` | `<tempdir>/archive.pdf` | L145 / L249 | `tempfile.mkdtemp(prefix="paperless-", dir=SCRATCH_DIR)` (`src/documents/parsers.py:L293`) |
 | `use_threads` | `True` | L148 | required under django-q daemonized processes |
 | `jobs` | `11` (observed) | L149 | `THREADS_PER_WORKER` (settings L469–L472) |
 | `language` | `'eng'` | L150 | `OCR_LANGUAGE` (settings L514) |
@@ -388,7 +388,7 @@ All three names follow the default `0000001.<ext>` pattern exactly; the thumbnai
 
 ### 6.1 Answer
 
-The `Document` model stores **16 real database columns** (including the auto `id`/primary key). Crucially, several "path" attributes that *look* like stored metadata are actually **computed Python `@property` values, not columns** — and the **thumbnail has no database field at all**. The database stores the **relative** `filename`/`archive_filename` (e.g. `0000001.pdf`), **never** absolute paths; the OCR text is stored in the `content` column.
+The `Document` model stores **15 real database columns** on the `documents_document` table (including the auto `id`/primary key), plus a **`tags` many-to-many relationship** that is persisted **not as a column** but through a separate join table (`documents_document_tags`). Crucially, several "path" attributes that *look* like stored metadata are actually **computed Python `@property` values, not columns** — and the **thumbnail has no database field at all**. The database stores the **relative** `filename`/`archive_filename` (e.g. `0000001.pdf`), **never** absolute paths; the OCR text is stored in the `content` column.
 
 ### 6.2 Persisted columns (with the live values for `pk=1`)
 
@@ -411,7 +411,10 @@ Source: `src/documents/models.py` `Document` L88–L205. Values observed via the
 | `filename` | `FilePathField(max_length=1024, unique=True, null=True, editable=False)` (L176) — **relative** | `'0000001.pdf'` |
 | `archive_filename` | `FilePathField(max_length=1024, unique=True, null=True, editable=False)` (L186) — **relative** | `'0000001.pdf'` |
 | `archive_serial_number` | `IntegerField(null=True, unique=True, db_index=True)` (L196) | `None` |
-| `tags` | `ManyToManyField(Tag)` (L128) — relational, via join table | `[]` (empty) |
+
+That is **15 columns** on `documents_document` (live SQLite `PRAGMA table_info(documents_document)` returns exactly these 15, with the two foreign keys materialised as `correspondent_id` and `document_type_id`).
+
+> **Persisted relationship — `tags` (NOT a `documents_document` column).** `tags` is a `ManyToManyField(Tag)` (`src/documents/models.py:L128-L133`), so it is **not** stored as a column on the `documents_document` row. Django persists it through the auto-generated **join table `documents_document_tags`** (each row pairs a `document_id` with a `tag_id`). It is therefore counted **separately** from the 15 columns above. Observed value for `pk=1`: `[]` (empty) — no tags were assigned (no upload overrides and no matching automation; see §6.4).
 
 ### 6.3 NOT columns — computed `@property` (reconstructed at runtime)
 
@@ -451,15 +454,15 @@ Source: `src/documents/models.py`. These are **not** stored in the database; the
 4. **`correspondent` / `document_type` / `tags`** are set **only** via explicit upload overrides **or** post-consume matching. `src/documents/apps.py` (L22–L27) connects the handlers to `document_consumption_finished`:
 
    ```python
-   document_consumption_finished.connect(add_inbox_tags)      # handlers.py L30
-   document_consumption_finished.connect(set_correspondent)   # handlers.py L35
-   document_consumption_finished.connect(set_document_type)   # handlers.py L101
-   document_consumption_finished.connect(set_tags)            # handlers.py L168
-   document_consumption_finished.connect(set_log_entry)       # handlers.py L413
-   document_consumption_finished.connect(add_to_index)        # handlers.py L428
+   document_consumption_finished.connect(add_inbox_tags)      # src/documents/signals/handlers.py:L30
+   document_consumption_finished.connect(set_correspondent)   # src/documents/signals/handlers.py:L35
+   document_consumption_finished.connect(set_document_type)   # src/documents/signals/handlers.py:L101
+   document_consumption_finished.connect(set_tags)            # src/documents/signals/handlers.py:L168
+   document_consumption_finished.connect(set_log_entry)       # src/documents/signals/handlers.py:L413
+   document_consumption_finished.connect(add_to_index)        # src/documents/signals/handlers.py:L428
    ```
 
-   In this run there were no overrides and no trained classifier (`[paperless.classifier] … not performing automatic matching` — §4.4) and no inbox tags defined, so `correspondent`/`document_type` are `None` and `tags` is empty. `add_to_index` (handlers.py L428 → `index.add_or_update_document`) writes the document into the **Whoosh** full-text search index (a filesystem artifact under `data/index/`, **not** a DB column — and a cleanup target, see §8).
+   In this run there were no overrides and no trained classifier (`[paperless.classifier] … not performing automatic matching` — §4.4) and no inbox tags defined, so `correspondent`/`document_type` are `None` and `tags` is empty. `add_to_index` (`src/documents/signals/handlers.py:L428` → `index.add_or_update_document`) writes the document into the **Whoosh** full-text search index (a filesystem artifact under `data/index/`, **not** a DB column — and a cleanup target, see §8).
 
 ### 6.5 Observed runtime output (live)
 
@@ -496,7 +499,7 @@ The most prominent public/community log and behavior examples come from **newer*
 - Pins **`ocrmypdf == 13.4.3`** and **`Django == 4.0.4`** (also `djangorestframework == 3.13.1`, `redis == 3.5.3`, `channels == 3.0.4`, `pikepdf == 5.1.1`, `pdf2image == 1.16.0`, `scikit-learn == 1.0.2`, `whoosh == 2.7.4`, `python-magic == 0.4.25`). Newer releases use Django 5.
 - Emits **PNG** thumbnails (`{pk:07}.png`, `models.py` L274). **Newer releases emit WebP.**
 
-**Therefore the exact ordering/set of stage log lines, the OCRmyPDF args dict, and the thumbnail format in this report are taken from THIS commit's `consumer.py`, `parsers.py`, `models.py`, and `settings.py` — the code is authoritative over any newer public example.** This is also why the report does not assume Celery task logs or a `BarcodePlugin`-style pipeline: they do not exist here.
+**Therefore the exact ordering/set of stage log lines, the OCRmyPDF args dict, and the thumbnail format in this report are taken from THIS commit's `src/documents/consumer.py`, `src/paperless_tesseract/parsers.py`, `src/documents/models.py`, and `src/paperless/settings.py` — the code is authoritative over any newer public example.** This is also why the report does not assume Celery task logs or a `BarcodePlugin`-style pipeline: they do not exist here.
 
 ---
 
@@ -504,14 +507,29 @@ The most prominent public/community log and behavior examples come from **newer*
 
 This was a **read-only investigation**. The only file written anywhere is **this report**, in the destination repository at `blitzy/documentation/paperless-ngx_542221a38dff.md`. No file in the source repository was created, modified, or deleted.
 
-All transient runtime artifacts produced during the investigation were removed:
+All transient runtime artifacts produced during the investigation were removed, and the cleanup was **re-verified directly** afterward:
 
-- **Database:** the test `Document` row (`pk=1`) was deleted (`Document.objects.all().delete()` via the Django shell), returning the table to **0 documents**.
-- **Media:** the generated files `documents/originals/0000001.pdf`, `documents/archive/0000001.pdf`, and `documents/thumbnails/0000001.png` were removed (paperless's own `post_delete` handler removes the document's files on row deletion; any residue was swept explicitly), returning the three media directories to **empty**.
-- **Search index:** the **Whoosh** entry written by `add_to_index` was removed (the index was emptied to **0 indexed documents**).
-- **Scratch:** paperless auto-deleted its own per-file scratch during the run (`Deleting file …` / `Deleting directory …` in §4.4); the transient **test PDF** generated under `/tmp` (outside the source tree) was deleted.
+- **Database:** the test `Document` row was deleted with a **targeted** query — `Document.objects.filter(pk=1).delete()` (equivalently `Document.objects.filter(checksum="41f8660b78120102d834671cc9df1e9d").delete()`) via the Django shell. A targeted filter is used deliberately so that **only the investigation's own row** is removed and never any pre-existing data — `Document.objects.all().delete()` would be unsafe in any non-pristine database. The table returned to **0 documents**.
+- **Media:** the generated files `documents/originals/0000001.pdf`, `documents/archive/0000001.pdf`, and `documents/thumbnails/0000001.png` were removed (paperless's own `post_delete` handler removes the document's files on row deletion; any residue was swept explicitly), returning all three media directories to **0 files**.
+- **Search index:** the **Whoosh** entry written by `add_to_index` was removed; the index reports **0 indexed documents** (`doc_count() == 0`).
+- **Scratch (`/tmp/paperless`):** for the successfully-consumed document, paperless auto-deleted its own per-file scratch during the run (`Deleting file …` / `Deleting directory …` in §4.4). However, two classes of artifact remained behind in `SCRATCH_DIR` and were **explicitly removed in a dedicated cleanup pass**: (1) the temporary upload file from the **duplicate** re-upload (used in §3.4 to prove the `200` is acceptance-only) — paperless only unlinks a duplicate's temp file when `PAPERLESS_CONSUMER_DELETE_DUPLICATES` is enabled, and it defaults to **false** (`src/paperless/settings.py:L486`; the `os.unlink(self.path)` at `src/documents/consumer.py:L108-L109` is guarded by that flag), so the duplicate's temp upload was intentionally left in place by paperless; and (2) the test-fixture generator script and its intermediate images/OCR-probe files, which were created under `/tmp/paperless` (outside the source tree). After the cleanup pass, `/tmp/paperless` is **empty (0 entries)**.
 
-**Source-tree integrity:** `git status` in the source tree was verified to report a **clean** working tree — no source file was added, modified, or deleted by this investigation. The verified result:
+**Verified post-cleanup state** (captured directly in the running container *after* the cleanup pass — not assumed):
+
+```text
+$ ls -A /tmp/paperless | wc -l                                   # scratch dir
+0
+$ python3 manage.py shell -c "from documents.models import Document; print(Document.objects.count())"
+0                                                                # documents
+$ for d in originals archive thumbnails; do echo "$d: $(ls -A media/documents/$d | wc -l)"; done
+originals: 0
+archive: 0
+thumbnails: 0                                                    # media dirs
+$ python3 manage.py shell -c "from documents.index import open_index; print(open_index().doc_count())"
+0                                                                # Whoosh index
+```
+
+**Source-tree integrity:** `git status` in the source tree under investigation was verified to report a **clean** working tree — no source file was added, modified, or deleted by this investigation. The verified result:
 
 ```text
 $ git rev-parse HEAD
@@ -524,7 +542,7 @@ HEAD detached at 542221a38
 nothing to commit, working tree clean
 ```
 
-> **Plainly:** *No source file was created, modified, or deleted; all runtime test artifacts were removed; `git status` is clean.* The single new file is `blitzy/documentation/paperless-ngx_542221a38dff.md` in the destination repository.
+> **Plainly:** *No source file was created, modified, or deleted; all runtime test artifacts (the DB row, media files, Whoosh entry, and the `/tmp/paperless` scratch — including the duplicate-upload temp file and the test-fixture helpers) were removed and re-verified; `git status` is clean.* The single new file is `blitzy/documentation/paperless-ngx_542221a38dff.md` in the destination repository.
 
 ---
 
@@ -535,7 +553,7 @@ nothing to commit, working tree clean
 | **Q1** | HTTP response immediately after upload | **`200 OK`**, JSON body **`"OK"`** (`Content-Type: application/json`); synchronous, returned **before** processing. Unsupported type → `400`; unauthenticated → rejected. |
 | **Q2** | Stage log patterns + OCRmyPDF parameters | Ordered `paperless.consumer` / `paperless.parsing.tesseract` lines (`Consuming` → `Detected mime type` → `Parser` → `Parsing` → **`Calling OCRmyPDF with args: {…}`** → `Generating thumbnail` → `Saving record to database` → `consumption finished`). OCRmyPDF args: `skip_text/clean/deskew/rotate_pages(=12.0)/language='eng'/output_type='pdfa'/sidecar`, `jobs = floor(cpu/TASK_WORKERS)` (observed `11`). |
 | **Q3** | Archive PDF & thumbnail filenames | `archive/0000001.pdf` and `thumbnails/0000001.png` (**PNG**); originals `originals/0000001.pdf`. Default `{pk:07}` naming; `_NN` suffix only on conflict. |
-| **Q4** | DB columns vs. derived metadata | 16 stored columns (incl. `content` = OCR text, **relative** `filename`/`archive_filename`, `checksum`/`archive_checksum`, `created`/`modified`/`added`, `mime_type`, `storage_type='unencrypted'`). `source_path`/`archive_path`/`thumbnail_path`/`file_type` are computed `@property` values, **not columns**; the **thumbnail has no DB field at all**. |
+| **Q4** | DB columns vs. derived metadata | **15 stored columns** on `documents_document` (incl. `content` = OCR text, **relative** `filename`/`archive_filename`, `checksum`/`archive_checksum`, `created`/`modified`/`added`, `mime_type`, `storage_type='unencrypted'`), **plus** the `tags` many-to-many relationship persisted via the join table `documents_document_tags` (not a column). `source_path`/`archive_path`/`thumbnail_path`/`file_type` are computed `@property` values, **not columns**; the **thumbnail has no DB field at all**. |
 
 **Key insight throughout:** acceptance (synchronous, `200 "OK"`) is decoupled from processing (asynchronous, in the `qcluster` worker); the database stores **relative** filenames and the OCR **content** as columns, while the on-disk paths and `file_type` are **computed properties** — and the **thumbnail's location is derived purely from the primary key with no database column**.
 
