@@ -48,23 +48,24 @@ shifts, the code — not the citation — is authoritative.
 
 The runtime is pinned by the base image to **Python 3.9** — `FROM python:3.9-slim-bullseye as main-app`
 `[Dockerfile:L18]`. The dependencies that govern the behaviors under investigation are pinned in
-`requirements.txt` (verified in the running environment as Python 3.9.23):
+`requirements.txt` (exact line citations below):
 
 | Package | Version | Relevance |
 |---------|---------|-----------|
-| scikit-learn | `1.0.2` | `MLPClassifier` used by `DocumentClassifier` `[requirements.txt]` |
-| joblib | `1.1.0` | serialization backend for scikit-learn `[requirements.txt]` |
-| numpy | `1.22.3` | numerical backend; global RNG used by the estimator `[requirements.txt]` |
-| scipy | `1.8.0` | scientific backend `[requirements.txt]` |
-| ocrmypdf | `13.4.3` | the OCR subprocess invoked by the parser `[requirements.txt]` |
-| pdf2image | `1.16.0` | renders PDF pages for barcode scanning `[requirements.txt]` |
-| pyzbar | `0.1.9` | decodes barcodes during the split decision `[requirements.txt]` |
-| django | `4.0.4` | web/ORM framework hosting the `documents` app `[requirements.txt]` |
-| python-magic | (per `Pipfile`) | MIME-type detection of the input document `[Pipfile]` |
-| pytest-xdist | (dev) | parallel test execution (`--numprocesses auto`) — central to the flakiness `[Pipfile]` |
+| scikit-learn | `1.0.2` | `MLPClassifier` used by `DocumentClassifier` `[requirements.txt:L88]` |
+| joblib | `1.1.0` | serialization backend for scikit-learn `[requirements.txt:L55]` |
+| numpy | `1.22.3` | numerical backend; global RNG used by the estimator `[requirements.txt:L59]` |
+| scipy | `1.8.0` | scientific backend `[requirements.txt:L89]` |
+| ocrmypdf | `13.4.3` | the OCR subprocess invoked by the parser `[requirements.txt:L60]` |
+| pdf2image | `1.16.0` | renders PDF pages for barcode scanning `[requirements.txt:L63]` |
+| pyzbar | `0.1.9` | decodes barcodes during the split decision `[requirements.txt:L83]` |
+| django | `4.0.4` | web/ORM framework hosting the `documents` app `[requirements.txt:L38]` |
+| python-magic | (declared in `Pipfile`) | MIME-type detection of the input document `[Pipfile:L31]` |
+| pytest-xdist | (dev) | parallel test execution (`--numprocesses auto`) — central to the flakiness `[Pipfile:L66]` |
 
-The dev/test harness (`pytest-django`, `pytest-env`, `pytest-xdist`, `pytest-sugar`, `pytest-cov`,
-`factory-boy`) is declared in `[Pipfile]`.
+The dev/test harness is declared in `Pipfile`: `pytest-cov` `[Pipfile:L62]`, `pytest-django`
+`[Pipfile:L63]`, `pytest-env` `[Pipfile:L64]`, `pytest-sugar` `[Pipfile:L65]`, `pytest-xdist`
+`[Pipfile:L66]`, and `factory-boy` `[Pipfile:L59]`.
 
 ### 1.5 How the tests are run
 
@@ -337,17 +338,59 @@ self.assertEqual(self.classifier.predict_correspondent(self.doc2.content), None)
 `[-1, c1.pk]` `[src/documents/tests/test_classifier.py:L108]`, consistent with the label analysis in
 §3.1.
 
-Run in isolation, these pass reliably for this tiny, well-separated 2-document dataset:
+Run in isolation, these pass reliably for this tiny, well-separated 2-document dataset. The exact
+20-run loop used (run from `src/`, using the project virtualenv interpreter) was:
 
-```
-$ for i in $(seq 1 20); do pytest .../testPredict -n0 --no-cov -q; done
+```bash
+$ cd src
+$ PASS=0; FAIL=0
+$ for i in $(seq 1 20); do \
+    ../.venv/bin/python -m pytest \
+      documents/tests/test_classifier.py::TestClassifier::testPredict \
+      -n0 --no-cov -q -W ignore >/dev/null 2>&1 \
+    && PASS=$((PASS+1)) || FAIL=$((FAIL+1)); \
+  done
+$ echo "testPredict over 20 independent runs: PASS=$PASS FAIL=$FAIL"
 testPredict over 20 independent runs: PASS=20 FAIL=0
 ```
 
-However, the **underlying estimator is provably non-deterministic**. An isolated probe that
-reproduces the exact training pipeline (same `CountVectorizer` config + `MLPClassifier(tol=0.01)`
-with **no** `random_state`) on the same two effective documents shows the fitted weights differ on
-every run:
+However, the **underlying estimator is provably non-deterministic**. The following **corroboration
+probe** — kept *outside* the repository tree (saved as `/tmp/blitzy_probe_mlp_determinism.py`) so it
+adds no code to the source repo, per the task's scope — reproduces the exact correspondent-training
+pipeline the classifier uses: `CountVectorizer(analyzer="word", ngram_range=(1, 2), min_df=0.01)`
+`[src/documents/classifier.py:L194-L197]` followed by `MLPClassifier(tol=0.01)` with **no**
+`random_state` `[src/documents/classifier.py:L227]`. It is fit on the two effective documents from
+`generate_test_data()` with the same labels `train()` would assign — `doc1`→`c1` is `MATCH_AUTO` so
+its label is `c1.pk`, while `doc2`→`c2` is **not** auto so its label is `-1`
+`[src/documents/classifier.py:L140-L144]`:
+
+```python
+# /tmp/blitzy_probe_mlp_determinism.py  — run with the project venv: ./.venv/bin/python
+import hashlib
+import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.neural_network import MLPClassifier
+
+contents = ["this is a document from c1", "this is another document, but from c2"]
+labels_correspondent = [1, -1]            # c1.pk (MATCH_AUTO) ; -1 (c2 is not auto)
+
+vec = CountVectorizer(analyzer="word", ngram_range=(1, 2), min_df=0.01)
+X = vec.fit_transform(contents)
+
+signatures, doc2_predictions = set(), []
+for _ in range(8):
+    clf = MLPClassifier(tol=0.01)          # NO random_state -> stochastic weight init
+    clf.fit(X, labels_correspondent)
+    coefs = np.concatenate([c.ravel() for c in clf.coefs_])
+    signatures.add(hashlib.sha1(coefs.tobytes()).hexdigest())
+    doc2_predictions.append(int(clf.predict(vec.transform([contents[1]]))[0]))
+
+print(f"distinct fitted-weight signatures across 8 identical fits: {len(signatures)}")
+print(f"=> weights differ run-to-run: {len(signatures) > 1}")
+print(f"predicted label for doc2 across 8 runs: {doc2_predictions}")
+```
+
+Running it (`./.venv/bin/python /tmp/blitzy_probe_mlp_determinism.py`) produced:
 
 ```
 distinct fitted-weight signatures across 8 identical fits: 8
@@ -594,7 +637,40 @@ for doc in Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True):
     ...
 ```
 
-### 6.2 Rationale / Conclusion
+### 6.2 Observed behavior
+
+`test_consume_barcode_file` `[src/documents/tests/test_tasks.py:L395-L406]` exercises this branch
+end-to-end. With `CONSUMER_ENABLE_BARCODES=True` `[src/documents/tests/test_tasks.py:L395]` it copies
+the multi-page fixture `patch-code-t-middle.pdf` into the scratch directory and asserts that
+`consume_file()` returns the split sentinel **instead of** creating a `Document`
+`[src/documents/tests/test_tasks.py:L406]`:
+
+```python
+self.assertEqual(tasks.consume_file(dst), "File successfully split")   # L406
+```
+
+Run serially (coverage disabled) together with `test_separate_pages` — the page-count check reused
+from Q4 `[src/documents/tests/test_tasks.py:L305-L313]`:
+
+```
+$ cd src
+$ ../.venv/bin/python -m pytest \
+    documents/tests/test_tasks.py::TestTasks::test_consume_barcode_file \
+    documents/tests/test_tasks.py::TestTasks::test_separate_pages \
+    -o addopts="" -n0 --no-cov -p no:sugar -v -W ignore
+
+documents/tests/test_tasks.py::TestTasks::test_consume_barcode_file PASSED [ 50%]
+documents/tests/test_tasks.py::TestTasks::test_separate_pages PASSED      [100%]
+============================== 2 passed in 1.80s ===============================
+```
+
+The passing `test_consume_barcode_file` confirms the Q5 mechanism directly: the barcode branch
+returns `"File successfully split"` **without** creating a `Document` in that call. The passing
+`test_separate_pages` confirms the one-separator input produced **two** split files. Each split file
+is subsequently re-consumed independently into its own `Document`, which is exactly what enlarges the
+effective (non-inbox) training set.
+
+### 6.3 Rationale / Conclusion
 
 Because the original input yields no `Document` in the splitting call but its **N split files each
 become a `Document`** upon re-consumption, splitting one input into N parts increases the effective
@@ -781,7 +857,12 @@ Code 128 `[L166]`; `test_separate_pages` `[L305-L313]`
 
 **`Dockerfile`** — `FROM python:3.9-slim-bullseye` `[L18]`
 
-**`requirements.txt` / `Pipfile`** — pinned dependency versions (see §1.4)
+**`requirements.txt`** — `django==4.0.4` `[L38]`, `joblib==1.1.0` `[L55]`, `numpy==1.22.3` `[L59]`,
+`ocrmypdf==13.4.3` `[L60]`, `pdf2image==1.16.0` `[L63]`, `pyzbar==0.1.9` `[L83]`,
+`scikit-learn==1.0.2` `[L88]`, `scipy==1.8.0` `[L89]`
+
+**`Pipfile`** — `python-magic` `[L31]`, `factory-boy` `[L59]`, `pytest-cov` `[L62]`, `pytest-django`
+`[L63]`, `pytest-env` `[L64]`, `pytest-sugar` `[L65]`, `pytest-xdist` `[L66]`
 
 ### 8.2 External best-practice sources (corroboration only)
 
@@ -793,10 +874,16 @@ are paraphrased, not quoted.
    and recommends passing an integer to obtain reproducible results across runs. This corroborates
    Cause #1: instantiating the estimator without `random_state` makes training non-deterministic by
    design. <https://scikit-learn.org/stable/modules/generated/sklearn.neural_network.MLPClassifier.html>
-2. **pytest-xdist test-isolation guidance** — parallel execution does not add randomness; it exposes
-   pre-existing coupling such as shared on-disk state, and the recommended remedy is per-test /
-   per-worker isolation of such resources. This corroborates Cause #4 (the persisted/shared model
-   under `--numprocesses auto`).
+2. **pytest-xdist documentation** — the official docs describe that, under the default `load`
+   distribution, pytest-xdist sends pending tests to **any available worker without a guaranteed
+   order**, so parallelism does not *introduce* randomness but **exposes** pre-existing coupling such
+   as a shared file on disk: differently-scheduled workers can interleave reads/writes of the same
+   persisted artifact. The documented mechanisms for per-worker isolation (e.g. the `worker_id` /
+   `testrun_uid` fixtures) are the basis for the recommended remedy of per-test / per-worker isolation
+   of such resources. This corroborates Cause #4 (the persisted/shared model under
+   `--numprocesses auto`). Paraphrased from the official pytest-xdist documentation:
+   <https://pytest-xdist.readthedocs.io/en/stable/distribution.html> and
+   <https://pytest-xdist.readthedocs.io/en/stable/known-limitations.html>.
 
 ### 8.3 Behavioral verification commands (for reproducibility)
 
@@ -823,9 +910,11 @@ pytest documents/tests/test_tasks.py::TestTasks::test_separate_pages \
        documents/tests/test_tasks.py::TestTasks::test_barcode_reader_128 -n0 --no-cov  # 4 passed
 ```
 
-The estimator non-determinism (Cause #1) was demonstrated with an isolated probe (run outside the
-repository tree) that fits `MLPClassifier(tol=0.01)` repeatedly on the two effective training
-documents and observes a distinct fitted-weight signature on every run.
+The estimator non-determinism (Cause #1) was demonstrated with the isolated corroboration probe shown
+in full in §3.4 (kept outside the repository tree as `/tmp/blitzy_probe_mlp_determinism.py` and run
+with `./.venv/bin/python`), which fits `MLPClassifier(tol=0.01)` repeatedly on the two effective
+training documents and observes a distinct fitted-weight signature on every run. The exact 20-run
+`testPredict` loop command is also given in §3.4 for reproducibility.
 
 ---
 
