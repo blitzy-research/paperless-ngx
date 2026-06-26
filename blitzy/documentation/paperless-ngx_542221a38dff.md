@@ -25,7 +25,9 @@ outside the repository and was deleted afterward. No product code was changed.
 
 ### Capture environment
 
-- **Runtime:** Python 3.9 / Django 4.0.10, with SQLite as the default database.
+- **Runtime:** Python 3.9 / Django 4.0.4, with SQLite as the default database. *(The Django
+  version was verified from `requirements.txt` (`django==4.0.4`) and `Pipfile.lock`
+  (`"version": "==4.0.4"`), corroborated by the runtime environment summary.)*
 - **Storage:** A scratch `MEDIA_ROOT` and `DATA_DIR` were provisioned **outside** the repository
   (under `/tmp/pngx_scratch`) so that no real document store was touched.
 - **Logging:** `DEBUG` was enabled on the `paperless.*` loggers so that the normally-quiet DEBUG
@@ -319,8 +321,13 @@ DEBUG [paperless.classifier] There are no document types. Not training document 
 INFO [paperless.tasks] Saving updated classifier model to /tmp/pngx_scratch/data/classification_model.pickle...
 ```
 
-Persisted `data_hash` (hex) = `083b30f0691d5fdbf30a18acdc96578f364fc92c`, length = **20 bytes**
-(SHA-1 ⇒ 20 bytes / 40 hex). *(ENV-SPECIFIC value; STABLE algorithm and length.)*
+The persisted `data_hash` was captured as a 20-byte SHA-1 digest (40 hex chars):
+
+```
+data_hash (hex) = 083b30f0691d5fdbf30a18acdc96578f364fc92c
+```
+
+Length = **20 bytes** (SHA-1 ⇒ 20 bytes / 40 hex). *(ENV-SPECIFIC value; STABLE algorithm and length.)*
 
 **SECOND run (unchanged data)** — the **SKIP** path:
 
@@ -332,8 +339,12 @@ DEBUG [paperless.tasks] Training data unchanged.
 No "Saving updated classifier model" line was emitted.
 
 **THIRD run (after adding a document)** — a full retrain again: the `INFO`
-`Saving updated classifier model to ...` line reappeared, and the new `data_hash` (hex) =
-`ebb42adf8cf57a694a4f50389a40facee82d08cd`; hash changed vs. the first = **True**.
+`Saving updated classifier model to ...` line reappeared, and the new `data_hash` changed vs. the
+first (changed = **True**):
+
+```
+data_hash (hex) = ebb42adf8cf57a694a4f50389a40facee82d08cd
+```
 
 This is exactly the "instant vs. long" framing: the skip path returns immediately, while the
 retrain path refits the model.
@@ -611,8 +622,19 @@ Five empirical insights emerge across the six behaviors:
 
 | Category | Artifacts |
 |----------|-----------|
-| **STABLE** (content-derived; reproducible anywhere) | All MD5 values — Q4 `ddd79f0900dd38ff0a7c1f9d8febfe7e` and `a9fb6f46f685d8abbe792ea2641636d1`; Q5 `592fc27cbc5285a99d0efae277d93dd0` (stored) and `d1b8e94a9f61ba5ff55d68f369c0883e` (actual). The SHA-1 algorithm plus its 20-byte / 40-hex length. All log message templates and logger names. The filename transform `Invoice.pdf` → `Invoice Paid.pdf`. The relative layout `documents/{originals,archive,thumbnails}/`. |
-| **ENV-SPECIFIC** (varies per run) | Absolute paths (here under `/tmp/pngx_scratch`); document primary keys; timestamps and the `2026-06-26` date prefix in `str(document)`; and the SHA-1 `data_hash` *value* (depends on the full corpus plus label primary keys) — e.g. `083b30f0691d5fdbf30a18acdc96578f364fc92c` then `ebb42adf8cf57a694a4f50389a40facee82d08cd`. |
+| **STABLE** (content-derived; reproducible anywhere) | All MD5 values from Q4 (the original `checksum` and the `archive_checksum`) and Q5 (the stored and actual checksums) — reproduced verbatim in the fenced capture below. The SHA-1 algorithm plus its 20-byte / 40-hex length. All log message templates and logger names. The filename transform `Invoice.pdf` → `Invoice Paid.pdf`. The relative layout `documents/{originals,archive,thumbnails}/`. |
+| **ENV-SPECIFIC** (varies per run) | Absolute paths (here under `/tmp/pngx_scratch`); document primary keys; timestamps and the `2026-06-26` date prefix in `str(document)`; and the SHA-1 `data_hash` *values* from Q3 (they depend on the full corpus plus label primary keys) — reproduced verbatim in the fenced capture below. |
+
+The specific captured hash values referenced above (reproduced verbatim from the Q3–Q5 sections):
+
+```
+STABLE       — MD5,   Q4 original checksum:          ddd79f0900dd38ff0a7c1f9d8febfe7e
+STABLE       — MD5,   Q4 archive_checksum:           a9fb6f46f685d8abbe792ea2641636d1
+STABLE       — MD5,   Q5 stored original checksum:   592fc27cbc5285a99d0efae277d93dd0
+STABLE       — MD5,   Q5 actual recomputed checksum: d1b8e94a9f61ba5ff55d68f369c0883e
+ENV-SPECIFIC — SHA-1, Q3 data_hash (first build):    083b30f0691d5fdbf30a18acdc96578f364fc92c
+ENV-SPECIFIC — SHA-1, Q3 data_hash (third run):      ebb42adf8cf57a694a4f50389a40facee82d08cd
+```
 
 ---
 
