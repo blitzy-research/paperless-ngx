@@ -93,7 +93,7 @@ The worker tunables feeding that block live just above it: `TASK_WORKERS` (L438)
 - `check_sanity(progress=False)` — `src/documents/sanity_checker.py:49-133`. It builds the set of present files by walking `settings.MEDIA_ROOT` (L53‑55), removes the search‑index lock file from that set (L57‑59), then per `Document` validates:
   - **thumbnail** existence and readability (L62‑72),
   - **original file** existence and an **MD5 checksum** match (L74‑91),
-  - **archive file** existence, checksum, filename consistency, integrity, and metadata (L93‑124),
+  - **archive file** checksum/filename field pairing, archive‑file existence and readability, and an **archive MD5 checksum** match (L93‑124),
   - flags **empty `content`** as an info message (L127‑128),
   - and finally reports any files left unreferenced as **orphan warnings** (L130‑131).
 - Logging: `class SanityCheckMessages` — `src/documents/sanity_checker.py:10-42` — collects messages via `error()` (L14‑15), `warning()` (L17‑18), and `info()` (L20‑21); `log_messages()` (L23‑30) emits each through the `paperless.sanity_checker` logger (defined at L24), mapping severity to `logger.error` / `logger.warning` / `logger.info`; `has_error()` (L38‑39) and `has_warning()` (L41‑42) summarize the outcome.
@@ -102,7 +102,7 @@ The worker tunables feeding that block live just above it: `TASK_WORKERS` (L438)
 - Manual entry point: `src/documents/management/commands/document_sanity_checker.py:22-26` calls `check_sanity(progress=...)` then `messages.log_messages()`.
 - Corroborating docs (secondary): `docs/administration.rst:390-403` lists the issue categories, and L408 documents the `document_sanity_checker` command.
 
-**Thinking / reasoning.** Three sub‑questions had to be separated. *What it validates* comes straight from the per‑document branches in `check_sanity()` (thumbnail, original+checksum, archive+checksum/metadata, content, orphans). *Its log output* is the severity‑tagged emission in `SanityCheckMessages.log_messages()` through the `paperless.sanity_checker` logger — the severities matter because they drive whether the scheduled task fails. *How often* is fixed by the WEEKLY `Schedule` row in migration 1004. Note the deliberate design: the *library* function `check_sanity()` only collects and logs; the *scheduled wrapper* `sanity_check()` is what escalates errors into a raised exception (so a weekly run with real corruption is recorded as a failed task), while warnings/info do not fail the run. I verified the function's real signature is `check_sanity(progress=False)` (not a `progress_bar_disable` parameter), and use that accurate name here.
+**Thinking / reasoning.** Three sub‑questions had to be separated. *What it validates* comes straight from the per‑document branches in `check_sanity()` (thumbnail, original+checksum, archive+checksum, content, orphans). *Its log output* is the severity‑tagged emission in `SanityCheckMessages.log_messages()` through the `paperless.sanity_checker` logger — the severities matter because they drive whether the scheduled task fails. *How often* is fixed by the WEEKLY `Schedule` row in migration 1004. Note the deliberate design: the *library* function `check_sanity()` only collects and logs; the *scheduled wrapper* `sanity_check()` is what escalates errors into a raised exception (so a weekly run with real corruption is recorded as a failed task), while warnings/info do not fail the run. I verified the function's real signature is `check_sanity(progress=False)` (not a `progress_bar_disable` parameter), and use that accurate name here.
 
 ---
 
@@ -123,7 +123,7 @@ The worker tunables feeding that block live just above it: `TASK_WORKERS` (L438)
       writer.commit(optimize=True)
   ```
 
-- The underlying Whoosh helper: `open_index_writer(optimize=False)` is a context manager at `src/documents/index.py:64-74` whose `finally` clause calls `writer.commit(optimize=optimize)` (L74); `open_index(recreate=False)` is at L52‑61. The DAILY task exercises the `optimize=True` path.
+- A *separate* Whoosh helper that the scheduled task does **not** use: `open_index_writer(optimize=False)` is a context manager at `src/documents/index.py:64-74` whose `finally` clause calls `writer.commit(optimize=optimize)` (L74); `open_index(recreate=False)` is at L52‑61. The DAILY `index_optimize` task does **not** call `open_index_writer`; as shown in the code block above (`src/documents/tasks.py:32-35`) it inlines its own `open_index()`, `AsyncWriter(ix)`, and `writer.commit(optimize=True)` sequence directly.
 - Corroborating docs (secondary): `docs/administration.rst:355-358` states index optimization "is regularly invoked by the task scheduler."
 
 **Thinking / reasoning.** This is a two‑part question and both parts must be answered from evidence, including the negative. The positive half is direct: a DAILY `Schedule` row points at `index_optimize`, which commits the Whoosh writer with `optimize=True` — the canonical Whoosh "compact/merge segments" operation. The negative half ("database cleanup") is an *absence* claim, so I justify it by what I searched: the four `Schedule` rows (§6), the task modules, and the cluster config — none of them schedules a DB‑cleanup routine. The closest thing to "cleanup" is Django‑Q trimming its own successful‑task history via `save_limit`, but that is framework housekeeping inside `django_q_task`, not an application maintenance task, and paperless does not configure it.
@@ -140,7 +140,7 @@ The worker tunables feeding that block live just above it: `TASK_WORKERS` (L438)
 - No schedule registers a retry/stuck‑job task: the four `Schedule` rows (§6) are `train_classifier`, `index_optimize`, `sanity_check`, and `process_mail_accounts` — none is a retry/recovery job.
 - No custom task model exists to track or drive retries (§10): `src/documents/models.py` defines no task table.
 
-**Framework behavior (Django‑Q 1.3 documentation).** Per the Django‑Q 1.3 documentation, `timeout` is the number of seconds a broker waits for a cluster to finish a task before the task is *presented again*, and `retry` is the window after which an unacknowledged task is re‑delivered. The documentation requires `timeout < retry`; if `retry` is less than the timeout (or less than the task's real duration), Django‑Q will start the task again — potentially producing duplicate runs. This is precisely why paperless defaults `retry = timeout + 10` (`src/paperless/settings.py:444-447`), mirroring the in‑code comment at L442‑443 that "timeout must be smaller than retry."
+**Framework behavior (Django‑Q 1.3; installed dependency source `django_q/conf.py:125-135`).** In Django‑Q, `timeout` bounds **worker execution**: it is the number of seconds to wait for a worker to finish a task before that worker is terminated and reincarnated — the installed source documents it at `django_q/conf.py:125-126` as "Number of seconds to wait for a worker to finish." `retry` is the **broker acknowledgement / re‑delivery interval**: the number of seconds the broker waits for acknowledgement before re‑presenting a task — the installed source documents it at `django_q/conf.py:133-135` as "Number of seconds to wait for acknowledgement before retrying a task." The framework requires `timeout < retry` (enforced by the check at `django_q/conf.py:138-142`, which warns "Set retry larger than timeout"); if `retry` is smaller than the timeout (or than the task's real duration), the broker can re‑present a task that is still running — potentially producing duplicate runs. This is precisely why paperless defaults `retry = timeout + 10` (`src/paperless/settings.py:444-447`), mirroring the in‑code comment at L442‑443 that "timeout must be smaller than retry."
 
 **Thinking / reasoning.** The honest answer is an absence backed by evidence. I confirmed there is no retry/stuck‑job task by enumerating every scheduled job (none qualifies) and confirming there is no custom task model that could store retry state. What *does* exist is generic, framework‑level resilience: if a worker takes longer than `timeout`, the broker may re‑present the task after `retry`. paperless tunes those two numbers so the re‑present window is always slightly larger than the timeout, avoiding accidental duplicate execution. So the system's answer to "stuck job" is "the broker's timeout/retry window," not a bespoke watchdog task. (See §8 for what happens to a task that genuinely fails.)
 
@@ -164,7 +164,23 @@ The worker tunables feeding that block live just above it: `TASK_WORKERS` (L438)
 - `process_mail_accounts` (every 10 minutes) is created in `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15`, with `schedule_type=Schedule.MINUTES` (L13) and `minutes=10` (L14).
 - Corroborating docs (secondary): `docs/administration.rst:416` states "Paperless automatically fetches your e-mail every 10 minutes by default."
 
-**Thinking / reasoning.** This is the literal "list ALL recurring tasks with intervals" question, and the only faithful way to answer it is to read the rows that the scheduler actually acts on. Because Django‑Q persists schedules as database rows seeded by migrations, the authoritative list is the union of the `schedule(...)` calls across the three migrations — not a settings dictionary. I cross‑checked the count: three migrations create four rows (migration 1001 creates two), and there are no other `schedule(...)` calls in the tree. The `MINUTES` + `minutes=10` pair is the Django‑Q idiom for "every N minutes," which is why the mail check is the most frequent job.
+**Django‑Q `schedule_type` codes (framework reference, `django_q/models.py:163-171`).** Django‑Q stores each schedule's cadence as a single‑character `schedule_type` code. The complete set defined by the installed Django‑Q 1.3.9 is:
+
+| Code | `schedule_type` constant | Meaning |
+|---|---|---|
+| `O` | `Schedule.ONCE` | Run once |
+| `I` | `Schedule.MINUTES` | Every N minutes (uses the `minutes` field) |
+| `H` | `Schedule.HOURLY` | Hourly |
+| `D` | `Schedule.DAILY` | Daily |
+| `W` | `Schedule.WEEKLY` | Weekly |
+| `M` | `Schedule.MONTHLY` | Monthly |
+| `Q` | `Schedule.QUARTERLY` | Quarterly |
+| `Y` | `Schedule.YEARLY` | Yearly |
+| `C` | `Schedule.CRON` | Cron expression |
+
+paperless‑ngx uses exactly four of these: `process_mail_accounts` is `I` (`MINUTES`, every 10 minutes), `train_classifier` is `H` (`HOURLY`), `index_optimize` is `D` (`DAILY`), and `sanity_check` is `W` (`WEEKLY`).
+
+**Thinking / reasoning.** This is the literal "list ALL recurring tasks with intervals" question, and the only faithful way to answer it is to read the rows that the scheduler actually acts on. Because Django‑Q persists schedules as database rows seeded by migrations, the authoritative list is the union of the `schedule(...)` calls across the three migrations — not a settings dictionary. I cross‑checked the count: three migrations create four rows (migration 1001 creates two), and no other imports or calls of `django_q.tasks.schedule(...)` register recurring Django‑Q schedules anywhere in the tree. (The only other `schedule(...)` in the source is the unrelated watchdog call `self.observer.schedule(...)` at `src/documents/management/commands/document_consumer.py:188`, which registers a filesystem‑polling observer for the consumption directory — not a Django‑Q periodic task.) The `MINUTES` + `minutes=10` pair is the Django‑Q idiom for "every N minutes," which is why the mail check is the most frequent job.
 
 ---
 
@@ -188,7 +204,7 @@ This is distinct from *event‑driven* dispatch — work that is enqueued on dem
   - `src/paperless_mail/migrations/0002_auto_20201117_1334.py` — `add_schedules` L9‑15, `remove_schedules` L18‑19, django_q dependency at L26, `operations` at L29.
 - Event‑driven (non‑scheduled) dispatch, for contrast: `src/documents/views.py` imports `async_task` (L28) and calls `async_task("documents.tasks.consume_file", ...)` (L523); `src/paperless_mail/mail.py` imports `async_task` (L11) and calls it (L336) to consume fetched attachments.
 
-**Thinking / reasoning.** "Where are they defined and registered" has two answers because Django‑Q decouples the two. The function bodies are ordinary Python in `tasks.py`; what makes four of them *recurring* is the existence of `Schedule` rows, and those rows are created by migrations rather than declared in settings. Using `RunPython` migrations is a notable design choice: it makes schedule creation **idempotent and reversible** — the forward function creates named schedules, the reverse function deletes them by `func`, and re‑running `migrate` will not duplicate them. I deliberately contrast this with `async_task(...)` so the reader does not mistake every `tasks.py` function for a scheduled job: `consume_file`, for instance, is dispatched on an event (an upload or a fetched e‑mail), never on a clock.
+**Thinking / reasoning.** "Where are they defined and registered" has two answers because Django‑Q decouples the two. The function bodies are ordinary Python in `tasks.py`; what makes four of them *recurring* is the existence of `Schedule` rows, and those rows are created by migrations rather than declared in settings. Using `RunPython` migrations is a notable design choice: it makes schedule registration **migration‑managed and reversible** — the forward function creates the named schedules and the reverse function deletes them by `func`. Registration runs once because an already‑applied Django migration is not re‑run in the normal migration flow; the `schedule(...)` helper itself is **not** idempotent (`django_q/tasks.py:106-108` raises `IntegrityError` if a schedule with the same name already exists), so it is Django's applied‑migration tracking, not the helper, that prevents duplicate rows. I deliberately contrast this with `async_task(...)` so the reader does not mistake every `tasks.py` function for a scheduled job: `consume_file`, for instance, is dispatched on an event (an upload or a fetched e‑mail), never on a clock.
 
 ---
 
@@ -266,7 +282,7 @@ LIMIT 20;
 **Answer.** Control is split across three levels, and notably **individual schedules cannot be toggled by an environment flag**:
 
 1. **Cluster‑wide environment variables** tune *how* the workers run (count, threads, timeout/retry, broker), but do not enable/disable individual jobs.
-2. **The `Schedule` rows themselves** determine *which* recurring jobs exist; once a migration has materialized them they exist and run, and the way to disable one is to **edit or delete it via the Django admin** (Django‑Q registers `Schedule` in the admin) — not via a config flag.
+2. **The `Schedule` rows themselves** determine *which* recurring jobs exist; once a migration has materialized them they exist and run, and the way to disable one is to **edit or delete it via the Django admin** (the `Schedule` model is registered in the Django admin by Django‑Q itself — framework behavior; installed dependency source `django_q/admin.py:107`: `admin.site.register(Schedule, ScheduleAdmin)`) — not via a config flag.
 3. **One task self‑disables in code**: `train_classifier` returns early when no tag, document type, or correspondent uses auto‑matching, so it effectively turns itself off when there is nothing to learn.
 
 **Evidence (`file:line`):**
