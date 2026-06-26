@@ -28,7 +28,7 @@ The stack was run inside the provided image. Three documents were submitted (one
 
 ### Answer
 
-Ingestion is performed by a **single django-q asynchronous task, `consume_file(...)`** [src/documents/tasks.py:L184-252], which constructs a `Consumer` and calls **`Consumer.try_consume_file(...)`** [src/documents/consumer.py:L180-377]. The task is enqueued the same way regardless of entry point: the directory watcher enqueues it via `async_task("documents.tasks.consume_file", ...)` [src/documents/management/commands/document_consumer.py:L86-87], and the REST upload endpoint enqueues the same task. `consume_file` returns `"Success. New document id {} created"` on success [src/documents/tasks.py:L247] or raises `ConsumerError` [src/documents/tasks.py:L249-252].
+Ingestion is performed by a **single django-q asynchronous task, `consume_file(...)`** [src/documents/tasks.py:L184-252], which constructs a `Consumer` and calls **`Consumer.try_consume_file(...)`** [src/documents/consumer.py:L180-377]. The task is enqueued the same way regardless of entry point: the directory watcher enqueues it via `async_task("documents.tasks.consume_file", ...)` [src/documents/management/commands/document_consumer.py:L86-87], and the REST upload endpoint `PostDocumentView.post(...)` enqueues the same `async_task("documents.tasks.consume_file", ...)` [src/documents/views.py:L523-533] (routed at `documents/post_document/` [src/paperless/urls.py:L57-59]). `consume_file` returns `"Success. New document id {} created"` on success [src/documents/tasks.py:L247] or raises `ConsumerError` [src/documents/tasks.py:L249-252].
 
 `try_consume_file` runs a **deterministic, staged pipeline**, guarded by a database transaction and a media file-lock. The ordered stages are:
 
@@ -65,7 +65,7 @@ Ingestion is performed by a **single django-q asynchronous task, `consume_file(.
 ### Why / rationale
 
 - **Asynchronous by design.** Detection (the watcher or an API request) is decoupled from processing. The detector only *enqueues* a task on the Redis-backed django-q queue; the heavy lifting (OCR, thumbnailing, classification, persistence) happens later inside a `qcluster` worker process. This is why log lines for one document appear across two processes — the watcher (`paperless.management.consumer`) and the worker (`paperless.consumer`) — and why an upload returns immediately while processing continues in the background [src/documents/management/commands/document_consumer.py:L86-87][src/documents/tasks.py:L184-252].
-- **Transaction + file-lock ordering guarantees atomicity.** The `Document` row is created first, *inside* `transaction.atomic()` [src/documents/consumer.py:L298-301]; only then, *inside* `FileLock(MEDIA_LOCK)` [src/documents/consumer.py:L315], are the files written and `document.save()` called (which renames the files into their final media location). The **source file is deleted last** — only after a successful store [src/documents/consumer.py:L349-350]. Consequently, a crash mid-pipeline rolls back the transaction and leaves the original file untouched in the consumption directory, so no partial document is ever left behind.
+- **Database writes are transactional; the source file is deleted only on success.** The `Document` row is created *inside* `transaction.atomic()` [src/documents/consumer.py:L298-301], and the `document_consumption_finished` signal handlers — which perform further **database** mutations (e.g. the `django_admin_log` audit row and any tag links) — are dispatched inside that same transaction [src/documents/consumer.py:L306-311]. The media files (original, thumbnail, and — when present — archive) are then written inside a `FileLock(MEDIA_LOCK)` block [src/documents/consumer.py:L315-342], `document.save()` moves/renames them into their final media location, and the **source consumption file is deleted last**, only after the store has completed successfully [src/documents/consumer.py:L346-350]. If an exception is raised mid-pipeline, the database transaction is rolled back — so no `Document` row, tag-link, or admin-log row persists — and, because the source deletion happens last, the original file remains in the consumption directory; the exception handler then fails the task and the `finally` block only cleans up the parser's working directory [src/documents/consumer.py:L362-369]. **The media filesystem writes are not themselves transactional**, however: the `_write(...)` copies happen inside the transaction but are not undone by a database rollback, so a crash *after* one or more media files have been written can leave orphaned files under `media/documents/` (the exception handler does not remove them). The transaction therefore guarantees **database** consistency, not full filesystem atomicity.
 - **The classifier is read, not trained, here.** During consumption the pipeline only *loads* an existing classifier to apply automatic matching [src/documents/consumer.py:L292]; it never trains it. On a fresh system this load reports that the model does not yet exist (see Q4).
 
 ### Pipeline flowchart
@@ -106,10 +106,20 @@ Three programs run under supervisor [docker/supervisord.conf:L10-35]:
 Supporting services:
 
 - **Redis** broker (`redis:6.0`) — backs both the django-q task queue and the Channels WebSocket layer [docker/compose/docker-compose.postgres.yml:L31-32][src/paperless/settings.py:L178-182,L456].
-- **Database** — PostgreSQL (`postgres:13`) [docker/compose/docker-compose.postgres.yml:L37-38] or **SQLite by default** [docker/compose/docker-compose.sqlite-tika.yml].
+- **Database** — PostgreSQL (`postgres:13`) [docker/compose/docker-compose.postgres.yml:L37-38] or **SQLite by default** [docker/compose/docker-compose.sqlite-tika.yml:L14]; Django's `DATABASES` setting defaults to the `sqlite3` engine at `DATA_DIR/db.sqlite3` when no PostgreSQL host is configured [src/paperless/settings.py:L297-300].
 - **File store** — the originals/archive/thumbnail tree under `MEDIA_ROOT/documents/...` [src/paperless/settings.py:L62-64].
 - **Whoosh search index** — a filesystem index at `INDEX_DIR` [src/paperless/settings.py:L73].
 - **Optional Tika + Gotenberg** — office-document conversion, feature-flagged [docker/compose/docker-compose.sqlite-tika.yml:L65-77].
+
+#### Watcher behavior (how files are detected and enqueued)
+
+For consumption-directory ingestion, the `document_consumer` watcher decides *when* a file is ready before it ever logs `Adding ...` and calls `async_task(...)`. It runs in one of two modes and, crucially, **waits for the file to become stable** so a half-written file is never enqueued:
+
+- **inotify mode (default).** When `PAPERLESS_CONSUMER_POLLING` is `0` (the default [src/paperless/settings.py:L478]) *and* `inotifyrecursive` is importable, the watcher uses inotify [src/documents/management/commands/document_consumer.py:L178-181]. It registers the flags **`CLOSE_WRITE | MOVED_TO`** [src/documents/management/commands/document_consumer.py:L203] so it reacts only when a file finishes being written in place (`CLOSE_WRITE`) or is atomically moved into the directory (`MOVED_TO`), and it applies a 0.5 s debounce — consuming a path only once no further inotify event has arrived for it within the debounce window [src/documents/management/commands/document_consumer.py:L211,L226-234].
+- **polling mode (fallback).** Otherwise (e.g. on filesystems where inotify is unavailable, such as some network mounts) it falls back to watchdog's `PollingObserver` [src/documents/management/commands/document_consumer.py:L185-187], whose `on_created` handler spawns `_consume_wait_unmodified` in a thread [src/documents/management/commands/document_consumer.py:L129-130].
+- **wait-for-stability.** Before logging `Adding ...` and enqueueing, the polling path runs `_consume_wait_unmodified`, which repeatedly `stat`s the file and only proceeds once its **`mtime` and `size` are unchanged across consecutive checks** (or aborts with a timeout error) [src/documents/management/commands/document_consumer.py:L99-125]. This is what guarantees a file is fully written before a `consume_file` task is queued.
+
+Only after this stability gate does the watcher emit `Adding {filepath} to the task queue.` and call `async_task("documents.tasks.consume_file", ...)` [src/documents/management/commands/document_consumer.py:L85-87].
 
 #### Two distinct log channels
 
@@ -120,29 +130,39 @@ The consumer emits over **two channels**, and it is important not to conflate th
 
 The `MESSAGE_*` constants are defined in [src/documents/consumer.py:L37-49]: `MESSAGE_NEW_FILE = "new_file"` [L43], `MESSAGE_PARSING_DOCUMENT = "parsing_document"` [L45], `MESSAGE_GENERATING_THUMBNAIL` [L46], `MESSAGE_PARSE_DATE` [L47], `MESSAGE_SAVE_DOCUMENT` [L48], `MESSAGE_FINISHED = "finished"` [L49], plus `MESSAGE_DOCUMENT_ALREADY_EXISTS = "document_already_exists"` [L37] and `MESSAGE_UNSUPPORTED_TYPE` [L44].
 
-#### Ordered event sequence (both channels merged)
+#### Ordered event sequence
 
-| Order | WebSocket status (`_send_progress`) | Text log line (`paperless.log`) | Code |
-|-------|-------------------------------------|---------------------------------|------|
-| 1 | `STARTING` / `new_file` (0%) | — | [src/documents/consumer.py:L202] |
-| 2 | — | `Adding {filepath} to the task queue.` *(watcher, `paperless.management.consumer`, INFO)* | [src/documents/management/commands/document_consumer.py:L85] |
-| 3 | — | `Consuming {filename}` *(INFO)* | [src/documents/consumer.py:L215] |
-| 4 | — | `Detected mime type: {mime_type}` *(DEBUG)* | [src/documents/consumer.py:L221] |
-| 5 | `parsing_document` (20%) | `Parsing {filename}...` *(DEBUG)* | [src/documents/consumer.py:L259-260] |
-| 6 | `generating_thumbnail` (70%) | `Generating thumbnail for {filename}...` *(DEBUG)* | [src/documents/consumer.py:L263-264] |
-| 7 | `parse_date` (90%, only if no embedded date) | — | [src/documents/consumer.py:L274] |
-| 8 | `save_document` (95%) | — | [src/documents/consumer.py:L294] |
-| 9 | — | `Saving record to database` *(DEBUG, from `_store`)* | [src/documents/consumer.py:L387] |
-| 10 | — | *consumption-finished handlers run* (e.g. `set_tags`: `Tagging "{}" with "{}"`, `paperless.handlers`) | [src/documents/signals/handlers.py:L224-228] |
-| 11 | — | `Deleting file {path}` *(DEBUG)* | [src/documents/consumer.py:L349] |
-| 12 | — | `Document {document} consumption finished` *(INFO)* | [src/documents/consumer.py:L373] |
-| 13 | `SUCCESS` / `finished` (100%) | — | [src/documents/consumer.py:L375] |
+The end-to-end sequence spans **two processes**, so it is presented as two phases to avoid conflating cross-process order with task-internal order. **Phase A** (the `document_consumer` watcher) always completes *before* **Phase B** (the `qcluster` worker running `Consumer.try_consume_file`) can begin: the watcher must log `Adding ...` and enqueue the task before any worker picks it up and emits its first progress event.
+
+**Phase A — detection & enqueue (watcher process)** — *consumption-directory ingestion only; for a REST upload this phase is replaced by the web request handler enqueueing the task [src/documents/views.py:L523-533]*
+
+| Order | Text log line (`paperless.log`) | Logger | Code |
+|-------|---------------------------------|--------|------|
+| A1 | `Adding {filepath} to the task queue.` *(INFO)*, then `async_task("documents.tasks.consume_file", ...)` enqueues the job on the Redis-backed queue | `paperless.management.consumer` | [src/documents/management/commands/document_consumer.py:L85-87] |
+
+**Phase B — task-internal pipeline (qcluster worker running `Consumer.try_consume_file`)** — begins only after Phase A has enqueued the task
+
+| Order | WebSocket status (`_send_progress`) | Text log line (`paperless.log`) | Logger | Code |
+|-------|-------------------------------------|---------------------------------|--------|------|
+| B1 | `STARTING` / `new_file` (0%) | — | — | [src/documents/consumer.py:L202] |
+| B2 | — | `Consuming {filename}` *(INFO)* | `paperless.consumer` | [src/documents/consumer.py:L215] |
+| B3 | — | `Detected mime type: {mime_type}` *(DEBUG)* | `paperless.consumer` | [src/documents/consumer.py:L221] |
+| B4 | `parsing_document` (20%) | `Parsing {filename}...` *(DEBUG)* | `paperless.consumer` | [src/documents/consumer.py:L259-260] |
+| B5 | `generating_thumbnail` (70%) | `Generating thumbnail for {filename}...` *(DEBUG)* | `paperless.consumer` | [src/documents/consumer.py:L263-264] |
+| B6 | `parse_date` (90%, only if no embedded date) | — | — | [src/documents/consumer.py:L274] |
+| B7 | — | `Document classification model does not exist (yet)...` *(DEBUG; only on a fresh system, emitted while loading the classifier)* | `paperless.classifier` | [src/documents/consumer.py:L292][src/documents/classifier.py:L31-35] |
+| B8 | `save_document` (95%) | — | — | [src/documents/consumer.py:L294] |
+| B9 | — | `Saving record to database` *(DEBUG, from `_store`)* | `paperless.consumer` | [src/documents/consumer.py:L387] |
+| B10 | — | *consumption-finished handlers run* (e.g. `set_tags`: `Tagging "{}" with "{}"`) | `paperless.handlers` | [src/documents/signals/handlers.py:L224-230] |
+| B11 | — | `Deleting file {path}` *(DEBUG)* | `paperless.consumer` | [src/documents/consumer.py:L349] |
+| B12 | — | `Document {document} consumption finished` *(INFO)* | `paperless.consumer` | [src/documents/consumer.py:L373] |
+| B13 | `SUCCESS` / `finished` (100%) | — | — | [src/documents/consumer.py:L375] |
 
 After the `Document` row is created, the `document_consumption_finished` signal fires **six handlers**, connected in this order in [src/documents/apps.py:L22-27]: `add_inbox_tags`, `set_correspondent`, `set_document_type`, `set_tags`, `set_log_entry`, `add_to_index` — implemented in [src/documents/signals/handlers.py:L30,L35,L101,L168,L413,L428] and logging under `paperless.handlers` [src/documents/signals/handlers.py:L27].
 
 ### Why / rationale
 
-- **Separation of concerns explains the cross-process logs.** The watcher's only job is to notice a stable file and enqueue work [src/documents/management/commands/document_consumer.py:L85-87]; the worker does everything else. That is why the *first* log line for a document is the watcher's `Adding ... to the task queue.` under `paperless.management.consumer`, and every subsequent line is under `paperless.consumer` (the worker). The web server (`gunicorn`) does not parse anything — it merely relays the `_send_progress` payloads to the browser via the Redis-backed Channels layer.
+- **Separation of concerns explains the cross-process logs.** The watcher's only job is to notice a stable file and enqueue work [src/documents/management/commands/document_consumer.py:L85-87]; the worker does everything else. That is why the *first* log line for a consumption-directory document is the watcher's `Adding ... to the task queue.` under **`paperless.management.consumer`** [src/documents/management/commands/document_consumer.py:L24]. The subsequent worker-side lines are **not** all under one logger: the `Consumer` orchestration logs under **`paperless.consumer`** [src/documents/consumer.py:L52-54], the classifier load/train logs under **`paperless.classifier`** [src/documents/classifier.py:L21], and the `document_consumption_finished` signal handlers log under **`paperless.handlers`** [src/documents/signals/handlers.py:L27]. (See the Logger column in the Phase B table above.) The web server (`gunicorn`) does not parse anything — it merely relays the `_send_progress` payloads to the browser via the Redis-backed Channels layer.
 - **Why the percentages are absent from the file log.** Progress percentages travel over the WebSocket channel (`group_send("status_updates", ...)`), not through the Python `logging` framework, so they are intentionally **not** in `paperless.log`. This was confirmed at runtime — the log file showed the textual lines but no `20%/70%/95%` events.
 - **The database, file store, and Whoosh index are touched near the end.** Persistence (`_store`) happens at stage 9–10, file writes inside the lock at stage 11, and the Whoosh index update happens inside the `document_consumption_finished` handler `add_to_index` [src/documents/signals/handlers.py:L428-431]. Everything expensive and I/O-heavy is deferred to the worker, late in the pipeline.
 
@@ -186,7 +206,7 @@ On a match it calls `_fail(MESSAGE_DOCUMENT_ALREADY_EXISTS, ...)` [src/documents
 
 - **Per-document, not per-batch.** Because every file maps to its own queued task, the system "reacts" to each upload independently and idempotently. There is no aggregate state across a batch — three uploads simply become three tasks.
 - **Idempotent on identical bytes.** The duplicate guard is keyed on the **content checksum**, not the filename — confirmed by the fact that `test_doc_1_dup.pdf` (a different name but identical bytes to the already-consumed `PK=1`) was rejected. Re-submitting the same bytes never creates a second row.
-- **Defense in depth at the database layer.** Independent of the pre-check, `documents_document.checksum` carries a **UNIQUE constraint**. When the directory watcher fired multiple inotify events for a single dropped file (a known quirk of `CLOSE_WRITE`/`MOVED_TO` on some filesystems) and several tasks raced before any committed, the redundant tasks failed with `UNIQUE constraint failed: documents_document.checksum` *(observed)* — so even a race cannot produce duplicate rows. This complements the application-level `pre_check_duplicate` short-circuit.
+- **Defense in depth at the database layer.** Independent of the pre-check, `documents_document.checksum` carries a **UNIQUE constraint** — the model field is declared `checksum = models.CharField(..., unique=True, ...)` [src/documents/models.py:L135-139]. When the directory watcher fired multiple inotify events for a single dropped file (a known quirk of `CLOSE_WRITE`/`MOVED_TO` on some filesystems) and several tasks raced before any committed, the redundant tasks failed with `UNIQUE constraint failed: documents_document.checksum` *(observed)* — so even a race cannot produce duplicate rows. This complements the application-level `pre_check_duplicate` short-circuit.
 
 ---
 
@@ -315,7 +335,7 @@ else:
 /app/media/documents/thumbnails/0000003.png     (observed)
 ```
 
-The database confirmed `Document(pk=1)` had `filename = 0000001.pdf` and `archive_filename = 0000001.pdf` *(observed)* — note that the source file `test_doc_1.pdf` was **renamed to its PK**, not preserved under its original name.
+The database confirmed `Document(pk=1)` had `filename = 0000001.pdf` and `archive_filename = 0000001.pdf` *(observed)* — i.e. the document was **stored under its PK-based filename** (`0000001.pdf`), not under the original `test_doc_1.pdf`. To be precise about the mechanism, the original is not renamed in place: during consumption it is **copied** into the media tree via `_write(...)` [src/documents/consumer.py:L319,L429-432] and the consumption/upload scratch file is then **deleted** [src/documents/consumer.py:L349-350]; the media copy itself is assigned its PK-based name and may subsequently be moved/renamed by `update_filename_and_move_files` during `document.save()` [src/documents/signals/handlers.py:L312-365].
 
 Two related artifacts live under the **data** tree (not the media tree): the Whoosh search index at `INDEX_DIR = DATA_DIR/index` [src/paperless/settings.py:L73] (observed as `MAIN_*.seg` segment files) and the classifier model at `MODEL_FILE = DATA_DIR/classification_model.pickle` [src/paperless/settings.py:L74].
 
@@ -332,15 +352,15 @@ Two related artifacts live under the **data** tree (not the media tree): the Who
 
 ### Answer
 
-A successful ingestion durably writes rows to **three** tables. (Row counts below were captured before and after consuming three documents.)
+A successful ingestion **always** writes rows to **two** tables — `documents_document` (the core document row) and `django_admin_log` (one audit row) — and **may also** write rows to a third, `documents_document_tags`, but only when one or more tags are attached (via consumption overrides, inbox tags, or auto-matching). The three tables that can therefore receive rows are detailed below. (Row counts were captured before and after consuming three documents.)
 
-**1. `documents_document`** — the core insert. `_store` calls `Document.objects.create(...)` with the title, content, MIME type, checksum, timestamps, and storage type [src/documents/consumer.py:L398-406]; the model is `Document` [src/documents/models.py:L88] (Django's default table name is `app_label + "_" + model` → `documents_document`).
+**1. `documents_document`** *(always written)* — the core insert. `_store` calls `Document.objects.create(...)` with the title, content, MIME type, checksum, timestamps, and storage type [src/documents/consumer.py:L398-406]; the model is `Document` [src/documents/models.py:L88] (Django's default table name is `app_label + "_" + model` → `documents_document`).
 *Observed: 0 → 3 rows (one per document).*
 
-**2. `documents_document_tags`** — the many-to-many join table behind `tags = models.ManyToManyField(Tag, related_name="documents")` [src/documents/models.py:L128-133]. Rows are inserted when tags are attached — either via consumption overrides `document.tags.add(...)` [src/documents/consumer.py:L425-427], or via the `set_tags` handler `document.tags.add(*relevant_tags)` [src/documents/signals/handlers.py:L230].
+**2. `documents_document_tags`** *(conditional — only when tags are attached)* — the many-to-many join table behind `tags = models.ManyToManyField(Tag, related_name="documents")` [src/documents/models.py:L128-133]. Rows are inserted when tags are attached — either via consumption overrides `document.tags.add(...)` [src/documents/consumer.py:L425-427], or via the `set_tags` handler `document.tags.add(*relevant_tags)` [src/documents/signals/handlers.py:L230].
 *Observed: stayed at 0 during plain consumption (no matching auto/override tags), then became 1 only after a tag was explicitly attached.* **This table may legitimately receive no rows for a document if nothing matches** — an honest nuance.
 
-**3. `django_admin_log`** — one audit row per document. The `set_log_entry` handler creates a `LogEntry` ADDITION [src/documents/signals/handlers.py:L413-425]:
+**3. `django_admin_log`** *(always written)* — one audit row per document. The `set_log_entry` handler creates a `LogEntry` ADDITION [src/documents/signals/handlers.py:L413-425]:
 
 ```python
 ct = ContentType.objects.get(model="document")
