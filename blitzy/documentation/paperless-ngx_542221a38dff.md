@@ -160,7 +160,12 @@ the question exhaustively and from code.
   override_title=..., override_correspondent_id=..., override_document_type_id=...,
   override_tag_ids=..., task_id=..., task_name=...)`.
 - This is the path used by the Angular single-page-application's drag-and-drop upload and
-  by any REST API client.
+  by any REST API client. The drag-and-drop surface is the `<ngx-file-drop>` zone declared
+  in `src-ui/src/app/app.component.html:L3-L4` (its `(onFileDrop)="dropped($event)"` handler
+  forwards the dropped files to the upload service, which ultimately calls `uploadDocument()`
+  in `src-ui/src/app/services/rest/document.service.ts:L145-L150`); that method issues an
+  HTTP `POST` to the `post_document` route, which Django maps to `PostDocumentView` at
+  `src/paperless/urls.py:L57-L59`.
 
 ### 2.3 Email / IMAP (the mail consumer)
 
@@ -252,9 +257,15 @@ status and then raises a `ConsumerError`.
   so they do not each reload it.
 - **95% — SAVE_DOCUMENT.** `_send_progress(95, 100, "WORKING", MESSAGE_SAVE_DOCUMENT)`
   (`src/documents/consumer.py:L294`).
-- **Atomic persistence.** `with transaction.atomic():` (`src/documents/consumer.py:L298`)
-  wraps the database insert **and** the file writes so they commit together or not at all.
-  Inside the block:
+- **Atomic database persistence (with non-transactional file writes).**
+  `with transaction.atomic():` (`src/documents/consumer.py:L298`) opens a **database**
+  transaction around the `Document` INSERT and the post-consume metadata changes. The file
+  writes are then performed *inside that same control-flow block*, so a file-write exception
+  aborts the transaction and the database work is rolled back — but the file writes
+  themselves are **not** transactional: they are ordinary filesystem copies performed by
+  `_write()` via `open(target, "wb")` (`src/documents/consumer.py:L429-L432`). In other
+  words, the database row commits or rolls back atomically, while bytes already written to
+  disk are not reverted by this code. Inside the block:
   - `document = self._store(text=text, date=date, mime_type=mime_type)` performs the DB
     INSERT (`src/documents/consumer.py:L301`);
   - the `document_consumption_finished` signal fires
@@ -318,16 +329,27 @@ then calls `Document.objects.create(...)` (`src/documents/consumer.py:L398-L406`
   `checksum` **or** `archive_checksum` (`src/documents/consumer.py:L102-L113`).
 - **Unsupported MIME types fail fast** before any parsing work
   (`src/documents/consumer.py:L224-L225`).
-- **Transactional persistence** means a failure in a post-consume hook or during file
-  writes rolls back the database insert, so paperless never ends up with a half-created
-  document (`src/documents/consumer.py:L298`, `src/documents/consumer.py:L362-L367`).
+- **Transactional persistence applies to the database only.** A failure in a post-consume
+  signal handler, in `document.save()`, or in any of the file-write steps raises out of the
+  `try`, so the `transaction.atomic()` block rolls back the `Document` INSERT and every
+  post-consume database change — paperless never *commits* a half-created database row
+  (`src/documents/consumer.py:L298`, `src/documents/consumer.py:L362-L367`). The filesystem
+  writes are **not** rolled back, however: `_write()` performs plain `open(target, "wb")`
+  copies (`src/documents/consumer.py:L429-L432`), so any target file already written before
+  the failure is left on disk and is not automatically deleted by this code. The atomic
+  block's guarantee is therefore that a file-write failure prevents the database row from
+  being committed — not that bytes already on disk are undone.
 
 **Thinking / why.** The progress percentages are not cosmetic — they are emitted by the
 consumer itself, so keying the narrative to them yields stages that are *provably* the real
 ones rather than an arbitrary grouping. The single most important correctness insight is
-the `transaction.atomic()` wrapper around both the INSERT *and* the file writes: the
-database row and the files on disk commit together or not at all, which is what guarantees
-the system's consistency under failure.
+the `transaction.atomic()` wrapper (`src/documents/consumer.py:L298`): the `Document`
+INSERT and the post-consume metadata changes commit or roll back as one unit, and because
+the file writes sit inside that same block, a file-write failure aborts the transaction so
+no database row is committed for a document whose files could not be stored. The filesystem
+writes themselves are *not* transactional — `_write()` does plain `open(target, "wb")`
+copies (`src/documents/consumer.py:L429-L432`) — so this guarantees **database** consistency
+under failure rather than literally rolling back bytes already written to disk.
 
 ---
 
@@ -683,12 +705,21 @@ The full-text index is Whoosh-based (`src/documents/index.py`): imports at
 `src/documents/index.py:L9-L26`, an `AsyncWriter` (`src/documents/index.py:L66`),
 `update_document` (`src/documents/index.py:L87`), `add_or_update_document`
 (`src/documents/index.py:L118`), and `remove_document_from_index`
-(`src/documents/index.py:L123`). Parsers self-register through a signal: `parsers.py`
-imports `document_consumer_declaration` (`src/documents/parsers.py:L13`), each parser app
-responds to it (`src/documents/parsers.py:L48`, `L71`, `L87`),
-`get_parser_class_for_mime_type` (`src/documents/parsers.py:L81`) resolves the parser for a
-MIME type, and `parse_date` (`src/documents/parsers.py:L212`) is the date fallback used by
-the consumer.
+(`src/documents/index.py:L123`). Parser **selection** is signal-driven, but two distinct
+roles must be kept apart: the signal is *sent* from `parsers.py`, and it is *received*
+(registered) in the parser apps.
+`parsers.py` imports the `document_consumer_declaration` signal
+(`src/documents/parsers.py:L13`) and **sends** it to collect every registered parser's
+declaration — `get_parser_class_for_mime_type` (`src/documents/parsers.py:L81-L98`) runs
+`document_consumer_declaration.send(None)` and resolves the highest-weight parser for a MIME
+type, while the sibling helpers `get_default_file_extension` (`src/documents/parsers.py:L48`)
+and `get_supported_file_extensions` (`src/documents/parsers.py:L71`) run the same send-loop
+for file extensions. The parser apps themselves **register** as *receivers* of that signal
+in their `AppConfig.ready()` methods via `document_consumer_declaration.connect(...)`:
+`src/paperless_tesseract/apps.py:L11-L13`, `src/paperless_text/apps.py:L11-L13`, and
+(conditionally, only when `PAPERLESS_TIKA_ENABLED`) `src/paperless_tika/apps.py:L10-L13`.
+Finally, `parse_date` (`src/documents/parsers.py:L212`) is the date fallback used by the
+consumer.
 
 ### 6.7 How they work together in practice
 
