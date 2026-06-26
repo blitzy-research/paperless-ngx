@@ -395,21 +395,32 @@ file was then submitted that is **byte-identical to the archive rendition** — 
 completely different from the original scan. *(Capture note: the in-memory channel layer was used so
 that `Consumer._send_progress` worked without Redis/ASGI — an outside-the-repo settings choice only.)*
 
+The probe **pins the exact input bytes** so the MD5 values below are reproducible verbatim by anyone.
+The two stored renditions were:
+
+```
+original (scanner) bytes  = b"%PDF-1.4\nPaperless-ngx Q4 probe -- ORIGINAL scanner rendition.\n"
+archive  (OCR)     bytes  = b"%PDF-1.4\nPaperless-ngx Q4 probe -- ARCHIVE OCR rendition.\n"
+```
+
+The incoming re-uploaded file was made **byte-identical to the archive rendition** above.
+
 ### Captured Evidence
 
-The existing document pk=1 stored two checksums:
+The existing document pk=1 stored two checksums — each is `hashlib.md5(<bytes above>).hexdigest()`:
 
 ```
-checksum         = ddd79f0900dd38ff0a7c1f9d8febfe7e   (MD5 of the "original" scanner bytes)
-archive_checksum = a9fb6f46f685d8abbe792ea2641636d1   (MD5 of the "archive" rendition bytes)
+checksum         = 2f9eaec824a91b25bf48f739ead36dd4   (MD5 of the pinned "original" scanner bytes)
+archive_checksum = 8bfd1e0d69f87157526dfb84d1caf3c8   (MD5 of the pinned "archive" rendition bytes)
 ```
 
-*(STABLE: both MD5 values.)*
+*(STABLE: both MD5 values — reproduce them with `md5(<original bytes>)` and `md5(<archive bytes>)`
+using the pinned byte literals above.)*
 
-The incoming file's MD5:
+The incoming file's MD5 (it is byte-identical to the pinned archive rendition):
 
 ```
-incoming MD5 = a9fb6f46f685d8abbe792ea2641636d1   → equals existing archive_checksum (True)
+incoming MD5 = 8bfd1e0d69f87157526dfb84d1caf3c8   → equals existing archive_checksum (True)
 ```
 
 **This is the crux:** the incoming MD5 is matched against **both** the `checksum` **and** the
@@ -439,8 +450,10 @@ characters — so SHA-256 is impossible here.
   `:L105-L107`. The `Q(...) | Q(...)` is precisely why an incoming MD5 can match either column.
 - On a hit: if `settings.CONSUMER_DELETE_DUPLICATES` is set, the file is removed via `os.unlink` at
   `:L109`; then `_fail(...)` raises a `ConsumerError` "Not consuming {filename}: It is a duplicate."
-  at `:L110-L113`. The `ConsumerError` string is formatted `f'{self.filename}: {log_message}'`
-  (`src/documents/consumer.py:L81`), which is why the exception text repeats the filename:
+  at `:L110-L113`. The `ConsumerError` string is formatted `f"{self.filename}: {log_message or message}"`
+  (`src/documents/consumer.py:L81`) — here `log_message` is the truthy "Not consuming … It is a
+  duplicate." string, so the `or message` fallback is not used — which is why the exception text
+  repeats the filename:
   `rescan_of_archive.pdf: Not consuming rescan_of_archive.pdf: It is a duplicate.`
 - The columns are `checksum = CharField(max_length=32, unique=True)` at
   `src/documents/models.py:L135-L141` and `archive_checksum` likewise at `:L143-L150` — the
@@ -454,11 +467,19 @@ characters — so SHA-256 is impossible here.
 
 ### Reproduction Steps
 
-1. Consume a document so that it has both a `checksum` and an `archive_checksum`.
-2. Submit a new file whose bytes equal the archive rendition (different from the original scan).
+1. Create a document whose `checksum` and `archive_checksum` are the MD5s of the **pinned bytes**
+   above — i.e. `checksum = md5(b"%PDF-1.4\nPaperless-ngx Q4 probe -- ORIGINAL scanner rendition.\n")`
+   = `2f9eaec824a91b25bf48f739ead36dd4` and
+   `archive_checksum = md5(b"%PDF-1.4\nPaperless-ngx Q4 probe -- ARCHIVE OCR rendition.\n")`
+   = `8bfd1e0d69f87157526dfb84d1caf3c8`.
+2. Submit a new file whose bytes equal the pinned **archive** rendition (different from the original
+   scan); its MD5 is `8bfd1e0d69f87157526dfb84d1caf3c8`, matching the `archive_checksum` column.
 3. Observe the `ConsumerError` and the `paperless.consumer` `ERROR` line.
 4. Toggle `CONSUMER_DELETE_DUPLICATES` to show the incoming file preserved (`False`) versus
    `os.unlink`-deleted (`True`).
+5. To regenerate the exact hexes anywhere, run:
+   `python -c "import hashlib; print(hashlib.md5(b'%PDF-1.4\nPaperless-ngx Q4 probe -- ARCHIVE OCR rendition.\n').hexdigest())"`
+   → `8bfd1e0d69f87157526dfb84d1caf3c8` (verbatim).
 
 ### Documentation corroboration
 
@@ -486,6 +507,17 @@ N does not exist"). It was run first with a healthy document (pk=1, whose real o
 thumbnail files have MD5s matching the stored checksums), then again after **overwriting the original
 file's bytes on disk** so that its MD5 no longer matched the stored value.
 
+The probe **pins the exact input bytes** so the stored/actual MD5 values below are reproducible
+verbatim by anyone. The healthy original and the corrupting bytes were:
+
+```
+healthy original bytes  = b"%PDF-1.4\nPaperless-ngx Q5 probe -- HEALTHY original bytes.\n"
+corrupting (overwrite)  = b"%PDF-1.4\nPaperless-ngx Q5 probe -- CORRUPTED original bytes.\n"
+```
+
+The stored `checksum` is `md5(<healthy bytes>)`; after the original file on disk is overwritten with
+the corrupting bytes, the recomputed ("actual") MD5 is `md5(<corrupting bytes>)`.
+
 ### Captured Evidence
 
 **HEALTHY** — `has_error=False`, `has_warning=False`, message count = 0:
@@ -497,14 +529,15 @@ INFO [paperless.sanity_checker] Sanity checker detected no issues.
 **CORRUPTED** — `has_error=True`, message count = 1:
 
 ```
-ERROR [paperless.sanity_checker] Checksum mismatch of document 1. Stored: 592fc27cbc5285a99d0efae277d93dd0, actual: d1b8e94a9f61ba5ff55d68f369c0883e.
+ERROR [paperless.sanity_checker] Checksum mismatch of document 1. Stored: d0c4264fa36808d43f596ddaa74c5570, actual: 8e1dfb095c8862c46bcb61c265726482.
 ```
 
-Both values are 32-hex MD5 digests *(STABLE)*:
+Both values are 32-hex MD5 digests *(STABLE — reproduce them with `md5(<healthy bytes>)` and
+`md5(<corrupting bytes>)` using the pinned byte literals above)*:
 
 ```
-Stored: 592fc27cbc5285a99d0efae277d93dd0
-actual: d1b8e94a9f61ba5ff55d68f369c0883e
+Stored: d0c4264fa36808d43f596ddaa74c5570   = md5(b"%PDF-1.4\nPaperless-ngx Q5 probe -- HEALTHY original bytes.\n")
+actual: 8e1dfb095c8862c46bcb61c265726482   = md5(b"%PDF-1.4\nPaperless-ngx Q5 probe -- CORRUPTED original bytes.\n")
 ```
 
 *(ENV-SPECIFIC: the document pk=1 and the absolute `source_path` `…/originals/0000001.pdf`.)*
@@ -527,11 +560,18 @@ actual: d1b8e94a9f61ba5ff55d68f369c0883e
 
 ### Reproduction Steps
 
-1. Seed a healthy document with matching original/archive/thumbnail files; run `check_sanity()` →
-   "Sanity checker detected no issues."
-2. Overwrite the stored original on disk with different bytes.
+1. Seed a healthy document whose original file holds the pinned **healthy bytes**
+   (`b"%PDF-1.4\nPaperless-ngx Q5 probe -- HEALTHY original bytes.\n"`) and whose stored `checksum`
+   is their MD5 (`d0c4264fa36808d43f596ddaa74c5570`), with matching archive/thumbnail files and
+   non-empty `content`; run `check_sanity()` → "Sanity checker detected no issues."
+2. Overwrite the stored original on disk with the pinned **corrupting bytes**
+   (`b"%PDF-1.4\nPaperless-ngx Q5 probe -- CORRUPTED original bytes.\n"`).
 3. Re-run `check_sanity()` → the `ERROR` "Checksum mismatch of document {pk}. Stored: …, actual: …"
-   with both MD5 values.
+   with both MD5 values (`Stored: d0c4264fa36808d43f596ddaa74c5570`,
+   `actual: 8e1dfb095c8862c46bcb61c265726482`).
+4. To regenerate the exact hexes anywhere, run:
+   `python -c "import hashlib; print(hashlib.md5(b'%PDF-1.4\nPaperless-ngx Q5 probe -- CORRUPTED original bytes.\n').hexdigest())"`
+   → `8e1dfb095c8862c46bcb61c265726482` (verbatim).
 
 ### Documentation corroboration
 
@@ -622,18 +662,22 @@ Five empirical insights emerge across the six behaviors:
 
 | Category | Artifacts |
 |----------|-----------|
-| **STABLE** (content-derived; reproducible anywhere) | All MD5 values from Q4 (the original `checksum` and the `archive_checksum`) and Q5 (the stored and actual checksums) — reproduced verbatim in the fenced capture below. The SHA-1 algorithm plus its 20-byte / 40-hex length. All log message templates and logger names. The filename transform `Invoice.pdf` → `Invoice Paid.pdf`. The relative layout `documents/{originals,archive,thumbnails}/`. |
-| **ENV-SPECIFIC** (varies per run) | Absolute paths (here under `/tmp/pngx_scratch`); document primary keys; timestamps and the `2026-06-26` date prefix in `str(document)`; and the SHA-1 `data_hash` *values* from Q3 (they depend on the full corpus plus label primary keys) — reproduced verbatim in the fenced capture below. |
+| **STABLE** (content-derived; reproducible anywhere) | All MD5 values from Q4 (the original `checksum` and the `archive_checksum`) and Q5 (the stored and actual checksums). Because Q4 and Q5 **pin the exact input byte literals**, each value is `hashlib.md5(<pinned bytes>).hexdigest()` and a reader reproduces it **verbatim** anywhere — see the fenced capture below, where every hex is shown alongside the literal bytes that produce it. The SHA-1 algorithm plus its 20-byte / 40-hex length. All log message templates and logger names. The filename transform `Invoice.pdf` → `Invoice Paid.pdf`. The relative layout `documents/{originals,archive,thumbnails}/`. |
+| **ENV-SPECIFIC** (varies per run) | Absolute paths (here under `/tmp/pngx_scratch`); document primary keys; timestamps and the `2026-06-26` date prefix in `str(document)`; and the SHA-1 `data_hash` *values* from Q3 (they depend on the full corpus plus label primary keys, which vary per run — so unlike the MD5s these are **not** reader-reproducible verbatim and are tagged ENV-SPECIFIC). |
 
-The specific captured hash values referenced above (reproduced verbatim from the Q3–Q5 sections):
+The specific captured hash values referenced above. The four MD5s are reproducible **verbatim**
+anywhere — each is the MD5 of the pinned byte literal printed beside it (run
+`hashlib.md5(<bytes>).hexdigest()`). The two SHA-1 `data_hash` values are representative
+ENV-SPECIFIC captures (they depend on env-assigned label primary keys, so re-running yields
+*equivalent* 40-hex digests, not these exact ones):
 
 ```
-STABLE       — MD5,   Q4 original checksum:          ddd79f0900dd38ff0a7c1f9d8febfe7e
-STABLE       — MD5,   Q4 archive_checksum:           a9fb6f46f685d8abbe792ea2641636d1
-STABLE       — MD5,   Q5 stored original checksum:   592fc27cbc5285a99d0efae277d93dd0
-STABLE       — MD5,   Q5 actual recomputed checksum: d1b8e94a9f61ba5ff55d68f369c0883e
-ENV-SPECIFIC — SHA-1, Q3 data_hash (first build):    083b30f0691d5fdbf30a18acdc96578f364fc92c
-ENV-SPECIFIC — SHA-1, Q3 data_hash (third run):      ebb42adf8cf57a694a4f50389a40facee82d08cd
+STABLE       — MD5,   Q4 original checksum:          2f9eaec824a91b25bf48f739ead36dd4  = md5(b"%PDF-1.4\nPaperless-ngx Q4 probe -- ORIGINAL scanner rendition.\n")
+STABLE       — MD5,   Q4 archive_checksum:           8bfd1e0d69f87157526dfb84d1caf3c8  = md5(b"%PDF-1.4\nPaperless-ngx Q4 probe -- ARCHIVE OCR rendition.\n")
+STABLE       — MD5,   Q5 stored original checksum:   d0c4264fa36808d43f596ddaa74c5570  = md5(b"%PDF-1.4\nPaperless-ngx Q5 probe -- HEALTHY original bytes.\n")
+STABLE       — MD5,   Q5 actual recomputed checksum: 8e1dfb095c8862c46bcb61c265726482  = md5(b"%PDF-1.4\nPaperless-ngx Q5 probe -- CORRUPTED original bytes.\n")
+ENV-SPECIFIC — SHA-1, Q3 data_hash (first build):    083b30f0691d5fdbf30a18acdc96578f364fc92c  (representative; depends on env-assigned label pks)
+ENV-SPECIFIC — SHA-1, Q3 data_hash (third run):      ebb42adf8cf57a694a4f50389a40facee82d08cd  (representative; depends on env-assigned label pks)
 ```
 
 ---
