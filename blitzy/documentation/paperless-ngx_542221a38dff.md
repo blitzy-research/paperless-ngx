@@ -71,9 +71,10 @@ generate an API token. There are **four** supported token-provisioning mechanism
 
 1. **`POST /api/token/`** — exchange a username + password for a token
    [src/paperless/urls.py:L81].
-2. **`manage.py drf_create_token <username>`** — the DRF management command.
+2. **`manage.py drf_create_token <username>`** — the DRF management command
+   [rest_framework/authtoken/management/commands/drf_create_token.py:L12-L19, L44-L45].
 3. **Django admin** — via `TokenAdmin`/`TokenProxy`
-   [rest_framework/authtoken/admin.py:L51].
+   [rest_framework/authtoken/admin.py:L23-L51].
 4. **Programmatic** — `Token.objects.get_or_create(user=...)`.
 
 **Preferred runtime (end-to-end).** Use the user-provided Docker image
@@ -97,10 +98,17 @@ used for an end-to-end check.
 
 **Rationale (Thinking).** Token authentication requires the `authtoken` app to be
 installed and migrated, because a token is a *row* in the `authtoken_token` table keyed
-by a 40-character primary key [rest_framework/authtoken/models.py:L13]. All four
-mechanisms ultimately call `Token.objects.get_or_create` and return/persist the **same**
-key, so `drf_create_token` and `POST /api/token/` are the most convenient for headless
-integration. The model is only concrete (non-abstract) when `rest_framework.authtoken`
+by a 40-character primary key [rest_framework/authtoken/models.py:L13]. The four
+mechanisms do **not** all reach that row the same way. `POST /api/token/`
+[rest_framework/authtoken/views.py:L54-L59] and `drf_create_token`
+[rest_framework/authtoken/management/commands/drf_create_token.py:L12-L19, L44-L45] both
+call `Token.objects.get_or_create`, and programmatic callers may use the same call; each
+returns/persists the **same** key for a given user (never a duplicate). The Django admin,
+by contrast, manages `Token` rows through `TokenProxy`/`TokenAdmin`
+[rest_framework/authtoken/admin.py:L23-L51] — it does **not** call `get_or_create`; the
+key is instead generated on first save by `Token.save()` → `generate_key()`
+[rest_framework/authtoken/models.py:L30-L37]. For headless integration, `drf_create_token`
+and `POST /api/token/` are the most convenient. The model is only concrete (non-abstract) when `rest_framework.authtoken`
 is in `INSTALLED_APPS` [rest_framework/authtoken/models.py:L26], which Paperless
 guarantees [src/paperless/settings.py:L108].
 
@@ -111,7 +119,7 @@ guarantees [src/paperless/settings.py:L108].
   `key = models.CharField(_("Key"), max_length=40, primary_key=True)`
   [rest_framework/authtoken/models.py:L13]; `generate_key` returns
   `binascii.hexlify(os.urandom(20)).decode()` — 20 random bytes → 40 hex characters
-  [rest_framework/authtoken/models.py:L36].
+  [rest_framework/authtoken/models.py:L36-L37].
 - `POST /api/token/` route [src/paperless/urls.py:L81]; admin registration
   `admin.site.register(TokenProxy, TokenAdmin)` [rest_framework/authtoken/admin.py:L51].
 - Runtime: `drf_create_token apitester` →
@@ -359,10 +367,16 @@ this 401 also carries `WWW-Authenticate: Basic realm="api"`.)
    request; `StandardPagination`
    [src/documents/views.py:L182, src/paperless/views.py:L8-L11] paginates the
    `DocumentSerializer` results.
-5. The same `Token` model backs all provisioning paths: `obtain_auth_token` (the
-   `POST /api/token/` view) returns `{'token': token.key}` via
-   `Token.objects.get_or_create` [rest_framework/authtoken/views.py], `drf_create_token`,
-   and `TokenAdmin` [rest_framework/authtoken/admin.py:L51].
+5. The same `Token` model backs all provisioning paths, though they reach it
+   differently. `obtain_auth_token` (the `POST /api/token/` view) returns
+   `{'token': token.key}` via `Token.objects.get_or_create`
+   [rest_framework/authtoken/views.py:L54-L59], and the `drf_create_token` management
+   command does the same
+   [rest_framework/authtoken/management/commands/drf_create_token.py:L12-L19, L44-L45].
+   The Django admin instead manages `Token` rows through `TokenProxy`/`TokenAdmin`
+   [rest_framework/authtoken/admin.py:L23-L51] — not via `get_or_create` — with the key
+   generated on save by `Token.save()` → `generate_key()`
+   [rest_framework/authtoken/models.py:L30-L37].
 
 **Token semantics.** The key is a **40-character hex** string; there is **one token per
 user** (`user = OneToOneField(..., related_name='auth_token')`
@@ -371,8 +385,10 @@ same key is returned by both `drf_create_token` and `POST /api/token/` (both use
 `get_or_create`).
 
 **Citations & Evidence.** [src/paperless/settings.py:L108, L120];
-[rest_framework/authtoken/models.py:L9, L13, L14, L18, L36];
-[rest_framework/authtoken/views.py]; [rest_framework/authtoken/admin.py:L51]. Runtime:
+[rest_framework/authtoken/models.py:L9, L13, L14, L18, L30-L37];
+[rest_framework/authtoken/views.py:L54-L59];
+[rest_framework/authtoken/management/commands/drf_create_token.py:L12-L19, L44-L45];
+[rest_framework/authtoken/admin.py:L23-L51]. Runtime:
 PROBE 4 (`POST /api/token/`) returned
 `{"token":"2242d6efaca7da52b0c8d2412fb5923fdba728a9"}` — the same key minted by
 `drf_create_token`. See the appendix.
@@ -574,9 +590,11 @@ The cited files and their roles (file paths only; line numbers are noted in-text
 - `src/paperless/views.py` — `StandardPagination` [L8-L11].
 - DRF 3.13.1 dependency internals:
   `rest_framework/authentication.py` [L44, L53, L57, L108-L109, L112, L151, L161, L203,
-  L211], `rest_framework/authtoken/models.py` [L9, L13, L14, L18, L36],
+  L211], `rest_framework/authtoken/models.py` [L9, L13, L14, L18, L30-L37],
   `rest_framework/views.py` [L89, L183-L190, L448-L461],
-  `rest_framework/authtoken/views.py`, `rest_framework/authtoken/admin.py` [L51],
+  `rest_framework/authtoken/views.py` [L54-L59],
+  `rest_framework/authtoken/management/commands/drf_create_token.py` [L12-L19, L44-L45],
+  `rest_framework/authtoken/admin.py` [L23-L51],
   `rest_framework/exceptions.py` [L167, L173].
 - Corroborating (web, corroborative only): the official DRF authentication docs at
   `https://www.django-rest-framework.org/api-guide/authentication/` confirm the
