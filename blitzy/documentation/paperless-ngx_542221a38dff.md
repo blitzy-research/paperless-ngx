@@ -57,7 +57,7 @@ The "standard interface" is the documents upload endpoint **`POST /api/documents
 
 ### 1.5 Live vs. code-derived evidence
 
-Every answer below was both **grounded in the source** (Phase 1) and **observed live** (Phase 2). Where a detail could not be surfaced live (specifically, OCRmyPDF's *own* internal log lines — see §4), this is stated explicitly and **no output is fabricated**.
+Every answer below was both **grounded in the source** (Phase 1) and **observed live** (Phase 2). Where a detail could not be surfaced live (specifically, OCRmyPDF's *own* routine **informational** log lines — which, at default verbosity with `progress_bar=False`, are not emitted), this is stated explicitly and **no output is fabricated**. See the routing note in §4.4, which also explains why ocrmypdf **warning/error** lines (e.g. logger `ocrmypdf._exec.tesseract`) route to `qcluster.out` but **never** to `paperless.log`.
 
 ---
 
@@ -272,7 +272,7 @@ and the stored Django-Q task result was exactly **`Success. New document id 1 cr
 - `[paperless.classifier] … not performing automatic matching.` is `load_classifier()` (consumer.py L292) reporting there is no trained model yet.
 - `Deleting file …` (consumer.py L349) and `Deleting directory …` (parser cleanup) remove the temp original and the parser tempdir.
 
-> **Honest caveat on OCRmyPDF's *own* logs.** With `progress_bar=False` and default verbosity, the **ocrmypdf** library (logger `ocrmypdf.*`) ran **quietly** in this configuration: its internal lines (e.g. a `Start processing N pages concurrently` style message) **did not appear** in either `paperless.log` or `qcluster.out` during the live run. They are therefore **not reproduced here** — the authoritative paperless stage logs are exactly as shown above.
+> **Honest caveat on OCRmyPDF's *own* logs — and exactly where they route.** The `LOGGING` config binds the `file_paperless` handler (→ `paperless.log`) **only** to the `paperless` logger (`src/paperless/settings.py:L392`, `L409`), while the **`root`** logger uses the `console` handler — the worker's **stdout**, captured in `qcluster.out` (`src/paperless/settings.py:L387`, `L407`). Because `disable_existing_loggers` is `False` (`L375`) and the `ocrmypdf.*` loggers are left unconfigured, **ocrmypdf's own records never reach `paperless.log`**; they propagate to `root` → `console` → `qcluster.out`. With `progress_bar=False` and default verbosity, ocrmypdf's routine *informational* lines (e.g. a `Start processing N pages concurrently`-style message) are **not emitted**, so the `paperless.*` stage logs above are the authoritative sequence and are **not** supplemented with any fabricated ocrmypdf output. Note, however, that `ocrmypdf.*` **warning/error** lines (e.g. logger `ocrmypdf._exec.tesseract`) **can appear in `qcluster.out`** for inputs that provoke them — for example, Tesseract orientation/script-detection (`[tesseract] Error during processing.`) on sparse pages when `rotate_pages=True`/`deskew=True` — but they **never** appear in `paperless.log`. This routing was confirmed live: `paperless.log` contained **0** `ocrmypdf` lines, while `qcluster.out` carried the `ocrmypdf._exec.tesseract` records.
 
 ### 4.5 The OCRmyPDF args, line-by-line
 
@@ -556,4 +556,3 @@ nothing to commit, working tree clean
 | **Q4** | DB columns vs. derived metadata | **15 stored columns** on `documents_document` (incl. `content` = OCR text, **relative** `filename`/`archive_filename`, `checksum`/`archive_checksum`, `created`/`modified`/`added`, `mime_type`, `storage_type='unencrypted'`), **plus** the `tags` many-to-many relationship persisted via the join table `documents_document_tags` (not a column). `source_path`/`archive_path`/`thumbnail_path`/`file_type` are computed `@property` values, **not columns**; the **thumbnail has no DB field at all**. |
 
 **Key insight throughout:** acceptance (synchronous, `200 "OK"`) is decoupled from processing (asynchronous, in the `qcluster` worker); the database stores **relative** filenames and the OCR **content** as columns, while the on-disk paths and `file_type` are **computed properties** — and the **thumbnail's location is derived purely from the primary key with no database column**.
-
