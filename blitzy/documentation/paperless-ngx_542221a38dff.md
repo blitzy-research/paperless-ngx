@@ -712,9 +712,10 @@ roles must be kept apart: the signal is *sent* from `parsers.py`, and it is *rec
 (`src/documents/parsers.py:L13`) and **sends** it to collect every registered parser's
 declaration — `get_parser_class_for_mime_type` (`src/documents/parsers.py:L81-L98`) runs
 `document_consumer_declaration.send(None)` and resolves the highest-weight parser for a MIME
-type, while the sibling helpers `get_default_file_extension` (`src/documents/parsers.py:L48`)
-and `get_supported_file_extensions` (`src/documents/parsers.py:L71`) run the same send-loop
-for file extensions. The parser apps themselves **register** as *receivers* of that signal
+type, while the sibling helpers `get_default_file_extension` (`src/documents/parsers.py:L47-L59`)
+and `get_supported_file_extensions` (`src/documents/parsers.py:L69-L78`) run the same send-loop
+(`document_consumer_declaration.send(None)` at `src/documents/parsers.py:L48` and
+`src/documents/parsers.py:L71`, respectively) for file extensions. The parser apps themselves **register** as *receivers* of that signal
 in their `AppConfig.ready()` methods via `document_consumer_declaration.connect(...)`:
 `src/paperless_tesseract/apps.py:L11-L13`, `src/paperless_text/apps.py:L11-L13`, and
 (conditionally, only when `PAPERLESS_TIKA_ENABLED`) `src/paperless_tika/apps.py:L10-L13`.
@@ -791,4 +792,3 @@ and a chain of handlers applies the inbox tag, the matched metadata, and the ind
   be generalized to other versions of paperless-ngx. Later releases change at least the
   background-execution engine (Celery) and may change model fields, the pipeline, and the
   matching internals described here.
-
