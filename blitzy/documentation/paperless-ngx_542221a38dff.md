@@ -146,6 +146,7 @@ The genuinely *separate* Django-Q tasks in this codebase are **recurring schedul
 | `documents.tasks.train_classifier` | HOURLY (`H`) | `src/documents/migrations/1001_auto_20201109_1636.py:10-14` |
 | `documents.tasks.index_optimize` | DAILY (`D`) | `src/documents/migrations/1001_auto_20201109_1636.py:15-19` |
 | `documents.tasks.sanity_check` | WEEKLY (`W`) | `src/documents/migrations/1004_sanity_check_schedule.py:10-13` |
+| `paperless_mail.tasks.process_mail_accounts` | every 10 min (`Schedule.MINUTES` = type `I`) | `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15` |
 | `documents.tasks.bulk_update_documents` | on UI bulk-edit | `src/documents/bulk_edit.py:18,31,47,63,87` |
 
 ### Evidence (observed)
@@ -184,7 +185,7 @@ The separate recurring schedules were observed live in the `django_q_schedule` t
   ```
 - Classification stage: `src/documents/classifier.py:30` `load_classifier()` (returns `None` when no model exists and logs `:33` `"Document classification model does not exist (yet), not …"`), `:60` `class DocumentClassifier`, `:63` `FORMAT_VERSION = 7`.
 - Indexing stage (Whoosh): `src/documents/index.py:52` `open_index()`, `:87` `update_document()`, `:118` `add_or_update_document()`, invoked by the handler `src/documents/signals/handlers.py:428-431` `add_to_index` → `index.add_or_update_document(document)`.
-- Separate scheduled tasks: `src/documents/tasks.py:48` `train_classifier`, `:32` `index_optimize`, `:255` `sanity_check`; registered in `src/documents/migrations/1001_auto_20201109_1636.py:10-19` (HOURLY/DAILY) and `src/documents/migrations/1004_sanity_check_schedule.py:10-13` (WEEKLY). Bulk: `src/documents/tasks.py:270` `bulk_update_documents`, dispatched from `src/documents/bulk_edit.py:18,31,47,63,87`.
+- Separate scheduled tasks: `src/documents/tasks.py:48` `train_classifier`, `:32` `index_optimize`, `:255` `sanity_check`; registered in `src/documents/migrations/1001_auto_20201109_1636.py:10-19` (HOURLY/DAILY) and `src/documents/migrations/1004_sanity_check_schedule.py:10-13` (WEEKLY). The mail poller `paperless_mail.tasks.process_mail_accounts` is a further recurring schedule, registered in `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15` (every 10 min, `Schedule.MINUTES` = type `I`). Bulk: `src/documents/tasks.py:270` `bulk_update_documents`, dispatched from `src/documents/bulk_edit.py:18,31,47,63,87`.
 
 ### Rationale
 
@@ -210,7 +211,7 @@ Captured with a standalone proof-of-concept using the real `django-q==1.3.9` aga
 
 - `Conf.PREFIX = 'paperless'`, `Conf.COMPRESSED = False`, broker list key = `django_q:paperless:q`.
 - After enqueue, the **only** Redis key present was `django_q:paperless:q` — a `LIST` with `LLEN = 1`. Its single element was **453 opaque bytes**.
-- Wire format = **three colon-separated, base64-encoded segments** — `<base64 pickle-payload>:<base64 timestamp>:<base64 HMAC-SHA256 signature>` — the classic Django `TimestampSigner` envelope. There is **no leading `.`**, which is Django-Q's marker for compression, confirming the payload is **not compressed**. The decoded pickle header bytes `\x80\x05` confirm **pickle protocol 5**.
+- Wire format = **three colon-separated segments** — `<URL-safe-base64 pickle-payload>:<base62 timestamp>:<URL-safe-base64 HMAC-SHA256 signature>` — the classic Django `TimestampSigner` envelope (the middle segment is the signing timestamp, `b62_encode(int(time.time()))` — **base62**, not base64). There is **no leading `.`**, which is Django-Q's marker for compression, confirming the payload is **not compressed**. The decoded pickle header bytes `\x80\x05` confirm **pickle protocol 5**.
 - Decoding with `SignedPackage.loads(raw)` yields a dict whose keys are EXACTLY `['args', 'func', 'id', 'kwargs', 'name', 'started']`:
 
 ```python
@@ -401,7 +402,7 @@ This chain is corroborated end-to-end by the observed evidence: the detection lo
 | **R1** | "All services" = `gunicorn` + `consumer` (`document_consumer`) + `scheduler` (`qcluster`), backed by Redis 6.0 + PostgreSQL 13 (SQLite default) | startup log: `spawned: 'consumer'/'gunicorn'/'scheduler'`; `redis-cli ping → PONG`; `curl :8000 → 302` | `docker/supervisord.conf` (`[program:gunicorn|consumer|scheduler]`); `docker/compose/docker-compose.postgres.yml` (`redis:6.0`, `postgres:13`); `settings.py:297-320` |
 | **R2/R3** | Detection logs `Adding {filepath} to the task queue.` then enqueues `documents.tasks.consume_file` via `async_task` | `[INFO] [paperless.management.consumer] Adding …/blitzy_probe.txt to the task queue.` | `document_consumer.py:24,46,85,86-91`; `tasks.py:184`; `settings.py:378` |
 | **R4** | Parsing/classification/indexing run **in-process** inside the one `consume_file` task via 6 signal handlers — not separate tasks | single-task DEBUG trace (`Consuming…` → `Detected mime type` → `Parser` → `Parsing` → `thumbnail` → classifier → `Saving record` → `consumption finished`); Whoosh index files written | `consumer.py:180,215,221,298,306,373`; `apps.py:22-27`; `classifier.py:30,63`; `index.py:118`; `handlers.py:428-431` |
-| **R4** | Separate Django-Q tasks are recurring schedules + bulk-edit | `django_q_schedule`: `train_classifier`(H), `index_optimize`(D), `sanity_check`(W), `process_mail_accounts`(I) | `migrations/1001_…:10-19`; `migrations/1004_…:10-13`; `bulk_edit.py:18,31,47,63,87` |
+| **R4** | Separate Django-Q tasks are recurring schedules + bulk-edit | `django_q_schedule`: `train_classifier`(H), `index_optimize`(D), `sanity_check`(W), `process_mail_accounts`(I) | `migrations/1001_…:10-19`; `migrations/1004_…:10-13`; `paperless_mail/migrations/0002_…:10-15`; `bulk_edit.py:18,31,47,63,87` |
 | **R5** | Queued payload = pickled+HMAC-signed dict on Redis list `django_q:paperless:q`; RPUSH/BLPOP; not compressed | only key `django_q:paperless:q` (LIST, LLEN=1), 453 bytes, 3 colon segments, pickle proto 5 `\x80\x05`; decoded keys `['args','func','id','kwargs','name','started']` | `settings.py:110,449-457`; `django_q/{tasks,signing,brokers/redis_broker,conf}.py` |
 | **R6** | Document row in `documents_document`; metadata fields; history in `django_q_task` / `django_q_schedule` / `django_admin_log` | `documents_document` id=1; `django_admin_log` user=`consumer`, flag=1; `django_q_task` result=`Success. New document id 1 created` | `models.py:88,196-205,285`; `consumer.py:379,398`; `handlers.py:413-425`; `tasks.py:247` |
 | **R7** | Task created by `document_consumer` (+ REST view + mail fetcher); dispatched by **Django-Q over Redis (not Celery)** via `async_task` | full chain reproduced (detection → payload → pipeline → rows) | `document_consumer.py:86-91`; `views.py:523-531`; `mail.py:336-337`; `consumer.py:180,398`; `settings.py:110,449-457` |
