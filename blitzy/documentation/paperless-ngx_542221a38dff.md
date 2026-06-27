@@ -12,20 +12,32 @@ This document answers five runtime questions about an idle Paperless-NGX instanc
 1. **Code is the source of truth.** Every factual claim carries an inline citation to a specific file and line range, e.g. `[gunicorn.conf.py:L17-L18]`. Nothing here rests on assumption or general Paperless folklore.
 2. **The system was actually built and run.** A live stack was brought up from the provided Docker image at the target commit, allowed to idle, and then deliberately perturbed (a reversible restart of the scheduler, the Redis broker, and the web server) so that real log output could be captured first-hand.
 
-> **Task engine note:** Paperless-NGX uses **Django-Q** (`django-q==1.3.9` `[requirements.txt:L37]`) for asynchronous and scheduled work. There is **no Celery** anywhere in the dependency set `[requirements.txt:L1-L113]`. All scheduling described below is Django-Q.
+> **Task engine note:** Paperless-NGX uses **Django-Q** (`django-q==1.3.9` `[requirements.txt:L37]`) for asynchronous and scheduled work. Django-Q is the **only** async/scheduled task engine in the dependency set — no alternative task-queue engine is present `[requirements.txt:L1-L113]`. All scheduling described below is Django-Q.
 
 ### How evidence is labelled in this document
 
-To keep the three kinds of evidence cleanly separated (a requirement of an audit-grade answer), every block is tagged:
+To keep the kinds of evidence cleanly separated (a requirement of an audit-grade answer), every block is tagged:
 
 - **`[file:Lx-Ly]`** — a citation to repository source/configuration at this commit. These are the authoritative facts.
+- **`(code-derived)`** — a description of how the **production** image behaves, read directly from the committed Docker configuration/scripts (the entrypoint, `docker-prepare.sh`, `supervisord.conf`, and the Compose healthcheck). These claims are grounded in the cited files but were **not** reproduced by the run performed here, because the provided image is an analysis image that does not execute the production entrypoint or Supervisor (see the next subsection). A `(code-derived)` block is always paired with a `[file:Lx-Ly]` citation.
 - **`(captured live)`** — verbatim output from the running stack described below. Where a block was shortened for length it is tagged **`(captured live — abbreviated)`** and the omitted lines are described explicitly; no block silently elides content. Mutable values (timestamps, PIDs, Django-Q cluster names, random task ids) vary per run and are shown as captured.
 - **`(probe / command)`** — a command that was *issued* (e.g. an HTTP request or a `kill`), as opposed to a line the application *emitted*. A probe is not an application log line.
 - **`(Django-Q library runtime)`** — strings emitted by the Django-Q library (not vendored in this repo), corroborated against the official Django-Q 1.3.x documentation **and** confirmed verbatim against the live `qcluster` output reproduced here.
 
+> **Code-derived vs captured-live — the boundary in this investigation.** The provided image runs the application through a **manual process-launch harness** (next subsection), not through the production entrypoint/Supervisor. Therefore the **production startup orchestration** — the entrypoint banner, the `docker-prepare.sh` sequence, Supervisor launching/merging the three programs, and the Compose **Docker** healthcheck/`healthy` state — is documented here as `(code-derived)` from the committed config, **not** as captured-live output. What *was* captured live: the three programs launched directly (`gunicorn`, `document_consumer`, `qcluster`), the Django-Q `[Q]` output, the repo's `wait-for-redis.py` plus the `migrate`/`collectstatic`/`reindex` helpers run by hand, and explicit `GET /` HTTP probes.
+
 ### How the live stack was assembled (exact, reproducible commands)
 
-Because the production stack needs Redis, PostgreSQL, and OCR tooling, the canonical run environment is the provided container image. **Credentials are supplied through the shell environment and are never hard-coded into commands** — set them once before running:
+Because the production stack needs Redis, PostgreSQL, and OCR tooling, the canonical run environment is the provided container image. **One property of that image must be stated up front, because it shapes every "captured live" claim below:** the provided image is an **analysis image** — it contains the repository at the target commit plus all Python/OCR dependencies, but it is **not** the production Dockerfile runtime. It has **no `paperless` system user** and **no Supervisor** (`supervisord`/`supervisorctl` are absent). Running the production entrypoint inside it prints the banner and then aborts at its first step `(captured live)`:
+
+```text
+Paperless-ngx docker container starting...
+id: 'paperless': no such user
+```
+
+Consequently the stack is brought up here with a **manual process-launch harness** that starts the *same three programs Supervisor would manage*, after running the same preparation steps `docker-prepare.sh` performs. The production entrypoint → `docker-prepare.sh` → Supervisor orchestration itself is therefore documented as `(code-derived)` from the committed config (Sections 1, 4.4, 5); the individual preparation helpers and the three programs were run by hand and their output **was** captured live. The `docker logs` of the `--entrypoint tail` container below is empty for the same reason — the supervised programs were launched via `docker exec` into separate log files, which is also what makes per-process attribution possible `(captured live)`.
+
+**Credentials are supplied through the shell environment and are never hard-coded into commands** — set them once before running:
 
 ```bash
 # Credentials are injected via the environment, not written into commands.
@@ -85,7 +97,7 @@ In the production image these same three programs are launched and supervised au
 
 **What the deployment unit is.** Paperless-NGX ships as a Docker Compose stack. A single `webserver` container runs **Supervisor in the foreground** (`nodaemon=true` `[docker/supervisord.conf:L2]`), which manages exactly three long-running programs `[docker/supervisord.conf:L10-L35]`. Two sidecar services complete the stack: a `broker` running `redis:6.0` `[docker/compose/docker-compose.postgres.yml:L31-L32]` and a `db` running `postgres:13` `[docker/compose/docker-compose.postgres.yml:L37-L38]`.
 
-**The startup sequence (what happens before "idle").** In the production image the container entrypoint prints a banner and then hands off to a preparation script:
+**The startup sequence (what happens before "idle").** In the production image the container entrypoint prints a banner and then hands off to a preparation script. This orchestration is `(code-derived)` — read from the committed scripts; in this investigation the same preparation steps were instead run by hand (see the Methodology harness), because the provided analysis image has no `paperless` user or Supervisor:
 
 - The entrypoint prints `Paperless-ngx docker container starting...` `[docker/docker-entrypoint.sh:L77]`, initializes directories/permissions, and execs the command `[docker/docker-entrypoint.sh:L84-L92]`.
 - `docker-prepare.sh`'s `do_work()` runs a fixed sequence: `wait_for_postgres` (only when `PAPERLESS_DBHOST` is set `[docker/docker-prepare.sh:L67-L69]`) → `wait_for_redis` → `migrations` → `search_index` → `superuser` `[docker/docker-prepare.sh:L66-L79]`. Migrations print `Apply database migrations...` `[docker/docker-prepare.sh:L44]`; the search index is rebuilt **only** if `data/.index_version` is missing or `!= "1"`, printing `Search index out of date. Updating...` `[docker/docker-prepare.sh:L53-L54]`.
@@ -108,7 +120,7 @@ ERRORS:
 
 After creating those directories (the transient helper above), `manage.py migrate` applied all migrations — including the data migrations that create the scheduled tasks (see Section 2) — and `collectstatic` reported `171 static files copied` to the configured static root `(captured live)`.
 
-**Reaching idle.** Supervisor then execs and the three programs come up `[docker/supervisord.conf:L10-L29]`. The web server answers `GET /`; there is **no dedicated `/health` endpoint** — the catch-all route serves the SPA index behind `login_required` `[src/paperless/urls.py:L132]`. A bare unauthenticated `GET /` therefore returns **`302 Found` → `/accounts/login/?next=/`**, and returns **`200 OK`** once the redirect is followed `(captured live)`. Both outcomes count as "up" for the healthcheck (Section 3.1).
+**Reaching idle.** In production, Supervisor then execs and brings up the three programs `[docker/supervisord.conf:L10-L29]`; in this investigation the manual harness launched those same three programs (Methodology). The web server answers `GET /`; there is **no dedicated `/health` endpoint** — the catch-all route serves the SPA index behind `login_required` `[src/paperless/urls.py:L132]`. A bare unauthenticated `GET /` therefore returns **`302 Found` → `/accounts/login/?next=/`**, and returns **`200 OK`** once the redirect is followed `(captured live)`. Both outcomes count as "up" for the healthcheck (Section 3.1).
 
 ---
 
@@ -170,9 +182,10 @@ healthcheck:
   retries: 5
 ```
 
-- **What it is (probe / command):** an external HTTP `GET /` issued by Docker via `curl -f` against `http://localhost:8000` every **30 seconds**, with a 10 s timeout and 5 retries before the container is marked unhealthy `[docker/compose/docker-compose.postgres.yml:L57-L59]`.
-- **It does NOT emit an application log line — verified live.** `gunicorn.conf.py` configures **no** access log (it defines only `bind`, `workers`, `worker_class`, `timeout`, and lifecycle hooks `[gunicorn.conf.py:L1-L18]`). Empirically, after issuing a `GET /` against the running server, gunicorn's stdout/stderr stream remained at exactly its four startup lines — **no access/`GET /` line was produced** `(captured live)`. The healthcheck is therefore a *probe*, observable as a container health state, **not** a periodic log entry.
-- **What "healthy" means here:** `curl -f` fails only on HTTP status ≥ 400, so the `302 Found` → `/accounts/login/` redirect that a bare `GET /` returns is treated as success `(captured live)`; there is no dedicated `/health` route `[src/paperless/urls.py:L132]`. A passing probe means gunicorn, its ASGI app, and the DB-backed index view are all responsive.
+- **What it is (code-derived):** the committed Compose healthcheck defines an external HTTP `GET /` issued by Docker via `curl -f` against `http://localhost:8000` every **30 seconds**, with a 10 s timeout and 5 retries before the container is marked unhealthy `[docker/compose/docker-compose.postgres.yml:L55-L59]`. This 30 s / `curl -f` / `healthy`-state behavior belongs to the **production Compose stack**.
+- **How readiness was checked in this investigation (probe / command).** The manual harness started the web container *without* a Docker healthcheck object (the `docker run` defined none), so Docker reports **no** health status for it (`State.Health = no-health`) and `docker ps` never shows `healthy` for this run `(captured live)`. Readiness was instead confirmed by issuing explicit `GET /` HTTP probes, which returned `302 → 200` `(captured live)`. The Compose `healthy` *container* state above is thus `(code-derived)`, while the responsiveness it asserts was verified here directly over HTTP.
+- **It does NOT emit an application log line — verified live.** `gunicorn.conf.py` configures **no** access log (it defines only `bind`, `workers`, `worker_class`, `timeout`, and lifecycle hooks `[gunicorn.conf.py:L1-L18]`). Empirically, after issuing a `GET /` against the running server, gunicorn's stdout/stderr stream remained at exactly its four startup lines — **no access/`GET /` line was produced** `(captured live)`. The healthcheck is therefore a *probe*, **not** a periodic log entry.
+- **What "healthy" means:** `curl -f` fails only on HTTP status ≥ 400, so the `302 Found` → `/accounts/login/` redirect that a bare `GET /` returns is treated as success `(captured live)`; there is no dedicated `/health` route `[src/paperless/urls.py:L132]`. A passing probe means gunicorn, its ASGI app, and the DB-backed index view are all responsive.
 
 ### 3.2 The Django-Q `[Q]` task-execution sequence — once per schedule firing
 
@@ -245,20 +258,23 @@ To answer "if you briefly interrupt and restart part of the system, what confirm
 These are the precise, sanitized commands issued. Process IDs were located by scanning `/proc/<pid>/cmdline` (the image ships no `ps`); each `<…-pid>` below is the master process of that program `(probe / command)`:
 
 ```bash
-# (4.1) Django-Q scheduler: graceful stop, then relaunch (run from src/)
+# (4.1) Django-Q scheduler: graceful stop, then relaunch (run from src/)   [executed here]
 kill -TERM <qcluster-master-pid>                                   # SIGTERM = graceful cluster stop
 python3 manage.py qcluster                                         # relaunch
 
-# (4.2) Redis broker: restart the container, then re-verify connectivity
+# (4.2) Redis broker: restart the container, then re-verify connectivity   [executed here]
 docker restart paperless-broker
 python3 ../docker/wait-for-redis.py                                # re-run the repo's readiness helper
 
-# (4.3) Web server: graceful stop, then relaunch (run from src/)
+# (4.3) Web server: graceful stop, then relaunch (run from src/)           [executed here]
 kill -TERM <gunicorn-master-pid>
 gunicorn -c ../gunicorn.conf.py paperless.asgi:application
 
-# (4.4) Supervisor-managed restart (when running under Supervisor)
-supervisorctl restart scheduler                                    # program name per docker/supervisord.conf:L28
+# (4.4) Supervisor-managed restart — PRODUCTION image only; NOT executed in this
+#       investigation, because the provided analysis image ships no Supervisor
+#       (supervisorctl/supervisord are absent). Shown as the code-derived production
+#       command; its program name is per docker/supervisord.conf:L28.
+supervisorctl restart scheduler
 ```
 
 ### 4.1 Restarting the Django-Q scheduler (`qcluster`)
@@ -354,39 +370,39 @@ Gracefully stopping and relaunching the gunicorn master re-emitted the readiness
 
 The decisive "operational again" line is **`Server is ready. Spawning workers`** `[gunicorn.conf.py:L17-L18]`.
 
-### 4.4 Supervisor-managed restart — the consumer readiness line and `entered RUNNING state`
+### 4.4 Production process supervision — the consumer readiness line and Supervisor's `entered RUNNING state`
 
-The manual restarts in §4.1–§4.3 launched each process directly, which is why their snippets are cleanly attributable to a single component; that method does **not** exercise Supervisor. In the production image, however, all three programs run under Supervisor `[docker/supervisord.conf:L10-L35]`, which emits its own lifecycle lines and **restarts any program that exits**. To capture those exact lines, Supervisor was run over the same three programs (`gunicorn`, `consumer`, `scheduler`) and the output captured verbatim.
+The manual restarts in §4.1–§4.3 launched each process directly, which is why their snippets are cleanly attributable to a single component; that method does **not** exercise Supervisor. In the **production image** all three programs instead run under Supervisor `[docker/supervisord.conf:L10-L35]`, which emits its own lifecycle lines and **restarts any program that exits**. The provided analysis image ships **no** Supervisor (`supervisord`/`supervisorctl` are absent `(captured live)`) and has no `paperless` user for the programs to run as `[docker/supervisord.conf:L12,L21,L30]`, so the Supervisor lifecycle output in this subsection is `(code-derived)` — its shape follows Supervisor's documented logging and the program names come straight from `docker/supervisord.conf`; it was **not** captured from this run. The per-component recovery lines that *were* captured live are the manual `qcluster`/`gunicorn`/Redis restarts in §4.1–§4.3.
 
-**Consumer readiness line.** On every (re)start the consumer prints exactly one readiness line and is then silent until a file event `[src/documents/management/commands/document_consumer.py:L200]`. Captured verbatim (directory rendered as its settings variable to keep this document container-path-neutral) `(captured live)`:
+**Consumer readiness line `(captured live)`.** On every (re)start the consumer prints exactly one readiness line and is then silent until a file event `[src/documents/management/commands/document_consumer.py:L200]`. The manually-launched `document_consumer` produced it verbatim (directory rendered as its settings variable to keep this document container-path-neutral):
 
 ```text
-[2026-06-26 22:22:38,151] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: <CONSUMPTION_DIR>
+[INFO] [paperless.management.consumer] Using inotify to watch directory for changes: <CONSUMPTION_DIR>
 ```
 
 (The default watch mode is inotify because `CONSUMER_POLLING` defaults to `0` `[src/paperless/settings.py:L478]`; in polling mode the line would instead read `Polling directory for changes: ...` `[src/documents/management/commands/document_consumer.py:L186]`.)
 
-**Supervisor lifecycle lines.** Supervisor's own log shows each program being spawned and then confirmed up. Captured verbatim — the `entered RUNNING state` line is Supervisor's "operational again" confirmation `(captured live)`:
+**Supervisor lifecycle lines `(code-derived)`.** Under Supervisor, each program is spawned and then confirmed up; the `entered RUNNING state` line is Supervisor's "operational again" confirmation. The shape follows Supervisor's documented behavior, with the three program names taken from `docker/supervisord.conf:L10,L19,L28` (`<pid>` is assigned at runtime):
 
 ```text
-2026-06-26 22:22:36,996 INFO spawned: 'consumer' with pid 1124
-2026-06-26 22:22:36,998 INFO spawned: 'gunicorn' with pid 1125
-2026-06-26 22:22:37,000 INFO spawned: 'scheduler' with pid 1126
-2026-06-26 22:22:38,151 INFO success: consumer entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
-2026-06-26 22:22:38,152 INFO success: gunicorn entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
-2026-06-26 22:22:38,152 INFO success: scheduler entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+INFO spawned: 'consumer' with pid <pid>
+INFO spawned: 'gunicorn' with pid <pid>
+INFO spawned: 'scheduler' with pid <pid>
+INFO success: consumer entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+INFO success: gunicorn entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+INFO success: scheduler entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
 ```
 
-A **Supervisor-managed restart** of one program (`supervisorctl restart scheduler` — program name per `[docker/supervisord.conf:L28]`) produced the stop → respawn → ready sequence, again ending in `entered RUNNING state` `(captured live)`:
+A **Supervisor-managed restart** of one program — `supervisorctl restart scheduler` (program name per `[docker/supervisord.conf:L28]`) — produces the stop → respawn → ready sequence, again ending in `entered RUNNING state`. This command is **not runnable in the provided analysis image** (no `supervisorctl`); the sequence below is `(code-derived)` from Supervisor's documented behavior:
 
 ```text
-2026-06-26 22:22:54,887 INFO waiting for scheduler to stop
-2026-06-26 22:22:56,050 INFO stopped: scheduler (exit status 0)
-2026-06-26 22:22:56,052 INFO spawned: 'scheduler' with pid 1202
-2026-06-26 22:22:57,054 INFO success: scheduler entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+INFO waiting for scheduler to stop
+INFO stopped: scheduler (exit status 0)
+INFO spawned: 'scheduler' with pid <pid>
+INFO success: scheduler entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
 ```
 
-- **Meaning / frequency:** these Supervisor lines appear **once per program (re)start**. In steady idle they are not periodic — they fire only when Supervisor starts the stack or when a managed program exits/crashes and Supervisor restarts it. `entered RUNNING state` is the authoritative "this program is operational again" signal at the process-supervision layer.
+- **Meaning / frequency:** these Supervisor lines appear **once per program (re)start**. In steady idle they are not periodic — they fire only when Supervisor starts the stack or when a managed program exits/crashes and Supervisor restarts it. `entered RUNNING state` is the authoritative "this program is operational again" signal at the process-supervision layer **in production**. In this investigation that role was filled by relaunching each program by hand (§4.1–§4.3) and confirming recovery from each program's own output.
 
 ### 4.5 A key behavioral nuance — `catch_up = False`
 
@@ -398,7 +414,7 @@ A **Supervisor-managed restart** of one program (`supervisorctl restart schedule
 
 Even with zero documents being processed, the following components stay up to keep Paperless-NGX ready:
 
-1. **The three Supervisor-managed processes** `[docker/supervisord.conf:L10-L29]`:
+1. **The three long-running processes** (Supervisor-managed in the production image `[docker/supervisord.conf:L10-L29]`; launched by the manual harness in this investigation — see §4.4):
    - **gunicorn** (ASGI) — serves HTTP and WebSocket on `:8000` `[gunicorn.conf.py:L3]`. Confirmed live with **2 web workers** (one master + two worker processes), matching the default `workers = 2` `[gunicorn.conf.py:L4]` `(captured live)`.
    - **document_consumer** — the inotify watcher. The default watch mode is inotify because `CONSUMER_POLLING` defaults to `0` `[src/paperless/settings.py:L478]`; it logs `Using inotify to watch directory for changes: <CONSUMPTION_DIR>` once `[src/documents/management/commands/document_consumer.py:L200]` and is then silent until a file event.
    - **qcluster** — the Django-Q cluster. Confirmed live with **11 task workers** plus a monitor, a pusher, and a guarding sentinel `(captured live)`. The worker count is `TASK_WORKERS = floor(sqrt(cpu_count))` for hosts with ≥4 cores `[src/paperless/settings.py:L427-L438]`; this host has 128 cores, hence 11. (A typical 2–4 core deployment would show 2.) This is a **separate worker pool** from gunicorn's 2 web workers.
@@ -431,7 +447,7 @@ This section makes explicit the reasoning that connects the code to the conclusi
 
 - **Why missed schedules don't replay after a restart.** `catch_up=False` `[src/paperless/settings.py:L451]` tells Django-Q to skip intervals that elapsed during downtime rather than back-fill them. This is the correct behavior for periodic maintenance work (re-running an hour of skipped "optimize the index" calls would be pointless), and it matched the live restart, where no catch-up tasks fired `(captured live)`.
 
-- **Why "healthy" is a probe on `/` rather than a `/health` endpoint.** There is no health route; the catch-all URL serves the SPA index behind `login_required` `[src/paperless/urls.py:L132]`, and the Compose healthcheck simply asserts `curl -f http://localhost:8000` succeeds `[docker/compose/docker-compose.postgres.yml:L55-L59]`. Because `curl -f` only fails on status ≥ 400, the `302 Found` → login redirect counts as healthy `(captured live)`; the probe asserts responsiveness of gunicorn, its ASGI app, and the DB-backed view, without emitting any application log line.
+- **Why "healthy" is a probe on `/` rather than a `/health` endpoint.** There is no health route; the catch-all URL serves the SPA index behind `login_required` `[src/paperless/urls.py:L132]`, and the Compose healthcheck simply asserts `curl -f http://localhost:8000` succeeds `[docker/compose/docker-compose.postgres.yml:L55-L59]`. Because `curl -f` only fails on status ≥ 400, the `302 Found` → login redirect is treated as success; the `302 → 200` was confirmed by a direct `GET /` probe `(captured live)`, while the Compose `healthy` *container* state itself is `(code-derived)` and was not observed for the manual run (see §3.1). The probe asserts responsiveness of gunicorn, its ASGI app, and the DB-backed view, without emitting any application log line.
 
 ---
 
@@ -493,12 +509,12 @@ Every factual claim above maps to one of the following file locators (verified b
 The following claims are grounded in `(captured live)` output reproduced in the body above, from the single run described in the Methodology section (image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01`, wall-clock window `2026-06-26 22:17–22:22 UTC`):
 
 - Redis readiness lines and the startup `paths_check` failure (Section 1).
-- `collectstatic` reporting `171 static files copied`, and `GET /` returning `302 → /accounts/login/` (`200` when followed) (Sections 1, 3.1).
+- `collectstatic` reporting `171 static files copied`; `GET /` returning `302 → /accounts/login/` (`200` when followed); and the manual web container reporting **no** Docker health object (`State.Health = no-health`) (Sections 1, 3.1).
 - The four `django_q` Schedule rows and their `next_run` advance (Section 2.2).
 - The absence of any gunicorn access-log line after a `GET /` (Section 3.1).
 - The `[Q]` execution triple with schedule-name vs random-task-name, worker recycling, and the sanity-check INFO line (Sections 3.2–3.3).
 - The two-sink routing counts: `[Q]` absent from `paperless.log`; sanity line in both sinks; consumer DEBUG file-only (Section 3.4).
-- The qcluster stop/start sequences, the Redis self-heal (`reincarnated pusher … after sudden death`) and probe-task recovery, the gunicorn restart, and the Supervisor `entered RUNNING state` lines (Section 4).
+- The qcluster stop/start sequences, the Redis self-heal (`reincarnated pusher … after sudden death`) and probe-task recovery, and the gunicorn restart (Section 4). The Supervisor lifecycle lines in §4.4 are `(code-derived)`, not part of this captured-live set.
 - The live worker counts (2 gunicorn workers; 11 Django-Q workers) (Section 5).
 
 ### Note on Django-Q `[Q]` strings (library runtime, not repository code)
