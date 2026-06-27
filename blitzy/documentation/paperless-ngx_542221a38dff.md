@@ -50,7 +50,7 @@ These match the pinned versions in `requirements.txt`. (Context-only packages: `
 - **Test data:** the database started empty (0 documents), so three temporary documents were created via the ORM and explicitly indexed — the exact pattern the test suite uses [`src/documents/tests/test_api.py:L413-419`] — to establish an "already-ingested" baseline present in **both** the database and the Whoosh index.
 - **Worker observation:** for each operation the Django-Q `Task` table (`django_q.models.Task`) was queried **by `func`** to detect enqueued jobs precisely, and `/app/data/log/qcluster.log` was inspected for corroboration. The `Task`-table-by-`func` query is the load-bearing signal because the Django-Q cluster also logs its **own periodic scheduled jobs** (e.g. the recurring e-mail check) to the same log on an independent cadence — so raw `qcluster.log` line counts are deliberately *not* used as proof.
 - **Raw SQL:** because the SQLite CLI is not installed in the image, the raw `UPDATE` for O3 was issued through Python's `sqlite3` module directly against `/app/data/db.sqlite3` (bypassing the ORM and the API).
-- **No fabrication, and reproducibility of the evidence.** Every behavioral outcome shown below — search hit/miss **counts**, HTTP **statuses**, Django-Q `Task`-table **deltas by `func`**, and index **`doc_count`** — is an actual observed value, and each is a **reproducible invariant** that holds on every run. A few runtime details are intrinsically *non-reproducible* across runs: auto-increment document IDs, the unique title tokens we chose, Django-Q's randomly-generated task **slug** names, exact sub-second **timings**, and absolute log-line counts. To keep the evidence corroborable on any future run rather than pinned to one transient execution, those non-reproducible details are presented as **representative shapes/placeholders** (e.g. `<unique-token>`, `<id>`, `<random-task-slug>`) or as **qualitative scales** (e.g. "sub-second", "~1.4 s", "tens of milliseconds"), with a concrete "in this run" figure given only where it is illustrative. The load-bearing proof is always the reproducible invariant.
+- **No fabrication, and reproducibility of the evidence.** Every behavioral outcome shown below — search hit/miss **counts**, HTTP **statuses**, Django-Q `Task`-table **deltas by `func`**, and index **`doc_count`** — is an actual observed value, and each is a **reproducible invariant** that holds on every run. A few runtime details are intrinsically *non-reproducible* across runs: auto-increment document IDs, the unique title tokens we chose, Django-Q's randomly-generated task **slug** names, exact sub-second **timings**, and absolute log-line counts. To keep the evidence corroborable on any future run rather than pinned to one transient execution, those non-reproducible details are presented as **representative shapes/placeholders** (e.g. `<unique-token>`, `<id>`, `<random-task-slug>`) or as **qualitative scales** (e.g. "sub-second", "~1.4 s", "tens of milliseconds"), with concrete figures given as observed ranges across independent runs only where illustrative. The load-bearing proof is always the reproducible invariant.
 
 ### Cleanup performed
 
@@ -110,7 +110,7 @@ Because Whoosh permits only one writer to hold the file-DB lock at a time, the s
 
 ### A4. Upsert-by-id (replace in place, never duplicate)
 
-`add_or_update_document(document)` opens a writer and calls `update_document(writer, doc)` [`src/documents/index.py:L118-120`], which issues `writer.update_document(id=doc.pk, title=doc.title, content=doc.content, ...)` [`src/documents/index.py:L87-107`]. Because the `id` field is `unique=True`, Whoosh's `update_document()` **replaces** any prior entry for that `id` rather than appending a duplicate. Removal mirrors this: `remove_document_from_index` → `remove_document_by_id` → `writer.delete_by_term("id", doc_id)` [`src/documents/index.py:L110-125`].
+`add_or_update_document(document)` opens a writer and calls `update_document(writer, doc)` [`src/documents/index.py:L118-120`], which issues `writer.update_document(id=doc.pk, title=doc.title, content=doc.content, ...)` [`src/documents/index.py:L87-107`]. Because the `id` field is `unique=True`, Whoosh's `update_document()` **replaces** any prior entry for that `id` rather than appending a duplicate. Removal mirrors this: `remove_document_from_index` → `remove_document` → `remove_document_by_id` → `writer.delete_by_term("id", doc_id)` [`src/documents/index.py:L110-125`].
 
 ### A5. The read path reads the **index**, not the database (root cause of staleness)
 
@@ -251,10 +251,10 @@ curl -sS "http://localhost:8000/api/documents/?query=$TOKEN" -H "Authorization: 
 ```
 PATCH  HTTP 200                          (response body title == the new unique token)
 GET    ?query=<unique-token>  ->  "count": 1        (HIT, in the very next request)
-PATCH + immediate-search round trip:  sub-second    (~0.06 s in this run)
+PATCH + immediate-search round trip:  sub-second    (~0.06-0.10 s observed across runs)
 ```
 
-The document was searchable by its new title **immediately** — searching the unique token in the very next request returned **`"count": 1`**, and the combined edit-then-search round trip completed in **well under a tenth of a second** (≈0.06 s in this run), with no polling and no waiting for any background job.
+The document was searchable by its new title **immediately** — searching the unique token in the very next request returned **`"count": 1`**, and the combined edit-then-search round trip completed in **a fraction of a second** (sub-second; ≈0.06-0.10 s observed across independent runs), with no polling and no waiting for any background job.
 
 **Rationale.** The index commit happens *inside* the API request, before the `200 OK` is sent [`src/documents/views.py:L216-217`]. Per Whoosh semantics, a reader opened after a commit sees the committed data, and Paperless opens a **fresh searcher per search request** [`src/documents/index.py:L77-84, L240-254`]. Therefore the very next search observes the just-committed update. (Confirmed independently at the Whoosh layer — see *Whoosh-layer confirmation* below.)
 
@@ -439,10 +439,10 @@ after rebuild:  index doc_count == 3;  every current title  ->  "count": 1   (HI
 
 reconstruction time (3 documents):
     full `document_index reindex` command  ~  1.4 s                  (dominated by Django process startup/imports)
-    pure index_reindex() index-write work  ~  tens of milliseconds   (~0.015 s in this run)
+    pure index_reindex() index-write work  ~  tens of milliseconds   (~0.015-0.022 s observed across runs)
 ```
 
-After deleting the index, the very next open **recreated an empty index** and search returned nothing. A `document_index reindex` rebuilt it in **well under two seconds** for this small set — the actual index-write work was only **tens of milliseconds** (≈0.015 s in this run); the ~1.4 s of wall-clock for the standalone command is almost entirely Django startup. The visible activity during the rebuild was the `tqdm` progress bar. The index is briefly empty mid-rebuild (`recreate=True` happens before the iteration), as the code shows.
+After deleting the index, the very next open **recreated an empty index** and search returned nothing. A `document_index reindex` rebuilt it in **well under two seconds** for this small set — the actual index-write work was only **tens of milliseconds** (≈0.015-0.022 s observed across independent runs); the ~1.4 s of wall-clock for the standalone command is almost entirely Django startup. The visible activity during the rebuild was the `tqdm` progress bar. The index is briefly empty mid-rebuild (`recreate=True` happens before the iteration), as the code shows.
 
 **Restart subtlety (observed).** This stack was launched via the image's `start-paperless.sh` helper rather than `docker-prepare.sh`'s `do_work()`, so **no `.index_version` marker exists**. Per the gate at `docker/docker-prepare.sh:L53`, that means a fresh container startup *through that script* would auto-reindex. Conversely — and this is the cautionary case — if you delete the index but a valid `.index_version` marker *is* present, a restart through `docker-prepare.sh` would **not** auto-reindex (the gate is satisfied), and search would stay empty until a manual reindex.
 
