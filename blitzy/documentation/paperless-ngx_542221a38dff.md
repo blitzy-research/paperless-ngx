@@ -483,11 +483,15 @@ characters — so SHA-256 is impossible here.
 
 ### Documentation corroboration
 
-> *Corroboration (code remains authoritative):* A Paperless-ngx maintainer explicitly states that
-> duplicates are detected using MD5 and that a detected duplicate means the files are bit-for-bit
-> identical — directly corroborating the code and refuting the SHA-256 claim. The docs also state
-> that with the default, "when the consumer detects a duplicate document, it will not touch the
-> original document … Defaults to false."
+> *Corroboration (code remains authoritative):* The code and the official Paperless-ngx
+> documentation corroborate that duplicate detection is exact-checksum / bit-for-bit based — a
+> re-scan that is not a bit-for-bit match is not flagged as a duplicate. The code is
+> authoritative for *which* algorithm is used: at this commit `src/documents/consumer.py:L104`
+> computes an **MD5** digest, and the `checksum` / `archive_checksum` columns are `max_length=32`
+> (`src/documents/models.py:L135-L150`) — so detection is MD5-based and a 64-character SHA-256
+> digest is impossible, refuting the SHA-256 claim from the code itself rather than from any
+> attributed statement. The docs also state that with the default, "when the consumer detects a
+> duplicate document, it will not touch the original document … Defaults to false."
 
 ---
 
