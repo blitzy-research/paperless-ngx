@@ -209,7 +209,7 @@ sequenceDiagram
     Note over C,DB: O3 — raw SQL edit (bypass)
     C->>DB: UPDATE documents_document SET title=token2
     C->>I: GET /api/documents/?query=token2
-    I-->>C: MISS (index stale; old title still hits)
+    I-->>C: MISS (index stale, old title still hits)
 ```
 
 ---
@@ -294,7 +294,7 @@ after BULK edit ({"result":"OK"})         N+1  (delta +1)              b+1  (del
 
 The single edit added no Task row and no new qcluster.log lines.
 The bulk edit added exactly one task, processed by the qcluster worker.
-Django-Q assigns each task a randomly-generated three-word slug name, so the
+Django-Q assigns each task a randomly-generated four-word slug name, so the
 log/Task name varies per run; the shape of the new qcluster.log lines is:
 
   HH:MM:SS [Q] INFO Process-1:N processing [<random-task-slug>]
