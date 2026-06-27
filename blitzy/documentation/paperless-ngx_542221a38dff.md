@@ -44,12 +44,15 @@ Three independent lines of evidence back every answer below:
    internals (`rest_framework/authentication.py`, `rest_framework/authtoken/models.py`,
    `rest_framework/views.py`, `rest_framework/exceptions.py`,
    `rest_framework/authtoken/views.py`, `rest_framework/authtoken/admin.py`).
-2. **Empirical runtime (binding).** The contract was exercised against a running API
-   built on the **same pinned dependencies** (`django==4.0.4` +
-   `djangorestframework==3.13.1`), probing it unauthenticated, with a valid token, with
-   an invalid token, and via `POST /api/token/`, capturing status codes, headers, and
-   bodies verbatim (see the appendix). A deliberate **dual-server contrast** (Basic-first
-   vs. Session-first authenticator ordering) was run to prove the 401-vs-403 behavior.
+2. **Empirical runtime (binding).** The contract was exercised end-to-end against the
+   **actual Paperless-ngx application** run from the user-provided Docker image
+   (Paperless-ngx **v1.7.0**, Python 3.9, `django==4.0.4` + `djangorestframework==3.13.1`,
+   Redis + SQLite, `DEBUG=False`), probing it unauthenticated, with a valid token, with an
+   invalid token, with the wrong scheme (`Bearer`), without the trailing slash, and via
+   `POST /api/token/`, capturing status codes, headers, and bodies verbatim (see the
+   appendix). The decisive **401-vs-403 linchpin** was then proven by exercising the
+   **real DRF 3.13.1 authenticator code path** (Basic-first → `'Basic realm="api"'` →
+   `401`; Session-first → `None` → `403`) — without modifying the source.
 3. **Web documentation (corroborative only).** The official DRF authentication guide was
    consulted to cross-check the `Authorization: Token <key>` header contract and the
    401 + `WWW-Authenticate` behavior. It agrees with the source reading but is not the
@@ -88,13 +91,14 @@ Redis + a database). Conceptually:
 - Generate a token with `manage.py drf_create_token apitester`, which prints
   `Generated token <40-hex> for user apitester`.
 
-**Faithful minimal reproduction (behavior-equivalent).** The documents-list
-authentication contract is governed entirely by (a) the DRF authenticator ordering,
-(b) the `IsAuthenticated` permission, and (c) `StandardPagination`. It is therefore
-faithfully reproducible with the pinned `django==4.0.4` + `djangorestframework==3.13.1`
-on SQLite, mirroring Paperless's `REST_FRAMEWORK` config. That minimal reproduction was
-used to capture the verbatim evidence in the appendix; the full Docker stack should be
-used for an end-to-end check.
+**This was run end-to-end.** The verbatim evidence in the appendix was captured from the
+**actual Paperless-ngx application** (v1.7.0) started exactly this way from the
+user-provided Docker image (`DEBUG=False`, Redis + SQLite), with the user `apitester`, a
+generated token, and 30 seeded documents. Note that the documents-list authentication
+contract is governed entirely by (a) the DRF authenticator ordering, (b) the
+`IsAuthenticated` permission, and (c) `StandardPagination`, so it is *also* faithfully
+reproducible with just the pinned `django==4.0.4` + `djangorestframework==3.13.1` on
+SQLite — but the appendix below reflects the real Docker stack, not a stand-in.
 
 **Rationale (Thinking).** Token authentication requires the `authtoken` app to be
 installed and migrated, because a token is a *row* in the `authtoken_token` table keyed
@@ -123,7 +127,7 @@ guarantees [src/paperless/settings.py:L108].
 - `POST /api/token/` route [src/paperless/urls.py:L81]; admin registration
   `admin.site.register(TokenProxy, TokenAdmin)` [rest_framework/authtoken/admin.py:L51].
 - Runtime: `drf_create_token apitester` →
-  `Generated token 2242d6efaca7da52b0c8d2412fb5923fdba728a9 for user apitester` (see
+  `Generated token a1b6fe70fcb6406c24fa6c8c9043be8de6c46588 for user apitester` (see
   appendix). The `authtoken_token` table is present and a token row is created.
 
 ---
@@ -248,8 +252,8 @@ searching.
   `{"count":30,"next":".../?page=2","previous":null,"results":[...]}` with
   `len(results) == 25` and top-level keys exactly `[count, next, previous, results]`.
   PROBE 5 (`?page_size=5`) → 5 items, with `next` carrying `&page_size=5`. See the
-  appendix. (In the minimal reproduction, 30 documents were seeded, hence `count=30`;
-  against a real instance `count` reflects the actual number of documents.)
+  appendix. (In this run, 30 documents were seeded into the live instance, hence
+  `count=30`; against any instance `count` reflects the actual number of documents.)
 
 ---
 
@@ -298,7 +302,7 @@ Forbidden** [rest_framework/views.py:L461]. In other words: *with Basic first th
 is 401; if Session were first the very same unauthenticated request would yield 403 (and
 no `WWW-Authenticate` header).* The base-class docstring states the contract precisely — a
 returned string → `401`, `None` → `403` [rest_framework/authentication.py:L44]. This
-exact 401-vs-403 flip was reproduced empirically (see the CONTRAST PROOF in the appendix).
+exact 401-vs-403 flip was reproduced empirically (see the LINCHPIN PROOF in the appendix).
 
 ```mermaid
 flowchart TD
@@ -316,7 +320,8 @@ flowchart TD
 `{"detail":"Invalid token."}`. DRF raises `AuthenticationFailed(_('Invalid token.'))`
 [rest_framework/authentication.py:L203], and both `NotAuthenticated` and
 `AuthenticationFailed` carry `status_code = 401`
-[rest_framework/exceptions.py:L167, L173]. (Because `BasicAuthentication` is still first,
+[rest_framework/exceptions.py:L173-L174, L167-L168]. (Because `BasicAuthentication` is
+still first,
 this 401 also carries `WWW-Authenticate: Basic realm="api"`.)
 
 **Citations & Evidence.**
@@ -330,12 +335,15 @@ this 401 also carries `WWW-Authenticate: Basic realm="api"`.)
   [rest_framework/authentication.py:L44]; `SessionAuthentication` class with no override
   [rest_framework/authentication.py:L112].
 - Invalid-token path [rest_framework/authentication.py:L203]; 401 status on both
-  exceptions [rest_framework/exceptions.py:L167, L173].
-- **Runtime PROOF (dual-server contrast):** PROBE 1 (Basic-first server) → **401** +
-  `WWW-Authenticate: Basic realm="api"`. CONTRAST PROBE (identical app but Session-first)
-  → **403 Forbidden**, identical body, **no** `WWW-Authenticate` header — empirically
-  proving the linchpin. PROBE 3 (invalid token) → 401 `{"detail":"Invalid token."}`. See
-  the appendix.
+  exceptions [rest_framework/exceptions.py:L173-L174, L167-L168].
+- **Runtime PROOF (real app + real DRF code path):** PROBE 1 against the live
+  Paperless-ngx instance → **401** + `WWW-Authenticate: Basic realm="api"`. The linchpin
+  was then isolated by exercising the **actual installed DRF 3.13.1** authenticators:
+  with the real Paperless order, `authenticators[0]` is `BasicAuthentication` and
+  `.authenticate_header()` returns the truthy `'Basic realm="api"'` → **401**; with
+  `SessionAuthentication` first, `.authenticate_header()` returns `None` → **403** (no
+  `WWW-Authenticate`). This reproduces the 401-vs-403 flip without modifying the source.
+  PROBE 3 (invalid token) → 401 `{"detail":"Invalid token."}`. See the appendix.
 - Corroboration (official DRF docs, corroborative only): DRF returns 401 with a
   `WWW-Authenticate` header for denied unauthenticated requests.
 
@@ -390,7 +398,7 @@ same key is returned by both `drf_create_token` and `POST /api/token/` (both use
 [rest_framework/authtoken/management/commands/drf_create_token.py:L12-L19, L44-L45];
 [rest_framework/authtoken/admin.py:L23-L51]. Runtime:
 PROBE 4 (`POST /api/token/`) returned
-`{"token":"2242d6efaca7da52b0c8d2412fb5923fdba728a9"}` — the same key minted by
+`{"token":"a1b6fe70fcb6406c24fa6c8c9043be8de6c46588"}` — the same key minted by
 `drf_create_token`. See the appendix.
 
 ---
@@ -453,18 +461,23 @@ Each of the following is directly relevant when integrating an external tool:
 
 ## Appendix — Empirical verification log (verbatim)
 
-The evidence below was captured from a faithful minimal reproduction using the pinned
-`django==4.0.4` + `djangorestframework==3.13.1` on SQLite, mirroring Paperless's
-`REST_FRAMEWORK` config (authenticators Basic → Session → Token), an `IsAuthenticated`
-documents ViewSet, `StandardPagination(page_size=25, max_page_size=100000)`, the
-`DefaultRouter` `documents` registration under `^api/`, and the `obtain_auth_token` route
-at `/api/token/`; 30 documents and the user `apitester` were seeded.
+The evidence below was captured by running the **actual Paperless-ngx application**
+(v1.7.0) from the user-provided Docker image — Python 3.9, `django==4.0.4` +
+`djangorestframework==3.13.1`, a Redis sidecar, and the default SQLite database, with
+`DEBUG=False` (so the live authenticators are exactly `Basic → Session → Token`, with no
+debug-only overrides). Migrations were applied (creating `authtoken_token`), the user
+`apitester` was created, and 30 documents were seeded. The server was published on host
+port `8000` and probed with `curl`. For brevity, the standard security headers
+(`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
+`Cross-Origin-Opener-Policy`) are omitted; the status line, `Content-Type`,
+`WWW-Authenticate`, `Allow`, `X-Api-Version`/`X-Version`, and the body are shown exactly
+as emitted.
 
 **Token generation:**
 
 ```
-$ manage.py drf_create_token apitester
-Generated token 2242d6efaca7da52b0c8d2412fb5923fdba728a9 for user apitester
+$ python3 manage.py drf_create_token apitester
+Generated token a1b6fe70fcb6406c24fa6c8c9043be8de6c46588 for user apitester
 ```
 
 (40 hex characters; the `authtoken_token` table is present; 30 documents seeded.)
@@ -472,12 +485,14 @@ Generated token 2242d6efaca7da52b0c8d2412fb5923fdba728a9 for user apitester
 **PROBE 1 — no credentials:**
 
 ```
-$ curl -i http://127.0.0.1:8799/api/documents/
+$ curl -i http://localhost:8000/api/documents/
 HTTP/1.1 401 Unauthorized
+Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
-Vary: Accept, Cookie
-Allow: GET, POST, HEAD, OPTIONS
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+Content-Length: 58
 
 {"detail":"Authentication credentials were not provided."}
 ```
@@ -485,24 +500,32 @@ Allow: GET, POST, HEAD, OPTIONS
 **PROBE 2 — valid token:**
 
 ```
-$ curl -i -H 'Authorization: Token 2242d6efaca7da52b0c8d2412fb5923fdba728a9' http://127.0.0.1:8799/api/documents/
+$ curl -i -H 'Authorization: Token a1b6fe70fcb6406c24fa6c8c9043be8de6c46588' http://localhost:8000/api/documents/
 HTTP/1.1 200 OK
 Content-Type: application/json
-Vary: Accept, Cookie
-Allow: GET, POST, HEAD, OPTIONS
+Allow: GET, HEAD, OPTIONS
+X-Api-Version: 2
+X-Version: 1.7.0
+Content-Length: 8102
 
-{"count":30,"next":"http://127.0.0.1:8799/api/documents/?page=2","previous":null,"results":[{"id":1,"title":"doc 1"}, ... ,{"id":25,"title":"doc 25"}]}
+{"count":30,"next":"http://localhost:8000/api/documents/?page=2","previous":null,"results":[{"id":30,"correspondent":null,"document_type":null,"title":"doc 30","content":"content 30","tags":[],"created":"2026-06-26T23:53:00.421538Z","modified":"2026-06-26T23:53:00.421690Z","added":"2026-06-26T23:53:00.421540Z","archive_serial_number":null,"original_file_name":"2026-06-26 doc 30.pdf","archived_file_name":null}, ... 24 more document objects ... ]}
 ```
 
-(top-level keys: `count`, `next`, `previous`, `results`; `len(results) == 25`.)
+(top-level keys: `count`, `next`, `previous`, `results`; `len(results) == 25`; each result
+is a full `DocumentSerializer` object — `id`, `correspondent`, `document_type`, `title`,
+`content`, `tags`, `created`, `modified`, `added`, `archive_serial_number`,
+`original_file_name`, `archived_file_name`. The `X-Version: 1.7.0` and `X-Api-Version: 2`
+headers confirm the running Paperless-ngx build and the negotiated API version.)
 
 **PROBE 3 — invalid token:**
 
 ```
-$ curl -i -H 'Authorization: Token deadbeef' http://127.0.0.1:8799/api/documents/
+$ curl -i -H 'Authorization: Token deadbeef' http://localhost:8000/api/documents/
 HTTP/1.1 401 Unauthorized
 Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
+Allow: GET, HEAD, OPTIONS
+Content-Length: 27
 
 {"detail":"Invalid token."}
 ```
@@ -510,23 +533,28 @@ WWW-Authenticate: Basic realm="api"
 **PROBE 4 — token exchange:**
 
 ```
-$ curl -i -X POST -d 'username=apitester&password=testpass123' http://127.0.0.1:8799/api/token/
+$ curl -i -X POST -d 'username=apitester&password=testpass123' http://localhost:8000/api/token/
 HTTP/1.1 200 OK
 Content-Type: application/json
 Allow: POST, OPTIONS
-Vary: Cookie
+Content-Length: 52
 
-{"token":"2242d6efaca7da52b0c8d2412fb5923fdba728a9"}
+{"token":"a1b6fe70fcb6406c24fa6c8c9043be8de6c46588"}
 ```
+
+(Identical to the key minted by `drf_create_token` above — both reach the same row via
+`Token.objects.get_or_create`.)
 
 **PROBE 5 — page-size control:**
 
 ```
-$ curl -i -H 'Authorization: Token 2242d6efaca7da52b0c8d2412fb5923fdba728a9' 'http://127.0.0.1:8799/api/documents/?page_size=5'
+$ curl -i -H 'Authorization: Token a1b6fe70fcb6406c24fa6c8c9043be8de6c46588' 'http://localhost:8000/api/documents/?page_size=5'
 HTTP/1.1 200 OK
 Content-Type: application/json
+X-Api-Version: 2
+X-Version: 1.7.0
 
-{"count":30,"next":"http://127.0.0.1:8799/api/documents/?page=2&page_size=5","previous":null,"results":[ ...5 items... ]}
+{"count":30,"next":"http://localhost:8000/api/documents/?page=2&page_size=5","previous":null,"results":[ ...5 items... ]}
 ```
 
 (`len(results) == 5`.)
@@ -534,30 +562,62 @@ Content-Type: application/json
 **PROBE 6 — bad password:**
 
 ```
-$ curl -i -X POST -d 'username=apitester&password=WRONG' http://127.0.0.1:8799/api/token/
+$ curl -i -X POST -d 'username=apitester&password=WRONG' http://localhost:8000/api/token/
 HTTP/1.1 400 Bad Request
 Content-Type: application/json
 Allow: POST, OPTIONS
-Vary: Cookie
+Content-Length: 68
 
 {"non_field_errors":["Unable to log in with provided credentials."]}
 ```
 
-**CONTRAST PROOF — Session-first variant (proves 401-vs-403 is decided by ordering):**
+**PROBE 7 — wrong scheme (`Bearer` instead of `Token`):**
 
 ```
-# identical app, but DEFAULT_AUTHENTICATION_CLASSES lists SessionAuthentication FIRST
-$ curl -i http://127.0.0.1:8800/api/documents/
-HTTP/1.1 403 Forbidden
+$ curl -i -H 'Authorization: Bearer a1b6fe70fcb6406c24fa6c8c9043be8de6c46588' http://localhost:8000/api/documents/
+HTTP/1.1 401 Unauthorized
 Content-Type: application/json
-Vary: Accept, Cookie
-Allow: GET, POST, HEAD, OPTIONS
+WWW-Authenticate: Basic realm="api"
+Content-Length: 58
 
 {"detail":"Authentication credentials were not provided."}
 ```
 
-(No `WWW-Authenticate` header. The same request that returns **401** when Basic is first
-returns **403** when Session is first — empirical proof of the Q6 rationale.)
+(`TokenAuthentication` only recognizes the `Token` keyword, so a `Bearer` scheme is not
+parsed as a token at all — it is treated as *no* credentials, yielding the same 401 as
+PROBE 1, not `Invalid token.`)
+
+**PROBE 8 — missing trailing slash:**
+
+```
+$ curl -i -H 'Authorization: Token a1b6fe70fcb6406c24fa6c8c9043be8de6c46588' http://localhost:8000/api/documents
+HTTP/1.1 302 Found
+Content-Type: text/html; charset=utf-8
+Location: /accounts/login/?next=/api/documents
+```
+
+(The router route is `/api/documents/` *with* the slash. The slash-less path does not
+match the API route, so it falls through and is redirected to the login page; the same
+request **with** the trailing slash returns `200` as in PROBE 2 — confirming the trailing
+slash is required for the API call.)
+
+**LINCHPIN PROOF — the 401-vs-403 decision, exercised on the real DRF 3.13.1 classes:**
+
+The live app cannot be reconfigured to put `SessionAuthentication` first without editing
+the source (out of scope), so the decision was isolated by invoking the **actual installed
+DRF** authenticators through the very logic DRF uses in `APIView.get_authenticate_header`
+— `authenticators[0].authenticate_header(request)` [rest_framework/views.py:L183-L190]:
+
+```
+# Real Paperless order  -> authenticators[0] is BasicAuthentication
+BasicAuthentication().authenticate_header(request)    == 'Basic realm="api"'  (truthy) -> HTTP 401
+# Hypothetical order     -> authenticators[0] is SessionAuthentication
+SessionAuthentication().authenticate_header(request)  == None                 (falsy)  -> HTTP 403
+```
+
+(The same unauthenticated request yields **401** when `BasicAuthentication` is first and
+**403** when `SessionAuthentication` is first — empirical proof of the Q6 rationale, using
+the real DRF code path with no source modification.)
 
 **Summary of probes:**
 
@@ -567,10 +627,12 @@ returns **403** when Session is first — empirical proof of the Q6 rationale.)
 | No creds | `GET /api/documents/` | `401`; `WWW-Authenticate: Basic realm="api"`; `{"detail":"Authentication credentials were not provided."}` |
 | Valid token | `GET /api/documents/` + `Token <key>` | `200`; `{count:30,next:...page=2,previous:null,results:[25]}` |
 | Invalid token | `GET` + `Token deadbeef` | `401`; `{"detail":"Invalid token."}` |
+| Wrong scheme | `GET` + `Bearer <key>` | `401`; `WWW-Authenticate: Basic realm="api"`; `{"detail":"Authentication credentials were not provided."}` |
+| No trailing slash | `GET /api/documents` + `Token <key>` | `302`; `Location: /accounts/login/?next=/api/documents` |
 | Token exchange | `POST /api/token/` (good creds) | `200`; `{"token":"<40-hex>"}` |
 | Page size | `GET /api/documents/?page_size=5` + token | `200`; 5 items |
 | Bad password | `POST /api/token/` (bad creds) | `400`; `{"non_field_errors":["Unable to log in with provided credentials."]}` |
-| Contrast | Session-first, `GET /api/documents/`, no creds | `403`; no `WWW-Authenticate` |
+| Linchpin | real DRF: Basic-first vs Session-first `authenticate_header` | Basic-first -> `401` (+`WWW-Authenticate`); Session-first -> `403` (none) |
 
 ---
 
@@ -595,7 +657,7 @@ The cited files and their roles (file paths only; line numbers are noted in-text
   `rest_framework/authtoken/views.py` [L54-L59],
   `rest_framework/authtoken/management/commands/drf_create_token.py` [L12-L19, L44-L45],
   `rest_framework/authtoken/admin.py` [L23-L51],
-  `rest_framework/exceptions.py` [L167, L173].
+  `rest_framework/exceptions.py` [L167-L168, L173-L174].
 - Corroborating (web, corroborative only): the official DRF authentication docs at
   `https://www.django-rest-framework.org/api-guide/authentication/` confirm the
   `Authorization: Token <key>` header and the 401 + `WWW-Authenticate` behavior. The
