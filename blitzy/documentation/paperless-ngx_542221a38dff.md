@@ -60,7 +60,7 @@ $ grep -E "monitoring at|guarding cluster|pushing tasks|running\." /tmp/blitzy_o
 05:46:58 [Q] INFO Q Cluster november-sink-oklahoma-zebra running.
 ```
 
-(The two blocks above are the verbatim `head -12` and a `grep` of the same file; the per‑worker "ready for work" lines for workers `:12`–`:17` between them are elided only because `grep` selected the monitor/guard/push/running lines.)
+(The two blocks above are the verbatim `head -12` and a `grep` of the same file. The `head -12` already shows the `Q Cluster … starting.` line followed by *every* `ready for work` worker — here `Process-1:1` through `Process-1:11` — so no worker line is elided between the two blocks; the `grep` then selects the lifecycle lines that come *after* the workers: the monitor (`Process-1:12`), the cluster guard, the task pusher (`Process-1:13`), and the final `running.` line. The number of `ready for work` workers equals the host CPU/worker count and is therefore environment‑dependent — on this host it was 11, so the monitor and pusher fall at `:12` and `:13`.)
 
 ```console
 $ setsid ../venv/bin/python manage.py document_consumer > /tmp/blitzy_obs/run/consumer.log 2>&1 &   # from src/
@@ -106,18 +106,19 @@ f08328e0bcec1b5c0bbf70dc8b9d3d96  /tmp/blitzy_obs/testinput/obs_demo.png
 
 ### Observed: consumption‑directory path
 
-The command below dropped the file into the watched directory and then captured the detection/handoff lines verbatim from both `paperless.log` and the `qcluster` stdout:
+The file was dropped into the watched directory, and the detection/handoff lines were then captured verbatim. Because these three lines are emitted by three different processes to three different streams, each is grepped from the stream it actually lands in — the human‑readable detection line from `paperless.log`, django‑q's `Enqueued` acknowledgement from the `document_consumer` process's own stdout capture (`consumer.log`, established in §0), and the worker pickup from the `qcluster` stdout (`qcluster.log`):
 
 ```console
 $ cp /tmp/blitzy_obs/testinput/obs_demo.png /tmp/blitzy_obs/consume/          # trigger
-$ grep -nE "task queue|Enqueued|processing \[" \
-       /tmp/blitzy_obs/data/log/paperless.log /tmp/blitzy_obs/run/qcluster.log
-```
-```text
+$ grep -hE "Adding .* to the task queue\." /tmp/blitzy_obs/data/log/paperless.log     # detection (paperless.log)
 [2026-07-01 05:51:58,769] [INFO] [paperless.management.consumer] Adding /tmp/blitzy_obs/consume/obs_demo.png to the task queue.
+$ grep -hE "Enqueued [0-9]+$" /tmp/blitzy_obs/run/consumer.log                        # enqueue ack (document_consumer stdout)
 05:51:58 [Q] INFO Enqueued 1
+$ grep -hE "processing \[obs_demo" /tmp/blitzy_obs/run/qcluster.log                  # worker pickup (qcluster stdout)
 05:51:58 [Q] INFO Process-1:5 processing [obs_demo.png]
 ```
+
+**Why the `Enqueued 1` acknowledgement is captured from `consumer.log`, not from `paperless.log` or `qcluster.log`.** The detection line `Adding … to the task queue.` is written by the `paperless.management.consumer` logger, so it reaches `paperless.log` (the `paperless` logger is wired to the `file_paperless` handler [`src/paperless/settings.py:L409`]). The `Enqueued 1` line, by contrast, is emitted by django‑q's *own* logger the instant the task is pushed onto the broker — `logger.info(f"Enqueued {enqueue_id}")` [`django_q/tasks.py:L74`] — and that `"django-q"` logger [`django_q/conf.py:L207`] sets `logger.propagate = False` [`django_q/conf.py:L212`] and attaches a bare `logging.StreamHandler()` [`django_q/conf.py:L216`], which defaults to the *calling* process's `stderr`. Because the enqueue executes inside the `document_consumer` process (the `async_task(…)` call at [`src/documents/management/commands/document_consumer.py:L86-L91`]), that line is written to `document_consumer`'s own `stderr` — captured here in `consumer.log` — and, being non‑propagating, it never reaches the `paperless.log` file handler. (`qcluster.log` does carry `Enqueued …` lines, but only at startup, when the scheduler enqueues its periodic tasks — a different set of tasks from this drop.) The `Process-1:5 processing [obs_demo.png]` line comes from yet another process, the `qcluster` worker, which is why it appears only in `qcluster.log`.
 
 **How the file was detected — the observed inotify path, not the polling fallback.** The runtime log `"Using inotify to watch directory for changes: …"` (captured in §0) proves the watcher took the **inotify** branch. That branch is selected when `settings.CONSUMER_POLLING == 0 and INotify` is truthy [`src/documents/management/commands/document_consumer.py:L178-L179`]; otherwise the watcher falls back to polling [`src/documents/management/commands/document_consumer.py:L180-L181`]. On the observed inotify branch, `handle_inotify()` logs that message [`src/documents/management/commands/document_consumer.py:L199-L200`], arms inotify with `inotify_flags = flags.CLOSE_WRITE | flags.MOVED_TO` [`src/documents/management/commands/document_consumer.py:L203`], and adds a watch on the directory [`src/documents/management/commands/document_consumer.py:L207`]. Its loop then reads raw inotify events via `inotify.read(timeout=1000)` [`src/documents/management/commands/document_consumer.py:L216`], reconstructs each `filepath = os.path.join(path, event.name)` [`src/documents/management/commands/document_consumer.py:L221`], and — after a debounce interval — calls the module‑level `_consume(filepath)` [`src/documents/management/commands/document_consumer.py:L230`]. The watchdog callbacks `Handler.on_created` [`src/documents/management/commands/document_consumer.py:L129-L130`] and `Handler.on_moved` [`src/documents/management/commands/document_consumer.py:L132-L133`] are **not** exercised on this path; they belong to the polling fallback, where `handle_polling()` schedules a `PollingObserver` with `Handler()` [`src/documents/management/commands/document_consumer.py:L185-L188`].
 
