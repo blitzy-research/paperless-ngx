@@ -208,11 +208,61 @@ The MIME type selects a parser through a signal-driven registry:
 ```
 — `src/documents/parsers.py:81`, `:101`. **Evidence** (which parser was chosen for `text/plain`): `[LOG DEBUG paperless.consumer] Parser: TextDocumentParser`.
 
+The registry is itself **signal-based**: every parser lookup *sends* the `document_consumer_declaration` signal and collects each plugin's declaration. The same send drives MIME→extension lookup, the supported-extension set, and parser-class selection:
+
+```python
+48:     for response in document_consumer_declaration.send(None):
+71:     for response in document_consumer_declaration.send(None):
+87:     for response in document_consumer_declaration.send(None):
+```
+— `src/documents/parsers.py:48` (inside `get_default_file_extension`, MIME→extension lookup), `:71` (inside `get_supported_file_extensions`, gathering the supported-extension set), and `:87` (inside `get_parser_class_for_mime_type`, collecting candidate declarations before returning the highest-`weight` one). **Evidence** — calling the real `document_consumer_declaration.send(None)` returns the two registered declarations, and `get_parser_class_for_mime_type` resolves each supported type to a parser:
+
+```text
+parser=get_parser weight=0 mime_types=['application/pdf', 'image/bmp', 'image/gif', 'image/jpeg', 'image/png', 'image/tiff']
+parser=get_parser weight=10 mime_types=['text/csv', 'text/plain']
+text/plain -> get_parser
+application/pdf -> get_parser
+```
+
 The three parser plugins each register against `document_consumer_declaration`:
 
 - **OCR / PDF** — `class RasterisedDocumentParser(DocumentParser):` at `src/paperless_tesseract/parsers.py:18`, registered at `src/paperless_tesseract/apps.py:13`.
 - **Plain text** — `class TextDocumentParser(DocumentParser):` at `src/paperless_text/parsers.py:12`, registered at `src/paperless_text/apps.py:13`.
 - **Office via Tika/Gotenberg** — `class TikaDocumentParser(DocumentParser):` at `src/paperless_tika/parsers.py:12`, registered at `src/paperless_tika/apps.py:13`.
+
+**Edge case — unsupported MIME / no registered parser.** When no plugin declares the detected MIME type, the candidate list is empty and `get_parser_class_for_mime_type()` returns `None`:
+
+```python
+94:     if not options:
+95:         return None
+```
+— `src/documents/parsers.py:94-95`. The consumer treats a missing parser as a **hard failure**, aborting the pipeline with the `unsupported_type` message before any parse work:
+
+```python
+223:         parser_class = get_parser_class_for_mime_type(mime_type)
+224:         if not parser_class:
+225:             self._fail(MESSAGE_UNSUPPORTED_TYPE, f"Unsupported mime type {mime_type}")
+```
+— `src/documents/consumer.py:223-225`, where the constant is `MESSAGE_UNSUPPORTED_TYPE = "unsupported_type"` (`src/documents/consumer.py:44`). **Evidence** — an unregistered MIME type resolves to `None` (so the `if not parser_class:` branch is taken):
+
+```text
+application/x-blitzy-unknown -> None
+```
+
+### Stage 3½ — `document_consumption_started` signal (after parser resolution, before parse)
+
+Once a parser class is resolved (and *before* the pre-consume script and any parsing), the consumer notifies listeners that work is beginning:
+
+```python
+229:         document_consumption_started.send(
+```
+— `src/documents/consumer.py:229` (the signal is imported at `src/documents/consumer.py:30`). This **start** signal is distinct from the **finished** signal fired later inside the atomic persistence block (`src/documents/consumer.py:306`, Stages 6/8); the six auto-organization handlers subscribe to the *finished* one (see Q6). **Evidence** — connecting receivers to both signals during a live consume shows the start signal fires first:
+
+```text
+document_consumption_started fired: filename=blitzy_signal_probe.txt
+document_consumption_finished fired: document_id=3
+signal order observed: ['started', 'finished']
+```
 
 ### Stage 4 — Parse: text, thumbnail, date (20% → 70% → 90%)
 
@@ -582,7 +632,7 @@ Handler definitions and their delegation to the matcher:
 148:         # this is done elsewhere.
 149:         return False
 ```
-— `src/documents/matching.py:60` (matcher), `:66-67` (empty `match` → `False`), `:127`/`:130`/`:131`/`:135` (fuzzy strips punctuation, then `fuzz.partial_ratio(match, text) >= 90` — the **fuzzy threshold is `src/documents/matching.py:135`**), and `:147-149` (**`MATCH_AUTO` returns `False` inside `matches()`** because automatic classification is delegated to the scikit-learn classifier loaded at `src/documents/consumer.py:292`; `scikit-learn=="==1.0.2"` at `Pipfile:36`).
+— `src/documents/matching.py:60` (matcher), `:66-67` (empty `match` → `False`), `:127`/`:130`/`:131`/`:135` (fuzzy strips punctuation, then `fuzz.partial_ratio(match, text) >= 90` — the **fuzzy threshold is `src/documents/matching.py:135`**), and `:147-149` (**`MATCH_AUTO` returns `False` inside `matches()`** because automatic classification is delegated to the scikit-learn classifier loaded at `src/documents/consumer.py:292`; `scikit-learn="==1.0.2"` at `Pipfile:36`).
 
 **Claim:** the six algorithms behave as specified. **Evidence** — calling the real `documents.matching.matches()` on in-memory instances (case-insensitive default):
 
@@ -616,7 +666,20 @@ In practice: create a `Correspondent`/`DocumentType`/`Tag`, give it a `match` st
 
 ## How the runtime evidence was produced
 
-All runtime evidence was captured inside the provided Docker stack (`paperless-app` + `paperless-redis`, Python 3.9.23 / Django 4.0.4 / django-q 1.3.9), using **temporary probe scripts kept entirely outside the repository** (under `/tmp`) and deleted afterward. Two probes were used:
+All runtime evidence was captured inside the provided Docker stack (`paperless-app` + `paperless-redis`, Python 3.9.23 / Django 4.0.4 / django-q 1.3.9), using **temporary probe scripts kept entirely outside the repository** (under `/tmp`) and deleted afterward.
+
+**Runtime versions (verbatim).** The pinned runtime — declared by the production image at `Dockerfile:18` — was confirmed live with three version probes inside `paperless-app`, backing the header claim of `Python 3.9.23` / `Django 4.0.4` / `django-q 1.3.9`:
+
+```console
+$ python --version
+Python 3.9.23
+$ python -c "import django; print('Django', django.get_version())"
+Django 4.0.4
+$ python -c "import django_q; print('django-q', '.'.join(map(str, django_q.VERSION)))"
+django-q 1.3.9
+```
+
+Two probes were then used:
 
 1. **In-memory model probe (Q4/Q5/Q6).** A standalone script added `/app/src` to `sys.path`, called `django.setup()` with a minimal in-memory SQLite config and `INSTALLED_APPS=[contenttypes, auth, admin, documents]` (banner `DJANGO VERSION: 4.0.4`), built the `Correspondent`/`DocumentType`/`Tag`/`Document` tables via `schema_editor`, introspected `Document._meta`, ran the three `create()` experiments, and called the real `documents.matching.matches()` for all six algorithms. (No `fuzzywuzzy` "slow pure-python SequenceMatcher" warning appeared in this environment; fuzzy matching still returned `True` as shown.)
 
@@ -641,7 +704,7 @@ Nothing in the repository was modified: the only change is this document. All pr
 ## Coverage-pass checklist
 
 - [x] **Q1** — all THREE entry points: directory watcher (`src/documents/management/commands/document_consumer.py:86-88`), REST (`src/documents/views.py:523-525` + route `src/paperless/urls.py:57-59`), IMAP (`src/paperless_mail/mail.py:336-338`); convergence on `async_task("documents.tasks.consume_file")` (three literals) + live `'Success. New document id 2 created'`.
-- [x] **Q2** — `consume_file` (`src/documents/tasks.py:184`) → `try_consume_file` (`src/documents/consumer.py:180`); all SIX milestones **0/20/70/90/95/100** (`consumer.py:202/259/264/274/294/375`) captured live; FAILED path (`:79`); OCR callback (`:240`); MIME (`:219`); dedup (`:102`); atomic (`:298`); create (`:398`); parser dispatch (`src/documents/parsers.py:81`/`:101`); THREE plugins (tesseract `:18`, text `:12`, tika `:12`); Whoosh (`src/documents/index.py:26`/`:66`/`:118`) with a live search hit.
+- [x] **Q2** — `consume_file` (`src/documents/tasks.py:184`) → `try_consume_file` (`src/documents/consumer.py:180`); all SIX milestones **0/20/70/90/95/100** (`consumer.py:202/259/264/274/294/375`) captured live; FAILED path (`:79`); OCR callback (`:240`); MIME (`:219`); **`document_consumption_started` start signal (`consumer.py:229`, imported `:30`, distinct from finished `:306`) with live signal-order evidence**; dedup (`:102`); atomic (`:298`); create (`:398`); parser dispatch (`src/documents/parsers.py:81`/`:101`) via the **`document_consumer_declaration.send(None)` signal (`parsers.py:48`/`:71`/`:87`)** with live registry evidence; **unsupported-MIME/no-parser edge case (`parsers.py:94-95` → `None`, then `consumer.py:223-225` fails with `MESSAGE_UNSUPPORTED_TYPE`)**; THREE plugins (tesseract `:18`, text `:12`, tika `:12`); Whoosh (`src/documents/index.py:26`/`:66`/`:118`) with a live search hit.
 - [x] **Q3** — Django-Q (`src/paperless/settings.py:110`) + Redis broker (`Q_CLUSTER` `:449-457`); NOT Celery (grep exit 1); ALL storage dirs (`:62`/`:63`/`:64`/`:73`/`:74`); FOUR schedules (`1001:10-19`, `1004:10-14`, mail `0002:10-15`) verified live; task funcs (`src/documents/tasks.py:32`/`:48`/`:255`/`:270`); `qcluster` boot captured.
 - [x] **Q4** — all 16 `Document` fields (`src/documents/models.py:88` + field lines) with live `_meta` introspection.
 - [x] **Q5** — required (`mime_type` `:126`, `checksum` `:135`) vs derived; runtime example (bare-create success → IntegrityError → checksum+mime success); M2M `tags` nuance.
