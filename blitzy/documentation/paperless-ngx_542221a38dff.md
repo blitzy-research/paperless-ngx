@@ -336,7 +336,7 @@ FIX = {"A": "fixtureA_notext.png", "B": "fixtureB_withtext.png",
        "C": "fixtureC_textlayer.pdf", "D": "fixtureD_blank.png"}
 name = FIX[sys.argv[1].upper()]
 src = f"/root/ocr_probe/fixtures/{name}"
-work = f"/root/ocr_probe/scratch/consume_{name}"
+work = f"/root/ocr_probe/scratch/{name}"
 shutil.copy(src, work)
 
 cl = get_channel_layer()
@@ -857,18 +857,18 @@ docker exec paperless-qna bash -lc 'cd /app/src && PYTHONPATH=/app/src python /r
 ```text
 ### Fixture C (PDF, real text layer)
 detected mime_type = 'application/pdf'
-original_has_text = True  (text_original len=207)
+original_has_text = True  (text_original len=130)
 skip-OCRmyPDF-entirely early-return fires? False (needs OCR_MODE=='skip_noarchive' AND original_has_text; OCR_MODE='skip')
 >>> ocrmypdf.ocr() INVOKED (call #3); skip_text=True … image_dpi=None
 DEBUG [paperless.parsing.tesseract] Incomplete sidecar file: discarding.
-self.text (len=207): 'This is a genuine embedded PDF text layer for skip_text contrast.\n\n…'
+self.text (len=130): 'This is a genuine embedded PDF text layer for skip_text contrast.\n\n…'
 sidecar len=26; contains '[OCR skipped on page' -> True
 sidecar repr: '[OCR skipped on page(s) 1]'
 ```
 
 Note the differences from the images:
 
-- `original_has_text = True` (`src/paperless_tesseract/parsers.py:236`) because the PDF page already had a text layer of length 207 (> 50).
+- `original_has_text = True` (`src/paperless_tesseract/parsers.py:236`) because the PDF page already had a text layer of length 130 (> 50).
 - The sidecar now **contains** the `[OCR skipped on page(s) 1]` marker (`-> True`), so the parser logged `Incomplete sidecar file: discarding.` (`src/paperless_tesseract/parsers.py:110`) and fell back to reading the text from the archive.
 - `image_dpi` is `None` for a PDF (images pass `image_dpi=150`).
 
@@ -1106,11 +1106,25 @@ docker exec paperless-qna bash -lc 'source /root/ocr_probe/_env.sh && cd /app/sr
 ```
 
 ```text
-correspondent (src/documents/models.py:97)       title (src/documents/models.py:106)          document_type (src/documents/models.py:108)
-content (src/documents/models.py:117)            mime_type (src/documents/models.py:126)      tags (src/documents/models.py:128)
-checksum (src/documents/models.py:135)           archive_checksum (src/documents/models.py:143)  created (src/documents/models.py:152)
-modified (src/documents/models.py:154)           storage_type (src/documents/models.py:161)   added (src/documents/models.py:169)
-filename (src/documents/models.py:176)           archive_filename (src/documents/models.py:186)  archive_serial_number (src/documents/models.py:196)
+Concrete fields on the Document model (name -> src/documents/models.py:line):
+  id                   AutoField          src/documents/models.py:(inherited/pk)
+  correspondent        ForeignKey         src/documents/models.py:97
+  title                CharField          src/documents/models.py:106
+  document_type        ForeignKey         src/documents/models.py:108
+  content              TextField          src/documents/models.py:117
+  mime_type            CharField          src/documents/models.py:126
+  checksum             CharField          src/documents/models.py:135
+  archive_checksum     CharField          src/documents/models.py:143
+  created              DateTimeField      src/documents/models.py:152
+  modified             DateTimeField      src/documents/models.py:154
+  storage_type         CharField          src/documents/models.py:161
+  added                DateTimeField      src/documents/models.py:169
+  filename             FilePathField      src/documents/models.py:176
+  archive_filename     FilePathField      src/documents/models.py:186
+  archive_serial_number IntegerField       src/documents/models.py:196
+
+Total concrete fields = 15
+Any field whose name implies processing state/status? NONE
 ```
 
 A grep for `status`/`state`/`processing` across the `Document` class body (`src/documents/models.py:88-244`) returns **nothing** — there is no processing‑status column. (`storage_type` at `src/documents/models.py:161` encodes unencrypted vs. GPG storage, not OCR/processing progress.)
