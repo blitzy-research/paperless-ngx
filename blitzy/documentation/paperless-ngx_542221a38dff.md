@@ -3,16 +3,20 @@
 This document answers, with verbatim runtime evidence and exact `file:line` source
 citations, how **token authentication** works in the paperless-ngx REST API so that
 external tools can be integrated against it. It was produced by a strictly **read-only**
-investigation: the relevant paperless code paths were actually built and run against a
-live HTTP server, real output was captured, and every behavioral claim below is placed
-directly next to the exact observed line that proves it.
+investigation: the genuine paperless code was actually built and run as a **live HTTP
+server**, real output was captured, and every behavioral claim below is placed directly
+next to the **exact command** that produced it and the **verbatim output** it emitted.
 
 The pinned framework versions used for the observations are the ones an integrator will
-actually hit against this build: **`Django==4.0.4`** and **`djangorestframework==3.13.1`**.
+actually hit against this build: **`Django==4.0.4`** and **`djangorestframework==3.13.1`**,
+on **Python 3.9.23** — the exact runtime of this project (see the `Server` header and the
+DRF introspection below).
 
-> **Read-only guarantee.** The investigation created only ephemeral, throwaway artifacts
-> (a test user, one API token, and 30 sample documents) in a temporary SQLite database
-> **outside** the repository. **No source file in the repository was modified.** See the
+> **Read-only guarantee.** The investigation ran the real paperless application inside a
+> **disposable Docker container**. It created only ephemeral rows in the container's
+> throwaway SQLite database (`/app/data/db.sqlite3`): a test user, one API token, and 30
+> sample documents. **No file in the repository was modified**, and all temporary
+> observation scripts (`/tmp/obs/*.py` inside the container) were removed afterward. See the
 > [Cleanup / repository integrity](#cleanup--repository-integrity) section.
 
 ---
@@ -21,7 +25,7 @@ actually hit against this build: **`Django==4.0.4`** and **`djangorestframework=
 
 | # | Question | One-line answer |
 |---|----------|-----------------|
-| **Q1** | Token header NAME and FORMAT | Header **name** is `Authorization`; **value format** is `Token <key>` — e.g. `Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2` |
+| **Q1** | Token header NAME and FORMAT | Header **name** is `Authorization`; **value format** is `Token <key>` — e.g. `Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3` |
 | **Q2** | Documents-listing endpoint PATH | `/api/documents/` (trailing slash included) |
 | **Q3** | Top-level JSON response fields | Exactly four keys: `count`, `next`, `previous`, `results` (standard DRF pagination envelope); each `results[]` item has 12 fields |
 | **Q4** | Pagination | **YES** — paginated; it does **not** dump everything at once. Default page size is **25**; adjust with the `page_size` query param, navigate with `page` |
@@ -32,45 +36,69 @@ actually hit against this build: **`Django==4.0.4`** and **`djangorestframework=
 
 ## How this was verified (runtime harness)
 
-The evidence below was captured from a **live dev server** serving on `127.0.0.1:8123`.
-A throwaway Django project (kept **outside** the repository) imported the genuine
-paperless `documents` app and reused paperless's **exact** `REST_FRAMEWORK` configuration
-and `ApiVersionMiddleware`, pinned to `Django==4.0.4` / `djangorestframework==3.13.1`.
-This mirrors the real components an integrator hits: the real `UnifiedSearchViewSet`,
-`DocumentSerializer`, `StandardPagination`, `ApiVersionMiddleware`, and the exact
-`DEFAULT_AUTHENTICATION_CLASSES` order. A `testuser` was created, a token was minted,
-30 documents were seeded, and the `curl`-style requests shown per question were issued.
+The evidence below was captured by running the **real paperless application** as a live dev
+server on `127.0.0.1:8000`, inside the project's own Docker container (Python 3.9.23,
+`Django==4.0.4`, `djangorestframework==3.13.1`). This exercises the exact components an
+integrator hits: the real `UnifiedSearchViewSet`, `DocumentSerializer`, `StandardPagination`,
+`ApiVersionMiddleware`, and the exact `DEFAULT_AUTHENTICATION_CLASSES` order.
 
-A condensed, reproducible version of this harness is given in
-[Reproduction harness](#reproduction-harness) at the end. No repository file was modified
-to produce any of this output.
+Because `curl`/`wget` are **not** installed in the container, HTTP requests were issued with
+a tiny raw-socket client, `raw.py` (its full source is in the
+[Reproduction harness](#reproduction-harness)); it prints the **verbatim** raw HTTP/1.1
+response the server emits. Small `requests`-based scripts (`parse.py`, `page.py`, `obj.py`)
+parse the JSON body, and `python manage.py shell -c` was used for source introspection and
+SQL. **Every output block below is immediately preceded by the exact command that produced
+it.**
 
-**Command:**
+**Command run** (bring up the environment — from the paperless source root `/app/src`):
 
 ```bash
-python3 obs_setup.py   # creates testuser, mints token via Token.objects.create, seeds 30 docs
+# 1) migrate: creates auth_user, authtoken_token, and the documents tables
+python manage.py migrate
+
+# 2) create the test user, mint a token via the ORM, seed 30 documents
+python manage.py shell -c "
+from django.contrib.auth.models import User
+from rest_framework.authtoken.models import Token
+from documents.models import Document
+import hashlib
+u, _ = User.objects.get_or_create(username='testuser'); u.set_password('testpass123'); u.save()
+tok, _ = Token.objects.get_or_create(user=u)
+print('USER id=%s username=%s' % (u.id, u.username))
+print('TOKEN key=%s len=%s user_id=%s created=%s' % (tok.key, len(tok.key), tok.user_id, tok.created.isoformat()))
+for i in range(1, 31):
+    Document.objects.get_or_create(title='Test Document %d' % i, defaults=dict(content='content body %d' % i, mime_type='application/pdf', checksum=hashlib.md5(('doc%d' % i).encode()).hexdigest()))
+print('DOCUMENTS count=%s' % Document.objects.count())
+"
+
+# 3) start the real paperless dev server (DEBUG=False and PAPERLESS_AUTO_LOGIN_USERNAME unset — both defaults)
+python manage.py runserver 127.0.0.1:8000 --noreload --insecure
 ```
 
-**Observed output (verbatim):**
+**Observed output (verbatim)** — the seed step:
 
 ```text
-CREATE TABLE "authtoken_token" ("key" varchar(40) NOT NULL PRIMARY KEY, "created" datetime NOT NULL, "user_id" integer NOT NULL UNIQUE REFERENCES "auth_user" ("id") DEFERRABLE INITIALLY DEFERRED)
-USER created: id=2 username=testuser
-TOKEN key=5682b475a4c7a5ed925f727521885d8bf059ebb2
-TOKEN len=40 user_id=2 created=2026-07-01T20:23:31.151977+00:00
-DOCUMENTS seeded: 30
+USER id=2 username=testuser
+TOKEN key=1e80755d969c5bbd8bf61516e74ff81085d115a3 len=40 user_id=2 created=2026-07-01T22:22:33.658654+00:00
+DOCUMENTS count=30
 ```
 
-This confirms the preconditions used throughout: a test user (`id=2`, `username=testuser`),
-a 40-character token key (`5682b475a4c7a5ed925f727521885d8bf059ebb2`), and 30 seeded
-documents (enough to exercise pagination, since the default page size is 25).
+**Observed output (verbatim)** — the server boot (proves it is the genuine paperless app on
+`Django 4.0.4`, and that no `--skip-checks` was needed):
 
-> **Note on the observed `Server` header.** The captured responses report
-> `Server: WSGIServer/0.2 CPython/3.12.3`. That Python minor version reflects the
-> throwaway harness process; it is **immaterial** to the answers, because the behavior
-> asked about (header keyword, pagination envelope, and the unauthenticated response) is
-> determined by the pinned `Django==4.0.4` / `djangorestframework==3.13.1`. The value is
-> reproduced verbatim rather than altered, per the "report observed reality" rule.
+```text
+Performing system checks...
+
+System check identified no issues (0 silenced).
+July 01, 2026 - 22:23:20
+Django version 4.0.4, using settings 'paperless.settings'
+Starting development server at http://127.0.0.1:8000/
+Quit the server with CONTROL-C.
+```
+
+This establishes the preconditions used throughout: a test user (`id=2`, `username=testuser`),
+a 40-character token key (`1e80755d969c5bbd8bf61516e74ff81085d115a3`), and 30 seeded
+documents — enough to exercise pagination, since the default page size is 25.
 
 ---
 
@@ -81,59 +109,117 @@ documents (enough to exercise pagination, since the default page size is 25).
 Full example:
 
 ```text
-Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2
+Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3
 ```
 
-**Command run** (authenticated request that SUCCEEDS with this header):
+**Command run** (authenticated request that SUCCEEDS with this header; `--status` prints only
+the status line):
 
 ```bash
-curl -s -i -H "Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2" http://127.0.0.1:8123/api/documents/
+python /tmp/obs/raw.py GET /api/documents/ "Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3" --status
 ```
 
-**Observed output (verbatim)** — status line `200 OK`, proving the header form is accepted:
+**Observed output (verbatim)** — `200 OK`, proving the header form is accepted:
 
 ```http
 HTTP/1.1 200 OK
 ```
 
-To prove that the keyword is specifically `Token` (and that the value is parsed by that
-keyword), an **invalid** token was sent with the same header form. DRF echoes the `Basic`
-challenge and surfaces its token-specific error:
+To prove the keyword is specifically `Token` (and that a well-formed but **unmatched** key is
+rejected as an *invalid token*), an invalid key was sent with the identical header form:
 
-**Command run** (INVALID token):
+**Command run** (INVALID token key — 40 hex chars, well-formed `Token <key>` header):
 
 ```bash
-curl -s -i -H "Authorization: Token deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" http://127.0.0.1:8123/api/documents/
+python /tmp/obs/raw.py GET /api/documents/ "Authorization: Token deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 ```
 
 **Observed output (verbatim):**
 
 ```http
 HTTP/1.1 401 Unauthorized
+Date: Wed, 01 Jul 2026 22:23:36 GMT
+Server: WSGIServer/0.2 CPython/3.9.23
+Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
+Content-Length: 27
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
 {"detail":"Invalid token."}
 ```
 
-The `{"detail":"Invalid token."}` body (as opposed to the "not provided" body seen in Q5)
-confirms that the `Token` keyword *was* recognized and the key *was* looked up — it simply
-did not match a stored token.
+The `{"detail":"Invalid token."}` body confirms the `Token` keyword *was* recognized and the
+key *was* looked up — it simply did not match a stored token.
 
-**DRF runtime introspection (verbatim)** — proves the keyword literal directly:
+**Command run** (prove the keyword literal directly, via runtime introspection):
+
+```bash
+python manage.py shell -c "from rest_framework.authentication import TokenAuthentication as T; print('TokenAuthentication.keyword =', repr(T.keyword)); print('TokenAuthentication.authenticate_header(None) =', repr(T().authenticate_header(None)))"
+```
+
+**Observed output (verbatim):**
 
 ```text
 TokenAuthentication.keyword = 'Token'
-TokenAuthentication.authenticate_header(req) = 'Token'
+TokenAuthentication.authenticate_header(None) = 'Token'
+```
+
+**Command run** (distinguish an **invalid token key** from an **absent header** — see the
+rationale; uses DRF's `APIRequestFactory` to call the authenticator directly):
+
+```bash
+python manage.py shell -c "
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.test import APIRequestFactory
+rf = APIRequestFactory()
+print('absent Authorization header ->', TokenAuthentication().authenticate(rf.get('/api/documents/')))
+print('wrong keyword (Bearer)      ->', TokenAuthentication().authenticate(rf.get('/api/documents/', HTTP_AUTHORIZATION='Bearer xyz')))
+try:
+    TokenAuthentication().authenticate(rf.get('/api/documents/', HTTP_AUTHORIZATION='Token deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'))
+except Exception as e:
+    print('invalid token key           -> raises', type(e).__name__ + ':', repr(str(e)))
+"
+```
+
+**Observed output (verbatim):**
+
+```text
+absent Authorization header -> None
+wrong keyword (Bearer)      -> None
+invalid token key           -> raises AuthenticationFailed: 'Invalid token.'
 ```
 
 **Source citation & rationale:**
 
 - `TokenAuthentication` is the DRF authenticator registered at
-  `src/paperless/settings.py:L120` (`"rest_framework.authentication.TokenAuthentication"`).
-- DRF's own `rest_framework/authentication.py` defines `class TokenAuthentication` with
-  `keyword = 'Token'` and parses the `Authorization` header by that keyword; an
-  unmatched/absent token raises `AuthenticationFailed('Invalid token.')`. That is why the
-  literal header keyword is `Token` and why the invalid-token body is `{"detail":"Invalid token."}`.
-- Corroborated by the project's own docs at `docs/api.rst:L143` (`Authorization: Token <token>`).
+  `src/paperless/settings.py:L120` (`"rest_framework.authentication.TokenAuthentication"`),
+  and its keyword is the literal `Token` (introspection above:
+  `TokenAuthentication.keyword = 'Token'`).
+- **Invalid vs. absent — an important distinction (do not conflate them):**
+  - An **invalid/unmatched token key** — a *well-formed* `Authorization: Token <key>` header
+    whose key is not in the database — reaches
+    `TokenAuthentication.authenticate_credentials()`, which raises
+    `AuthenticationFailed('Invalid token.')`. That is the observed
+    `{"detail":"Invalid token."}` `401` body above.
+  - An **absent `Authorization` header** (or a header with a *different* keyword such as
+    `Bearer`) causes `TokenAuthentication.authenticate()` to **return `None`** — it does
+    **not** raise. (Runtime proof above: both `absent ... -> None` and
+    `wrong keyword (Bearer) -> None`.) No authenticator then succeeds, so the `IsAuthenticated`
+    permission denies the request with the **different** body
+    `{"detail":"Authentication credentials were not provided."}` seen in
+    [Q5](#q5--unauthenticated-request-status-code-and-error-message).
+  - This matches DRF's own `rest_framework/authentication.py`, where
+    `TokenAuthentication.authenticate()` returns `None` when the header is missing or the
+    keyword does not match, and only `authenticate_credentials()` raises
+    `AuthenticationFailed('Invalid token.')` for an unmatched key.
+- Corroborated by the project's own docs at `docs/api.rst:L143`
+  (``Authorization: Token <token>``).
 
 ---
 
@@ -144,10 +230,10 @@ TokenAuthentication.authenticate_header(req) = 'Token'
 **Command run:**
 
 ```bash
-curl -s -i -H "Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2" http://127.0.0.1:8123/api/documents/
+python /tmp/obs/raw.py GET /api/documents/ "Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3" --status
 ```
 
-**Observed output (verbatim)** — status line proves the path resolves and returns data:
+**Observed output (verbatim)** — the status line proves the path resolves and returns data:
 
 ```http
 HTTP/1.1 200 OK
@@ -174,47 +260,72 @@ is a document object with these **12** fields: `id`, `correspondent`, `document_
 `title`, `content`, `tags`, `created`, `modified`, `added`, `archive_serial_number`,
 `original_file_name`, `archived_file_name`.
 
-**Command run:**
+**Command run** (capture the response **headers** verbatim; `--headers` prints the status
+line and headers only):
 
 ```bash
-curl -s -i -H "Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2" http://127.0.0.1:8123/api/documents/
+python /tmp/obs/raw.py GET /api/documents/ "Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3" --headers
 ```
 
-**Observed response headers (verbatim):**
+**Observed output (verbatim):**
 
 ```http
 HTTP/1.1 200 OK
-Date: Wed, 01 Jul 2026 20:24:07 GMT
-Server: WSGIServer/0.2 CPython/3.12.3
+Date: Wed, 01 Jul 2026 22:24:05 GMT
+Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
-Vary: Accept, Cookie
+Vary: Accept, Accept-Language, Origin, Cookie
 Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
 X-Api-Version: 2
 X-Version: 1.7.0
-Content-Length: 8735
+Content-Length: 8727
+Content-Language: en-us
 X-Content-Type-Options: nosniff
 Referrer-Policy: same-origin
 Cross-Origin-Opener-Policy: same-origin
 ```
 
-**Observed body — top-level envelope (verbatim, `results` elided for readability):**
+**Command run** (capture the genuine **first 480 bytes** of the response body; `--body`
+prints the body only, and `head -c 480` truncates to exactly 480 bytes — this is a real,
+tool-produced prefix, not a hand-edited excerpt):
 
-```json
-{
-  "count": 30,
-  "next": "http://127.0.0.1:8123/api/documents/?page=2",
-  "previous": null,
-  "results": [ "<...25 document objects...>" ]
-}
+```bash
+python /tmp/obs/raw.py GET /api/documents/ "Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3" --body | head -c 480
 ```
 
-**Raw leading bytes of the body (verbatim, un-pretty-printed, showing the envelope + first result object):**
+**Observed output (verbatim — exactly 480 bytes; it therefore ends mid-token inside the
+second result object, which is expected of a byte truncation):**
 
-```json
-{"count":30,"next":"http://127.0.0.1:8123/api/documents/?page=2","previous":null,"results":[{"id":30,"correspondent":null,"document_type":null,"title":"Test Document 30","content":"content body 30","tags":[],"created":"2026-07-01T20:23:31.236004Z","modified":"2026-07-01T20:23:31.236107Z","added":"2026-07-01T20:23:31.236029Z","archive_serial_number":null,"original_file_name":"2026-07-01 Test Document 30.pdf","archived_file_name":null}, ...]}
+```text
+{"count":30,"next":"http://127.0.0.1:8000/api/documents/?page=2","previous":null,"results":[{"id":30,"correspondent":null,"document_type":null,"title":"Test Document 30","content":"content body 30","tags":[],"created":"2026-07-01T22:22:33.741082Z","modified":"2026-07-01T22:22:33.741195Z","added":"2026-07-01T22:22:33.741086Z","archive_serial_number":null,"original_file_name":"2026-07-01 Test Document 30.pdf","archived_file_name":null},{"id":29,"correspondent":null,"document_ty
 ```
 
-**One full `results[0]` object (verbatim, pretty-printed)** — enumerates the 12 per-item fields:
+**Command run** (parse the JSON and print the exact top-level and item key sets):
+
+```bash
+python /tmp/obs/parse.py http://127.0.0.1:8000/api/documents/ 1e80755d969c5bbd8bf61516e74ff81085d115a3
+```
+
+**Observed output (verbatim):**
+
+```text
+TOP-LEVEL KEYS: ['count', 'next', 'previous', 'results']
+count = 30
+next = http://127.0.0.1:8000/api/documents/?page=2
+previous = None
+len(results) on this page = 25
+results[0] KEYS = ['id', 'correspondent', 'document_type', 'title', 'content', 'tags', 'created', 'modified', 'added', 'archive_serial_number', 'original_file_name', 'archived_file_name']
+```
+
+**Command run** (dump one full `results[0]` object exactly as `json.dumps(..., indent=2)`
+produces it — enumerates the 12 per-item fields):
+
+```bash
+python /tmp/obs/obj.py http://127.0.0.1:8000/api/documents/ 1e80755d969c5bbd8bf61516e74ff81085d115a3
+```
+
+**Observed output (verbatim):**
 
 ```json
 {
@@ -224,24 +335,13 @@ Cross-Origin-Opener-Policy: same-origin
   "title": "Test Document 30",
   "content": "content body 30",
   "tags": [],
-  "created": "2026-07-01T20:23:31.236004Z",
-  "modified": "2026-07-01T20:23:31.236107Z",
-  "added": "2026-07-01T20:23:31.236029Z",
+  "created": "2026-07-01T22:22:33.741082Z",
+  "modified": "2026-07-01T22:22:33.741195Z",
+  "added": "2026-07-01T22:22:33.741086Z",
   "archive_serial_number": null,
   "original_file_name": "2026-07-01 Test Document 30.pdf",
   "archived_file_name": null
 }
-```
-
-**Parsed proof of the key sets (verbatim tool output):**
-
-```text
-TOP-LEVEL KEYS: ['count', 'next', 'previous', 'results']
-count = 30
-next = http://127.0.0.1:8123/api/documents/?page=2
-previous = None
-len(results) on page 1 = 25
-results[0] KEYS = ['id', 'correspondent', 'document_type', 'title', 'content', 'tags', 'created', 'modified', 'added', 'archive_serial_number', 'original_file_name', 'archived_file_name']
 ```
 
 **Source citation & rationale:**
@@ -257,10 +357,10 @@ results[0] KEYS = ['id', 'correspondent', 'document_type', 'title', 'content', '
 - **Serializer-branch nuance:** `UnifiedSearchViewSet.get_serializer_class`
   (`src/documents/views.py:L382-L392`) returns `DocumentSerializer` for a **plain**
   listing and only switches to `SearchResultSerializer` when a `query` or `more_like_id`
-  query parameter is present (`src/documents/views.py:L377` is the class; the plain-list
-  default is `serializer_class = DocumentSerializer` at `src/documents/views.py:L181`).
-  Because the request above had **no** `query`, the standard document fields are returned —
-  which is exactly what an integrator listing documents will get.
+  query parameter is present (the class is defined at `src/documents/views.py:L377`; the
+  plain-list default is `serializer_class = DocumentSerializer` at
+  `src/documents/views.py:L181`). Because the request above had **no** `query`, the standard
+  document fields are returned — which is exactly what an integrator listing documents gets.
 
 ---
 
@@ -271,54 +371,55 @@ The default page size is **25**; the page size is client-adjustable via the `pag
 query parameter, and pages are navigated via `page`. The envelope's `count` is the TOTAL
 across all pages, while `results` holds only the current page.
 
-**Command run** (default page — 30 docs seeded, only 25 returned, `next` is non-null):
+**Command run** (default page — 30 docs seeded, `page.py` prints a one-line summary):
 
 ```bash
-curl -s -i -H "Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2" http://127.0.0.1:8123/api/documents/
+python /tmp/obs/page.py http://127.0.0.1:8000/api/documents/ 1e80755d969c5bbd8bf61516e74ff81085d115a3
 ```
 
-**Observed proof (verbatim)** — 30 total, 25 on the first page, and a non-null `next`,
-demonstrating a page size of **25**:
+**Observed output (verbatim)** — 30 total, **25** on the first page, non-null `next`,
+demonstrating the default page size of **25** (it does not dump all 30):
 
 ```text
-count = 30
-next = http://127.0.0.1:8123/api/documents/?page=2
-previous = None
-len(results) on page 1 = 25
+count=30 len(results)=25 next=http://127.0.0.1:8000/api/documents/?page=2 previous=None
 ```
 
-**Command run** (`?page_size=5` — the `page_size` query parameter is honored):
+**Command run** (`?page_size=5` — prove the `page_size` query parameter is honored):
 
 ```bash
-curl -s -H "Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2" "http://127.0.0.1:8123/api/documents/?page_size=5"
+python /tmp/obs/page.py "http://127.0.0.1:8000/api/documents/?page_size=5" 1e80755d969c5bbd8bf61516e74ff81085d115a3
 ```
 
 **Observed output (verbatim)** — the page now holds 5 items and `next` carries the
 `page_size=5` param forward:
 
 ```text
-count=30 len(results)=5 next=http://127.0.0.1:8123/api/documents/?page=2&page_size=5 previous=None
+count=30 len(results)=5 next=http://127.0.0.1:8000/api/documents/?page=2&page_size=5 previous=None
 ```
 
-**Command run** (`?page=2` — a later page, where `previous` becomes non-null):
+**Command run** (`?page=2` — a later page **at the default page size**, where `previous`
+becomes non-null):
 
 ```bash
-curl -s -H "Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2" "http://127.0.0.1:8123/api/documents/?page=2"
+python /tmp/obs/page.py "http://127.0.0.1:8000/api/documents/?page=2" 1e80755d969c5bbd8bf61516e74ff81085d115a3
 ```
 
-**Observed output (verbatim)** — on page 2 the `previous` link is now populated:
+**Observed output (verbatim):**
 
 ```text
-count=30 len(results)=5 next=None previous=http://127.0.0.1:8123/api/documents/
+count=30 len(results)=5 next=None previous=http://127.0.0.1:8000/api/documents/
 ```
 
 > **Reading these three blocks.** The **default page-size** proof is the first block
-> (`len(results) on page 1 = 25` with `count = 30`), which demonstrates the page size of
-> 25. The second block demonstrates the `page_size` query parameter. The third block
-> demonstrates that `previous` becomes non-null on later pages. (In that third capture,
-> `len(results)=5` reflects the effective small page the harness process was serving at
-> that moment; the authoritative default-page-size evidence is the first block.) Each
-> block is presented next to the specific claim it proves.
+> (`len(results)=25` with `count=30` and a non-null `next`), demonstrating the page size of
+> 25. The second block demonstrates the `page_size` query parameter (page shrinks to 5, and
+> `next` carries `page_size=5` forward). The third block demonstrates that `previous` becomes
+> non-null on a later page. Note that the third request carries **no** `page_size` parameter,
+> and its `previous` link (`http://127.0.0.1:8000/api/documents/`) also carries **no**
+> `page_size`: with the **default page size of 25** and a **total `count` of 30**, page 2
+> naturally contains the **remaining 5** documents (25 on page 1 + 5 on page 2 = 30), and
+> `next=None` because it is the last page. This is expected and further demonstrates
+> pagination. Each block is presented next to the specific claim it proves.
 
 **Source citation & rationale:**
 
@@ -332,7 +433,6 @@ count=30 len(results)=5 next=None previous=http://127.0.0.1:8123/api/documents/
 
 ---
 
-
 ## Q5 — Unauthenticated request: status code and error message
 
 **Answer:** re-issuing the identical `GET /api/documents/` with **no** `Authorization`
@@ -343,8 +443,8 @@ challenge header, and the JSON body `{"detail":"Authentication credentials were 
 *bypasses* were confirmed inactive:
 
 - `DEBUG=False`, so the DEBUG-gated `AngularApiAuthenticationOverride` was **not** appended
-  to the authenticators (`src/paperless/settings.py:L129-L132`; note that `channels` /
-  override are only added when `DEBUG`, per `src/paperless/settings.py:L113-L114`).
+  to the authenticators (`src/paperless/settings.py:L129-L132`; DEBUG-only apps/overrides are
+  added only under `if DEBUG:` per `src/paperless/settings.py:L113-L114`).
 - `PAPERLESS_AUTO_LOGIN_USERNAME` was **unset**, so `AutoLoginMiddleware` did not silently
   authenticate the request (`src/paperless/settings.py:L193-L199`).
 - `IsAuthenticated` is enforced on the view (`src/documents/views.py:L183`).
@@ -356,25 +456,46 @@ The bypass classes themselves live in `src/paperless/auth.py`
 **Command run:**
 
 ```bash
-curl -s -i http://127.0.0.1:8123/api/documents/
+python /tmp/obs/raw.py GET /api/documents/
 ```
 
 **Observed output (verbatim — full status line, headers, and body):**
 
 ```http
 HTTP/1.1 401 Unauthorized
-Date: Wed, 01 Jul 2026 20:23:57 GMT
-Server: WSGIServer/0.2 CPython/3.12.3
+Date: Wed, 01 Jul 2026 22:24:39 GMT
+Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
-Vary: Accept, Cookie
+Vary: Accept, Accept-Language, Origin, Cookie
 Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
 Content-Length: 58
+Content-Language: en-us
 X-Content-Type-Options: nosniff
 Referrer-Policy: same-origin
 Cross-Origin-Opener-Policy: same-origin
 
 {"detail":"Authentication credentials were not provided."}
+```
+
+**Command run** (why `401` and not `403` — introspect the first authenticator's challenge):
+
+```bash
+python manage.py shell -c "
+from rest_framework.authentication import BasicAuthentication, TokenAuthentication
+from rest_framework.test import APIRequestFactory
+req = APIRequestFactory().get('/api/documents/')
+print('BasicAuthentication.authenticate_header(req) =', repr(BasicAuthentication().authenticate_header(req)))
+print('TokenAuthentication.authenticate_header(req) =', repr(TokenAuthentication().authenticate_header(req)))
+"
+```
+
+**Observed output (verbatim):**
+
+```text
+BasicAuthentication.authenticate_header(req) = 'Basic realm="api"'
+TokenAuthentication.authenticate_header(req) = 'Token'
 ```
 
 **Source citation & rationale:**
@@ -383,24 +504,21 @@ Cross-Origin-Opener-Policy: same-origin
   from the **first** authenticator in `DEFAULT_AUTHENTICATION_CLASSES`. Paperless lists
   `BasicAuthentication` **first** at `src/paperless/settings.py:L118` (the order is Basic
   at L118, Session at L119, Token at L120, within `src/paperless/settings.py:L117-L121`).
-- `BasicAuthentication.authenticate_header()` returns a non-null challenge, so DRF emits
-  `401` plus a `WWW-Authenticate` header. Runtime introspection proof (verbatim):
-
-  ```text
-  BasicAuthentication.authenticate_header(req) = 'Basic realm="api"'
-  TokenAuthentication.authenticate_header(req) = 'Token'
-  ```
-
-  The `WWW-Authenticate: Basic realm="api"` header in the response matches
-  `BasicAuthentication`'s challenge exactly, confirming why the status is `401` rather than
-  `403`. (Had the first authenticator returned no challenge, DRF would instead emit `403`.)
+- `BasicAuthentication.authenticate_header()` returns the non-null challenge
+  `Basic realm="api"` (introspection above), so DRF emits `401` plus a matching
+  `WWW-Authenticate: Basic realm="api"` header — which is exactly the header observed in the
+  response. (Had the first authenticator returned no challenge, DRF would instead emit `403`.)
+- **This is the "absent header" path from [Q1](#q1--token-header-name-and-format):** with no
+  `Authorization` header, `TokenAuthentication.authenticate()` returns `None` (it does not
+  raise `Invalid token.`), so the request reaches `IsAuthenticated`, which produces the
+  `{"detail":"Authentication credentials were not provided."}` body seen above.
 - **Version-headers nuance (one claim, one piece of evidence):** the `X-Api-Version` /
   `X-Version` headers are **ABSENT** from this `401` response — compare the header block
-  above with the Q3 authenticated header block, where both are present (`X-Api-Version: 2`
-  and `X-Version: 1.7.0`). This is because `ApiVersionMiddleware` only sets them
-  `if request.user.is_authenticated` (`src/paperless/middleware.py:L11`, with the headers
-  written at `:L13-L14`). Since the unauthenticated request has no authenticated user, the
-  middleware skips those headers.
+  above with the [Q3](#q3--top-level-json-response-fields) authenticated header block, where
+  both are present (`X-Api-Version: 2` and `X-Version: 1.7.0`). This is because
+  `ApiVersionMiddleware` only sets them `if request.user.is_authenticated`
+  (`src/paperless/middleware.py:L11`, with the headers written at `:L13-L14`). Since the
+  unauthenticated request has no authenticated user, the middleware skips those headers.
 
 ---
 
@@ -413,7 +531,24 @@ Cross-Origin-Opener-Policy: same-origin
   table `authtoken_token`, enabled by adding the `rest_framework.authtoken` app to
   `INSTALLED_APPS`.
 
-**DRF runtime introspection (verbatim — run after `django.setup()`):**
+**Command run** (DRF runtime introspection, after `manage.py shell` performs `django.setup()`):
+
+```bash
+python manage.py shell -c "
+import rest_framework
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.authtoken.models import Token
+print('DRF version =', rest_framework.VERSION)
+print('TokenAuthentication FQN =', TokenAuthentication.__module__ + '.' + TokenAuthentication.__name__)
+print('TokenAuthentication.keyword =', repr(TokenAuthentication.keyword))
+print('Token model FQN =', Token.__module__ + '.' + Token.__name__)
+print('Token db_table =', Token._meta.db_table)
+kf = Token._meta.get_field('key')
+print('Token.key field =', type(kf).__name__, 'max_length =', kf.max_length)
+"
+```
+
+**Observed output (verbatim):**
 
 ```text
 DRF version = 3.13.1
@@ -422,44 +557,70 @@ TokenAuthentication.keyword = 'Token'
 Token model FQN = rest_framework.authtoken.models.Token
 Token db_table = authtoken_token
 Token.key field = CharField max_length = 40
-BasicAuthentication.authenticate_header(req) = 'Basic realm="api"'
-TokenAuthentication.authenticate_header(req) = 'Token'
 ```
 
-**Token table schema (verbatim, from SQLite `sqlite_master`):**
+**Command run** (the token table's actual schema, straight from SQLite's `sqlite_master`):
+
+```bash
+python manage.py shell -c "
+from django.db import connection
+with connection.cursor() as c:
+    c.execute(\"SELECT sql FROM sqlite_master WHERE type='table' AND name='authtoken_token'\")
+    print(c.fetchone()[0])
+"
+```
+
+**Observed output (verbatim):**
 
 ```sql
 CREATE TABLE "authtoken_token" ("key" varchar(40) NOT NULL PRIMARY KEY, "created" datetime NOT NULL, "user_id" integer NOT NULL UNIQUE REFERENCES "auth_user" ("id") DEFERRABLE INITIALLY DEFERRED)
 ```
 
-**Actual token row for the test user (verbatim, `SELECT key,user_id,created FROM authtoken_token`):**
+**Command run** (the actual token row created for the test user):
+
+```bash
+python manage.py shell -c "
+from django.db import connection
+with connection.cursor() as c:
+    c.execute('SELECT key, user_id, created FROM authtoken_token')
+    for row in c.fetchall():
+        print('key=%s | user_id=%s | created=%s' % row)
+"
+```
+
+**Observed output (verbatim):**
 
 ```text
-key=5682b475a4c7a5ed925f727521885d8bf059ebb2 | user_id=2 | created=2026-07-01 20:23:31.151977
+key=1e80755d969c5bbd8bf61516e74ff81085d115a3 | user_id=2 | created=2026-07-01 22:22:33.658654
 ```
 
 The stored `key` equals the token used to authenticate throughout this document, `user_id=2`
-matches the created `testuser`, and the `user_id` UNIQUE constraint means one token per user.
+matches the created `testuser`, and the `user_id` UNIQUE constraint (see the DDL) means one
+token per user.
 
-**Token-mint endpoint proof — `POST /api/token/` returns the key (verbatim):**
+**Command run** (the HTTP token-mint endpoint — `POST /api/token/` returns the key):
 
 ```bash
-curl -s -i -X POST -d "username=testuser&password=testpass123" http://127.0.0.1:8123/api/token/
+python /tmp/obs/raw.py POST /api/token/ --data "username=testuser&password=testpass123"
 ```
+
+**Observed output (verbatim):**
 
 ```http
 HTTP/1.1 200 OK
-Date: Wed, 01 Jul 2026 20:24:42 GMT
-Server: WSGIServer/0.2 CPython/3.12.3
+Date: Wed, 01 Jul 2026 22:24:58 GMT
+Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
 Allow: POST, OPTIONS
+X-Frame-Options: SAMEORIGIN
 Content-Length: 52
-Vary: Cookie
+Vary: Accept-Language, Origin, Cookie
+Content-Language: en-us
 X-Content-Type-Options: nosniff
 Referrer-Policy: same-origin
 Cross-Origin-Opener-Policy: same-origin
 
-{"token":"5682b475a4c7a5ed925f727521885d8bf059ebb2"}
+{"token":"1e80755d969c5bbd8bf61516e74ff81085d115a3"}
 ```
 
 **Source citation & rationale:**
@@ -473,16 +634,15 @@ Cross-Origin-Opener-Policy: same-origin
 - The token-mint endpoint is `path("token/", views.obtain_auth_token)` at
   `src/paperless/urls.py:L81`, where `views` is `rest_framework.authtoken.views` imported
   at `src/paperless/urls.py:L26`. The returned key
-  (`{"token":"5682b475a4c7a5ed925f727521885d8bf059ebb2"}`) equals the stored key, tying the
+  (`{"token":"1e80755d969c5bbd8bf61516e74ff81085d115a3"}`) equals the stored key, tying the
   HTTP mint path to the `authtoken_token` row.
-- **Two mint paths.** The same key was also obtainable directly via the ORM
-  (`Token.objects.create(user=...)`, per the setup output in
+- **Two mint paths.** The same key was also created directly via the ORM
+  (`Token.objects.get_or_create(user=...)`, per the seed output in
   [How this was verified](#how-this-was-verified-runtime-harness)). Both the HTTP endpoint
   (`POST /api/token/`) and the ORM yield a key usable in the `Authorization: Token <key>`
   header.
 
 ---
-
 
 ## Contextual details
 
@@ -514,10 +674,10 @@ source. The corroboration is tied to the locally observed evidence below (not me
 restatement of the docs).
 
 - **DRF authentication guide** — <https://www.django-rest-framework.org/api-guide/authentication/>.
-  The guide states the key is "prefixed by the string literal 'Token'", with whitespace
+  The guide states the key is prefixed by the string literal `Token`, with whitespace
   separating the two (its example is `Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b`).
   This matches the locally observed header form
-  `Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2` accepted with `200 OK` in
+  `Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3` accepted with `200 OK` in
   Q1. The guide also states that `rest_framework.authtoken` must be in `INSTALLED_APPS` and
   that `manage.py migrate` creates the token table — matching the observed
   `authtoken_token` DDL in Q6 and the `rest_framework.authtoken` app at
@@ -525,32 +685,38 @@ restatement of the docs).
   yield "HTTP 401 Unauthorized" with a `WWW-Authenticate` header — matching the observed
   Q5 `401` plus `WWW-Authenticate: Basic realm="api"`.
 - **DRF source** — <https://github.com/encode/django-rest-framework/blob/main/rest_framework/authentication.py>.
-  `class TokenAuthentication` sets `keyword = 'Token'`. This matches the locally observed
-  introspection `TokenAuthentication.keyword = 'Token'` on the pinned `djangorestframework==3.13.1`
-  (Q1 and Q6).
+  `class TokenAuthentication` sets `keyword = 'Token'`; its `authenticate()` returns `None`
+  when the header is missing or the keyword does not match, and only
+  `authenticate_credentials()` raises `AuthenticationFailed('Invalid token.')` for an
+  unmatched key. This matches the locally observed introspection
+  (`TokenAuthentication.keyword = 'Token'`) and the absent-vs-invalid demonstration in Q1 on
+  the pinned `djangorestframework==3.13.1`.
 
 ---
 
 ## Coverage checklist
 
 - [x] **Q1 — header NAME + FORMAT:** NAME `Authorization`; FORMAT `Token <key>` (e.g.
-  `Authorization: Token 5682b475a4c7a5ed925f727521885d8bf059ebb2`). Evidence: `200 OK` on
-  valid token; `{"detail":"Invalid token."}` on bad token; introspection
-  `TokenAuthentication.keyword = 'Token'`. Citation: `src/paperless/settings.py:L120`,
-  `docs/api.rst:L143`.
+  `Authorization: Token 1e80755d969c5bbd8bf61516e74ff81085d115a3`). Evidence: `200 OK` on
+  valid token; `{"detail":"Invalid token."}` on a bad token key; introspection
+  `TokenAuthentication.keyword = 'Token'`; and the absent-vs-invalid demo
+  (`absent ... -> None`, `invalid token key -> raises AuthenticationFailed: 'Invalid token.'`).
+  Citation: `src/paperless/settings.py:L120`, `docs/api.rst:L143`.
 - [x] **Q2 — endpoint PATH:** `/api/documents/`. Evidence: `200 OK`. Citation:
   `src/paperless/urls.py:L29,L32,L40,L83`, `docs/api.rst:L16`.
 - [x] **Q3 — top-level fields:** `count`, `next`, `previous`, `results`, plus the 12
-  per-item fields (`id` … `archived_file_name`). Evidence: `TOP-LEVEL KEYS` and
-  `results[0] KEYS` output. Citation: `src/documents/views.py:L182`,
+  per-item fields (`id` … `archived_file_name`). Evidence: `--headers` block, genuine
+  `head -c 480` body prefix, `TOP-LEVEL KEYS` / `results[0] KEYS` parse output, and the full
+  `results[0]` object. Citation: `src/documents/views.py:L182`,
   `src/paperless/views.py:L8-L11`, `src/documents/serialisers.py:L222-L234`.
 - [x] **Q4 — pagination:** YES; default page size 25; `page_size` and `page` query params.
-  Evidence: `count = 30` / `len(results) on page 1 = 25` / non-null `next`; `?page_size=5`
-  block; `?page=2` `previous` non-null block. Citation: `src/paperless/views.py:L9-L11`,
-  `src/documents/views.py:L182`.
+  Evidence: `count=30` / `len(results)=25` / non-null `next`; `?page_size=5` block;
+  `?page=2` block (remaining 5, `next=None`, `previous` non-null). Citation:
+  `src/paperless/views.py:L9-L11`, `src/documents/views.py:L182`.
 - [x] **Q5 — unauthenticated status + message:** `401 Unauthorized` +
   `{"detail":"Authentication credentials were not provided."}` +
-  `WWW-Authenticate: Basic realm="api"`. Evidence: full verbatim response. Citation:
+  `WWW-Authenticate: Basic realm="api"`. Evidence: full verbatim response;
+  `BasicAuthentication.authenticate_header(req) = 'Basic realm="api"'`. Citation:
   `src/paperless/settings.py:L117-L121` (Basic first at L118), `src/documents/views.py:L183`.
 - [x] **Q6a — authentication class:** `rest_framework.authentication.TokenAuthentication`.
   Evidence: introspection `TokenAuthentication FQN = ...`. Citation:
@@ -559,6 +725,10 @@ restatement of the docs).
   Evidence: introspection `Token model FQN` / `Token db_table`; the `authtoken_token` DDL;
   the actual token row; and `POST /api/token/` returning the same key. Citation:
   `src/paperless/settings.py:L108`, `src/paperless/urls.py:L26,L81`.
+- [x] **Nuance — invalid token key vs. absent header:** invalid key →
+  `AuthenticationFailed('Invalid token.')` (`{"detail":"Invalid token."}`); absent header →
+  `authenticate()` returns `None` → `IsAuthenticated` →
+  `{"detail":"Authentication credentials were not provided."}`. Evidence: Q1 demo output.
 - [x] **Nuance — serializer branch:** plain list → `DocumentSerializer`;
   `query`/`more_like_id` → `SearchResultSerializer` (`src/documents/views.py:L377,L382-L392`).
 - [x] **Nuance — 401 vs 403:** determined by the first authenticator (`BasicAuthentication`)
@@ -570,69 +740,123 @@ restatement of the docs).
 
 ## Cleanup / repository integrity
 
-- The investigation ran in a **throwaway Django project OUTSIDE the repository** (temporary
-  directories `/tmp/obs` and `/tmp/pylibs`).
-- It created only **ephemeral rows** in a temporary SQLite database: a `testuser`, one
-  `authtoken_token` row, and 30 sample `documents`. All of these are outside the repository
-  and are discarded with the temporary environment.
-- **No source file in the repository was modified.** Any temporary observation scripts were
-  removed after use.
-- `git status --porcelain` was verified to be **empty** (clean working tree) except for this
-  single new document, `blitzy/documentation/paperless-ngx_542221a38dff.md`.
+- The investigation ran the real paperless application inside a **disposable Docker
+  container**; all runtime state lives in the container's throwaway SQLite database
+  (`/app/data/db.sqlite3`) and is discarded when the container is removed.
+- It created only **ephemeral rows**: a `testuser`, one `authtoken_token` row, and 30 sample
+  `documents`. None of these are in the repository.
+- The temporary observation scripts used to produce the output above
+  (`/tmp/obs/raw.py`, `parse.py`, `page.py`, `obj.py`) live **inside the container**, outside
+  the repository, and were removed after use.
+- **No file in the repository was modified.** `git status --porcelain` on the host repository
+  is empty except for this single new document,
+  `blitzy/documentation/paperless-ngx_542221a38dff.md`.
 
 ---
 
 ## Reproduction harness
 
-This is **optional** context for reproduction — the authoritative content is the observed
-output captured per question above. A temporary Django project (kept **outside** the repo)
-imported the genuine paperless `documents` app and reused paperless's **exact**
-`REST_FRAMEWORK` config and `ApiVersionMiddleware`, pinned to `Django==4.0.4` /
-`djangorestframework==3.13.1`.
+This section makes every command above fully reproducible. Run everything **inside the
+project's Docker container** (Python 3.9.23, `Django==4.0.4`, `djangorestframework==3.13.1`),
+from the paperless source root `/app/src`, with `DEBUG=False` and
+`PAPERLESS_AUTO_LOGIN_USERNAME` unset (both are defaults).
 
-1. **Install pinned deps** (into an isolated target): `Django==4.0.4`,
-   `djangorestframework==3.13.1`, `django-filter==21.1`, `django-cors-headers==3.11.0`,
-   plus the app's transitive pure-Python deps (`python-dateutil`, `pathvalidate`, `Whoosh`,
-   `python-magic`, `python-dotenv`, `concurrent-log-handler`, `filelock`, `django-q`,
-   `python-gnupg`, `setuptools==70.3.0`) and system `libmagic1`.
-2. **Settings mirror paperless:** `INSTALLED_APPS` includes `rest_framework`,
-   `rest_framework.authtoken`, `django_filters`, `django_q`, and
-   `documents.apps.DocumentsConfig`; `REST_FRAMEWORK` with
-   `DEFAULT_AUTHENTICATION_CLASSES = [BasicAuthentication, SessionAuthentication, TokenAuthentication]`
-   and `AcceptHeaderVersioning` / `DEFAULT_VERSION "1"` / `ALLOWED_VERSIONS ["1","2"]`;
-   `MIDDLEWARE` includes `paperless.middleware.ApiVersionMiddleware`. `DEBUG=False`,
-   `PAPERLESS_AUTO_LOGIN_USERNAME` unset.
-3. **URLs mirror paperless:**
-   `re_path(r"^api/", include([ path("token/", views.obtain_auth_token) ] + DefaultRouter().register(r"documents", UnifiedSearchViewSet).urls))`.
-4. `migrate --skip-checks` (the `--skip-checks` avoids the unrelated "No parsers found"
-   system check that guards document consumption but is irrelevant to a read-only list).
-5. Create the user, mint the token (`Token.objects.create`), seed 30 documents
-   (`mime_type="application/pdf"`), then run
-   `runserver 127.0.0.1:8123 --skip-checks --noreload`, and issue the requests shown per
-   question.
+**1. Bring up the environment** (migrate, seed the user/token/30 docs, start the server) —
+exactly the commands shown in [How this was verified](#how-this-was-verified-runtime-harness).
+
+**2. The observation scripts** (written under `/tmp/obs/` in the container — outside the
+repository — and deleted afterward). Because `curl`/`wget` are not installed, `raw.py` is a
+minimal raw-socket HTTP client that prints the verbatim raw response:
 
 ```python
-# Condensed harness sketch (illustrative; run outside the repository)
-import django, os
-os.environ["DJANGO_SETTINGS_MODULE"] = "obs_settings"   # mirrors paperless REST_FRAMEWORK
-django.setup()
+# /tmp/obs/raw.py — minimal raw-HTTP client; modes: --status | --headers | --body | (full)
+# Usage: raw.py METHOD PATH [HEADER ...] [--data BODY]
+import socket, sys
 
-from django.contrib.auth.models import User
-from rest_framework.authtoken.models import Token
-from documents.models import Document
+def main():
+    args = sys.argv[1:]
+    mode, data, positional = "full", None, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--status", "--headers", "--body"):
+            mode = a[2:]
+        elif a == "--data":
+            i += 1; data = args[i]
+        else:
+            positional.append(a)
+        i += 1
+    method, path = positional[0], positional[1]
+    headers = positional[2:]
+    lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1:8000", "Connection: close"]
+    body = b""
+    if data is not None:
+        body = data.encode()
+        lines.append("Content-Type: application/x-www-form-urlencoded")
+        lines.append(f"Content-Length: {len(body)}")
+    lines += headers
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    s = socket.create_connection(("127.0.0.1", 8000))
+    s.sendall(raw)
+    buf = b""
+    while True:
+        c = s.recv(4096)
+        if not c:
+            break
+        buf += c
+    s.close()
+    text = buf.decode("latin-1")
+    sep = text.find("\r\n\r\n")
+    head = text[:sep] if sep != -1 else text
+    resp_body = text[sep + 4:] if sep != -1 else ""
+    if mode == "status":
+        sys.stdout.write(head.split("\r\n")[0] + "\n")
+    elif mode == "headers":
+        sys.stdout.write(head.replace("\r\n", "\n") + "\n")
+    elif mode == "body":
+        sys.stdout.write(resp_body)
+    else:
+        sys.stdout.write(text.replace("\r\n", "\n"))
 
-u = User.objects.create_user("testuser", password="testpass123")
-tok = Token.objects.create(user=u)                       # ORM mint path
-print("TOKEN", tok.key, len(tok.key))
-for i in range(1, 31):                                    # seed 30 docs -> exercises paging
-    Document.objects.create(title=f"Test Document {i}",
-                            content=f"content body {i}",
-                            mime_type="application/pdf")
-# then: manage.py runserver 127.0.0.1:8123 --skip-checks --noreload
+main()
 ```
+
+```python
+# /tmp/obs/parse.py — print the parsed top-level + item key sets
+import sys, requests
+url, token = sys.argv[1], sys.argv[2]
+j = requests.get(url, headers={"Authorization": f"Token {token}"}).json()
+print("TOP-LEVEL KEYS:", list(j.keys()))
+print("count =", j["count"])
+print("next =", j["next"])
+print("previous =", j["previous"])
+print("len(results) on this page =", len(j["results"]))
+print("results[0] KEYS =", list(j["results"][0].keys()))
+```
+
+```python
+# /tmp/obs/page.py — one-line pagination summary
+import sys, requests
+url, token = sys.argv[1], sys.argv[2]
+j = requests.get(url, headers={"Authorization": f"Token {token}"}).json()
+print(f"count={j['count']} len(results)={len(j['results'])} next={j['next']} previous={j['previous']}")
+```
+
+```python
+# /tmp/obs/obj.py — pretty-print results[0] exactly as json.dumps produces it
+import sys, json, requests
+url, token = sys.argv[1], sys.argv[2]
+r = requests.get(url, headers={"Authorization": f"Token {token}"})
+print(json.dumps(r.json()["results"][0], indent=2))
+```
+
+**3. Issue the requests** shown per question above (`raw.py`, `parse.py`, `page.py`,
+`obj.py`, and the `manage.py shell -c` introspection/SQL commands). Every output block in this
+document is the verbatim result of the command printed immediately above it.
 
 ---
 
-*End of document. All runtime blocks above are verbatim captures; all `file:line`
-references were confirmed against the source branch `paperless-ngx_542221a38dff`
-(commit `542221a38dff`).*
+*End of document. All runtime blocks above are verbatim captures from the live in-container
+server (`Server: WSGIServer/0.2 CPython/3.9.23`, `Django 4.0.4`,
+`djangorestframework 3.13.1`); all `file:line` references were confirmed against the source
+branch `paperless-ngx_542221a38dff` (commit `542221a38dff`).*
