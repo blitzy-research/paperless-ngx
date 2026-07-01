@@ -94,7 +94,7 @@ def ckpt(label):
 
 ### 2.3 Read-only & cleanup discipline
 
-- Baseline before any work: `git status --porcelain` returned **empty** (clean tree), branch `blitzy-aab05a0a-04cf-40e2-a694-3bf6834a73f6`, HEAD `542221a38dff06361e07976452f9aea24d210542`.
+- Baseline before any work: `git status --porcelain` returned **empty** (clean tree). The investigated source checkout was branch `paperless-ngx_542221a38dff` at HEAD `542221a38dff06361e07976452f9aea24d210542` (verified with `git branch --show-current` and `git rev-parse HEAD`); the Blitzy destination branch on which this answer document is written is `blitzy-aab05a0a-04cf-40e2-a694-3bf6834a73f6`.
 - Every observation script was written **outside** the repository (host `/tmp/obs`, then `docker cp` into the container's `/tmp`), executed, its output captured verbatim, and then **deleted**.
 - After capture, all temporary scripts were removed (host and container) and `git status --porcelain` was re-verified **empty** apart from this new document. No source file, dependency manifest, test, or CI file was touched. No diagnosed hotspot was remediated (recommendations only — see §12).
 
