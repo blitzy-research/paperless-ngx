@@ -34,7 +34,7 @@ The user asked five things, answered by name in Section 4: (1) root-cause the sp
 - **`tracemalloc`** — traces **Python-object allocations only**. Used to detect whether Python objects are retained (a true Python leak) or reclaimed.
 - **Process RSS** — read from `/proc/self/status` `VmRSS`, `psutil`, and `resource.getrusage(RUSAGE_SELF).ru_maxrss`. Captures **native + allocator** memory (C-extension buffers and glibc arenas).
 
-**Critical measurement limitation.** `tracemalloc` does **NOT** observe C-extension native allocations — specifically qpdf via `pikepdf` and NumPy's C buffers. Those are **only** visible via RSS. Wherever native memory is discussed, this limitation is restated, and the gap is quantified (e.g., EXACT `[A1] RSS-vs-tracemalloc gap : 42.84 MB`, and the `[P]` block below where RSS moves +32.28 MB while `tracemalloc` sees 0.223 MB).
+**Critical measurement limitation.** `tracemalloc` does **NOT** observe C-extension native allocations — specifically qpdf via `pikepdf` and NumPy's C buffers. Those are **only** visible via RSS. Wherever native memory is discussed, this limitation is restated, and the gap is quantified (e.g., EXACT `[A1] RSS-vs-tracemalloc gap : 42.84 MB`, and the `[P]` block below where RSS moves +2.99 MB across 50 un-closed opens while `tracemalloc` sees only 0.236 MB).
 
 **Two environments were used and are labeled throughout:**
 
@@ -89,8 +89,9 @@ Each subsection pastes the single specific evidence line next to each behavioral
 
 **The native PDF handle is never explicitly closed.** In `extract_metadata` (`src/paperless_tesseract/parsers.py:L26`), the handle `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`) is **never explicitly closed** before `return result`; it is released non-deterministically when the local goes out of scope at function return. **This is native qpdf memory NOT visible to `tracemalloc`** and must be assessed via RSS.
 
-- **Claim:** repeatedly opening PDF handles without closing grows native RSS that `tracemalloc` cannot see, and that gc alone does not reclaim.
-- **Evidence (EXACT):** `[P] RSS after 50 open (no close):   214.55 MB (delta +32.28 MB)` while `[P] tracemalloc peak (same)    :     0.223 MB`; then `[P] RSS after del+gc handles   :   214.55 MB` (not freed by gc alone) versus `[P] RSS after malloc_trim(0)   :   183.46 MB (trim rc=1)`.
+- **Claim:** repeatedly opening PDF handles without closing grows native RSS that `tracemalloc` cannot see and that gc alone does not reclaim; the retention scales roughly linearly with the number of un-closed opens (≈ `0.06 MB/open`) and is independent of the PDF's size.
+- **Evidence (EXACT, focused pikepdf probe — see §6.1.1):** `[P] RSS after 50 open (no close):    36.91 MB (delta +2.99 MB)` while `[P] tracemalloc peak (same)    :     0.236 MB`; then `[P] RSS after del+gc handles   :    36.91 MB` (not freed by gc alone) versus `[P] RSS after malloc_trim(0)   :    34.18 MB (trim rc=1)`. Linear scaling is confirmed at `[P] 200 open (no close): delta +12.14 MB` (tracemalloc peak `0.938 MB`), i.e. ≈ `0.06 MB/open`.
+- **Grounding note (why not a bigger number):** the per-open figure above is measured from a *warm* baseline (after `pikepdf`/qpdf are already initialized). The **first** `pikepdf.open` additionally pays a **one-time** native qpdf library initialization — `[P] one-time qpdf lib init     :    21.18 MB  (cold->warm)` — which is a fixed startup cost, **not** per-open retention. Measuring the delta from a *cold* baseline conflates the two (`[P] delta from COLD baseline   :   +24.17 MB` for 50 opens, rising toward ~`+33 MB` at 200 opens); the un-closed-handle retention proper is the warm-baseline `+2.99 MB` for 50 opens.
 
 **Two references are held for the document's processing duration** (by design, not a leak): the plain-text parser reads the whole file into memory at `self.text = f.read()` (`src/paperless_text/parsers.py:L42`), and `Document.content` is held on the model instance as a `TextField` (`src/documents/models.py:L117` = `content = models.TextField(`).
 
@@ -104,6 +105,8 @@ Each subsection pastes the single specific evidence line next to each behavioral
 - **No** Django `CACHES` setting in `src/paperless/settings.py` — grep result: `ZERO: no CACHES setting`.
 
 **The only caching-adjacent constructs do not retain document metadata server-side.** They are (a) an HTTP `cache_control` response header for **client-side** caching in `src/documents/views.py` — imported at `src/documents/views.py:L25` (`from django.views.decorators.cache import cache_control`) and applied at `src/documents/views.py:L340` (`@method_decorator(cache_control(public=False, max_age=315360000))`) — and (b) a Redis-backed `CHANNEL_LAYERS` (`src/paperless/settings.py:L178`) used strictly for WebSocket notifications. **Neither retains document metadata server-side.**
+
+**Runtime nuance (grounding).** The absence noted above is at the **source** level — `src/paperless/settings.py` defines no `CACHES` key (confirmed: the literal `CACHES` does not appear in the file). At **runtime**, Django still supplies its built-in default cache — measured `settings.CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}` — but it is **not used to store document metadata**: a grep for `cache.set(` / `cache.get(` across non-test source returns **none**, so no document data is written to or read from any cache. The Q3 conclusion is therefore unchanged: no server-side cache accumulates document metadata.
 
 **The classifier is reloaded per consume, not retained across documents.** The load happens inside `try_consume_file` at `classifier = load_classifier()` (`src/documents/consumer.py:L292`) for each document.
 
@@ -133,7 +136,7 @@ Each subsection pastes the single specific evidence line next to each behavioral
 **Document type — each arm maps to a distinct parser code path:**
 
 - **Plain text** reads the whole file into memory: `self.text = f.read()` (`src/paperless_text/parsers.py:L42`); footprint is proportional to document size.
-- **PDF-with-text** opens a native qpdf handle: `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`). **Measured native +32.28 MB, tracemalloc-invisible** — evidence `[P] RSS after 50 open (no close):   214.55 MB (delta +32.28 MB)` vs `[P] tracemalloc peak (same)    :     0.223 MB`.
+- **PDF-with-text** opens a native qpdf handle: `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`). **Measured native +2.99 MB for 50 un-closed opens (≈ 0.06 MB/open), tracemalloc-invisible** — evidence `[P] RSS after 50 open (no close):    36.91 MB (delta +2.99 MB)` vs `[P] tracemalloc peak (same)    :     0.236 MB`.
 - **Image / scanned OCR** uses `ocrmypdf` — the higher-memory document-type arm: `import ocrmypdf` (`src/paperless_tesseract/parsers.py:L246`) followed by `ocrmypdf.ocr(**args)` (`src/paperless_tesseract/parsers.py:L261`; block `L246-L261`), with a fallback `ocrmypdf.ocr(**args)` on the safe-fallback path (`src/paperless_tesseract/parsers.py:L288-L298`). Described here; **not separately measured** in this harness.
 - **Office / Tika** builds a metadata dict via a comprehension over the Tika response in `extract_metadata` (`src/paperless_tika/parsers.py:L29-L49`). Locally minor — evidence `[B] tracemalloc current (both metadata dict-lists): 0.014 MB`.
 
@@ -154,7 +157,7 @@ Where memory actually goes during import, attributed to specific code with `file
 | `preprocess_content` (×3 / doc) | `src/documents/classifier.py:L24-L27` | transient content copies (`.lower().strip()`, `re.sub`) | REPR 2.723 MB peak |
 | `predict_correspondent` / `predict_document_type` / `predict_tags` | `src/documents/classifier.py:L251` / `L262` / `L273` | vectorizer transform + predict | — |
 | `matches()` `MATCH_FUZZY` copy | `src/documents/matching.py:L131,L134` | full-content copy **per matching model** | REPR 41.8× at N=40 |
-| `pikepdf.open` (no close) | `src/paperless_tesseract/parsers.py:L34` | native qpdf handle held until function return | **EXACT +32.28 MB RSS**, tracemalloc 0.223 MB |
+| `pikepdf.open` (no close) | `src/paperless_tesseract/parsers.py:L34` | native qpdf handle held until function return | **EXACT +2.99 MB RSS / 50 opens** (≈0.06 MB/open), tracemalloc 0.236 MB |
 | `self.text = f.read()` | `src/paperless_text/parsers.py:L42` | whole-file read into memory | ∝ doc size |
 | `Document.content` `TextField` | `src/documents/models.py:L117` | full extracted text held on the model instance | — |
 | REST metadata extraction (original always; archive conditional) | `src/documents/views.py:L295` (original, always) and `L300-L305` (archive, only if `doc.has_archive_version`) via `get_metadata` (`L260`) | one `extract_metadata` call without an archive version; a second only when `doc.has_archive_version` is true | — |
@@ -197,13 +200,52 @@ The script trains a real `CountVectorizer(analyzer="word", ngram_range=(1,2), mi
 [D] tracemalloc AFTER del+gc   :     0.00 MB
 [D] RSS AFTER del+gc           :   221.05 MB
 [D] RSS AFTER malloc_trim(0)   :   180.10 MB  (trim rc=1)
-[P] sample.pdf size            :    0.047 MB
-[P] RSS after 50 open (no close):   214.55 MB (delta +32.28 MB)
-[P] tracemalloc peak (same)    :     0.223 MB
-[P] RSS after del+gc handles   :   214.55 MB
-[P] RSS after malloc_trim(0)   :   183.46 MB (trim rc=1)
-VmRSS KB (final): 187860 ; ru_maxrss MB (peak): 307.54
+ru_maxrss MB (peak): 307.54   (high-water mark at [D] RSS AFTER load: 309.05 MB)
 ```
+
+The `[P]` un-closed-`pikepdf` measurement is reported separately below, because the native qpdf handle must be isolated from a **warm** baseline (see §6.1.1) so the one-time library-init cost is not folded into the per-open figure.
+
+### 6.1.1 EXACT — focused `pikepdf` native-retention probe
+
+The un-closed `pikepdf.open` handle holds **native qpdf** memory that `tracemalloc` cannot see, so it is measured with a dedicated probe that mirrors `extract_metadata` (`src/paperless_tesseract/parsers.py:L34-L35`): `pdf = pikepdf.open(document_path)` then `meta = pdf.open_metadata()`, opening the fixture **50 times without closing** and holding the handles. The per-open retention is measured from a **warm** baseline (after `pikepdf`/qpdf are already initialized) so it is not conflated with the one-time native library initialization.
+
+Producing command:
+
+```bash
+docker run --rm --entrypoint bash -v <repo>:/workspace:ro -v /tmp/mem_probe:/probe \
+  -e PDF=/workspace/src/documents/tests/samples/simple.pdf -e N=50 -e WITH_META=1 \
+  paperless-ngx-memtest:local -c 'python3 /probe/pikepdf_probe.py'
+```
+
+Verbatim output:
+
+```text
+---- pikepdf native-retention probe (mirrors parsers.py:L34-L35) ----
+[P] pdf fixture                : simple.pdf
+[P] pdf size                   :     0.022 MB
+[P] opens (no close)           :        50   (with_open_metadata=True)
+[P] RSS cold (before import)   :     12.74 MB
+[P] RSS after import pikepdf   :     34.82 MB
+[P] RSS after 1st open (warm)  :     35.32 MB
+[P] one-time qpdf lib init     :     21.18 MB  (cold->warm)
+[P] RSS before 50 open         :     33.91 MB
+[P] RSS after 50 open (no close):    36.91 MB (delta +2.99 MB)
+[P] tracemalloc peak (same)    :     0.236 MB
+[P] RSS after del+gc handles   :     36.91 MB
+[P] RSS after malloc_trim(0)   :     34.18 MB (trim rc=1)
+[P] per-open retention         :    0.0598 MB/open
+[P] delta from COLD baseline   :   +24.17 MB  (includes one-time lib init)
+```
+
+Scaling with open-count and independence from PDF size (same probe, varying `N` / `PDF`), verbatim excerpts:
+
+```text
+[P] RSS after 200 open (no close):    45.86 MB (delta +12.14 MB)   # N=200, simple.pdf     -> tracemalloc peak 0.938 MB, ~0.06 MB/open
+[P] RSS after  50 open (no close):    35.23 MB (delta +1.50 MB)    # multi-page-images.pdf (0.144 MB)
+[P] RSS after  50 open (no close):    35.86 MB (delta +1.77 MB)    # rotated.pdf (1.261 MB)
+```
+
+**Reading.** The un-closed handle adds `+2.99 MB` of **native** RSS across 50 opens (`≈0.06 MB/open`) that `tracemalloc` reports as only `0.236 MB` — native memory is invisible to it. `del`+`gc` does **not** reclaim it (`36.91 MB` unchanged), and only `malloc_trim(0)` releases it (`34.18 MB`, `trim rc=1`). The delta does **not** grow with PDF size (the 0.022→1.261 MB fixtures all land at ≈1.5–3 MB for 50 opens); only the **open-count** scales it (200 opens → `+12.14 MB`). This is the same native / `tracemalloc`-invisible / arena-released signature seen on model load, now applied to qpdf. The separate one-time `qpdf lib init` of `21.18 MB` (cold→warm) is a fixed startup cost, not per-open retention; a cold-baseline measurement conflates the two (`delta from COLD baseline +24.17 MB` for 50 opens, approaching `~+33 MB` at 200 opens).
 
 ### 6.2 REPRESENTATIVE
 
@@ -269,7 +311,7 @@ Peak RSS during the batch is contrasted with the post-`malloc_trim` steady state
 | Document type | Parser code path | Memory characteristic | Measured |
 |---------------|------------------|-----------------------|----------|
 | Plain text | `self.text = f.read()` (`src/paperless_text/parsers.py:L42`) | whole-file read into memory | ∝ doc size |
-| PDF-with-text | `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`) | native qpdf handle, not closed until return | **EXACT** `[P]` +32.28 MB RSS; tracemalloc `0.223 MB` |
+| PDF-with-text | `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`) | native qpdf handle, not closed until return | **EXACT** `[P]` +2.99 MB RSS / 50 opens (≈0.06 MB/open); tracemalloc `0.236 MB` |
 | Image / scanned OCR | `ocrmypdf.ocr(**args)` (`src/paperless_tesseract/parsers.py:L246-L261`; fallback `L288-L298`) | higher-memory arm | described; not separately measured here |
 | Office / Tika | dict comprehension over Tika response (`src/paperless_tika/parsers.py:L29-L49`) | small metadata dict | **REPR** `[B]` 0.014 MB |
 
@@ -306,7 +348,7 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 
 ### 8.4 Measurement limitation (restated where native memory is involved)
 
-`tracemalloc` observes only Python-object allocations, so qpdf-via-`pikepdf` and NumPy C buffers are **assessed via RSS**, not `tracemalloc`. This is quantified by the EXACT `[A1] RSS-vs-tracemalloc gap    :    42.84 MB` and by the `[P]` block, where RSS moves `+32.28 MB` while `tracemalloc` sees only `0.223 MB`. Any conclusion about native memory in this report rests on RSS, by necessity.
+`tracemalloc` observes only Python-object allocations, so qpdf-via-`pikepdf` and NumPy C buffers are **assessed via RSS**, not `tracemalloc`. This is quantified by the EXACT `[A1] RSS-vs-tracemalloc gap    :    42.84 MB` and by the `[P]` block, where RSS moves `+2.99 MB` across 50 un-closed opens while `tracemalloc` sees only `0.236 MB`. Any conclusion about native memory in this report rests on RSS, by necessity.
 
 ---
 
@@ -315,7 +357,7 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 > The following are **optional recommendations**. Consistent with the read-only mandate, **none were applied**, and they are **not part of this deliverable**. The shipped `recycle: 1` policy (`src/paperless/settings.py:L452`) already bounds the practical impact of the retention described above.
 
 1. **Return arenas to the OS sooner.** Call `ctypes` `malloc_trim(0)` at task boundaries, or set `MALLOC_ARENA_MAX` / `MALLOC_MMAP_THRESHOLD_` in the environment, to release retained glibc arenas back to the OS earlier. Evidence that this works: `[D] RSS AFTER malloc_trim(0) : 180.10 MB (trim rc=1)` (EXACT).
-2. **Context-manage the PDF handle.** Wrap the qpdf handle as `with pikepdf.open(...) as pdf:` in `extract_metadata` (`src/paperless_tesseract/parsers.py:L34`) so the native handle closes deterministically rather than at function return. Evidence of the current native retention: `[P] RSS after 50 open (no close): 214.55 MB (delta +32.28 MB)`.
+2. **Context-manage the PDF handle.** Wrap the qpdf handle as `with pikepdf.open(...) as pdf:` in `extract_metadata` (`src/paperless_tesseract/parsers.py:L34`) so the native handle closes deterministically rather than at function return. Evidence of the current native retention: `[P] RSS after 50 open (no close): 36.91 MB (delta +2.99 MB)` (≈0.06 MB/open, released by `malloc_trim(0)`).
 3. **Keep the loaded classifier across post-consume hooks.** Optionally cache/keep the loaded classifier across hooks; this is already partially mitigated by the single per-consume load at `src/documents/consumer.py:L292` (rationale comment `L288-L290`).
 
 ---
@@ -326,7 +368,7 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 |-----------------|----------------|----------------------------|
 | Spikes / root-cause | §4 Q1, §5 | `[A1] RSS after ONE load : 219.92 MB (delta +123.48 MB)` vs `28 bytes`; `src/documents/classifier.py:L86-L92` |
 | Unnecessary copies | §4 Q2 | `[E] tracemalloc peak (3 copies): 2.723 MB`; `[C-cumulative] … N=40: 9.062 MB (41.8x)`; `src/documents/classifier.py:L24-L27`, `src/documents/matching.py:L131,L134` |
-| References held too long | §4 Q2 | `[P] RSS after del+gc handles : 214.55 MB`; `src/paperless_tesseract/parsers.py:L34`, `src/paperless_text/parsers.py:L42`, `src/documents/models.py:L117` |
+| References held too long | §4 Q2 | `[P] RSS after del+gc handles : 36.91 MB` (native, released by `malloc_trim(0)`); `src/paperless_tesseract/parsers.py:L34`, `src/paperless_text/parsers.py:L42`, `src/documents/models.py:L117` |
 | Caching accumulation | §4 Q3 | grep `ZERO: no CACHES setting`, `ZERO: no lru_cache/functools.cache/@cache`, `ZERO: no gc.collect/import gc`; `src/documents/consumer.py:L292` |
 | Spike-vs-no-spike difference | §4 Q4, §7.3 | `[NO-SPIKE] … +0.00 MB` vs `[SPIKE] … +52.55 MB`; `src/paperless/settings.py:L74`, `src/documents/classifier.py:L31` |
 | Document types | §4 Q5, §7.2 | `src/paperless_text/parsers.py:L42`, `src/paperless_tesseract/parsers.py:L34`, `src/paperless_tika/parsers.py:L29-L49`; `[P]` and `[B]` |
