@@ -2,18 +2,18 @@
 
 **Investigative answer document — root cause of duplicated / disappearing rows across neighboring pages of `/api/documents/`.**
 
-| Field | Value |
-|-------|-------|
-| Repository | paperless-ngx |
-| Branch / HEAD | `paperless-ngx_542221a38dff` / `542221a38` |
-| Method | **Run-first**: the operative ORM / ordering / pagination / filter code paths were mirrored in a faithful Django harness, executed, and the real output captured *before* this answer was written |
+| Field               | Value                                                                                                                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Repository          | paperless-ngx                                                                                                                                                                                                      |
+| Branch / HEAD       | `paperless-ngx_542221a38dff` / `542221a38`                                                                                                                                                                         |
+| Method              | **Run-first**: the operative ORM / ordering / pagination / filter code paths were mirrored in a faithful Django harness, executed, and the real output captured _before_ this answer was written                   |
 | Reproduction engine | Django **4.0.4**, DRF **3.13.1**, django-filter **21.1**, Whoosh **2.7.4** on **SQLite** (`requirements.txt:L38,L39,L35,L111`) — run inside the pinned Python 3.9.23 image (see §9 for why, and the exact command) |
-| Scope | **Read-only.** No source file was modified. The one artifact produced is this document. The corrective change is *described and verified in the harness only*, never applied to source. |
+| Scope               | **Read-only.** No source file was modified. The one artifact produced is this document. The corrective change is _described and verified in the harness only_, never applied to source.                            |
 
 > **TL;DR verdict.** The instability is a **total-ordering defect**, not a de-duplication defect. The default sort key is a single, non-unique column — `Meta.ordering = ("-created",)` at `src/documents/models.py:L208`, over the indexed-but-not-unique `created` field at `src/documents/models.py:L152` — with **no unique tiebreaker**. When several rows share the same `created` value, the database is free to return that tied block in any valid order, and two independent page queries (`LIMIT/OFFSET`) can slice the block differently, so the same document lands on two adjacent pages while another is skipped.
 >
-> - **H1 (backend produces duplicates collapsed later):** **CONFIRMED but already handled** — the many-to-many tag join multiplies rows (`.count() = 120` for 60 docs), and `.distinct()` collapses them (`= 60`) *inside* the page query.
-> - **H2 (pagination happens before de-duplication):** **REFUTED** — `get_queryset()` returns `Document.objects.distinct()` (`src/documents/views.py:L198-199`), so the SQL is `SELECT DISTINCT … ORDER BY … LIMIT 25 OFFSET 25`; de-dup is *inside* each windowed query.
+> - **H1 (backend produces duplicates collapsed later):** **CONFIRMED but already handled** — the many-to-many tag join multiplies rows (`.count() = 120` for 60 docs), and `.distinct()` collapses them (`= 60`) _inside_ the page query.
+> - **H2 (pagination happens before de-duplication):** **REFUTED** — `get_queryset()` returns `Document.objects.distinct()` (`src/documents/views.py:L198-199`), so the SQL is `SELECT DISTINCT … ORDER BY … LIMIT 25 OFFSET 25`; de-dup is _inside_ each windowed query.
 > - **H3 (ordering quietly unstable on ties):** **CONFIRMED — this is the primary root cause.**
 > - **"Sharing rules" premise:** does **not** match the code at this commit — there is no per-user / object-level document visibility filter; the destabilizers are **independent of administrator status**.
 
@@ -23,7 +23,7 @@
 
 ### 1.1 Restated question
 
-With a couple of common filters enabled on the documents list, the same document sometimes appears **twice** across neighboring pages, or a document **disappears** for a page and then comes back — even though nobody is editing and the sort order looks unchanged. What is the exact condition that destabilizes the list? The investigation is framed around three explicit hypotheses, and additionally asks about an observation that the glitch "seems to depend on what the user is allowed to see rather than what exists," appearing worse for a viewer who is *not* an all-powerful admin and "whose visibility is shaped by sharing rules." The stated method is to watch what the API actually returns across consecutive page requests and line it up with what the UI thinks pagination means.
+With a couple of common filters enabled on the documents list, the same document sometimes appears **twice** across neighboring pages, or a document **disappears** for a page and then comes back — even though nobody is editing and the sort order looks unchanged. What is the exact condition that destabilizes the list? The investigation is framed around three explicit hypotheses, and additionally asks about an observation that the glitch "seems to depend on what the user is allowed to see rather than what exists," appearing worse for a viewer who is _not_ an all-powerful admin and "whose visibility is shaped by sharing rules." The stated method is to watch what the API actually returns across consecutive page requests and line it up with what the UI thinks pagination means.
 
 ### 1.2 The three hypotheses (verbatim)
 
@@ -49,16 +49,16 @@ Each of these is answered explicitly below, and a final coverage pass (§10) con
 - **Routing.** The route is registered to `UnifiedSearchViewSet` — `src/paperless/urls.py:L32` → `api_router.register(r"documents", UnifiedSearchViewSet)` (imported at `src/paperless/urls.py:L23`). That class extends `DocumentViewSet` — `src/documents/views.py:L377` → `class UnifiedSearchViewSet(DocumentViewSet):`.
 - **The fork.** `UnifiedSearchViewSet.filter_queryset` at `src/documents/views.py:L394` branches on `_is_search_request()` (`src/documents/views.py:L388-392`, true when `"query"` or `"more_like_id"` is in the query params):
 
-| Path | Trigger | Code | What orders the rows |
-|------|---------|------|----------------------|
-| **ORM list path** | no `query=` | falls through to `super().filter_queryset(queryset)` at `src/documents/views.py:L411` | the ORM `ORDER BY` from `Meta.ordering` / the `ordering=` param — **the focus of H1/H2/H3** |
-| **Whoosh full-text path** | `query=` present | `query_class = index.DelayedFullTextQuery` at `src/documents/views.py:L398-399` (else `more_like_id` → `DelayedMoreLikeThisQuery` at `L400-401`; otherwise `raise ValueError()` at `L403`) | Whoosh relevance score, unless an `ordering=` param overrides it |
+| Path                      | Trigger          | Code                                                                                                                                                                                       | What orders the rows                                                                        |
+| ------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| **ORM list path**         | no `query=`      | falls through to `super().filter_queryset(queryset)` at `src/documents/views.py:L411`                                                                                                      | the ORM `ORDER BY` from `Meta.ordering` / the `ordering=` param — **the focus of H1/H2/H3** |
+| **Whoosh full-text path** | `query=` present | `query_class = index.DelayedFullTextQuery` at `src/documents/views.py:L398-399` (else `more_like_id` → `DelayedMoreLikeThisQuery` at `L400-401`; otherwise `raise ValueError()` at `L403`) | Whoosh relevance score, unless an `ordering=` param overrides it                            |
 
 ### 2.1 The Whoosh path is an independent, secondary source of instability
 
 When the request has `query=` but **no** `ordering` param, `src/documents/index.py:L165` `_get_query_sortedby()` returns `None, False` (`src/documents/index.py:L166-167`), and that `(sortedby, reverse)` pair is passed straight into `self.searcher.search_page(...)` at `src/documents/index.py:L210-217`. With `sortedby=None`, Whoosh orders hits by **relevance score**. This is corroborated by the project's own docs — `docs/api.rst:L162`: "Results are always sorted by search score." — and `docs/api.rst:L158` notes full-text pagination "works exactly the same as it does for normal requests on this endpoint."
 
-Relevance-score ordering has the *same* structural weakness as H3 for any documents whose scores tie, so it is an **independent secondary source** of cross-page instability, distinct from the ORM ordering defect. Because the reported symptom occurs "with a couple of common filters enabled" (i.e. the ORM path, no `query=`), the remainder of this document focuses on the ORM path; the Whoosh note is flagged here so the analysis is complete.
+Relevance-score ordering has the _same_ structural weakness as H3 for any documents whose scores tie, so it is an **independent secondary source** of cross-page instability, distinct from the ORM ordering defect. Because the reported symptom occurs "with a couple of common filters enabled" (i.e. the ORM path, no `query=`), the remainder of this document focuses on the ORM path; the Whoosh note is flagged here so the analysis is complete.
 
 ---
 
@@ -72,7 +72,7 @@ Environment confirmed: django 4.0.4 | drf 3.13.1 | django_filter (21, 1) | whoos
 
 ### 3.1 H1 — "Is the backend producing duplicates that get collapsed somewhere later?" → **CONFIRMED, but already handled**
 
-**Verdict:** True — the backend *can* produce duplicate rows — but they are collapsed *before* the response, so H1 is not the source of the cross-page symptom.
+**Verdict:** True — the backend _can_ produce duplicate rows — but they are collapsed _before_ the response, so H1 is not the source of the cross-page symptom.
 
 **Mechanism.** Filtering across a many-to-many relationship joins one row per matching related row. `TagsFilter` at `src/documents/filters.py:L36` takes the `tags__id__in` branch at `src/documents/filters.py:L51-52`:
 
@@ -81,7 +81,7 @@ if self.in_list:
     qs = qs.filter(tags__id__in=tag_ids).distinct()
 ```
 
-A document carrying *both* requested tags matches the join *twice*. The harness created 60 documents, each tagged with both `tag-A` and `tag-B`, then measured the row count with and without `.distinct()`:
+A document carrying _both_ requested tags matches the join _twice_. The harness created 60 documents, each tagged with both `tag-A` and `tag-B`, then measured the row count with and without `.distinct()`:
 
 ```text
 tags__id__in WITHOUT distinct -> .count() = 120
@@ -102,7 +102,7 @@ So both the filter (`filters.py:L52`) and the base queryset (`views.py:L198-199`
 
 ### 3.2 H2 — "Is pagination happening before any de-duplication?" → **REFUTED**
 
-**Verdict:** No. De-duplication is expressed *inside* the same query that is windowed for a page; pagination does not slice a pre-de-dup result set.
+**Verdict:** No. De-duplication is expressed _inside_ the same query that is windowed for a page; pagination does not slice a pre-de-dup result set.
 
 **Mechanism.** Because `get_queryset()` returns `Document.objects.distinct()` (`src/documents/views.py:L198-199`), the compiled SQL is a `SELECT DISTINCT`. The list view wires `pagination_class = StandardPagination` at `src/documents/views.py:L182` and the filter/ordering backends at `src/documents/views.py:L184`. `StandardPagination` (`src/paperless/views.py:L8`) sets `page_size = 25` (`src/paperless/views.py:L9`). Paginating page 2 issues `LIMIT 25 OFFSET 25` **on that same `SELECT DISTINCT` query**. The harness printed the full queryset SQL, then the page-2 window SQL, then paginated:
 
@@ -114,7 +114,7 @@ SELECT DISTINCT "testapp_document"."id", "testapp_document"."title", "testapp_do
 
 **Observed:** the window is `SELECT DISTINCT … ORDER BY "testapp_document"."created" DESC LIMIT 25 OFFSET 25` — the `DISTINCT` and the `LIMIT/OFFSET` live in **one** query. `StandardPagination.paginate_queryset` returned **25** objects for page 2.
 
-**Rationale:** SQL evaluation applies `WHERE` → `DISTINCT` → `ORDER BY` → `LIMIT/OFFSET`, so de-duplication is complete *before* the 25-row window is taken. There is no "paginate first, de-dup later" step to blame. H2 is refuted — which forces the real question onto *what order* those distinct rows are in when the window is taken, i.e. H3.
+**Rationale:** SQL evaluation applies `WHERE` → `DISTINCT` → `ORDER BY` → `LIMIT/OFFSET`, so de-duplication is complete _before_ the 25-row window is taken. There is no "paginate first, de-dup later" step to blame. H2 is refuted — which forces the real question onto _what order_ those distinct rows are in when the window is taken, i.e. H3.
 
 ### 3.3 H3 — "Is the ordering quietly unstable when multiple rows tie on the primary sort key?" → **CONFIRMED (primary root cause)**
 
@@ -133,7 +133,7 @@ over the `created` field at `src/documents/models.py:L152`:
 created = models.DateTimeField(_("created"), default=timezone.now, db_index=True)
 ```
 
-`created` is **indexed** (`db_index=True`) but **not unique** — there is no unique secondary key in the ordering. When many rows share the same `created` value, `ORDER BY created DESC` is satisfied by *any* permutation of that tied block; the database may return a different — but equally valid — order between two separate query executions. The page window (`page_size = 25`, `src/paperless/views.py:L9`) is taken by `LIMIT/OFFSET` against whatever order the database produced *for that execution*.
+`created` is **indexed** (`db_index=True`) but **not unique** — there is no unique secondary key in the ordering. When many rows share the same `created` value, `ORDER BY created DESC` is satisfied by _any_ permutation of that tied block; the database may return a different — but equally valid — order between two separate query executions. The page window (`page_size = 25`, `src/paperless/views.py:L9`) is taken by `LIMIT/OFFSET` against whatever order the database produced _for that execution_.
 
 The harness seeded 50 documents that all tie on `created`, then compared the default order against a fixed order that appends `id`:
 
@@ -149,7 +149,7 @@ DUPLICATED: ['chk-tied-45', 'chk-tied-46', 'chk-tied-47', 'chk-tied-48', 'chk-ti
 DISAPPEARED: ['chk-tied-20', 'chk-tied-21', 'chk-tied-22', 'chk-tied-23', 'chk-tied-24']
 ```
 
-**Observed:** five documents (`chk-tied-45` … `chk-tied-49`) appear on **both** page 1 and page 2 (duplicated), and five others (`chk-tied-20` … `chk-tied-24`) that belong in the true first 50 are **never shown** — a symmetric **5 duplicated + 5 disappeared**, with no edits and an unchanged nominal `-created` sort. (The **count** of 5+5 and its symmetry are structural; the *specific* checksums are seed/DB-tie-order dependent for this run.)
+**Observed:** five documents (`chk-tied-45` … `chk-tied-49`) appear on **both** page 1 and page 2 (duplicated), and five others (`chk-tied-20` … `chk-tied-24`) that belong in the true first 50 are **never shown** — a symmetric **5 duplicated + 5 disappeared**, with no edits and an unchanged nominal `-created` sort. (The **count** of 5+5 and its symmetry are structural; the _specific_ checksums are seed/DB-tie-order dependent for this run.)
 
 This is exactly the reported symptom. The destabilizing sequence:
 
@@ -165,14 +165,13 @@ flowchart TD
     H --> I["Same doc on adjacent pages AND another doc skipped"]
 ```
 
-**Rationale:** `LIMIT/OFFSET` is only stable if the underlying order is a *total* order. A single non-unique key defines only a *partial* order; the tie block's internal arrangement is unspecified, so two page requests that straddle a tie block can overlap (duplicate) and gap (omit) by exactly the amount the block shifts. This is a total-ordering defect, not a de-duplication defect — which is why H1 (fixed by `.distinct()`) and H2 (refuted) do not explain the symptom, but H3 does.
-
+**Rationale:** `LIMIT/OFFSET` is only stable if the underlying order is a _total_ order. A single non-unique key defines only a _partial_ order; the tie block's internal arrangement is unspecified, so two page requests that straddle a tie block can overlap (duplicate) and gap (omit) by exactly the amount the block shifts. This is a total-ordering defect, not a de-duplication defect — which is why H1 (fixed by `.distinct()`) and H2 (refuted) do not explain the symptom, but H3 does.
 
 ---
 
 ## Section 4 — The "sharing rules / per-user visibility" premise does not match the code
 
-The prompt observes that the glitch "seems to depend on what the user is allowed to see … whose visibility is shaped by sharing rules." **Stated plainly: at commit `542221a38`, there is no per-user, owner, or object-level document visibility filter in the documents code paths.** The perceived permission dependence is a side effect of *filter/result-set size*, not of any sharing-rule filter.
+The prompt observes that the glitch "seems to depend on what the user is allowed to see … whose visibility is shaped by sharing rules." **Stated plainly: at commit `542221a38`, there is no per-user, owner, or object-level document visibility filter in the documents code paths.** The perceived permission dependence is a side effect of _filter/result-set size_, not of any sharing-rule filter.
 
 Evidence:
 
@@ -185,10 +184,11 @@ Evidence:
       return SavedView.objects.filter(user=user)
   ```
 
-  That scopes *saved views* to their owner. By contrast, the documents `get_queryset()` (`src/documents/views.py:L198-199`) is `Document.objects.distinct()` — **no** `user`, `owner`, or permission filter.
+  That scopes _saved views_ to their owner. By contrast, the documents `get_queryset()` (`src/documents/views.py:L198-199`) is `Document.objects.distinct()` — **no** `user`, `owner`, or permission filter.
+
 - **No object-level permission library is present.** `django-guardian` is **absent** from `requirements.txt` (and from `Pipfile`); a grep of `src/documents/` finds no `guardian`, `has_perm`, `get_objects_for_user`, or `ObjectPermission` usage, and the `Document` model has no `owner` field. There is nothing at this commit that could make one user "see less" of the documents table than another.
 
-**Rationale / honest reconciliation.** Because there is no sharing-rule filter, the destabilizers (H3, and secondarily the Whoosh relevance path) are **independent of administrator status**. What *looks* like a permission effect is really this: different users tend to land on different **saved views** and **filter sets**, which change the **result-set size** and therefore **where the tie-block boundaries fall relative to the 25-row page window**. A viewer whose habitual filters produce a result set whose page boundary happens to cut through a large `created` tie block will see the duplicate/skip symptom more often — but that is a function of *which rows are in the set*, not of a visibility rule. The prompt's "sharing rules shaping visibility" framing therefore does **not** correspond to any code at this commit, and should not be treated as the cause.
+**Rationale / honest reconciliation.** Because there is no sharing-rule filter, the destabilizers (H3, and secondarily the Whoosh relevance path) are **independent of administrator status**. What _looks_ like a permission effect is really this: different users tend to land on different **saved views** and **filter sets**, which change the **result-set size** and therefore **where the tie-block boundaries fall relative to the 25-row page window**. A viewer whose habitual filters produce a result set whose page boundary happens to cut through a large `created` tie block will see the duplicate/skip symptom more often — but that is a function of _which rows are in the set_, not of a visibility rule. The prompt's "sharing rules shaping visibility" framing therefore does **not** correspond to any code at this commit, and should not be treated as the cause.
 
 ---
 
@@ -214,7 +214,6 @@ FIX: page1==page1' True | page2==page2' True | dups []
 
 > **Read-only scope.** This remedy is **described and verified in the harness only.** No source file in the repository was modified, added, or deleted for this investigation — the sole artifact is this document. Applying the tiebreaker to `src/documents/models.py` (or configuring a default `OrderingFilter` order) is the recommended corrective change, but it is intentionally **not** performed here.
 
-
 ---
 
 ## Section 6 — Why it is intermittent: database nuance + framework guidance
@@ -223,11 +222,11 @@ FIX: page1==page1' True | page2==page2' True | dups []
 
 The harness ran on **SQLite** (`engine sqlite` in the environment line; PostgreSQL and `psycopg2` were unavailable in the investigation environment). SQLite is generally **stable per execution** for a given query plan — with `db_index=True` on `created` it tends to walk the index in a consistent physical order — so a single process usually sees the tied block the same way each time. To exercise the defect deterministically, the harness therefore **induced** an alternate-but-equally-valid ordering (state **B** = a left-rotation of the tied block) rather than relying on the engine to reorder spontaneously.
 
-**PostgreSQL** exhibits the reordering **spontaneously** across executions: the planner may choose a sequential scan vs. an index scan, physical heap order changes after updates/vacuum, and parallel workers can interleave rows — all of which are valid under `ORDER BY created DESC` when `created` ties. This is precisely why the production symptom is **intermittent**: two consecutive page requests can hit different plans / heap states, so the tied block is arranged differently for page 1 than for page 2. The defect is latent in the ordering contract regardless of engine; the engine only determines how *often* the latent instability becomes visible.
+**PostgreSQL** exhibits the reordering **spontaneously** across executions: the planner may choose a sequential scan vs. an index scan, physical heap order changes after updates/vacuum, and parallel workers can interleave rows — all of which are valid under `ORDER BY created DESC` when `created` ties. This is precisely why the production symptom is **intermittent**: two consecutive page requests can hit different plans / heap states, so the tied block is arranged differently for page 1 than for page 2. The defect is latent in the ordering contract regardless of engine; the engine only determines how _often_ the latent instability becomes visible.
 
 ### 6.2 Framework guidance (short, attributed)
 
-- The **Django REST Framework pagination documentation** states that a pagination ordering field should be "Should be unique, or nearly unique." — i.e. reliable paging requires a unique (or nearly unique) ordering, not a bare non-unique column. (Stated for cursor pagination, but the underlying requirement — a *total* order — is what any `LIMIT/OFFSET` window needs to be stable.)
+- The **Django REST Framework pagination documentation** states that a pagination ordering field should be "Should be unique, or nearly unique." — i.e. reliable paging requires a unique (or nearly unique) ordering, not a bare non-unique column. (Stated for cursor pagination, but the underlying requirement — a _total_ order — is what any `LIMIT/OFFSET` window needs to be stable.)
 - DRF's own `CursorPagination` source encodes the same rule in an assertion recommending a "unique or nearly-unique field" such as `-created` or `pk`.
 - A DRF issue (encode/django-rest-framework #7887) makes the concrete point that a paginator that "defaults to -created which has no reason to be unique" is unsafe, and the accepted remedy in the surrounding discussions is to append the primary key to the ordering (e.g. `ordering = ['-event_date', 'id']`).
 
@@ -237,7 +236,7 @@ Synthesis in this codebase's terms: `Meta.ordering = ("-created",)` (`src/docume
 
 ## Section 7 — Edge case: perceived "jumping" from a 404 snap-back
 
-A second, distinct effect can *look* like documents disappearing but has a different cause. When the result-set size shrinks — e.g. a user applies a filter or switches to a saved view — a page number that was valid before can now exceed the available range, so the backend returns **404** for that page. The Angular list service handles this by silently resetting to page 1 and reloading — `src-ui/src/app/services/document-list-view.service.ts:L158-161`:
+A second, distinct effect can _look_ like documents disappearing but has a different cause. When the result-set size shrinks — e.g. a user applies a filter or switches to a saved view — a page number that was valid before can now exceed the available range, so the backend returns **404** for that page. The Angular list service handles this by silently resetting to page 1 and reloading — `src-ui/src/app/services/document-list-view.service.ts:L158-161`:
 
 ```typescript
 if (activeListViewState.currentPage != 1 && error.status == 404) {
@@ -264,7 +263,6 @@ The backend and frontend agree on the destabilizing key and the page-number cont
 - **Page-number contract, no cursor, no client de-dup.** The client list request `abstract-paperless-service.ts:L32-48` sets `page`, `page_size`, and `ordering`, and consumes the `{ count, results }` envelope defined at `src-ui/src/app/data/results.ts:L1-5` (`count: number` at `L2`, `results: T[]` at `L4`). There is **no cursor** and **no client-side de-duplication or order stabilization**: `document-list.component.ts:L86-87` maps `onSort` → `this.list.setSort(...)`, and reloads at `L107/126/164/197` via `this.list.reload()`; a grep of the component finds no `distinct`/`dedup`/`unique` logic. The client keys purely on the backend `count` and the `page`/`page_size`/`ordering` params — so it inherits whatever (in)stability the backend order has.
 - **Pagination is opt-in per viewset.** `REST_FRAMEWORK` in `src/paperless/settings.py:L116-127` defines authentication and versioning only — **no** `DEFAULT_PAGINATION_CLASS` and **no** `PAGE_SIZE`. Pagination is supplied per viewset by `StandardPagination` (`src/documents/views.py:L182`; `src/paperless/views.py:L8-11`, `page_size = 25`). Together the `page_size = 25` window and the `{ count, results }` envelope define a page-number contract whose stability **depends on a total ordering** — the exact property missing in §3.3.
 
-
 ---
 
 ## Section 9 — Appendix: exact commands, harness source, and verbatim output
@@ -273,7 +271,7 @@ Everything below is reproducible. The harness lived **outside** the repository (
 
 ### 9.1 Environment note (why the harness ran in a container)
 
-The reproduction requires the *exact* pins from `requirements.txt` — `django==4.0.4` (`requirements.txt:L38`), `djangorestframework==3.13.1` (`requirements.txt:L39`), `django-filter==21.1` (`requirements.txt:L35`), `whoosh==2.7.4` (`requirements.txt:L111`). Django 4.0.4 imports the standard-library `cgi` module, which was **removed in Python 3.13**; on this host's Python 3.13 the harness fails at import with `ModuleNotFoundError: No module named 'cgi'`. The harness was therefore run inside the project's pinned image (Python 3.9.23 with those exact deps preinstalled), which is the faithful environment for this commit. The observed `engine` is SQLite (PostgreSQL/`psycopg2` unavailable — see §6.1).
+The reproduction requires the _exact_ pins from `requirements.txt` — `django==4.0.4` (`requirements.txt:L38`), `djangorestframework==3.13.1` (`requirements.txt:L39`), `django-filter==21.1` (`requirements.txt:L35`), `whoosh==2.7.4` (`requirements.txt:L111`). Django 4.0.4 imports the standard-library `cgi` module, which was **removed in Python 3.13**; on this host's Python 3.13 the harness fails at import with `ModuleNotFoundError: No module named 'cgi'`. The harness was therefore run inside the project's pinned image (Python 3.9.23 with those exact deps preinstalled), which is the faithful environment for this commit. The observed `engine` is SQLite (PostgreSQL/`psycopg2` unavailable — see §6.1).
 
 ### 9.2 Scratch setup (outside the repo)
 
@@ -412,7 +410,7 @@ FIX: page1==page1' True | page2==page2' True | dups []
 **Which numbers are stable vs. seed-dependent (honest labeling):**
 
 - **Stable / reproducible:** `120` (without `.distinct()`) → `60` (with `.distinct()`); both `SELECT DISTINCT … ORDER BY "testapp_document"."created" DESC` literals (the second adding `LIMIT 25 OFFSET 25`); "returned 25 objects for page 2"; the two `ORDER BY` clauses (`… DESC` vs `… DESC, "testapp_document"."id" ASC`); the symmetric **5 duplicated + 5 disappeared**; and the FIX result (`page1==page1' True | page2==page2' True | dups []`).
-- **Seed / DB-tie-order dependent (this run only):** the H1 example `id=1`; the H3 lists `DUPLICATED = chk-tied-45..49` and `DISAPPEARED = chk-tied-20..24`. These particular labels come from how SQLite walked the tied block for this seed; a different engine/seed yields different specific checksums but the same *shape*.
+- **Seed / DB-tie-order dependent (this run only):** the H1 example `id=1`; the H3 lists `DUPLICATED = chk-tied-45..49` and `DISAPPEARED = chk-tied-20..24`. These particular labels come from how SQLite walked the tied block for this seed; a different engine/seed yields different specific checksums but the same _shape_.
 
 ### 9.6 Clean working tree + cleanup
 
@@ -435,17 +433,16 @@ rm -rf /tmp/blitzy_harness
 
 Every distinct sub-part of the question is answered explicitly:
 
-| # | Sub-question | Verdict | Primary evidence | Where |
-|---|--------------|---------|------------------|-------|
-| H1 | Backend produces duplicates collapsed later? | **CONFIRMED, already handled** | `.count()` **120 → 60** via `.distinct()`; `filters.py:L52`, `views.py:L198-199` | §3.1 |
-| H2 | Pagination happens before de-duplication? | **REFUTED** | `SELECT DISTINCT … LIMIT 25 OFFSET 25` (one query); 25 objects returned | §3.2 |
-| H3 | Ordering unstable when rows tie on the primary key? | **CONFIRMED — primary root cause** | `Meta.ordering=("-created",)` (`models.py:L208`) over non-unique `created` (`models.py:L152`); 5 duplicated + 5 disappeared | §3.3 |
-| — | "Sharing rules / per-user visibility" shapes the glitch? | **Does not match the code; admin-independent** | only `IsAuthenticated` (`views.py:L183`); only `SavedView` is user-scoped (`views.py:L461-463`); no `django-guardian` | §4 |
-| — | Remedy | **Append unique `id` tiebreaker** (described/verified only) | FIX verified — page 1 & page 2 invariant, cross-page `dups []`; `id` already in `ordering_fields` (`views.py:L188`) | §5 |
-| — | Why intermittent | **SQLite stable per run; PostgreSQL reorders spontaneously** | `engine sqlite`; DRF unique-ordering guidance | §6 |
-| — | Perceived "jumping" | **404 snap-back to page 1 on shrunken result set** | `document-list-view.service.ts:L158-161` | §7 |
-| — | Two list code paths | **ORM (focus) vs Whoosh relevance (secondary instability)** | `urls.py:L32`; `views.py:L394-411`; `index.py:L165-167`; `docs/api.rst:L162` | §2 |
-| — | Client contract consistency | **Default `ordering=-created`; page-number; no cursor/de-dup** | `document-list-view.service.ts:L93-94`; `abstract-paperless-service.ts:L24-48`; `results.ts:L1-5` | §8 |
+| #   | Sub-question                                             | Verdict                                                        | Primary evidence                                                                                                            | Where |
+| --- | -------------------------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----- |
+| H1  | Backend produces duplicates collapsed later?             | **CONFIRMED, already handled**                                 | `.count()` **120 → 60** via `.distinct()`; `filters.py:L52`, `views.py:L198-199`                                            | §3.1  |
+| H2  | Pagination happens before de-duplication?                | **REFUTED**                                                    | `SELECT DISTINCT … LIMIT 25 OFFSET 25` (one query); 25 objects returned                                                     | §3.2  |
+| H3  | Ordering unstable when rows tie on the primary key?      | **CONFIRMED — primary root cause**                             | `Meta.ordering=("-created",)` (`models.py:L208`) over non-unique `created` (`models.py:L152`); 5 duplicated + 5 disappeared | §3.3  |
+| —   | "Sharing rules / per-user visibility" shapes the glitch? | **Does not match the code; admin-independent**                 | only `IsAuthenticated` (`views.py:L183`); only `SavedView` is user-scoped (`views.py:L461-463`); no `django-guardian`       | §4    |
+| —   | Remedy                                                   | **Append unique `id` tiebreaker** (described/verified only)    | FIX verified — page 1 & page 2 invariant, cross-page `dups []`; `id` already in `ordering_fields` (`views.py:L188`)         | §5    |
+| —   | Why intermittent                                         | **SQLite stable per run; PostgreSQL reorders spontaneously**   | `engine sqlite`; DRF unique-ordering guidance                                                                               | §6    |
+| —   | Perceived "jumping"                                      | **404 snap-back to page 1 on shrunken result set**             | `document-list-view.service.ts:L158-161`                                                                                    | §7    |
+| —   | Two list code paths                                      | **ORM (focus) vs Whoosh relevance (secondary instability)**    | `urls.py:L32`; `views.py:L394-411`; `index.py:L165-167`; `docs/api.rst:L162`                                                | §2    |
+| —   | Client contract consistency                              | **Default `ordering=-created`; page-number; no cursor/de-dup** | `document-list-view.service.ts:L93-94`; `abstract-paperless-service.ts:L24-48`; `results.ts:L1-5`                           | §8    |
 
-**Conclusion.** The documents list paginates unstably because its default order — `Meta.ordering = ("-created",)` (`src/documents/models.py:L208`) over the non-unique `created` field (`src/documents/models.py:L152`) — is not a *total* order. With no unique tiebreaker, tied `created` rows may be windowed differently across two independent `LIMIT/OFFSET` page queries, so the same document can appear on adjacent pages while another is skipped — with no edits and an unchanged nominal sort. H1 is real but already neutralized by `.distinct()`; H2 is refuted because `.distinct()` is inside the paginated query; H3 is the root cause. The behavior is independent of administrator status — there is no per-user document visibility filter at this commit. Appending a unique `id` tiebreaker makes the order total and, as the harness verified, eliminates the cross-page duplicates and omissions.
-
+**Conclusion.** The documents list paginates unstably because its default order — `Meta.ordering = ("-created",)` (`src/documents/models.py:L208`) over the non-unique `created` field (`src/documents/models.py:L152`) — is not a _total_ order. With no unique tiebreaker, tied `created` rows may be windowed differently across two independent `LIMIT/OFFSET` page queries, so the same document can appear on adjacent pages while another is skipped — with no edits and an unchanged nominal sort. H1 is real but already neutralized by `.distinct()`; H2 is refuted because `.distinct()` is inside the paginated query; H3 is the root cause. The behavior is independent of administrator status — there is no per-user document visibility filter at this commit. Appending a unique `id` tiebreaker makes the order total and, as the harness verified, eliminates the cross-page duplicates and omissions.
