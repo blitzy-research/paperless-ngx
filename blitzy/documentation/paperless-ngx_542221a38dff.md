@@ -1,6 +1,6 @@
 # Paperless-ngx Import Memory Investigation — Diagnostic Report
 
-> **Deliverable identity.** This is the single, only file added to the repository for this investigation. The git branch was verified with `git rev-parse --abbrev-ref HEAD` = `paperless-ngx_542221a38dff`, so the filename is exactly `paperless-ngx_542221a38dff.md`, placed in `blitzy/documentation/`.
+> **Deliverable identity.** This is the single, only file added to the repository for this investigation. The filename is derived from the **source branch** mandated by the AAP — `paperless-ngx_542221a38dff` — so the deliverable is named exactly `paperless-ngx_542221a38dff.md`, placed in `blitzy/documentation/`. This source-branch name is distinct from the current implementation branch: `git rev-parse --abbrev-ref HEAD` returns `blitzy-680a32bd-58ed-4a69-b43f-ef1a0acdff8b` (the working branch), not the source-branch name.
 >
 > **Scope: READ-ONLY.** Governed by the `SWE-AtlasQnA-Repo` rule set. No existing repository file was modified, created, or deleted; no code remediation was implemented. All temporary observation scripts lived outside the repository (under `/tmp/mem_probe`) and were removed. The git working tree ends unchanged except for this one `.md` file.
 
@@ -49,7 +49,7 @@ Cross-environment agreement is noted where relevant: the **patterns are identica
 
 ## 3. Structural Note — Two Meanings of "Metadata Handling" (read this first)
 
-**`extract_metadata` — the literal "metadata handling" the user references — is invoked by the REST metadata endpoint (`src/documents/views.py:L260-L305`), NOT by the core consume path.** On the REST path, `get_metadata` (`src/documents/views.py:L260`) calls `parser.extract_metadata(...)` (`src/documents/views.py:L269`), and the `metadata` action (`src/documents/views.py:L283`) invokes it **twice per request** — once for the original at `src/documents/views.py:L295` and once for the archive at `src/documents/views.py:L302`.
+**`extract_metadata` — the literal "metadata handling" the user references — is invoked by the REST metadata endpoint (`src/documents/views.py:L260-L305`), NOT by the core consume path.** On the REST path, `get_metadata` (`src/documents/views.py:L260`) calls `parser.extract_metadata(...)` (`src/documents/views.py:L269`). Within the `metadata` action (`src/documents/views.py:L283`), the **original** metadata extraction **always runs** — `"original_metadata": self.get_metadata(doc.source_path, doc.mime_type)` (`src/documents/views.py:L295`) — while a **second, archive** extraction runs **only when `doc.has_archive_version` is true**: the `if doc.has_archive_version:` guard (`src/documents/views.py:L300`) gates the archive call `self.get_metadata(doc.archive_path, "application/pdf")` (`src/documents/views.py:L302-L305`). So the endpoint performs **one** metadata extraction for a document without an archive version, and **two** only when an archive version exists.
 
 The **consume path's** "metadata processing" work is dominated instead by **classification** (`src/documents/classifier.py`) and **rule-matching** (`src/documents/matching.py`). Because the user's phrase "metadata is being processed" can mean either, **this report covers both interpretations**: the classifier/matching work that dominates during import, and the `extract_metadata` parser code that runs on the REST endpoint.
 
@@ -134,7 +134,7 @@ Each subsection pastes the single specific evidence line next to each behavioral
 
 - **Plain text** reads the whole file into memory: `self.text = f.read()` (`src/paperless_text/parsers.py:L42`); footprint is proportional to document size.
 - **PDF-with-text** opens a native qpdf handle: `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`). **Measured native +32.28 MB, tracemalloc-invisible** — evidence `[P] RSS after 50 open (no close):   214.55 MB (delta +32.28 MB)` vs `[P] tracemalloc peak (same)    :     0.223 MB`.
-- **Image / scanned OCR** uses `ocrmypdf` — the higher-memory document-type arm. Described here; not separately measured in this harness.
+- **Image / scanned OCR** uses `ocrmypdf` — the higher-memory document-type arm: `import ocrmypdf` (`src/paperless_tesseract/parsers.py:L246`) followed by `ocrmypdf.ocr(**args)` (`src/paperless_tesseract/parsers.py:L261`; block `L246-L261`), with a fallback `ocrmypdf.ocr(**args)` on the safe-fallback path (`src/paperless_tesseract/parsers.py:L288-L298`). Described here; **not separately measured** in this harness.
 - **Office / Tika** builds a metadata dict via a comprehension over the Tika response in `extract_metadata` (`src/paperless_tika/parsers.py:L29-L49`). Locally minor — evidence `[B] tracemalloc current (both metadata dict-lists): 0.014 MB`.
 
 **Base-parser default.** The base `extract_metadata` returns an empty list `return []` (`src/documents/parsers.py:L305`), with the parser's scratch tempdir created at `self.tempdir = tempfile.mkdtemp(...)` (`src/documents/parsers.py:L293`) and removed by `shutil.rmtree(self.tempdir)` in `cleanup` (`src/documents/parsers.py:L350`).
@@ -157,7 +157,7 @@ Where memory actually goes during import, attributed to specific code with `file
 | `pikepdf.open` (no close) | `src/paperless_tesseract/parsers.py:L34` | native qpdf handle held until function return | **EXACT +32.28 MB RSS**, tracemalloc 0.223 MB |
 | `self.text = f.read()` | `src/paperless_text/parsers.py:L42` | whole-file read into memory | ∝ doc size |
 | `Document.content` `TextField` | `src/documents/models.py:L117` | full extracted text held on the model instance | — |
-| REST metadata double-extraction | `src/documents/views.py:L295` and `L302` (via `get_metadata` `L260`) | two `extract_metadata` calls per request | — |
+| REST metadata extraction (original always; archive conditional) | `src/documents/views.py:L295` (original, always) and `L300-L305` (archive, only if `doc.has_archive_version`) via `get_metadata` (`L260`) | one `extract_metadata` call without an archive version; a second only when `doc.has_archive_version` is true | — |
 | `Q_CLUSTER {"recycle": 1}` | `src/paperless/settings.py:L452` (block `L449-L457`) | worker restart per task — **bounding factor** | — |
 
 ---
@@ -177,7 +177,7 @@ docker run --rm -v /tmp/mem_probe:/work -w /work python:3.9-slim-bullseye bash -
   "pip install --no-cache-dir numpy==1.22.3 scipy==1.8.0 joblib==1.1.0 threadpoolctl==3.1.0 scikit-learn==1.0.2 pikepdf==5.1.1 psutil && python exact_repro.py"
 ```
 
-The script trains a real `CountVectorizer(analyzer="word", ngram_range=(1,2), min_df=0.01)` + `MultiLabelBinarizer` + 3× `MLPClassifier(tol=0.01)`, pickles them in the exact 7-object order of `save()` (`src/documents/classifier.py:L100-L108`), then loads via six sequential `pickle.load` mirroring `load()` (`src/documents/classifier.py:L86-L92`). Verbatim output:
+The script trains a real `CountVectorizer(analyzer="word", ngram_range=(1,2), min_df=0.01)` + `MultiLabelBinarizer` + 3× `MLPClassifier(tol=0.01)`, pickles them in the exact 7-object order of `save()` — `FORMAT_VERSION`, `data_hash`, `data_vectorizer`, `tags_binarizer`, `tags_classifier`, `correspondent_classifier`, `document_type_classifier` (`src/documents/classifier.py:L101-L109`) — then loads via six sequential `pickle.load` mirroring `load()` (`src/documents/classifier.py:L86-L92`). Verbatim output:
 
 ```text
 [train] REAL model: n_features(vocab)=6000, docs=600, hidden_layer_sizes(default)=(100,)
@@ -270,7 +270,7 @@ Peak RSS during the batch is contrasted with the post-`malloc_trim` steady state
 |---------------|------------------|-----------------------|----------|
 | Plain text | `self.text = f.read()` (`src/paperless_text/parsers.py:L42`) | whole-file read into memory | ∝ doc size |
 | PDF-with-text | `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`) | native qpdf handle, not closed until return | **EXACT** `[P]` +32.28 MB RSS; tracemalloc `0.223 MB` |
-| Image / scanned OCR | `ocrmypdf` pipeline | higher-memory arm | described; not separately measured here |
+| Image / scanned OCR | `ocrmypdf.ocr(**args)` (`src/paperless_tesseract/parsers.py:L246-L261`; fallback `L288-L298`) | higher-memory arm | described; not separately measured here |
 | Office / Tika | dict comprehension over Tika response (`src/paperless_tika/parsers.py:L29-L49`) | small metadata dict | **REPR** `[B]` 0.014 MB |
 
 ### 7.3 Spike vs no-spike (toggled by the model artifact)
