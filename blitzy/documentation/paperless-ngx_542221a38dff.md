@@ -1026,7 +1026,7 @@ Step by step, with source anchors:
 4. Text is *still* absent, and there was no original text, so the last‑resort branch logs the warning and sets empty content:
 
 ```python
-if not self.text:                                   # src/paperless_tesseract/parsers.py:316
+if not self.text:                                   # src/paperless_tesseract/parsers.py:318
     if original_has_text:                           # src/paperless_tesseract/parsers.py:319
         self.text = text_original                   # src/paperless_tesseract/parsers.py:320
     else:
