@@ -670,4 +670,3 @@ Additionally, the REST upload endpoint at this commit returns the literal body `
 - **Run live:** the environment standup; the REST upload (`Response("OK")` + enqueue); the Django Q `Q_CLUSTER`/`CHANNEL_LAYERS`/`Schedule`/broker introspection; the `Document` field introspection, live create, and constraint sequence; the `matches()` exercise across all six algorithms (including a `MATCH_FUZZY` hit and miss); `load_classifier() → None`; the `DocumentFilterSet` param dump; and the duplicate `ConsumerError`.
 - **Traced from code, not run live:** the full OCR/Tika consume end-to-end (heavyweight OCR stack not provisioned) — the ordered Q2 stages are cited from `consumer.py` with the verbatim `MESSAGE_*` constants and progress percentages rather than a captured OCR log.
 - **Unverified:** none of the claims above are left unverified; anything not executed is explicitly labeled "traced from code."
-
