@@ -87,15 +87,17 @@ documents/tests/test_classifier.py::TestClassifier::testVersionIncreased PASSED 
 
 **Sub-question.** During a single test run, does `DocumentClassifier.train()` refit, or does it reuse/short-circuit when the data has not changed — and can a model trained in one test leak into a later one?
 
-**What was run.** A temporary test created one auto-matching `Correspondent` and one `Document`, then called `train()` **twice** on the unchanged data:
+**What was run.** A temporary pytest observation script (`test_zz_obs_q1.py`, created **inside the container only** and subclassing `DirectoriesMixin`/`TestCase` for per-test isolation) created one auto-matching `Correspondent` and one `Document`, then called `train()` **twice** on the unchanged data (essential body shown):
 
 ```python
 c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
 Document.objects.create(title="doc1", content="this is a document from c1", correspondent=c1, checksum="A")
 clf = DocumentClassifier()
-first  = clf.train();  h1 = clf.data_hash.hex()
-second = clf.train();  h2 = clf.data_hash.hex()
+first  = clf.train();  h1 = clf.data_hash.hex()   # -> Q1_FIRST_TRAIN, Q1_DATA_HASH_AFTER_1
+second = clf.train();  h2 = clf.data_hash.hex()   # -> Q1_SECOND_TRAIN, Q1_DATA_HASH_AFTER_2
 ```
+
+**Exact command** (run from `/app/src` inside the container): `python -m pytest test_zz_obs_q1.py -o addopts='' -p no:xdist -p no:cacheprovider -p no:warnings -v -s`
 
 **Observed output (verbatim):**
 
@@ -105,9 +107,10 @@ Q1_DATA_HASH_AFTER_1=230b98c1cbe4bb261c254b08a6d463334e9ba45d
 Q1_SECOND_TRAIN=False
 Q1_DATA_HASH_AFTER_2=230b98c1cbe4bb261c254b08a6d463334e9ba45d
 Q1_HASH_UNCHANGED=True
+============================== 1 passed in 1.81s ===============================
 ```
 
-The repository's own `testDatasetHashing` asserts exactly this pair (`assertTrue(train())` then `assertFalse(train())`) at `src/documents/tests/test_classifier.py:137`, and it `PASSED` in the baseline run above.
+The repository's own `testDatasetHashing` (method defined at `src/documents/tests/test_classifier.py:137`) asserts exactly this pair — `self.assertTrue(self.classifier.train())` at `src/documents/tests/test_classifier.py:141` then `self.assertFalse(self.classifier.train())` at `src/documents/tests/test_classifier.py:142` — and it `PASSED` in the baseline run above.
 
 **Answer.** Within a single run against **unchanged** data, `train()` does **not** refit — it **short-circuits**. The **first** call fits the model, stores a 40-hex-character SHA1 digest in `self.data_hash`, and returns **`True`**; the **second** call recomputes the SHA1 over the (unchanged) data, finds it equal to the stored hash, and returns **`False`** without refitting. The two hashes are byte-identical (`230b98c1cbe4bb261c254b08a6d463334e9ba45d` in this run — the value depends on the data content, but is identical across the two calls on the same data).
 
@@ -120,7 +123,7 @@ The repository's own `testDatasetHashing` asserts exactly this pair (`assertTrue
 
 The persisted model is a versioned pickle keyed by `FORMAT_VERSION = 7` at `src/documents/classifier.py:63`.
 
-**Real-world reuse path.** In production the reuse is explicit: `train_classifier()` (`src/documents/tasks.py:48`) loads any existing model via `load_classifier()` (reuse), calls `classifier.train()`, and only calls `classifier.save()` when `train()` returned truthy — otherwise it logs **`"Training data unchanged."`** at `src/documents/tasks.py:69`. The CLI entry point `document_create_classifier`'s `handle()` delegates to `train_classifier()` (`src/documents/management/commands/document_create_classifier.py`).
+**Real-world reuse path.** In production the reuse is explicit: `train_classifier()` (`src/documents/tasks.py:48`) loads any existing model via `load_classifier()` (reuse), calls `classifier.train()`, and only calls `classifier.save()` when `train()` returned truthy — otherwise it logs **`"Training data unchanged."`** at `src/documents/tasks.py:69`. The CLI entry point `document_create_classifier`'s `handle()` (at `src/documents/management/commands/document_create_classifier.py:19`) delegates to `train_classifier()` (called at `src/documents/management/commands/document_create_classifier.py:20`, imported at `src/documents/management/commands/document_create_classifier.py:3`).
 
 **Effect on later tests — none.** A model trained in one test cannot leak into the next, because (1) each test gets a fresh per-test `MODEL_FILE` temp path (`src/documents/tests/utils.py:45`) so there is no shared on-disk model, and (2) Django `TestCase` rolls back the DB transaction after each test so no `Document`/`Correspondent` rows persist. The repository demonstrates the persistence half of this directly: `testSaveClassifier` (`src/documents/tests/test_classifier.py:168`) trains, saves, loads into a **new** `DocumentClassifier`, and asserts `train()` now returns `False` (the loaded `data_hash` matches) — again `PASSED` above. Because every training test starts from a fresh `DocumentClassifier()` against a rolled-back DB and a fresh model path, "reuse vs. retrain" is decided **only** by the in-run `data_hash` comparison, never by cross-test state.
 
@@ -130,18 +133,20 @@ The persisted model is a versioned pickle keyed by `FORMAT_VERSION = 7` at `src/
 
 **Sub-questions.** (a) How many training documents are created? (b) When does `train()` occur relative to the `Document` inserts? (c) What **confidence threshold** is used to accept or reject a prediction?
 
-**What was run.** Two temporary tests mirroring the repository's real ones. The **1-document** case creates one auto-matching correspondent and one document; the **2-document** case adds a second document with **no** correspondent. In both, `train()` is called **after** the inserts, then `classes_` and predictions are printed:
+**What was run.** A temporary pytest observation script (`test_zz_obs_q2.py`, created **inside the container only**, subclassing `DirectoriesMixin`/`TestCase`) with two test methods mirroring the repository's real ones. The **1-document** case (`test_one_doc`) creates one auto-matching correspondent and one document; the **2-document** case (`test_many_docs`) adds a second document with **no** correspondent. In both, `train()` is called **after** the inserts, then `classes_` and predictions are printed (essential bodies shown):
 
 ```python
-# 1-doc
+# test_one_doc  (1-doc)
 c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
 doc1 = Document.objects.create(title="doc1", content="this is a document from c1", correspondent=c1, checksum="A")
 clf = DocumentClassifier(); clf.train()           # train AFTER insert
-# 2-doc adds:
+# test_many_docs adds a second, correspondent-less document:
 doc2 = Document.objects.create(title="doc2", content="this is a document from noone", checksum="B")  # no correspondent
 ```
 
-**Observed output (verbatim):**
+**Exact command** (run from `/app/src` inside the container): `python -m pytest test_zz_obs_q2.py -o addopts='' -p no:xdist -p no:cacheprovider -p no:warnings -v -s`
+
+**Observed output (verbatim — the two test methods' markers, grouped here by case for readability; each method runs against its own rolled-back DB):**
 
 ```
 Q2_1DOC_TRAINING_DOCS=1
@@ -181,7 +186,7 @@ There is **no** `predict_proba` call, no probability comparison, and no numeric 
 
 The `-1` value is a **sentinel label** the trainer injects for documents that have no auto-assigned correspondent. That is why the observed `classes_` differ by case: in the strict **1-document** case the model sees a single label, so `classes_=[1]` (**no `-1`**); the `-1` sentinel appears only once at least one training document lacks an auto-correspondent — the **2-document** case yields `classes_=[-1, 1]`. Correspondingly, `predict_correspondent` returns a numpy array `[1]` (accept `c1`) for the known document and `None` (reject) for the unknown `doc2` (`Q2_2DOC_predict_doc2=None`). The repository's `testTrain` (`src/documents/tests/test_classifier.py:103`) codifies the sentinel by asserting `correspondent_classifier.classes_ == [-1, self.c1.pk]` on its richer fixture.
 
-**Supporting model construction and gating (citations).** The shared text features are a `CountVectorizer(analyzer="word", ngram_range=(1, 2), min_df=0.01)` (`analyzer="word"` at `src/documents/classifier.py:195`, `ngram_range=(1, 2)` at `:196`, `min_df=0.01` at `:197`); the correspondent estimator is `MLPClassifier(tol=0.01)` at `src/documents/classifier.py:227`. "Automatic" gating uses the `MatchingModel.MATCH_AUTO` algorithm (value `6` at `src/documents/models.py:26`); the auto branch that consults the classifier lives at `src/documents/matching.py:147` (calling `classifier.predict_correspondent(document.content)`), and only auto-matched labels are folded into training by the label loop at `src/documents/classifier.py:125`.
+**Supporting model construction and gating (citations).** The shared text features are a `CountVectorizer(analyzer="word", ngram_range=(1, 2), min_df=0.01)` (`analyzer="word"` at `src/documents/classifier.py:195`, `ngram_range=(1, 2)` at `:196`, `min_df=0.01` at `:197`); the correspondent estimator is `MLPClassifier(tol=0.01)` at `src/documents/classifier.py:227`. "Automatic" gating uses the `MatchingModel.MATCH_AUTO` algorithm (value `6` at `src/documents/models.py:26`). The classifier is consulted in `match_correspondents(document, classifier)` at `src/documents/matching.py:21`–`30`, which calls `pred_id = classifier.predict_correspondent(document.content)` at `src/documents/matching.py:23` and then accepts a correspondent whose `o.pk == pred_id` via the `filter(...)` at `src/documents/matching.py:29`–`30`. Importantly, this auto-matching is **not** performed inside `matches()`: for `MatchingModel.MATCH_AUTO` the `matches()` function deliberately returns `False` at `src/documents/matching.py:149` — its `elif matching_model.matching_algorithm == MatchingModel.MATCH_AUTO:` branch at `src/documents/matching.py:147` carries the source comment `# this is done elsewhere.` at `src/documents/matching.py:148`, the "elsewhere" being `match_correspondents()` above. Only auto-matched labels are folded into training: the correspondent label becomes `cor.pk` only when `if cor and cor.matching_algorithm == MatchingModel.MATCH_AUTO:` at `src/documents/classifier.py:141`–`142` (otherwise the `-1` sentinel), inside the per-document loop that begins at `src/documents/classifier.py:125`.
 
 > **Explicit statement for the coverage pass:** *No numeric confidence threshold exists in this version; acceptance/rejection is decided by the `-1` sentinel class in `predict_correspondent` (`src/documents/classifier.py:255`).*
 
@@ -191,29 +196,53 @@ The `-1` value is a **sentinel label** the trainer injects for documents that ha
 
 **Sub-questions.** When a document has no extractable text, how is it handled, which **OCR subprocess** is invoked, and what **MIME type** is assigned to the output?
 
-**What was run.** A temporary test ran `RasterisedDocumentParser.parse()` on the committed text-less fixture `no-text-alpha.png`, with `magic.from_file(..., mime=True)` for the MIME type and `--log-cli-level=DEBUG` to capture the OCRmyPDF argument dicts and the parser's log lines:
+**What was run.** A temporary pytest observation script, `test_zz_obs_q3.py`, was created **inside the container only** (never written into the repository). It subclasses `DirectoriesMixin`/`TestCase` (so it inherits the per-test temp dirs and settings overrides), detects the fixture's MIME type with `magic.from_file(..., mime=True)`, and runs `RasterisedDocumentParser.parse()` on the committed text-less fixture `no-text-alpha.png`:
 
 ```python
-sample = ".../paperless_tesseract/tests/samples/no-text-alpha.png"
-mime = magic.from_file(sample, mime=True)          # -> image/png
-parser = RasterisedDocumentParser(None)
-parser.parse(sample, mime)
-print(repr(parser.text))
+# test_zz_obs_q3.py  (created at /app/src inside the container; removed with the container)
+import magic
+from django.test import TestCase
+from documents.tests.utils import DirectoriesMixin
+from paperless_tesseract.parsers import RasterisedDocumentParser
+
+
+class ObsQ3(DirectoriesMixin, TestCase):
+    def test_no_text(self):
+        sample = "/app/src/paperless_tesseract/tests/samples/no-text-alpha.png"
+        mime = magic.from_file(sample, mime=True)
+        print(f"Q3_MIME={mime}")
+        parser = RasterisedDocumentParser(None)
+        parser.parse(sample, mime)
+        print(f"Q3_TEXT_REPR={parser.text!r}")
+        print(f"Q3_ARCHIVE_PATH={parser.archive_path}")
 ```
 
-**Observed output (verbatim, abridged only where paths repeat):**
+**Exact command** (run from `/app/src` inside the container; `--log-cli-level=DEBUG` surfaces the parser's `self.log("debug", ...)` OCRmyPDF argument dicts):
+
+```
+$ python -m pytest test_zz_obs_q3.py -o addopts='' -p no:xdist -p no:cacheprovider \
+    -p no:warnings --log-cli-level=DEBUG -v -s > /tmp/q3_raw.log 2>&1
+```
+
+The full DEBUG log is dominated by third-party PIL / img2pdf / unpaper / Tesseract-internal lines; the parser's own log lines plus the printed markers were extracted verbatim with this exact command:
+
+```
+$ grep -nE "Calling OCRmyPDF with args|Fallback: Calling OCRmyPDF|Encountered an error while running OCR|the content will be empty|Q3_MIME|Q3_TEXT_REPR|Q3_ARCHIVE_PATH|tesseract\] Error during processing|[0-9]+ passed" /tmp/q3_raw.log
+```
+
+**Observed output (verbatim — full paths and argument dicts exactly as emitted this run; only the per-run `/tmp/tmp…` temp directory varies between runs, everything else is stable):**
 
 ```
 Q3_MIME=image/png
-DEBUG  paperless.parsing.tesseract  Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/no-text-alpha.png', 'output_file': '/tmp/.../archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/.../sidecar.txt', 'image_dpi': 35}
-[ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-WARNING  paperless.parsing.tesseract  Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
-DEBUG  paperless.parsing.tesseract  Fallback: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/no-text-alpha.png', 'output_file': '/tmp/.../archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/.../sidecar-fallback.txt', 'image_dpi': 35}
-[ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-WARNING  paperless.parsing.tesseract  No text was found in /app/src/paperless_tesseract/tests/samples/no-text-alpha.png, the content will be empty.
+DEBUG    paperless.parsing.tesseract:loggers.py:21 Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/no-text-alpha.png', 'output_file': '/tmp/tmpbblkb9sz/paperless-0j0c5ta2/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpbblkb9sz/paperless-0j0c5ta2/sidecar.txt', 'image_dpi': 35}
+[2026-07-01 05:55:27,875] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-01 05:55:28,494] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+DEBUG    paperless.parsing.tesseract:loggers.py:21 Fallback: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/no-text-alpha.png', 'output_file': '/tmp/tmpbblkb9sz/paperless-0j0c5ta2/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpbblkb9sz/paperless-0j0c5ta2/sidecar-fallback.txt', 'image_dpi': 35}
+[2026-07-01 05:55:28,749] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-01 05:55:29,367] [WARNING] [paperless.parsing.tesseract] No text was found in /app/src/paperless_tesseract/tests/samples/no-text-alpha.png, the content will be empty.
 Q3_TEXT_REPR=''
-Q3_ARCHIVE_PATH=/tmp/.../archive.pdf
-============================== 1 passed in 8.10s ===============================
+Q3_ARCHIVE_PATH=/tmp/tmpbblkb9sz/paperless-0j0c5ta2/archive.pdf
+============================== 1 passed in 3.38s ===============================
 ```
 
 **Answers.**
@@ -236,16 +265,43 @@ Q3_ARCHIVE_PATH=/tmp/.../archive.pdf
 
 **Sub-questions.** When barcode splitting is involved: how many **document records** are created from a single input, which **barcode value** triggers a split, **where** in the code that decision is made, and does it **change the effective training data** during the run?
 
-**What was run.** A temporary test (with `libzbar0` + `poppler-utils` installed) read the separator setting, decoded the barcodes on page 0 of `patch-code-t.pdf`, scanned three fixtures with `scan_file_for_separating_barcodes()`, split `patch-code-t-middle.pdf` with `separate_pages(..., [1])`, and counted `Document` rows afterward:
+**What was run.** A temporary pytest observation script, `test_zz_obs_q4.py`, was created **inside the container only** (the base image already had `libzbar0` + `poppler-utils` installed for the `pyzbar`/`pdf2image` scan path). Subclassing `DirectoriesMixin`/`TestCase`, it read the separator setting, decoded the barcodes on page 0 of `patch-code-t.pdf`, scanned three fixtures with `scan_file_for_separating_barcodes()`, split `patch-code-t-middle.pdf` with `separate_pages(..., [1])`, and counted `Document` rows afterward:
 
 ```python
-print(settings.CONSUMER_BARCODE_STRING, settings.CONSUMER_ENABLE_BARCODES)
-tasks.barcode_reader(convert_from_path("patch-code-t.pdf")[0])   # decode page 0
-tasks.scan_file_for_separating_barcodes("patch-code-t.pdf")      # -> indices
-tasks.scan_file_for_separating_barcodes("patch-code-t-middle.pdf")
-tasks.scan_file_for_separating_barcodes("several-patcht-codes.pdf")
-splits = tasks.separate_pages("patch-code-t-middle.pdf", [1])
-print(len(splits), [os.path.basename(p) for p in splits], Document.objects.count())
+# test_zz_obs_q4.py  (created at /app/src inside the container; removed with the container)
+import os
+from django.conf import settings
+from django.test import TestCase
+from documents import tasks
+from documents.models import Document
+from documents.tests.utils import DirectoriesMixin
+from pdf2image import convert_from_path
+
+BARCODES = os.path.join(
+    os.path.dirname(__file__), "documents", "tests", "samples", "barcodes"
+)
+
+
+class ObsQ4(DirectoriesMixin, TestCase):
+    def test_barcode_split(self):
+        print(f"Q4_CONSUMER_BARCODE_STRING={settings.CONSUMER_BARCODE_STRING!r}")
+        print(f"Q4_CONSUMER_ENABLE_BARCODES={settings.CONSUMER_ENABLE_BARCODES}")
+        page0 = convert_from_path(os.path.join(BARCODES, "patch-code-t.pdf"))[0]
+        print(f"Q4_barcode_reader_page0={tasks.barcode_reader(page0)}")
+        print(f"Q4_scan_patchcodet={tasks.scan_file_for_separating_barcodes(os.path.join(BARCODES, 'patch-code-t.pdf'))}")
+        print(f"Q4_scan_middle={tasks.scan_file_for_separating_barcodes(os.path.join(BARCODES, 'patch-code-t-middle.pdf'))}")
+        print(f"Q4_scan_several={tasks.scan_file_for_separating_barcodes(os.path.join(BARCODES, 'several-patcht-codes.pdf'))}")
+        splits = tasks.separate_pages(os.path.join(BARCODES, "patch-code-t-middle.pdf"), [1])
+        print(f"Q4_separate_count={len(splits)}")
+        print(f"Q4_separate_names={[os.path.basename(p) for p in splits]}")
+        print(f"Q4_document_count_after_split={Document.objects.count()}")
+```
+
+**Exact command** (run from `/app/src` inside the container):
+
+```
+$ python -m pytest test_zz_obs_q4.py -o addopts='' -p no:xdist -p no:cacheprovider \
+    -p no:warnings -v -s
 ```
 
 **Observed output (verbatim):**
@@ -260,18 +316,39 @@ Q4_scan_several=[2, 5]
 Q4_separate_count=2
 Q4_separate_names=['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
 Q4_document_count_after_split=0
+============================== 1 passed in 3.04s ===============================
 ```
 
-The relevant real repository tests all `PASSED` (the six named ones plus the rest of the barcode suite):
+**The relevant real repository tests all `PASSED`** — the complete, unfiltered barcode-suite transcript (exact command: `python -m pytest documents/tests/test_tasks.py -k 'barcode or separat or splitter' -o addopts='' -p no:xdist -p no:cacheprovider -p no:warnings -v`):
 
 ```
-documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes PASSED
-documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes3 PASSED
-documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes4 PASSED
-documents/tests/test_tasks.py::TestTasks::test_separate_pages PASSED
-documents/tests/test_tasks.py::TestTasks::test_barcode_splitter PASSED
-documents/tests/test_tasks.py::TestTasks::test_consume_barcode_file PASSED
-====================== 25 passed, 15 deselected in 5.59s =======================
+collecting ... collected 40 items / 15 deselected / 25 selected
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader PASSED     [  4%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader2 PASSED    [  8%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_128 PASSED [ 12%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_custom_128_separator PASSED [ 16%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_custom_qr_separator PASSED [ 20%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_custom_separator PASSED [ 24%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_distorsion PASSED [ 28%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_distorsion2 PASSED [ 32%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_no_barcode PASSED [ 36%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_qr PASSED  [ 40%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_reader_unreadable PASSED [ 44%]
+documents/tests/test_tasks.py::TestTasks::test_barcode_splitter PASSED   [ 48%]
+documents/tests/test_tasks.py::TestTasks::test_consume_barcode_file PASSED [ 52%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes PASSED [ 56%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes2 PASSED [ 60%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes3 PASSED [ 64%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes4 PASSED [ 68%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes_upsidedown PASSED [ 72%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_custom_128_barcodes PASSED [ 76%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_custom_barcodes PASSED [ 80%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_custom_qr_barcodes PASSED [ 84%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_qr_barcodes PASSED [ 88%]
+documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_wrong_qr_barcodes PASSED [ 92%]
+documents/tests/test_tasks.py::TestTasks::test_separate_pages PASSED     [ 96%]
+documents/tests/test_tasks.py::TestTasks::test_separate_pages_no_list PASSED [100%]
+====================== 25 passed, 15 deselected in 5.03s =======================
 ```
 
 **Answers.**
@@ -288,7 +365,7 @@ documents/tests/test_tasks.py::TestTasks::test_consume_barcode_file PASSED
 
 ## ND — Root-cause diagnosis of the non-deterministic classification-test failures
 
-**What was run.** A temporary test trained **10 fresh** `DocumentClassifier()` instances on **identical** 2-document data (the same corpus each time), capturing `classes_`, the fitted `loss_`, `n_iter_`, the first weight of the first layer, and the prediction for four probe strings on every fit:
+**What was run.** A temporary pytest observation script (`test_zz_obs_nd.py`, created **inside the container only**, subclassing `DirectoriesMixin`/`TestCase`) trained **10 fresh** `DocumentClassifier()` instances on **identical** 2-document data (the same corpus each time), capturing `classes_`, the fitted `loss_`, `n_iter_`, the first weight of the first layer, and the prediction for four probe strings on every fit:
 
 ```python
 for _ in range(10):
@@ -299,7 +376,9 @@ for _ in range(10):
     # record clf.predict_correspondent(probe) for each probe
 ```
 
-**Observed output (verbatim — this run; the numbers are expected to differ on every run):**
+**Exact command** (run from `/app/src` inside the container): `python -m pytest test_zz_obs_nd.py -o addopts='' -p no:xdist -p no:cacheprovider -p no:warnings -v -s`
+
+**Observed output (verbatim — this run; the numbers are expected to differ on every run. An independent re-run re-confirmed the same qualitative signature: `ND_classes_=[-1, 1]`, `ND_distinct_losses=10`, and the two borderline probes each `distinct=2`):**
 
 ```
 ND_classes_=[-1, 1]
