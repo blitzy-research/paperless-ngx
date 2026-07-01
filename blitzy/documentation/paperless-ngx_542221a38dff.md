@@ -71,7 +71,7 @@ $ cat /tmp/blitzy_obs/run/consumer.log
 The watcher's `"Using inotify to watch directory for changes: …"` line confirms the **inotify** watch mode was selected — the default, because `CONSUMER_POLLING` defaults to `0` [`src/paperless/settings.py:L478`] and the code takes the inotify branch when `settings.CONSUMER_POLLING == 0 and INotify` [`src/documents/management/commands/document_consumer.py:L178-L179`], whose `handle_inotify()` logs that exact message [`src/documents/management/commands/document_consumer.py:L200`]. This distinction matters for Q1 below.
 
 ```console
-$ setsid ./venv/bin/gunicorn -c ../gunicorn.conf.py paperless.asgi:application > /tmp/blitzy_obs/run/gunicorn.log 2>&1 &   # from src/
+$ setsid ../venv/bin/gunicorn -c ../gunicorn.conf.py paperless.asgi:application > /tmp/blitzy_obs/run/gunicorn.log 2>&1 &   # from src/
 $ head -4 /tmp/blitzy_obs/run/gunicorn.log
 [2026-07-01 05:48:25 +0000] [69639] [INFO] Starting gunicorn 20.1.0
 [2026-07-01 05:48:25 +0000] [69639] [INFO] Listening at: http://0.0.0.0:8000 (69639)
@@ -269,6 +269,28 @@ The persisted `Task` record — the first `success=True` row already shown under
 **Reasoning.** The stage transitions are observable as a deterministic, ordered log sequence on the `paperless.consumer` logger (Consuming → Detected mime type → Parser → Parsing → Generating thumbnail → Saving record → consumption finished), with parsing delegated to a MIME‑specific parser logger (`paperless.parsing.tesseract` here). Classification and indexing are **not** inline log steps: they are signal‑driven consequences of `document_consumption_finished`, sent *after* the store at [`src/documents/consumer.py:L306`] and wired centrally in `apps.py` [`src/documents/apps.py:L22-L27`]. Because the classification handlers had nothing to assign in this run they emitted no log, so their execution is source‑verified rather than log‑evidenced; the one signal receiver that leaves observable state — `add_to_index` — is what runtime‑proves the signal fired (the Whoosh hit under Q4). Note the `paperless.classifier` line is *not* part of this post‑store phase: it is classifier **loading**, emitted before the store (see the timing note above).
 
 > **Edge case (barcode split).** Before normal consumption, `consume_file()` optionally scans for separator barcodes; if found it splits the file and returns the string `"File successfully split"` *instead of* consuming [`src/documents/tasks.py:L233`]. This path is disabled by default (`CONSUMER_ENABLE_BARCODES` defaults to `False` [`src/paperless/settings.py:L502-L503`], via `__get_boolean(default="NO")` [`src/paperless/settings.py:L34`]), so the normal run above went straight to `try_consume_file` [`src/documents/tasks.py:L236`].
+
+**Edge case (unsupported type) — observed.** A file that no parser can handle is rejected by **two distinct guards**, exercised here as a targeted follow‑up. (1) The **watcher** rejects unknown *extensions* before it ever enqueues a task — `_consume()` calls `is_file_ext_supported()` [`src/documents/management/commands/document_consumer.py:L54-L55`] — so dropping a `.zip` into the consumption directory is turned away up front:
+
+```text
+[2026-07-01 08:59:45,784] [WARNING] [paperless.management.consumer] Not consuming file /tmp/blitzy_obs/consume/obs_unsupported.zip: Unknown file extension.
+```
+
+(2) The **consumer** independently rejects unsupported *MIME types* once a file actually reaches `try_consume_file()` — the non‑watcher entry points (REST upload and email) enqueue `consume_file` directly and so bypass the extension guard above. `magic.from_file(...)` detects the type [`src/documents/consumer.py:L219`] and, when `get_parser_class_for_mime_type(...)` returns no parser [`src/documents/consumer.py:L223-L224`], the consumer calls `self._fail(MESSAGE_UNSUPPORTED_TYPE, f"Unsupported mime type {mime_type}")` [`src/documents/consumer.py:L225`], where `MESSAGE_UNSUPPORTED_TYPE = "unsupported_type"` [`src/documents/consumer.py:L44`]. Enqueuing the same zip's bytes directly reproduced this second guard verbatim:
+
+```text
+[2026-07-01 09:00:03,252] [INFO] [paperless.consumer] Consuming obs_unsupported.zip
+[2026-07-01 09:00:03,253] [DEBUG] [paperless.consumer] Detected mime type: application/zip
+[2026-07-01 09:00:03,256] [ERROR] [paperless.consumer] Unsupported mime type application/zip
+```
+
+Because `_fail()` broadcasts a `FAILED` frame at `100/100` *before* raising `ConsumerError` [`src/documents/consumer.py:L78-L81`], the channel‑layer tap captured a payload of the same shape as the duplicate case in Q5 — the identical seven `_send_progress()` keys — but carrying `"status": "FAILED"` with `"message": "unsupported_type"`:
+
+```text
+{"type": "status_update", "data": {"filename": "obs_unsupported.zip", "task_id": "5eed493a-9762-4632-99a8-d1c3e25057d5", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "unsupported_type", "document_id": null}}
+```
+
+The django‑q `Task` row corroborates the task‑queue side: `func='documents.tasks.consume_file'`, `success=False`, with `result` beginning `obs_unsupported.zip: Unsupported mime type application/zip : Traceback (most recent call last):`. This is the very same `_fail()` mechanism that produces the duplicate `document_already_exists` frame under Q5 — only the `message` literal differs (`unsupported_type` vs. `document_already_exists`).
 
 
 ---
