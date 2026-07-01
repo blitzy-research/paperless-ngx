@@ -200,8 +200,28 @@ t=+ 2.42s  broker.queue_size()=0  django_q_task_rows=1   [DONE]          # resul
 **Grounding.**
 - `queue_size()` returns `self.connection.llen(self.list_key)` (`django_q/brokers/redis_broker.py:L26`) — i.e. the length of the Redis list; dequeue is `self.connection.blpop(self.list_key, 1)` (`django_q/brokers/redis_broker.py:L21`), which pops (removes) the element. This is exactly *why* `queue_size()` counts waiting tasks but not the running one — proven by the `1 → 0 → 0-with-row` transition above.
 - **`recycled worker Process-1:1`** is a direct consequence of `"recycle": 1` (`src/paperless/settings.py:L452`; `Conf.RECYCLE==1`): the worker is recycled after **every** task. (Django-Q's default would be `500`, `django_q/conf.py:L119`.)
-- **Reliability window (grounded config literals):** `retry = 1810` seconds (`Q_CLUSTER["retry"]`, `src/paperless/settings.py:L453`; observed `Conf.RETRY==1810`) — after this a task not acknowledged as finished is re-presented to the queue; `timeout = 1800` seconds (`Q_CLUSTER["timeout"]`, `src/paperless/settings.py:L454`; observed `Conf.TIMEOUT==1800`) — the maximum a task may run. `timeout < retry` is intentional (comment `src/paperless/settings.py:L442-L443`; `PAPERLESS_WORKER_RETRY = PAPERLESS_WORKER_TIMEOUT + 10`, `L444-L447`).
-- **Cluster banner name is random per run, and is NOT the queue name.** Across four separate `qcluster` launches the boot banner read `island-ten-juliet-leopard`, `dakota-pluto-purple-beer`, `low-floor-uniform-idaho`, and `florida-don-batman-oxygen` — while the Redis key stayed `django_q:paperless:q` every time. The banner is `self.name = current_process().name` (`django_q/cluster.py:L151`), a random human-readable label, distinct from the configured `Q_CLUSTER["name"]="paperless"` that becomes `Conf.PREFIX` and forms the queue key.
+- **Reliability window (grounded config literals) — with a Redis-broker caveat.** `timeout = 1800` seconds (`Q_CLUSTER["timeout"]`, `src/paperless/settings.py:L454`; observed `Conf.TIMEOUT==1800`) is the maximum a task may run, and `retry = 1810` seconds (`Q_CLUSTER["retry"]`, `src/paperless/settings.py:L453`; observed `Conf.RETRY==1810`) is the acknowledgement-wait window. `timeout < retry` is required and intentional — Django-Q validates the relationship (`django_q/conf.py:L137-L142`) and paperless sets `PAPERLESS_WORKER_RETRY = PAPERLESS_WORKER_TIMEOUT + 10` (comment `src/paperless/settings.py:L442-L443`; code `L444-L447`). **Important caveat:** with Django-Q 1.3.9's **Redis list broker** — the broker actually in use here — `retry` does **not** cause a popped, in-flight task to be *re-presented to the queue*. A worker takes a task with `BLPOP`, which removes it from the list immediately (`django_q/brokers/redis_broker.py:L20-L23`), and that `dequeue()` returns `[(None, task[1])]` — i.e. an **`ack_id` of `None`** (`django_q/cluster.py:L353`). The Redis broker overrides neither `acknowledge()` nor `lock_size()`, so the base `Broker.acknowledge()` no-op is used (`django_q/brokers/__init__.py:L69-L74`), and the monitor's `broker.acknowledge(ack_id)` is skipped by its `if ack_id …` guard (`django_q/cluster.py:L386-L388`). A popped Redis task is therefore **not** automatically recovered after `retry` (e.g. on a worker crash). `retry` re-presentation is only meaningful for brokers that provide delivery/acknowledge semantics — e.g. the **ORM broker**, where `retry` is the visibility window (`_timeout() = now − timedelta(seconds=Conf.RETRY)`, `django_q/brokers/orm.py:L14`), an un-acknowledged task past that window is re-dequeued (`orm.py:L63-L77`), and `acknowledge()` deletes the row (`orm.py:L87-L88`).
+- **Cluster banner name is random per run, and is NOT the queue name.** Across four separate `qcluster` launches the boot banner read `island-ten-juliet-leopard`, `dakota-pluto-purple-beer`, `low-floor-uniform-idaho`, and `florida-don-batman-oxygen` — while the Redis key stayed `django_q:paperless:q` every time. The banner is emitted by `logger.info(_(f"Q Cluster {self.name} starting."))` (`django_q/cluster.py:L79`), where `self.name` is the `Cluster.name` property that returns `humanize(self.cluster_id.hex)` (`django_q/cluster.py:L109-L111`); `cluster_id` is a fresh random `uuid.uuid4()` assigned per cluster instance (`django_q/cluster.py:L58`), and `humanize()` (`django_q/humanhash.py:L292`, default `words=4, separator="-"`) turns that hex into the four hyphenated words. (The same humanized id reappears in the `"Q Cluster … running."` log, `django_q/cluster.py:L261`.) This random label is distinct from the configured `Q_CLUSTER["name"]="paperless"` that becomes `Conf.PREFIX` and forms the queue key. Note that `django_q/cluster.py:L151` — `self.name = current_process().name` — is a *different* attribute set on the `Sentinel` (the OS process name, e.g. `Process-1`), **not** the cluster boot banner.
+
+**Evidence — broker ack/retry semantics & the random cluster banner** (verbatim), captured from the running project:
+
+```text
+# printed from django_q.brokers.get_broker() in the running project
+broker class                      : django_q.brokers.redis_broker.Redis
+acknowledge is base Broker no-op  : True
+broker has own lock_size override : False
+Conf.RETRY / Conf.TIMEOUT         : 1810 / 1800
+```
+
+```text
+# printed by instantiating django_q.cluster.Cluster in the running project
+Conf.PREFIX (queue name)  : paperless
+Cluster.name (boot banner): nitrogen-social-skylark-march
+cluster_id.hex (uuid4)    : 030fb2233c3f408f8c773809dd5d5556
+humanize(cluster_id.hex)  : nitrogen-social-skylark-march
+banner == humanize(hex) ? : True
+banner == Conf.PREFIX ?   : False
+```
 
 ---
 
@@ -271,7 +291,7 @@ TypeError: consume_file() missing 1 required positional argument: 'path'
 
 **Grounding.**
 - `success` is the boolean flag; for a real successful ingest the `result` is exactly `"Success. New document id {} created"` (`src/documents/tasks.py:L247`) — observed as `'Success. New document id 2 created'`. For a failure, `success=False` and `result` holds the exception/traceback text.
-- `Success` and `Failure` are proxy managers over `Task` filtered by `success=True`/`success=False` (`django_q/models.py:L113`,`L129`) — the counts above (`Success=0`, `Failure=1`) come straight from those proxies. All three share the `django_q_task` table (see Q5).
+- `Success` and `Failure` are **proxy models over `Task`** (`class Success(Task)`/`class Failure(Task)`, `django_q/models.py:L113`/`L129`), each with a custom default manager whose `get_queryset()` filters the shared table: `SuccessManager` applies `.filter(success=True)` (`django_q/models.py:L108-L110`) and `FailureManager` applies `.filter(success=False)` (`django_q/models.py:L124-L126`) — the counts above (`Success=0`, `Failure=1`) come straight from those managers. All three share the `django_q_task` table (see Q5).
 - The traceback shows the worker's exact invocation site: `res = f(*task["args"], **task["kwargs"])` at `django_q/cluster.py:line 432` — how Django-Q calls the task function with the package's `args`/`kwargs`.
 
 ### (b) `time_taken()` spans enqueue → stopped (a subtlety worth flagging)
