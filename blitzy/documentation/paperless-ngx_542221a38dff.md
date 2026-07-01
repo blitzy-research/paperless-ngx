@@ -9,7 +9,8 @@
 | Item | Value | How confirmed |
 |---|---|---|
 | Repository | paperless-ngx | working tree on disk |
-| HEAD commit | `542221a38dff06361e07976452f9aea24d210542` | `git rev-parse HEAD` |
+| Docker `/app` source HEAD (evidence baseline — the commit every `file:line` citation below was verified against) | `542221a38dff06361e07976452f9aea24d210542` | `git -C /app rev-parse HEAD` **run inside the container** |
+| Destination documentation repo HEAD (the checkout that actually carries this `.md` file) | a **separate** commit that adds this file (distinct from the source baseline above) | `git rev-parse HEAD` in the destination checkout |
 | Run environment | Docker image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01` (a.k.a. `andrewparkscaleai/coding-agent:paperless-ngx__paperless-ngx__542221a38dff…`) | container `paperless_setup` |
 | Python / Django / DRF / django-filter | `3.9.23` / `4.0.4` / `3.13.1` / `21.1` | `python -c "import django, rest_framework, django_filters; …"` in the image |
 | Pinned versions in repo | `django==4.0.4` [requirements.txt:38], `djangorestframework==3.13.1` [requirements.txt:39], `django-filter==21.1` [requirements.txt:35] | direct file read |
@@ -54,19 +55,25 @@ print("created user:", u.username, "| token key length:", len(tok.key))
 PY
 ```
 
-**Verbatim output:**
+**Verbatim output — step 1, `python manage.py migrate --noinput`:**
 
 ```
 Operations to perform:
   Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
 Running migrations:
   No migrations to apply.
-...
+```
+
+*(“No migrations to apply.” because the container’s SQLite DB was already migrated by the setup step; the `authtoken` app is listed among the applied migrations, which is what creates the `authtoken_token` table.)*
+
+**Verbatim output — step 2, the Django-shell heredoc:**
+
+```
 created user: blitzy_tester | token key length: 40
 ```
 
 - The measured **token key length is `40`** (verbatim).
-- **Alternative (no shell needed):** obtain a token over HTTP by POSTing credentials to `/api/token/`, wired to DRF's `obtain_auth_token` view — `                path("token/", views.obtain_auth_token),` — [src/paperless/urls.py:81]; corroborated by the project docs: *"POST a username and password … to `/api/token/`"* — [docs/api.rst:136]. (See Q3/Q7 for the live `POST /api/token/` transcript.) Inside Docker you can also use paperless's built‑in `python manage.py drf_create_token <username>`.
+- **Alternative (no shell needed):** obtain a token over HTTP by POSTing credentials to `/api/token/`, wired to DRF's `obtain_auth_token` view — `                path("token/", views.obtain_auth_token),` — [src/paperless/urls.py:81]; corroborated by the project docs: *"POST a username and password … to `/api/token/`"* — [docs/api.rst:136]. (See **Q9** for the live `POST /api/token/` transcript.) Inside Docker you can also use paperless's built‑in `python manage.py drf_create_token <username>`.
 
 ---
 
@@ -82,7 +89,7 @@ curl -si -H "Authorization: Token <YOUR_TOKEN>" http://127.0.0.1:8000/api/docume
 
 ```
 HTTP/1.1 200 OK
-Date: Wed, 01 Jul 2026 04:41:57 GMT
+Date: Wed, 01 Jul 2026 05:15:02 GMT
 Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
 Vary: Accept, Accept-Language, Origin, Cookie
@@ -118,11 +125,11 @@ Authorization: Token <key>
 **Command run + verbatim fact‑check:**
 
 ```bash
-python manage.py shell -c "from rest_framework.authentication import TokenAuthentication; print('keyword =', repr(TokenAuthentication.keyword))"
+python manage.py shell -c "from rest_framework.authentication import TokenAuthentication; print('TokenAuthentication.keyword =', repr(TokenAuthentication.keyword))"
 ```
 
 ```
-   TokenAuthentication.keyword = 'Token'
+TokenAuthentication.keyword = 'Token'
 ```
 
 **Citations:**
@@ -252,7 +259,7 @@ curl -si http://127.0.0.1:8000/api/documents/
 
 ```
 HTTP/1.1 401 Unauthorized
-Date: Wed, 01 Jul 2026 04:41:57 GMT
+Date: Wed, 01 Jul 2026 05:15:02 GMT
 Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
@@ -284,7 +291,19 @@ curl -si -H "Authorization: Bearer <YOUR_TOKEN>" http://127.0.0.1:8000/api/docum
 
 ```
 HTTP/1.1 401 Unauthorized
-...
+Date: Wed, 01 Jul 2026 05:15:03 GMT
+Server: WSGIServer/0.2 CPython/3.9.23
+Content-Type: application/json
+WWW-Authenticate: Basic realm="api"
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
+Content-Length: 58
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
 {"detail":"Authentication credentials were not provided."}
 ```
 
@@ -341,9 +360,9 @@ PY
 ```
 
 ```
-   Token model = rest_framework.authtoken.models.Token
-   Token DB table = authtoken_token
-   Token key max_length = 40
+Token model = rest_framework.authtoken.models.Token
+Token DB table = authtoken_token
+Token key max_length = 40
 ```
 
 **Live proof the table exists in the migrated DB:**
@@ -358,7 +377,7 @@ python -c "import sqlite3; c=sqlite3.connect('/app/data/db.sqlite3'); print([r[0
 
 **Citation:** the model/table is provided by the `rest_framework.authtoken` app enabled at `    "rest_framework.authtoken",` — [src/paperless/settings.py:108]. paperless uses this model **unchanged** (no custom token model).
 
-**Live `POST /api/token/` proof the stored 40‑char key is what the endpoint returns:**
+**Live `POST /api/token/` proof the stored 40‑char key is what the endpoint returns** *(the response headers below are quoted verbatim; the secret token in the JSON body is shown as the redaction placeholder `<40-char key>`, not the live value):*
 
 ```bash
 curl -si -X POST -d 'username=blitzy_tester&password=testpass123' http://127.0.0.1:8000/api/token/
@@ -366,12 +385,22 @@ curl -si -X POST -d 'username=blitzy_tester&password=testpass123' http://127.0.0
 
 ```
 HTTP/1.1 200 OK
+Date: Wed, 01 Jul 2026 05:15:21 GMT
+Server: WSGIServer/0.2 CPython/3.9.23
 Content-Type: application/json
-...
+Allow: POST, OPTIONS
+X-Frame-Options: SAMEORIGIN
+Content-Length: 52
+Vary: Accept-Language, Origin, Cookie
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
 {"token":"<40-char key>"}
 ```
 
-Measured: response keys `['token']`, **token length 40**, and the returned value **matched the token stored** for the user (`matches stored token: True`). *(The 40‑character key is redacted here; only its length — the asked‑for value — is quoted.)*
+Measured (from the same live response, parsed in Python): response keys `['token']`, **token length 40**, and the returned value **matched the token stored** for the user (`matches stored token: True`). The verbatim `Content-Length: 52` header above equals the exact byte length of the real body `{"token":"<40‑char key>"}` — i.e. `len('{"token":"') + 40 + len('"}')` = `10 + 40 + 2 = 52` — which independently confirms the **40‑character** key even though the key itself is redacted for safety.
 
 ---
 
@@ -410,7 +439,7 @@ FACT CHECKS
 
 ---
 
-## Citation table (line numbers verified on this checkout, HEAD `542221a38dff`)
+## Citation table (line numbers verified on the Docker `/app` source checkout, HEAD `542221a38dff`)
 
 | Fact (asked‑for literal) | Exact value | Citation |
 |---|---|---|
