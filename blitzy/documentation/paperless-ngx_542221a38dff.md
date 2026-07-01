@@ -25,9 +25,9 @@ The evidence was produced against a live backend stood up as follows (this is th
 
 | Component | Value (observed) | How selected |
 |---|---|---|
-| Python | `Python 3.9.25` | Dockerfile target `python:3.9-slim-bullseye` |
+| Python | `Python 3.9.25` | Dockerfile target `python:3.9-slim-bullseye` (`Dockerfile:18`) |
 | Django | `4.0.4` | `requirements.txt:38` (`django==4.0.4`) |
-| Database | SQLite | absence of `PAPERLESS_DBHOST` selects SQLite (`src/paperless/settings.py`) |
+| Database | SQLite | absence of `PAPERLESS_DBHOST` selects SQLite (`src/paperless/settings.py:297-304`) |
 | Broker | Redis (`Redis 8.0.2`) | Django Q broker + Channels layer |
 
 ```console
@@ -586,12 +586,14 @@ MATCH_ALL  corr 'acme corp' vs doc_miss: False
 MATCH_LITERAL dtype vs doc_hit : True
 MATCH_LITERAL dtype vs doc_miss: False
 MATCH_REGEX tag 'ACME\s+Corp' vs doc_hit : True
+MATCH_FUZZY tag 'Correspondence' vs doc_hit : True
+MATCH_FUZZY tag 'Correspondence' vs doc_miss: False
 empty-match tag vs doc_hit           : False
 MATCH_AUTO tag vs doc_hit            : False
 load_classifier() (no trained model) : None
 ```
 
-Every algorithm behaves as documented: `MATCH_ANY`/`MATCH_ALL`/`MATCH_LITERAL`/`MATCH_REGEX` return `True` on a hit and `False` on a miss; an empty `match` returns `False`; and `MATCH_AUTO` returns `False` from `matches()` because auto-matching is delegated to the classifier.
+Every algorithm behaves as documented: `MATCH_ANY`/`MATCH_ALL`/`MATCH_LITERAL`/`MATCH_REGEX` return `True` on a hit and `False` on a miss; `MATCH_FUZZY` returns `True` for the near-match `match="Correspondence"` against a document containing the misspelling `Correspondance` (`fuzz.partial_ratio(...) >= 90`, `matching.py:135`) and `False` against an unrelated document, demonstrating the typo-tolerance that distinguishes it from the exact algorithms; an empty `match` returns `False`; and `MATCH_AUTO` returns `False` from `matches()` because auto-matching is delegated to the classifier.
 
 ### Assignment mechanism 2 — ML classification (`MATCH_AUTO`)
 
@@ -645,7 +647,7 @@ Each distinct sub-question, mapped to the section that answers it and the primar
 | **Q4** — fields + REQUIRED/OPTIONAL/DERIVED | §Q4 (table + `_meta.get_fields()`) | `models.py:88-208`; runtime introspection transcript | ✔ addressed |
 | **Q4** — runtime example (explicitly requested) | §Q4 (evidence 2 & 3) | live `Document.objects.create(...)` transcript + the empty-string/`IntegrityError`/`ValidationError` sequence | ✔ addressed |
 | **Q5** — tags/correspondents/types data model | §Q5 (ER diagram) | `MatchingModel` `models.py:19`; FK/FK/M2M `models.py:97/108/128` | ✔ addressed |
-| **Q5** — rule-based + ML assignment | §Q5 | live `matches()` True/False for all 6 algorithms; `load_classifier() → None`; `classifier.py` | ✔ addressed |
+| **Q5** — rule-based + ML assignment | §Q5 | live `matches()` True/False for all 6 algorithms (incl. `MATCH_FUZZY` hit `True` / miss `False`); `load_classifier() → None`; `classifier.py` | ✔ addressed |
 | **Q5** — filtering/retrieval | §Q5 | live `DocumentFilterSet` (60 params); `tags__id__all/none/in`, `correspondent/document_type __isnull` | ✔ addressed |
 
 All five questions and every sub-part are addressed.
@@ -657,7 +659,7 @@ Every statement above reflects the code at commit **`542221a38dff`** (v1.7.0). T
 - **Celery** — the task queue here is **Django Q `1.3.9`** (`requirements.txt:37`); a `grep` for `celery` returns nothing. (Current docs describe Celery — not applicable to this commit.)
 - **Workflows / Consumption Templates** — not present.
 - **Custom fields** — not present.
-- **Trash / soft-delete** — not present.
+- **Soft-delete / trash UI (later-version workflow)** — the modern soft-delete/trash *workflow* (a recycle-bin view with restore and retention) is not present. However, "trash" is **not wholly absent** at this commit: v1.7.0 does include a simpler file **delete-to-trash** mechanism — setting `PAPERLESS_TRASH_DIR` (`settings.py:68` `TRASH_DIR = os.getenv("PAPERLESS_TRASH_DIR")`; documented at `paperless.conf.example:22`) makes the `cleanup_document_deletion` post-delete receiver `shutil.move` a deleted document's files into that directory instead of unlinking them (`handlers.py:233-262`). Only the later-version soft-delete/trash *UI* is excluded here.
 - **Two-factor authentication (2FA)** — not present.
 - **Object-level permissions (owner/view/edit per object)** — not present.
 
@@ -665,7 +667,7 @@ Additionally, the REST upload endpoint at this commit returns the literal body `
 
 ## Evidence & honesty ledger
 
-- **Run live:** the environment standup; the REST upload (`Response("OK")` + enqueue); the Django Q `Q_CLUSTER`/`CHANNEL_LAYERS`/`Schedule`/broker introspection; the `Document` field introspection, live create, and constraint sequence; the `matches()` exercise across all six algorithms; `load_classifier() → None`; the `DocumentFilterSet` param dump; and the duplicate `ConsumerError`.
+- **Run live:** the environment standup; the REST upload (`Response("OK")` + enqueue); the Django Q `Q_CLUSTER`/`CHANNEL_LAYERS`/`Schedule`/broker introspection; the `Document` field introspection, live create, and constraint sequence; the `matches()` exercise across all six algorithms (including a `MATCH_FUZZY` hit and miss); `load_classifier() → None`; the `DocumentFilterSet` param dump; and the duplicate `ConsumerError`.
 - **Traced from code, not run live:** the full OCR/Tika consume end-to-end (heavyweight OCR stack not provisioned) — the ordered Q2 stages are cited from `consumer.py` with the verbatim `MESSAGE_*` constants and progress percentages rather than a captured OCR log.
 - **Unverified:** none of the claims above are left unverified; anything not executed is explicitly labeled "traced from code."
 
