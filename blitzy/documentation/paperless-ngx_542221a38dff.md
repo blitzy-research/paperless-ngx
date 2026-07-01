@@ -392,7 +392,7 @@ The digest is then `new_data_hash = m.digest()` (`src/documents/classifier.py:L1
 if self.data_hash and new_data_hash == self.data_hash:
     return False
 ```
-(`src/documents/classifier.py:L163-L164`). If the freshly computed digest equals the stored one, `train()` returns `False` immediately — *before* any model fitting. Notably, the scikit-learn imports are **lazy** — `from sklearn.feature_extraction.text import CountVectorizer` and friends live *inside* `train()` at `src/documents/classifier.py:L188-L190` (and `:L274`), i.e. **after** the hash+skip check. This means the change-detection hash is computed with no scikit-learn involvement and is therefore **version-independent**.
+(`src/documents/classifier.py:L163-L164`). If the freshly computed digest equals the stored one, `train()` returns `False` immediately — *before* any model fitting. Notably, the scikit-learn imports are **lazy** — `from sklearn.feature_extraction.text import CountVectorizer` and friends live *inside* `train()` at `src/documents/classifier.py:L188-L190`, i.e. **after** the hash+skip check. This means the change-detection hash is computed with no scikit-learn involvement and is therefore **version-independent**. (A separate lazy scikit-learn import, `from sklearn.utils.multiclass import type_of_target`, appears at `src/documents/classifier.py:L274`, but that one lives inside `predict_tags()` — not `train()` — so it plays no part in the training skip/retrain decision.)
 
 The task wrapper `train_classifier()` (`src/documents/tasks.py:L48`) is a **no-op unless** at least one `Tag`, `DocumentType`, or `Correspondent` uses automatic matching:
 
@@ -789,7 +789,7 @@ Several of these code paths log through `LoggingMixin` (`src/documents/loggers.p
 
 ### Management-command entry points
 
-The classifier and sanity behaviors are reachable from the CLI: `document_create_classifier` (`docs/administration.rst:~L333`) invokes the same `train_classifier()` path exercised in §3, and `document_sanity_checker` (`docs/administration.rst:~L408`) invokes the same `check_sanity()` path exercised in §5/§6. The observation harness called these code paths directly rather than through the task queue, but the logic is identical.
+The classifier and sanity behaviors are reachable from the CLI: `document_create_classifier` (`docs/administration.rst:~L333`) invokes the same `train_classifier()` path exercised in §3 — its command class imports `train_classifier` (`src/documents/management/commands/document_create_classifier.py:L1-L3`) and calls it directly inside `handle()` (`src/documents/management/commands/document_create_classifier.py:L19-L20`) — and `document_sanity_checker` (`docs/administration.rst:~L408`) invokes the same `check_sanity()` path exercised in §5/§6 — its command class imports `check_sanity` (`src/documents/management/commands/document_sanity_checker.py:L1-L2`) and calls `check_sanity(...)` followed by `messages.log_messages()` inside `handle()` (`src/documents/management/commands/document_sanity_checker.py:L22-L26`). The observation harness called these code paths directly rather than through the task queue, but the logic is identical.
 
 ---
 
