@@ -309,7 +309,6 @@ Cross-Origin-Opener-Policy: same-origin
 
 Because `TokenAuthentication.keyword` is `'Token'` (Q3) and paperless does **not** subclass it, an `Authorization: Bearer …` header is treated as *no token provided* → same **`401`** and the same error body.
 
-
 ---
 
 ## Q8 — WHICH authentication class handles token authentication
