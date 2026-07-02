@@ -1273,4 +1273,3 @@ docker exec -u testuser -w /app paperless git rev-parse --short HEAD
 ```
 
 Both git commands return empty and the artifact search finds nothing, confirming the paperless‑ngx source repository is left **exactly** as found (read‑only mandate satisfied). The sole artifact produced by this task is this documentation file, `blitzy/documentation/paperless-ngx_542221a38dff.md`, which is added in the **destination** repository — not in the source tree verified above.
-
