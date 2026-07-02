@@ -35,6 +35,18 @@ $ python -c "import sklearn, django; print(sklearn.__version__, django.VERSION)"
 
 scikit‑learn `1.0.2` (`requirements.txt:88`) and Django `4.0.4` (`requirements.txt:38`) — matching the pins.
 
+**Claim — the scikit‑learn pin is the exact equality‑form literal `scikit-learn==1.0.2` at `requirements.txt:88`.**
+
+```bash
+docker exec -u testuser -w /app/src paperless bash -c "sed -n '88p' /app/requirements.txt"
+```
+
+```text
+scikit-learn==1.0.2
+```
+
+The pin is a hard equality (`==`), not a range — required because the `FORMAT_VERSION 7` model pickle (`src/documents/classifier.py:63`) is not cross‑version compatible. This is the exact literal the questions concern, cited to `requirements.txt:88`.
+
 **Claim — the system libraries needed for OCR (Q3) and barcode decoding (Q4) are present.**
 
 ```
@@ -91,36 +103,111 @@ $ ls -l documents/tests/data/model.pickle
 $ python3 -m pytest documents/tests/test_classifier.py::TestClassifier::testDatasetHashing \
     -o addopts="" -p no:cacheprovider -v -p no:warnings
 documents/tests/test_classifier.py::TestClassifier::testDatasetHashing PASSED [100%]
-============================== 1 passed in 1.96s ===============================
+============================== 1 passed in 1.92s ===============================
 ```
 
 The `PASSED` marker confirms `train()` → `True` then `train()` → `False` on identical DB state.
 
 ### Q1 evidence — observed SHA‑1 hashes and boolean returns (train‑twice, then mutate)
 
-A temporary probe (subclass of the real `TestClassifier`, reusing its `generate_test_data()` fixture and `DirectoriesMixin` isolation) instantiated `DocumentClassifier`, trained twice on identical DB state, then mutated the data (added one `Document`) and trained again — printing `self.data_hash.hex()` and the boolean each time:
+**Producing code** — temporary probe `documents/tests/blitzy_adhoc_test_probe.py`, a subclass of the real `TestClassifier` that reuses its `generate_test_data()` fixture and `DirectoriesMixin` isolation (fresh per‑test `MODEL_FILE` + DB rollback). Invocation:
 
 ```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_q1_probe \
+    -o addopts="" -p no:cacheprovider -s -q
+```
+
+```python
+def test_q1_probe(self):
+    print("Q1PROBE FORMAT_VERSION=%d" % DocumentClassifier.FORMAT_VERSION)
+    print("Q1PROBE MODEL_FILE_exists=%s" % os.path.isfile(settings.MODEL_FILE))
+    print("Q1PROBE load_classifier_returns=%s" % load_classifier())
+    self.generate_test_data()
+    print("Q1PROBE total_documents=%d" % Document.objects.count())
+    print("Q1PROBE eligible_documents=%d"
+          % Document.objects.exclude(tags__is_inbox_tag=True).count())
+    r1 = self.classifier.train(); h1 = self.classifier.data_hash.hex()
+    print("Q1PROBE TRAIN#1 return=%s data_hash=%s" % (r1, h1))
+    r2 = self.classifier.train(); h2 = self.classifier.data_hash.hex()
+    print("Q1PROBE TRAIN#2 return=%s data_hash=%s" % (r2, h2))
+    print("Q1PROBE IDENTICAL_HASH_1_vs_2=%s" % (h1 == h2))
+    Document.objects.create(title="doc_extra",
+        content="this is an extra document from c1",
+        correspondent=self.c1, checksum="Z")
+    print("Q1PROBE total_documents_after_mutate=%d" % Document.objects.count())
+    r3 = self.classifier.train(); h3 = self.classifier.data_hash.hex()
+    print("Q1PROBE TRAIN#3(after mutate) return=%s data_hash=%s" % (r3, h3))
+    print("Q1PROBE HASH_CHANGED_2_vs_3=%s" % (h2 != h3))
+```
+
+Each claim below pairs the single producing `print(...)` line with its own verbatim observed output line.
+
+**Claim — `FORMAT_VERSION` is `7`** (`classifier.py:63`).
+```python
+print("Q1PROBE FORMAT_VERSION=%d" % DocumentClassifier.FORMAT_VERSION)
+```
+```
 Q1PROBE FORMAT_VERSION=7
+```
+
+**Claim — `load_classifier()` returns `None` when the model file is absent** (`classifier.py:30-36`; the fresh per‑test `MODEL_FILE` from `DirectoriesMixin` has no serialized model).
+```python
+print("Q1PROBE MODEL_FILE_exists=%s" % os.path.isfile(settings.MODEL_FILE))
+print("Q1PROBE load_classifier_returns=%s" % load_classifier())
+```
+```
 Q1PROBE MODEL_FILE_exists=False
 Q1PROBE load_classifier_returns=None
+```
+
+**Claim — the fixture creates 3 documents but only 2 are training‑eligible** (inbox exclusion at `classifier.py:125`).
+```python
+print("Q1PROBE total_documents=%d" % Document.objects.count())
+print("Q1PROBE eligible_documents=%d"
+      % Document.objects.exclude(tags__is_inbox_tag=True).count())
+```
+```
 Q1PROBE total_documents=3
 Q1PROBE eligible_documents=2
+```
+
+**Claim — the first `train()` returns `True` and computes a 40‑hex‑char (SHA‑1, 160‑bit) `data_hash`** (`hashlib.sha1()` `classifier.py:124`, `m.digest()` `classifier.py:161`).
+```python
+r1 = self.classifier.train(); h1 = self.classifier.data_hash.hex()
+print("Q1PROBE TRAIN#1 return=%s data_hash=%s" % (r1, h1))
+```
+```
 Q1PROBE TRAIN#1 return=True data_hash=b41ce39793cd61f391afe34e6e4de9b361c74447
+```
+
+**Claim — the second `train()` on identical DB state returns `False` with the identical hash (reuse short‑circuit)** (`if self.data_hash and new_data_hash == self.data_hash:` → `return False` — `classifier.py:163-164`).
+```python
+r2 = self.classifier.train(); h2 = self.classifier.data_hash.hex()
+print("Q1PROBE TRAIN#2 return=%s data_hash=%s" % (r2, h2))
+print("Q1PROBE IDENTICAL_HASH_1_vs_2=%s" % (h1 == h2))
+```
+```
 Q1PROBE TRAIN#2 return=False data_hash=b41ce39793cd61f391afe34e6e4de9b361c74447
 Q1PROBE IDENTICAL_HASH_1_vs_2=True
+```
+
+**Claim — mutating the eligible set (adding one non‑inbox `Document`, 3 → 4 rows) changes the hash and forces a retrain, so the next `train()` returns `True`** (`self.data_hash = new_data_hash` `classifier.py:247`; `return True` `classifier.py:249`).
+```python
+Document.objects.create(title="doc_extra",
+    content="this is an extra document from c1",
+    correspondent=self.c1, checksum="Z")
+print("Q1PROBE total_documents_after_mutate=%d" % Document.objects.count())
+r3 = self.classifier.train(); h3 = self.classifier.data_hash.hex()
+print("Q1PROBE TRAIN#3(after mutate) return=%s data_hash=%s" % (r3, h3))
+print("Q1PROBE HASH_CHANGED_2_vs_3=%s" % (h2 != h3))
+```
+```
 Q1PROBE total_documents_after_mutate=4
-Q1PROBE TRAIN#3(after mutate) return=True data_hash=2f0b4d6e6243eb32723da65c40e0de4ec42e3e79
+Q1PROBE TRAIN#3(after mutate) return=True data_hash=1c7c836d999c3931b1b85c6bc673431a5733f7b0
 Q1PROBE HASH_CHANGED_2_vs_3=True
 ```
 
-Reading these observed lines against the mechanism:
-
-- **`FORMAT_VERSION=7`** matches `classifier.py:63`.
-- **`MODEL_FILE_exists=False` → `load_classifier_returns=None`** confirms `load_classifier()` returns `None` when the model file is absent (`classifier.py:30-36`) — the fresh per‑test `MODEL_FILE` (DirectoriesMixin) has no serialized model.
-- **`TRAIN#1 return=True`** with a 40‑hex‑character (`b41ce397…c74447`) digest. 40 hex chars = 20 bytes = **SHA‑1** (160 bits), confirming `hashlib.sha1()` (`classifier.py:124`) / `m.digest()` (`classifier.py:161`).
-- **`TRAIN#2 return=False`** with the **identical** digest (`IDENTICAL_HASH_1_vs_2=True`) — the reuse short‑circuit at `classifier.py:163-164` fired because the eligible‑Document set was unchanged.
-- **`TRAIN#3 return=True`** after adding one document (3 → 4 rows) with a **different** digest (`2f0b4d6e…3e79`, `HASH_CHANGED_2_vs_3=True`) — the changed training set forced a retrain (`classifier.py:247,249`).
+> Reported exactly as observed: the `TRAIN#3` digest `1c7c836d…f7b0` differs from the `TRAIN#1`/`TRAIN#2` digest `b41ce397…c74447` because the added document changed the preprocessed‑content/label byte‑stream fed into `hashlib.sha1()`. The exact `TRAIN#3` value depends on the specific mutating document (here content `"this is an extra document from c1"`, correspondent `c1`); the invariant demonstrated is `HASH_CHANGED_2_vs_3=True` → retrain (`return True`).
 
 ### Q1 downstream effect on subsequent tests
 
@@ -143,27 +230,79 @@ The three documents are:
 
 `doc_inbox` carries the inbox tag `t2` (created with `is_inbox_tag=True` at `test_classifier.py:44`, added to `doc_inbox` at `test_classifier.py:82`), so it is excluded from training.
 
-**Observed count** (temporary probe after building the fixture):
+**Producing code** — temporary probe `documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_q2_probe` (same `TestClassifier` subclass), run with:
 
+```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_q2_probe \
+    -o addopts="" -p no:cacheprovider -s -q
+```
+
+The full method is shown once here (it produces every Q2 marker below); each subsequent claim repeats only its own producing `print(...)` line:
+
+```python
+def test_q2_probe(self):
+    self.generate_test_data()
+    print("Q2PROBE total_documents_created=%d" % Document.objects.count())
+    print("Q2PROBE training_eligible=%d"
+          % Document.objects.exclude(tags__is_inbox_tag=True).count())
+    print("Q2PROBE about_to_train (inserts already done above)")
+    self.classifier.train()
+    print("Q2PROBE trained")
+    print("Q2PROBE c1_pk=%d c2_pk=%d" % (self.c1.pk, self.c2.pk))
+    print("Q2PROBE correspondent_classes_=%s"
+          % list(self.classifier.correspondent_classifier.classes_))
+    print("Q2PROBE tags_binarizer_classes_=%s"
+          % list(self.classifier.tags_binarizer.classes_))
+    print("Q2PROBE predict_correspondent(doc1)=%r (expect c1.pk=%d)"
+          % (self.classifier.predict_correspondent(self.doc1.content), self.c1.pk))
+    print("Q2PROBE predict_correspondent(doc2)=%r (expect None)"
+          % (self.classifier.predict_correspondent(self.doc2.content),))
+    vec = self.classifier.data_vectorizer
+    raw1 = self.classifier.correspondent_classifier.predict(
+        vec.transform(["this is a document from c1"]))
+    raw2 = self.classifier.correspondent_classifier.predict(
+        vec.transform(["this is another document, but from c2"]))
+    print("Q2PROBE raw_predict(doc1)=%s raw_predict(doc2)=%s" % (list(raw1), list(raw2)))
+    src = inspect.getsource(DocumentClassifier.predict_correspondent)
+    print("Q2PROBE predict_correspondent_has_predict_proba=%s" % ("predict_proba" in src))
+    print("Q2PROBE predict_correspondent_has_threshold_literal=%s" % ("threshold" in src))
+    for line in src.rstrip().splitlines():
+        print("Q2PROBE_SRC %s" % line)
+```
+
+**Claim — the fixture creates 3 `Document` rows.**
+```python
+print("Q2PROBE total_documents_created=%d" % Document.objects.count())
+```
 ```
 Q2PROBE total_documents_created=3
-Q2PROBE training_eligible=2
 ```
 
-`Document.objects.count()` → **3**; `Document.objects.exclude(tags__is_inbox_tag=True).count()` → **2**. (The Q1 probe independently observed the same `total_documents=3` / `eligible_documents=2`.)
+**Claim — only 2 of them are training‑eligible** (`Document.objects.exclude(tags__is_inbox_tag=True)` mirrors the inbox exclusion at `classifier.py:125`).
+```python
+print("Q2PROBE training_eligible=%d"
+      % Document.objects.exclude(tags__is_inbox_tag=True).count())
+```
+```
+Q2PROBE training_eligible=2
+```
 
 ### Q2(b) — When does training occur relative to those inserts?
 
 **Answer:** Training runs **after** the document inserts. Both `testTrain` (`test_classifier.py:103`) and `testPredict` (`test_classifier.py:115`) call `self.generate_test_data()` (which performs the inserts) and *then* `self.classifier.train()`.
 
-**Observed ordering** (probe printed a marker immediately before/after training, with inserts already done):
-
+**Observed ordering** — the probe prints a marker immediately before and after `train()`, with the fixture inserts already complete (`generate_test_data()` runs first in the method above).
+```python
+print("Q2PROBE about_to_train (inserts already done above)")
+self.classifier.train()
+print("Q2PROBE trained")
+```
 ```
 Q2PROBE about_to_train (inserts already done above)
 Q2PROBE trained
 ```
 
-The fixture inserts complete before `train()` is invoked. (In real consumption, classifier training is a separate task that runs after documents already exist in the database.)
+The `about_to_train` marker prints only after `generate_test_data()` has inserted the rows, so `train()` is invoked strictly after the inserts. (In real consumption, classifier training is a separate task that runs after documents already exist in the database.)
 
 ### Q2(c) — What confidence threshold accepts or rejects a prediction?
 
@@ -175,23 +314,70 @@ The fixture inserts complete before `train()` is invoked. (In real consumption, 
 
 The `-1` label is the "no automatic correspondent" sentinel.
 
-**Observed — the classifier's classes and the accept/reject outcomes:**
+**Observed — the classifier's classes and the accept/reject outcomes** (one claim per block):
 
+**Claim — `c1.pk=1` and `c2.pk=2`.**
+```python
+print("Q2PROBE c1_pk=%d c2_pk=%d" % (self.c1.pk, self.c2.pk))
+```
 ```
 Q2PROBE c1_pk=1 c2_pk=2
+```
+
+**Claim — `correspondent_classifier.classes_` is `[-1, c1.pk]` = `[-1, 1]`** (asserted at `test_classifier.py:106-109`). Among the two training docs, `doc1.correspondent=c1` is `MATCH_AUTO` → label `c1.pk=1`, while `doc2.correspondent=c2` is not auto → label `-1` (the default `y = -1` in `train()`).
+```python
+print("Q2PROBE correspondent_classes_=%s"
+      % list(self.classifier.correspondent_classifier.classes_))
+```
+```
 Q2PROBE correspondent_classes_=[-1, 1]
+```
+
+**Claim — `tags_binarizer.classes_` is `[t1.pk, t3.pk]` = `[12, 45]`** (asserted at `test_classifier.py:110-113`).
+```python
+print("Q2PROBE tags_binarizer_classes_=%s"
+      % list(self.classifier.tags_binarizer.classes_))
+```
+```
 Q2PROBE tags_binarizer_classes_=[12, 45]
+```
+
+**Claim — `predict_correspondent(doc1)` is accepted** — predicted class `1` (= `c1.pk`) is `!= -1`, so it is returned. Reported exactly as observed: the method returns a NumPy `array([1])`, not a scalar `1`; `assertEqual(..., c1.pk)` still passes because `array([1]) == 1`.
+```python
+print("Q2PROBE predict_correspondent(doc1)=%r (expect c1.pk=%d)"
+      % (self.classifier.predict_correspondent(self.doc1.content), self.c1.pk))
+```
+```
 Q2PROBE predict_correspondent(doc1)=array([1]) (expect c1.pk=1)
+```
+
+**Claim — `predict_correspondent(doc2)` is rejected → `None`** — the raw predicted class for `doc2` is the `-1` sentinel, so the `if correspondent_id != -1:` gate is false.
+```python
+print("Q2PROBE predict_correspondent(doc2)=%r (expect None)"
+      % (self.classifier.predict_correspondent(self.doc2.content),))
+```
+```
 Q2PROBE predict_correspondent(doc2)=None (expect None)
+```
+
+**Claim — the raw categorical `predict()` output (before the `!= -1` gate) is `[1]` for doc1 and `[-1]` for doc2.**
+```python
+raw1 = self.classifier.correspondent_classifier.predict(vec.transform(["this is a document from c1"]))
+raw2 = self.classifier.correspondent_classifier.predict(vec.transform(["this is another document, but from c2"]))
+print("Q2PROBE raw_predict(doc1)=%s raw_predict(doc2)=%s" % (list(raw1), list(raw2)))
+```
+```
 Q2PROBE raw_predict(doc1)=[1] raw_predict(doc2)=[-1]
 ```
 
-- `correspondent_classes_=[-1, 1]` is exactly `[-1, c1.pk]` (asserted at `test_classifier.py:106-109`). This arises because, among the two training documents, `doc1.correspondent=c1` is `MATCH_AUTO` → label `c1.pk=1`, while `doc2.correspondent=c2` is **not** `MATCH_AUTO` → label `-1` (the label expansion happens in `train()`, defaulting `y = -1` unless the correspondent's `matching_algorithm == MatchingModel.MATCH_AUTO`).
-- `predict_correspondent(doc1)=array([1])` — the predicted class is `1` (= `c1.pk`), which is `!= -1`, so it is **returned**. (Reported exactly as observed: the method returns a NumPy `array([1])`, not a scalar `1`; the test's `assertEqual(... , c1.pk)` still passes because `array([1]) == 1`.)
-- `predict_correspondent(doc2)=None` — the raw predicted class for `doc2` is `[-1]` (the sentinel), so the `if correspondent_id != -1:` gate is false and the method returns `None`.
-
-**Observed — there is no probability/threshold logic in the source:**
-
+**Claim — there is NO numeric probability threshold: the method contains neither `predict_proba` nor any `threshold` literal.** The probe checks the method source and dumps it verbatim:
+```python
+src = inspect.getsource(DocumentClassifier.predict_correspondent)
+print("Q2PROBE predict_correspondent_has_predict_proba=%s" % ("predict_proba" in src))
+print("Q2PROBE predict_correspondent_has_threshold_literal=%s" % ("threshold" in src))
+for line in src.rstrip().splitlines():
+    print("Q2PROBE_SRC %s" % line)
+```
 ```
 Q2PROBE predict_correspondent_has_predict_proba=False
 Q2PROBE predict_correspondent_has_threshold_literal=False
@@ -206,14 +392,18 @@ Q2PROBE_SRC                 return None
 Q2PROBE_SRC         else:
 Q2PROBE_SRC             return None
 ```
+Both flags are `False` and the dumped body shows acceptance is the categorical `predict()` output gated only by `if correspondent_id != -1:` (`classifier.py:255`).
 
-The full method source contains neither `predict_proba` nor any `threshold` literal — confirming acceptance is the categorical `predict()` output gated only by `!= -1`.
-
-**Run markers** (both single‑run assertions pass):
-
+**Run markers** — produced by:
 ```
-documents/tests/test_classifier.py::TestClassifier::testTrain PASSED     [100%]
+$ python3 -m pytest documents/tests/test_classifier.py::TestClassifier::testTrain \
+    documents/tests/test_classifier.py::TestClassifier::testPredict \
+    -o addopts="" -p no:cacheprovider -v -p no:warnings
+```
+```
+documents/tests/test_classifier.py::TestClassifier::testTrain PASSED     [ 50%]
 documents/tests/test_classifier.py::TestClassifier::testPredict PASSED   [100%]
+============================== 2 passed in 1.99s ===============================
 ```
 
 `testPredict` asserts `predict_correspondent(doc1.content) == c1.pk` (`test_classifier.py:118-121`) and `predict_correspondent(doc2.content) == None` (`test_classifier.py:122`). (See the Non‑determinism section for repeated‑run behavior of these exact‑equality assertions.)
@@ -261,28 +451,119 @@ When the primary OCR yields no text, a **force‑OCR fallback** runs:
 $ python3 -m pytest paperless_tesseract/tests/test_parser.py -k "notext" -o addopts="" -v
 paperless_tesseract/tests/test_parser.py::TestParser::test_skip_noarchive_notext PASSED [ 50%]
 paperless_tesseract/tests/test_parser.py::TestParser::test_with_form_error_notext PASSED [100%]
-====================== 2 passed, 33 deselected in 10.02s =======================
+================= 2 passed, 33 deselected, 6 warnings in 9.90s =================
 ```
 
 These are `test_with_form_error_notext` (`test_parser.py:190`, `@override_settings(OCR_MODE="redo")`, sample `with-form.pdf`) and `test_skip_noarchive_notext` (`test_parser.py:370`, `OCR_MODE="skip_noarchive"`, sample `multi-page-images.pdf`).
 
-**Observed — the actual invocation and force‑OCR retry** (temporary probe using `unittest.mock.patch("ocrmypdf.ocr")` to record the args, with `extract_text` patched to return `""` so the `NoTextFoundException` branch fires; input sample `no-text-alpha.png`):
+**Observed — the actual invocation and force‑OCR retry.** A temporary probe mocks `ocrmypdf.ocr` to record its call arguments and patches `RasterisedDocumentParser.extract_text` to return `""` so the `NoTextFoundException` branch fires. The sample `no-text-alpha.png` is **copied to a temp path first** because `construct_ocrmypdf_parameters()` rewrites alpha images in place, and the source sample must remain unmodified (read‑only mandate). Producing command:
 
 ```
+$ python3 -m pytest paperless_tesseract/tests/blitzy_adhoc_test_ocr_probe.py::BlitzyOcrProbe::test_q3_ocr_fallback_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code — temporary file `paperless_tesseract/tests/blitzy_adhoc_test_ocr_probe.py`, module preamble plus the `test_q3_ocr_fallback_probe` method (verbatim as executed):
+
+```python
+import os
+import shutil
+import tempfile
+from unittest import mock
+
+import magic
+from django.test import TestCase
+
+from documents.tests.utils import DirectoriesMixin
+from paperless_tesseract.parsers import NoTextFoundException
+from paperless_tesseract.parsers import RasterisedDocumentParser
+
+SAMPLES = os.path.join(os.path.dirname(__file__), "samples")
+
+
+class BlitzyOcrProbe(DirectoriesMixin, TestCase):
+
+    def test_q3_ocr_fallback_probe(self):
+        # copy the sample so the in-place alpha rewrite never touches the source
+        workdir = tempfile.mkdtemp()
+        work_png = os.path.join(workdir, "no-text-alpha.png")
+        shutil.copyfile(os.path.join(SAMPLES, "no-text-alpha.png"), work_png)
+        print("Q3PROBE input_sample=%s" % os.path.basename(work_png))
+
+        parser = RasterisedDocumentParser(None)
+        with mock.patch("ocrmypdf.ocr") as mock_ocr, mock.patch.object(
+            RasterisedDocumentParser, "extract_text", return_value="",
+        ):
+            with self.assertLogs("paperless.parsing", level="WARNING") as cm:
+                parser.parse(work_png, "image/png")
+
+        print("Q3PROBE ocrmypdf_ocr_call_count=%d" % mock_ocr.call_count)
+        primary = mock_ocr.call_args_list[0].kwargs
+        fallback = mock_ocr.call_args_list[1].kwargs
+        print("Q3PROBE primary_call_force_ocr=%s" % primary.get("force_ocr"))
+        print("Q3PROBE primary_call_keys=%s" % sorted(primary.keys()))
+        print("Q3PROBE fallback_call_force_ocr=%s" % fallback.get("force_ocr"))
+        print("Q3PROBE fallback_input_file=%s" % os.path.basename(fallback.get("input_file")))
+        warn = [m for m in cm.output if "Attempting force OCR" in m][0]
+        # strip the "WARNING:paperless.parsing:" prefix for the raw message
+        print("Q3PROBE warning_log=%s" % warn.split(":", 2)[-1])
+        print("Q3PROBE NoTextFoundException_str=%r" % str(NoTextFoundException("No text was found in the original document")))
+```
+
+**Claim — the input sample fed to the probe is `no-text-alpha.png`.**
+
+```python
+print("Q3PROBE input_sample=%s" % os.path.basename(work_png))
+```
+```
 Q3PROBE input_sample=no-text-alpha.png
+```
+
+**Claim — `ocrmypdf.ocr` is invoked exactly TWICE** — the primary call (`parsers.py:261`) plus the force‑OCR fallback (`parsers.py:298`).
+
+```python
+print("Q3PROBE ocrmypdf_ocr_call_count=%d" % mock_ocr.call_count)
+```
+```
 Q3PROBE ocrmypdf_ocr_call_count=2
+```
+
+**Claim — the primary call does NOT set `force_ocr`; it carries `skip_text` instead** (under the default `OCR_MODE="skip"`, `skip_text = True` is set at `parsers.py:157-158`).
+
+```python
+print("Q3PROBE primary_call_force_ocr=%s" % primary.get("force_ocr"))
+print("Q3PROBE primary_call_keys=%s" % sorted(primary.keys()))
+```
+```
 Q3PROBE primary_call_force_ocr=None
 Q3PROBE primary_call_keys=['clean', 'deskew', 'image_dpi', 'input_file', 'jobs', 'language', 'output_file', 'output_type', 'progress_bar', 'rotate_pages', 'rotate_pages_threshold', 'sidecar', 'skip_text', 'use_threads']
+```
+
+`force_ocr` is absent (reported as `None`) while `skip_text` is present in the key list — confirming the primary call uses `skip_text`, not `force_ocr`.
+
+**Claim — the fallback call sets `force_ocr=True`** (`parsers.py:155-156`), re‑using the same input file `no-text-alpha.png`.
+
+```python
+print("Q3PROBE fallback_call_force_ocr=%s" % fallback.get("force_ocr"))
+print("Q3PROBE fallback_input_file=%s" % os.path.basename(fallback.get("input_file")))
+```
+```
 Q3PROBE fallback_call_force_ocr=True
 Q3PROBE fallback_input_file=no-text-alpha.png
+```
+
+**Claim — the fallback is triggered by the exact warning, whose text embeds the exception message `No text was found in the original document`** (exception raised at `parsers.py:267`; caught at `parsers.py:276`; warning "Attempting force OCR to get the text." emitted at `parsers.py:280`).
+
+```python
+warn = [m for m in cm.output if "Attempting force OCR" in m][0]
+print("Q3PROBE warning_log=%s" % warn.split(":", 2)[-1])
+print("Q3PROBE NoTextFoundException_str=%r"
+      % str(NoTextFoundException("No text was found in the original document")))
+```
+```
 Q3PROBE warning_log=Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
 Q3PROBE NoTextFoundException_str='No text was found in the original document'
 ```
-
-- `ocrmypdf_ocr_call_count=2` — `ocrmypdf.ocr` is called **twice**: the primary call (`parsers.py:261`) and the force‑OCR fallback (`parsers.py:298`).
-- `primary_call_force_ocr=None` with `skip_text` present in the primary args — under the test's default `OCR_MODE` (`skip`/`skip_noarchive`), the primary call uses `skip_text=True`, not `force_ocr`.
-- `fallback_call_force_ocr=True` — the fallback sets **`force_ocr=True`** (`parsers.py:155-156`), i.e. it forces OCR to run.
-- The warning log embeds the exact exception text, and the exception message string is exactly **`No text was found in the original document`** (`parsers.py:267`).
 
 **Sample files present** in `src/paperless_tesseract/tests/samples/` (observed by `ls`): `encrypted.pdf`, `multi-page-digital.pdf`, `multi-page-images.pdf`, `multi-page-mixed.pdf`, `no-text-alpha.png`, `rotated.pdf`, `signed.pdf`, `simple-alpha.png`, `simple-digital.pdf`, `simple-no-dpi.png`, `simple.bmp`, `simple.gif`, `simple.jpg`, `simple.png`, `simple.tif`, `with-form.pdf`. There is **no bare `simple.pdf`** in this directory:
 
@@ -301,11 +582,37 @@ The sample fed to the probe was **`no-text-alpha.png`** (reported exactly as use
 - Parser dispatch keys off it: `get_parser_class_for_mime_type(mime_type)` — `src/documents/consumer.py:223`
 - Persistence: value flows to `self._store(text=text, date=date, mime_type=mime_type)` (`consumer.py:301`; `_store` def `consumer.py:379`) and is written to the `Document` as `mime_type=mime_type` (`consumer.py:401`).
 
-**Observed — the detected MIME string for PDF samples** (temporary probe):
+**Observed — the detected MIME string for PDF samples.** A temporary probe calls `magic.from_file(..., mime=True)` — the exact function used by the consumer at `consumer.py:219` — on three sample PDFs. Producing command:
+
+```
+$ python3 -m pytest paperless_tesseract/tests/blitzy_adhoc_test_ocr_probe.py::BlitzyOcrProbe::test_q3_mime_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code — the `test_q3_mime_probe` method of the same `blitzy_adhoc_test_ocr_probe.py` file (`magic` is imported at module top; `SAMPLES` defined as shown in Q3(a)), verbatim as executed:
+
+```python
+def test_q3_mime_probe(self):
+    for name in ["simple-digital.pdf", "with-form.pdf", "multi-page-images.pdf"]:
+        mt = magic.from_file(os.path.join(SAMPLES, name), mime=True)
+        print("Q3PROBE magic.from_file(%s)=%r" % (name, mt))
+```
+
+**Claim — `magic.from_file("simple-digital.pdf", mime=True)` returns `'application/pdf'`.**
 
 ```
 Q3PROBE magic.from_file(simple-digital.pdf)='application/pdf'
+```
+
+**Claim — `magic.from_file("with-form.pdf", mime=True)` returns `'application/pdf'`.**
+
+```
 Q3PROBE magic.from_file(with-form.pdf)='application/pdf'
+```
+
+**Claim — `magic.from_file("multi-page-images.pdf", mime=True)` returns `'application/pdf'`.**
+
+```
 Q3PROBE magic.from_file(multi-page-images.pdf)='application/pdf'
 ```
 
@@ -320,66 +627,196 @@ For each PDF sample, `magic.from_file(..., mime=True)` returns exactly **`applic
 
 **Answer:** `(number_of_separators) + 1` output PDFs, with each separator (barcode) page **removed**. `separate_pages()` (def `src/documents/tasks.py:113`) writes `{fname}_document_0.pdf` for the pages before the first separator (`tasks.py:134`), then loops writing `{fname}_document_{count+1}.pdf` (`tasks.py:154`), skipping each barcode page via `for page in range(page_number + 1, next_page):` (`tasks.py:149`), and returns `document_paths` (`tasks.py:161`).
 
-**Run marker** — `test_separate_pages` (`test_tasks.py:305`) calls `separate_pages(patch-code-t-middle.pdf, [1])` and asserts `len(pages) == 2` (`test_tasks.py:313`):
+**Run marker** — `test_separate_pages` (`test_tasks.py:305`) calls `separate_pages(patch-code-t-middle.pdf, [1])` and asserts `len(pages) == 2` (`test_tasks.py:313`). Producing command:
 
 ```
-documents/tests/test_tasks.py::TestTasks::test_separate_pages PASSED     [ 85%]
+$ python3 -m pytest documents/tests/test_tasks.py -k "separate_pages" -o addopts="" -v
+documents/tests/test_tasks.py::TestTasks::test_separate_pages PASSED     [ 50%]
 documents/tests/test_tasks.py::TestTasks::test_separate_pages_no_list PASSED [100%]
+================= 2 passed, 38 deselected, 6 warnings in 1.58s =================
 ```
 
-**Observed count and filenames** (temporary probe calling `separate_pages` directly on `patch-code-t-middle.pdf` with its one separator at page index `1`):
+**Observed count and filenames.** A temporary probe calls `separate_pages` directly on `patch-code-t-middle.pdf` (one separator at page index `1`). Producing command:
 
+```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_barcode_probe.py::BlitzyBarcodeProbe::test_q4_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code — the `separate_pages` portion of `test_q4_probe` (temporary file `documents/tests/blitzy_adhoc_test_barcode_probe.py`; `BARCODES = os.path.join(SAMPLES, "barcodes")`, and `_scan(relpath)` wraps `tasks.scan_file_for_separating_barcodes(os.path.join(SAMPLES, relpath))`), verbatim as executed:
+
+```python
+middle = os.path.join(BARCODES, "patch-code-t-middle.pdf")
+seps = self._scan("barcodes/patch-code-t-middle.pdf")
+print("Q4PROBE separators_for_middle=%s (num_separators=%d)" % (seps, len(seps)))
+out = tasks.separate_pages(middle, [1])
+print("Q4PROBE separate_pages_output_count=%d" % len(out))
+print("Q4PROBE separate_pages_output_names=%s" % [os.path.basename(p) for p in out])
+empty = tasks.separate_pages(middle, [])
+print("Q4PROBE separate_pages_empty_list=%s" % empty)
+```
+
+**Claim — `patch-code-t-middle.pdf` has exactly one separator, at page index `1`.**
+
+```python
+print("Q4PROBE separators_for_middle=%s (num_separators=%d)" % (seps, len(seps)))
+```
 ```
 Q4PROBE separators_for_middle=[1] (num_separators=1)
+```
+
+**Claim — one separator produces `N+1 = 2` output documents.**
+
+```python
+print("Q4PROBE separate_pages_output_count=%d" % len(out))
+```
+```
 Q4PROBE separate_pages_output_count=2
+```
+
+**Claim — the two outputs are named `_document_0.pdf` and `_document_1.pdf`** (the separator page itself is removed).
+
+```python
+print("Q4PROBE separate_pages_output_names=%s" % [os.path.basename(p) for p in out])
+```
+```
 Q4PROBE separate_pages_output_names=['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
+```
+
+**Claim — an EMPTY separator list returns `[]`** (no split performed).
+
+```python
+print("Q4PROBE separate_pages_empty_list=%s" % empty)
+```
+```
 Q4PROBE separate_pages_empty_list=[]
 ```
 
-One separator (`[1]`) → **2** output documents (`_document_0.pdf`, `_document_1.pdf`), with the separator page removed. An **empty** split list returns `[]` and logs a warning — `test_separate_pages_no_list` (`test_tasks.py:315`) asserts `pages == []` and `cm.output == ["WARNING:paperless.tasks:No pages to split on!"]` (`test_tasks.py:328`).
+The empty-list case also logs a warning — `test_separate_pages_no_list` (`test_tasks.py:315`) asserts `pages == []` and `cm.output == ["WARNING:paperless.tasks:No pages to split on!"]` (`test_tasks.py:328`).
 
 ### Q4(b) — Which barcode values trigger a split?
 
 **Answer:** The default trigger string is **`"PATCHT"`**: `CONSUMER_BARCODE_STRING = os.getenv("PAPERLESS_CONSUMER_BARCODE_STRING", "PATCHT")` — `src/paperless/settings.py:506`. The whole feature is gated by `CONSUMER_ENABLE_BARCODES` — `src/paperless/settings.py:502` (default `False`).
 
-**Observed — default settings:**
+**Observed — default settings.** The same `test_q4_probe` (producing command as in Q4(a)) reads the two settings directly. Producing code:
+
+```python
+print("Q4PROBE default_CONSUMER_BARCODE_STRING=%r" % settings.CONSUMER_BARCODE_STRING)
+print("Q4PROBE default_CONSUMER_ENABLE_BARCODES=%s" % settings.CONSUMER_ENABLE_BARCODES)
+```
+
+**Claim — the default trigger string is `'PATCHT'`** (`settings.py:506`).
 
 ```
 Q4PROBE default_CONSUMER_BARCODE_STRING='PATCHT'
+```
+
+**Claim — the barcode feature is gated off by default (`CONSUMER_ENABLE_BARCODES=False`)** (`settings.py:502`).
+
+```
 Q4PROBE default_CONSUMER_ENABLE_BARCODES=False
 ```
 
-**Observed — `scan_file_for_separating_barcodes(...)` return list per named sample** (default `PATCHT`):
+**Observed — `scan_file_for_separating_barcodes(...)` return list per named sample (default `PATCHT`).** Producing code — the per-sample scan loop in `test_q4_probe` (each line calls the `_scan` helper shown above):
+
+```python
+print("Q4PROBE scan[barcodes/patch-code-t.pdf]=%s" % self._scan("barcodes/patch-code-t.pdf"))
+print("Q4PROBE scan[simple.pdf]=%s" % self._scan("simple.pdf"))
+print("Q4PROBE scan[barcodes/patch-code-t-middle.pdf]=%s" % self._scan("barcodes/patch-code-t-middle.pdf"))
+print("Q4PROBE scan[barcodes/several-patcht-codes.pdf]=%s" % self._scan("barcodes/several-patcht-codes.pdf"))
+print("Q4PROBE scan[barcodes/patch-code-t-middle_reverse.pdf]=%s" % self._scan("barcodes/patch-code-t-middle_reverse.pdf"))
+print("Q4PROBE scan[barcodes/patch-code-t-qr.pdf]=%s" % self._scan("barcodes/patch-code-t-qr.pdf"))
+```
+
+**Claim — `patch-code-t.pdf` → `[0]`** (PATCHT on page 0; asserted `test_tasks.py:207-215`).
 
 ```
 Q4PROBE scan[barcodes/patch-code-t.pdf]=[0]
+```
+
+**Claim — `simple.pdf` → `[]`** (no PATCHT barcode; `test_tasks.py:217-220`).
+
+```
 Q4PROBE scan[simple.pdf]=[]
+```
+
+**Claim — `patch-code-t-middle.pdf` → `[1]`** (PATCHT on page 1; `test_tasks.py:222-230`).
+
+```
 Q4PROBE scan[barcodes/patch-code-t-middle.pdf]=[1]
+```
+
+**Claim — `several-patcht-codes.pdf` → `[2, 5]`** (two separators; `test_tasks.py:232-240`).
+
+```
 Q4PROBE scan[barcodes/several-patcht-codes.pdf]=[2, 5]
+```
+
+**Claim — `patch-code-t-middle_reverse.pdf` → `[1]`** (upside‑down PATCHT; `test_tasks.py:242-250`).
+
+```
 Q4PROBE scan[barcodes/patch-code-t-middle_reverse.pdf]=[1]
+```
+
+**Claim — `patch-code-t-qr.pdf` → `[0]`** (QR‑encoded PATCHT; `test_tasks.py:252-260`).
+
+```
 Q4PROBE scan[barcodes/patch-code-t-qr.pdf]=[0]
 ```
 
-- `patch-code-t.pdf` → `[0]` (asserted `test_tasks.py:207-215`)
-- `simple.pdf` → `[]` (no PATCHT barcode; `test_tasks.py:217-220`)
-- `patch-code-t-middle.pdf` → `[1]` (`test_tasks.py:222-230`)
-- `several-patcht-codes.pdf` → `[2, 5]` (two separators; `test_tasks.py:232-240`)
-- `patch-code-t-middle_reverse.pdf` → `[1]` (upside‑down; `test_tasks.py:242-250`)
-- `patch-code-t-qr.pdf` → `[0]` (QR‑encoded PATCHT; `test_tasks.py:252-260`)
+**Observed — a custom trigger string only splits when configured.** Under the default `PATCHT`, a custom‑barcode sample does **not** trigger; overriding `CONSUMER_BARCODE_STRING="CUSTOM BARCODE"` (via `@override_settings`) makes the custom samples trigger at page `0`. Two producing commands:
 
-**Observed — a custom trigger string only splits when configured.** With the default `PATCHT`, a custom‑barcode sample does **not** trigger; overriding `CONSUMER_BARCODE_STRING="CUSTOM BARCODE"` makes the custom samples trigger at page `0`:
+```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_barcode_probe.py::BlitzyBarcodeProbe::test_q4_custom_default_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_barcode_probe.py::BlitzyBarcodeProbe::test_q4_custom_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code (two methods):
+
+```python
+def test_q4_custom_default_probe(self):
+    # same custom sample under the DEFAULT PATCHT string -> no split
+    print("Q4PROBE scan[barcode-39-custom.pdf, default PATCHT]=%s" % self._scan("barcodes/barcode-39-custom.pdf"))
+
+@override_settings(CONSUMER_BARCODE_STRING="CUSTOM BARCODE")
+def test_q4_custom_probe(self):
+    print("Q4PROBE override_CONSUMER_BARCODE_STRING=%r" % settings.CONSUMER_BARCODE_STRING)
+    print("Q4PROBE scan[barcode-39-custom.pdf, CUSTOM BARCODE]=%s" % self._scan("barcodes/barcode-39-custom.pdf"))
+    print("Q4PROBE scan[barcode-qr-custom.pdf, CUSTOM BARCODE]=%s" % self._scan("barcodes/barcode-qr-custom.pdf"))
+    print("Q4PROBE scan[barcode-128-custom.pdf, CUSTOM BARCODE]=%s" % self._scan("barcodes/barcode-128-custom.pdf"))
+```
+
+**Claim — under the default `PATCHT`, `barcode-39-custom.pdf` → `[]`** (its Code‑39 "CUSTOM BARCODE" is not `PATCHT`; `test_tasks.py:295-303`).
 
 ```
 Q4PROBE scan[barcode-39-custom.pdf, default PATCHT]=[]
-Q4PROBE override_CONSUMER_BARCODE_STRING='CUSTOM BARCODE'
-Q4PROBE scan[barcode-39-custom.pdf, CUSTOM BARCODE]=[0]
-Q4PROBE scan[barcode-qr-custom.pdf, CUSTOM BARCODE]=[0]
-Q4PROBE scan[barcode-128-custom.pdf, CUSTOM BARCODE]=[0]
 ```
 
-- `barcode-39-custom.pdf` → `[]` under default `PATCHT`, but `[0]` under `CUSTOM BARCODE` (`test_tasks.py:263`, and the without‑override case `test_tasks.py:295-303`)
-- `barcode-qr-custom.pdf` → `[0]` under `CUSTOM BARCODE` (`test_tasks.py:274`)
-- `barcode-128-custom.pdf` → `[0]` under `CUSTOM BARCODE` (`test_tasks.py:285`)
+**Claim — the override sets the trigger string to `'CUSTOM BARCODE'`.**
+
+```
+Q4PROBE override_CONSUMER_BARCODE_STRING='CUSTOM BARCODE'
+```
+
+**Claim — under `CUSTOM BARCODE`, `barcode-39-custom.pdf` → `[0]`** (`test_tasks.py:263`).
+
+```
+Q4PROBE scan[barcode-39-custom.pdf, CUSTOM BARCODE]=[0]
+```
+
+**Claim — under `CUSTOM BARCODE`, `barcode-qr-custom.pdf` → `[0]`** (`test_tasks.py:274`).
+
+```
+Q4PROBE scan[barcode-qr-custom.pdf, CUSTOM BARCODE]=[0]
+```
+
+**Claim — under `CUSTOM BARCODE`, `barcode-128-custom.pdf` → `[0]`** (`test_tasks.py:285`).
+
+```
+Q4PROBE scan[barcode-128-custom.pdf, CUSTOM BARCODE]=[0]
+```
 
 The 18 barcode sample files live in `src/documents/tests/samples/barcodes/` (including `barcode-39-PATCHT.png`, `patch-code-t.pdf`, `patch-code-t-middle.pdf`, `several-patcht-codes.pdf`, `barcode-128-custom.pdf`).
 
@@ -397,7 +834,7 @@ Orchestration is `consume_file` (def `src/documents/tasks.py:184`): the gate `if
 
 **Answer:** Each split file is **re‑consumed as its own `Document`** (via `save_to_dir(...)` at `tasks.py:210`, which drops each split PDF back into consumption). So a single input becomes `N+1` `Document` rows, which changes the training‑set count read by `classifier.py:125` (`Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)`), which changes the SHA‑1 `data_hash` (`classifier.py:161-164`), and therefore forces a **retrain** on the next `train()`.
 
-This links **Q4 → Q1/Q2 directly**, and the link is empirically demonstrated by the Q1 probe: adding a single document (3 → 4 rows) changed the observed `data_hash` from `b41ce397…c74447` to `2f0b4d6e…3e79` and flipped the next `train()` from a reuse (`False`) to a retrain (`True`). Thus barcode splitting's `N+1` documents feed both the reuse‑vs‑retrain decision (Q1) and the correspondent training labels (Q2).
+This links **Q4 → Q1/Q2 directly**, and the link is empirically demonstrated by the Q1 probe: adding a single document changed the observed `data_hash` from `b41ce397…c74447` (2 eligible docs) to `1c7c836d…f7b0` (3 eligible docs) and flipped the next `train()` from a reuse (`False`) to a retrain (`True`). Thus barcode splitting's `N+1` documents feed both the reuse‑vs‑retrain decision (Q1) and the correspondent training labels (Q2).
 
 
 ---
@@ -416,51 +853,227 @@ The three classifiers are all constructed without a `random_state`:
 
 With `random_state=None`, scikit‑learn's `MLPClassifier` uses non‑deterministic weight/bias initialization (and batch sampling for the `adam`/`sgd` solvers), so a retrained model's internal weights differ from run to run.
 
-**Observed — the randomness is REAL: `random_state` is `None` and the trained weights differ run‑to‑run.** A probe trained two fresh `DocumentClassifier` instances on identical fixture data and compared the correspondent network's first‑layer weight matrix:
+**Observed — the randomness is REAL: `random_state` is `None` and the trained weights differ run‑to‑run.** A probe trained two fresh `DocumentClassifier` instances on identical fixture data and compared the correspondent network's first‑layer weight matrix. Producing command:
 
+```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_nd3_weights_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code (temporary probe method, subclass of the real `TestClassifier` so it reuses `generate_test_data()`):
+
+```python
+def test_nd3_weights_probe(self):
+    self.generate_test_data()
+    a = DocumentClassifier(); a.train()
+    b = DocumentClassifier(); b.train()
+    print("ND3PROBE correspondent_random_state=%s" % a.correspondent_classifier.random_state)
+    print("ND3PROBE tags_random_state=%s" % a.tags_classifier.random_state)
+    print("ND3PROBE document_type_random_state=%s" % a.document_type_classifier.random_state)
+    wa = a.correspondent_classifier.coefs_[0]
+    wb = b.correspondent_classifier.coefs_[0]
+    print("ND3PROBE correspondent_weights_identical_run_to_run=%s" % bool(np.array_equal(wa, wb)))
+    print("ND3PROBE correspondent_weights_max_abs_diff=%.6f" % float(np.max(np.abs(wa - wb))))
+    pa = a.predict_correspondent(self.doc1.content)
+    pb = b.predict_correspondent(self.doc1.content)
+    print("ND3PROBE predict_doc1_modelA=%s modelB=%s" % (int(pa), int(pb)))
+```
+
+**Claim — no seed is set: `random_state` is `None` on all three fitted estimators** (`classifier.py:219,227,238`).
+
+```python
+print("ND3PROBE correspondent_random_state=%s" % a.correspondent_classifier.random_state)
+print("ND3PROBE tags_random_state=%s" % a.tags_classifier.random_state)
+print("ND3PROBE document_type_random_state=%s" % a.document_type_classifier.random_state)
+```
 ```
 ND3PROBE correspondent_random_state=None
 ND3PROBE tags_random_state=None
 ND3PROBE document_type_random_state=None
+```
+
+**Claim — two independent trainings on identical data produce different weight matrices (`identical_run_to_run=False`).**
+
+```python
+print("ND3PROBE correspondent_weights_identical_run_to_run=%s" % bool(np.array_equal(wa, wb)))
+```
+```
 ND3PROBE correspondent_weights_identical_run_to_run=False
-ND3PROBE correspondent_weights_max_abs_diff=0.433783
+```
+
+**Claim — the first‑layer weight matrices differ materially; a representative observed max absolute difference is `0.484841`.**
+
+```python
+print("ND3PROBE correspondent_weights_max_abs_diff=%.6f" % float(np.max(np.abs(wa - wb))))
+```
+```
+ND3PROBE correspondent_weights_max_abs_diff=0.484841
+```
+
+> Reported exactly as observed (R7): this `max_abs_diff` figure **changes on every run** (earlier runs in this investigation produced `0.508544` and `0.433783`) — that run‑to‑run variability *is* the non‑determinism being demonstrated. The reproducible invariants are `random_state=None` and `identical_run_to_run=False`; the specific magnitude is inherently non‑reproducible.
+
+**Claim — despite the differing weights, both models still predict `c1.pk=1` on `doc1`.**
+
+```python
+print("ND3PROBE predict_doc1_modelA=%s modelB=%s" % (int(pa), int(pb)))
+```
+```
 ND3PROBE predict_doc1_modelA=1 modelB=1
 ```
 
-- `random_state=None` on all three fitted estimators — confirming no seed is set.
-- `correspondent_weights_identical_run_to_run=False` with `max_abs_diff=0.433783` — two independent trainings on identical data produce **materially different weight matrices**. This is the genuine non‑determinism vector.
-- `predict_doc1_modelA=1 modelB=1` — despite different weights, both models still predict `c1.pk=1`.
+**Observed — at magnitude, the varying weights did NOT change predictions on the current fixtures.** A probe built the canonical fixture once and trained a fresh classifier `N=100` times, tallying deviations from the expected labels. Producing command:
 
-**Observed — at magnitude, the varying weights did NOT change predictions on the current fixtures.** A probe built the canonical fixture once and trained a fresh classifier `N=100` times, tallying deviations from the expected labels (`c1.pk` / `dt.pk` / `[t1.pk]`):
+```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_nd1_magnitude_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code (temporary probe method):
+
+```python
+def test_nd1_magnitude_probe(self):
+    self.generate_test_data()
+    N = 100
+    exp_corr, exp_dt, exp_tags = self.c1.pk, self.dt.pk, [self.t1.pk]
+    print("ND1PROBE N=%d" % N)
+    print("ND1PROBE expected correspondent=c1.pk=%d document_type=dt.pk=%d tags=[t1.pk]=%s"
+          % (exp_corr, exp_dt, exp_tags))
+    corr_dev = dt_dev = tag_dev = 0
+    dist = {}
+    for _ in range(N):
+        c = DocumentClassifier(); c.train()
+        pc = c.predict_correspondent(self.doc1.content)
+        pcv = None if pc is None else int(pc)
+        dist[str(pcv)] = dist.get(str(pcv), 0) + 1
+        if pcv != exp_corr: corr_dev += 1
+        if c.predict_document_type(self.doc1.content) != exp_dt: dt_dev += 1
+        if c.predict_tags(self.doc1.content) != exp_tags: tag_dev += 1
+    print("ND1PROBE predict_correspondent DEVIATIONS=%d/%d" % (corr_dev, N))
+    print("ND1PROBE predict_correspondent value_distribution=%s" % dist)
+    print("ND1PROBE predict_document_type DEVIATIONS=%d/%d" % (dt_dev, N))
+    print("ND1PROBE predict_tags DEVIATIONS=%d/%d" % (tag_dev, N))
+```
+
+**Claim — the expected labels are `correspondent=c1.pk=1`, `document_type=dt.pk=1`, `tags=[t1.pk]=[12]`.**
 
 ```
 ND1PROBE N=100
 ND1PROBE expected correspondent=c1.pk=1 document_type=dt.pk=1 tags=[t1.pk]=[12]
+```
+
+**Claim — over 100 fresh trainings, `predict_correspondent` had `0/100` deviations (always `1`).**
+
+```
 ND1PROBE predict_correspondent DEVIATIONS=0/100
 ND1PROBE predict_correspondent value_distribution={'1': 100}
+```
+
+**Claim — over 100 fresh trainings, `predict_document_type` had `0/100` deviations.**
+
+```
 ND1PROBE predict_document_type DEVIATIONS=0/100
+```
+
+**Claim — over 100 fresh trainings, `predict_tags` had `0/100` deviations.**
+
+```
 ND1PROBE predict_tags DEVIATIONS=0/100
 ```
 
-Zero deviations in 100 fresh trainings. Repeating on the *harder* fixture from `test_one_correspondent_predict_manydocs` (`test_classifier.py:206`), where the two documents differ by a single word — `"this is a document from c1"` vs. `"this is a document from noone"` — at `N=200`:
+Repeating on the *harder* fixture from `test_one_correspondent_predict_manydocs` (`test_classifier.py:206`), where the two documents differ by a single word — `"this is a document from c1"` vs. `"this is a document from noone"` — at `N=200`. Producing command:
+
+```
+$ python3 -m pytest documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_nd2_manydocs_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code (temporary probe method — builds its own single‑word‑diff fixture):
+
+```python
+def test_nd2_manydocs_probe(self):
+    c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
+    doc1 = Document.objects.create(title="doc1", content="this is a document from c1",
+                                   correspondent=c1, checksum="A")
+    doc2 = Document.objects.create(title="doc2", content="this is a document from noone", checksum="B")
+    N = 200
+    print("ND2PROBE N=%d c1.pk=%d" % (N, c1.pk))
+    d1_dev = d2_dev = 0; dist1 = {}; dist2 = {}
+    for _ in range(N):
+        c = DocumentClassifier(); c.train()
+        p1 = c.predict_correspondent(doc1.content); p1v = None if p1 is None else int(p1)
+        dist1[str(p1v)] = dist1.get(str(p1v), 0) + 1
+        if p1v != c1.pk: d1_dev += 1
+        p2 = c.predict_correspondent(doc2.content); p2v = None if p2 is None else int(p2)
+        dist2[str(p2v)] = dist2.get(str(p2v), 0) + 1
+        if p2v is not None: d2_dev += 1
+    print("ND2PROBE doc1_expected=c1.pk=%d DEVIATIONS=%d/%d distribution=%s" % (c1.pk, d1_dev, N, dist1))
+    print("ND2PROBE doc2_expected=None DEVIATIONS=%d/%d distribution=%s" % (d2_dev, N, dist2))
+```
+
+**Claim — `doc1` (expected `c1.pk=1`) had `0/200` deviations (always `1`).**
 
 ```
 ND2PROBE N=200 c1.pk=1
 ND2PROBE doc1_expected=c1.pk=1 DEVIATIONS=0/200 distribution={'1': 200}
+```
+
+**Claim — `doc2` (expected `None`) had `0/200` deviations (always `None`).**
+
+```
 ND2PROBE doc2_expected=None DEVIATIONS=0/200 distribution={'None': 200}
 ```
 
-Still zero deviations in 200 fresh trainings.
+**Observed — the real exact‑equality tests do not flake at 50 repetitions each.** Three probe methods replicate the exact‑equality assertions of `testPredict`, `test_one_correspondent_predict`, and `test_one_correspondent_predict_manydocs`, each against a freshly retrained classifier, 50 times. Producing command:
 
-**Observed — the real exact‑equality tests do not flake at 50 repetitions each (serial):**
+```
+$ python3 -m pytest \
+    documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_loop_testpredict_probe \
+    documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_loop_one_correspondent_probe \
+    documents/tests/blitzy_adhoc_test_probe.py::BlitzyClassifierProbe::test_loop_one_correspondent_manydocs_probe \
+    -o addopts='' -p no:cacheprovider -s -q
+```
+
+Producing code (the core of each loop method; `N = 50`, fresh `DocumentClassifier().train()` per iteration):
+
+```python
+# test_loop_testpredict_probe — replicates testPredict's correspondent asserts
+ok = (c.predict_correspondent(self.doc1.content) == self.c1.pk
+      and c.predict_correspondent(self.doc2.content) is None)
+# test_loop_one_correspondent_probe — replicates test_one_correspondent_predict
+if c.predict_correspondent(doc1.content) == c1.pk: passed += 1
+# test_loop_one_correspondent_manydocs_probe — replicates the manydocs variant
+if c.predict_correspondent(doc1.content) == c1.pk and c.predict_correspondent(doc2.content) is None:
+    passed += 1
+```
+
+**Claim — the `testPredict` assertions passed `50/50`.**
 
 ```
 TESTPREDICT_LOOP pass=50 fail=0 out_of=50
+```
+
+**Claim — the `test_one_correspondent_predict` assertion passed `50/50`.**
+
+```
 LOOP test_one_correspondent_predict: pass=50 fail=0 out_of=50
+```
+
+**Claim — the `test_one_correspondent_predict_manydocs` assertions passed `50/50`.**
+
+```
 LOOP test_one_correspondent_predict_manydocs: pass=50 fail=0 out_of=50
 ```
 
-**Control — the loaded‑model path is deterministic.** `test_load_and_classify` (`test_classifier.py:183`) *loads* the pre‑trained `model.pickle` (`new_classifier.load()`) instead of retraining, so its weights are fixed:
+**Control — the loaded‑model path is deterministic.** `test_load_and_classify` (`test_classifier.py:183`) *loads* the pre‑trained `model.pickle` (`new_classifier.load()`) instead of retraining, so its weights are fixed. This ran the real test 20 times via a shell loop. Producing command:
+
+```
+$ for i in $(seq 1 20); do \
+    python3 -m pytest documents/tests/test_classifier.py::TestClassifier::test_load_and_classify \
+      -o addopts="" -p no:cacheprovider -q 2>&1 | tail -1; \
+  done   # tallied into passed/skipped/failed
+```
+
+**Claim — the loaded‑model test passed all `20/20` runs (0 skipped, 0 failed).**
 
 ```
 LOAD_AND_CLASSIFY_LOOP passed=20 skipped=0 failed=0 out_of=20
@@ -472,28 +1085,94 @@ LOAD_AND_CLASSIFY_LOOP passed=20 skipped=0 failed=0 out_of=20
 
 The suite default enables xdist parallelism: `addopts = --pythonwarnings=all --cov --cov-report=html --numprocesses auto --quiet` — `src/setup.cfg:10`. Parallel workers can surface isolation issues invisible in serial runs.
 
-**Observed — no failure‑rate difference between serial and parallel** for the full `documents/tests/test_classifier.py` (23 tests collected; 22 run, 1 skipped), 10 runs each:
+**Observed — no failure‑rate difference between serial and parallel** for the full `documents/tests/test_classifier.py` (23 tests collected; 22 run, 1 skipped), 10 runs each. Producing commands (two shell loops — one single‑process, one xdist `-n auto`):
 
 ```
-SERIAL_RESULT pass=10 fail=0 out_of=10          # -o addopts=""  (single process)
-PARALLEL_RESULT pass=10 fail=0 out_of=10        # -n auto  (pytest-xdist 3.8.0)
-# sample parallel summary: "22 passed, 1 skipped in 25.41s"
+$ for i in $(seq 1 10); do \
+    python3 -m pytest documents/tests/test_classifier.py -o addopts="" -p no:cacheprovider -q 2>&1 | tail -1; \
+  done   # SERIAL (single process)
+$ for i in $(seq 1 10); do \
+    python3 -m pytest documents/tests/test_classifier.py -o addopts="" -n auto -p no:cacheprovider -q 2>&1 | tail -1; \
+  done   # PARALLEL (pytest-xdist)
 ```
 
-The one skipped test is `test_load_classifier_cached` (`test_classifier.py:391`), skipped with reason *"Disabled caching due to high memory usage - need to investigate."* — unrelated to flakiness.
+**Claim — 10 serial runs all passed (`10/10`), sample summary `22 passed, 1 skipped, 6 warnings in 2.53s`.**
+
+```
+SERIAL_RESULT pass=10 fail=0 out_of=10
+sample: 22 passed, 1 skipped, 6 warnings in 2.53s
+```
+
+**Claim — 10 parallel runs (pytest‑xdist `3.8.0`) all passed (`10/10`), sample summary `22 passed, 1 skipped, 774 warnings in 25.56s`.**
+
+```
+xdist_version=3.8.0
+PARALLEL_RESULT pass=10 fail=0 out_of=10
+sample: 22 passed, 1 skipped, 774 warnings in 25.56s
+```
+
+**Claim — the one skipped test is `test_load_classifier_cached`, skipped via `@pytest.mark.skip(...)` at `test_classifier.py:399-401` (def at `:402`), reason `"Disabled caching due to high memory usage - need to investigate."`** — unrelated to flakiness.
+
+```
+$ sed -n '399,402p' documents/tests/test_classifier.py
+    @pytest.mark.skip(
+        reason="Disabled caching due to high memory usage - need to investigate.",
+    )
+    def test_load_classifier_cached(self):
+```
 
 **Isolation / ordering facts observed:**
 
-- No `conftest.py` exists under `src/` (a `find` for it returned nothing), **pytest‑randomly is not installed** (`pip list` shows only `pytest-cov` and `pytest-xdist 3.8.0` among the relevant plugins), and there is **no `.python-version`** file. Test ordering is therefore stable except for xdist worker distribution.
+- No `conftest.py` exists under `src/` (a `find` for it returned nothing). Producing command + output:
+
+```
+$ find . -name conftest.py | wc -l
+0
+```
+
+- **pytest‑randomly is not installed**; the observed plugin set is `pytest-cov 7.0.0`, `pytest-django 4.11.1`, `pytest-env 1.1.5`, `pytest-sugar 1.1.1`, `pytest-xdist 3.8.0` (on `pytest 8.4.2`). Producing command + output:
+
+```
+$ pip list 2>/dev/null | grep -Ei 'pytest'
+pytest                 8.4.2
+pytest-cov             7.0.0
+pytest-django          4.11.1
+pytest-env             1.1.5
+pytest-sugar           1.1.1
+pytest-xdist           3.8.0
+```
+
+(No `pytest-randomly` line appears.) There is also **no `.python-version`** file. Test ordering is therefore stable except for xdist worker distribution.
+
 - `DirectoriesMixin` (`utils.py:72`) overrides `DATA_DIR`/`SCRATCH_DIR`/`MEDIA_ROOT`/`MODEL_FILE` per test (`utils.py:35-47`, `MODEL_FILE` at `utils.py:45`) and Django `TestCase` rolls back the DB, so cross‑test model‑file bleed is unlikely. This isolation does **not** remove the within‑test weight‑init randomness of Vector 1.
 
 ### Conclusion (reported exactly as observed)
 
-- The **code‑level non‑determinism vector is Vector 1**: the `MLPClassifier` instances are trained with `random_state=None` (`classifier.py:219,227,238`), and this randomness is empirically real — two trainings on identical data produced different weight matrices (`max_abs_diff=0.433783`). This is the mechanism that *can* make the exact‑equality classifier assertions (`testPredict` at `test_classifier.py:115`, `test_one_correspondent_predict` at `:191`, `test_one_correspondent_predict_manydocs` at `:206`) flaky when the training set is larger or less separable.
+- The **code‑level non‑determinism vector is Vector 1**: the `MLPClassifier` instances are trained with `random_state=None` (`classifier.py:219,227,238`), and this randomness is empirically real — two trainings on identical data produced different weight matrices (`max_abs_diff=0.484841` in the representative run reported above; the figure varies each run, which is the point). This is the mechanism that *can* make the exact‑equality classifier assertions (`testPredict` at `test_classifier.py:115`, `test_one_correspondent_predict` at `:191`, `test_one_correspondent_predict_manydocs` at `:206`) flaky when the training set is larger or less separable.
 - **However, at the magnitudes run** (200 fresh trainings on two fixtures with 0 deviations; 50 repetitions each of three real exact‑equality tests with 0 failures; 10 serial and 10 parallel full‑suite runs with 0 failures), **neither vector reproduced an actual failure**. The current fixtures are tiny and linearly separable, so the decision boundary is robust even though the underlying weights vary.
 - **Vector 2 (xdist)** showed no difference in failure frequency between serial and parallel execution and is mitigated by `DirectoriesMixin` isolation + DB rollback.
 - Practical implication for whoever fixes the flakiness (out of scope here, stated for the reader): the latent risk lives in the unseeded `MLPClassifier`; the observed stability is a property of these specific small fixtures, not a guarantee. Because the mechanism is confirmed present but did not fire at this scale, the exact real‑world trigger (e.g. a larger/edge‑case training set, or a specific worker interleaving) **could not be reproduced by reading or running the code at the scale attempted**, and is reported as such rather than asserted.
 
+### External references checked
+
+The two non‑determinism vectors depend on documented behavior of external packages. The **primary evidence for this repository's behavior is the runtime/source observation above**; the official documentation below is cited only to substantiate the general package semantics that the observations rely on.
+
+- **scikit‑learn `MLPClassifier.random_state`** — official API reference: <https://scikit-learn.org/stable/modules/generated/sklearn.neural_network.MLPClassifier.html>. The documented constructor default is `random_state=None`. Per the official parameter description, `random_state` governs the random number generation used for the network's weight and bias initialization (and for batch sampling under the `sgd`/`adam` solvers); the documentation states to "Pass an int for reproducible results across multiple function calls." paperless‑ngx constructs `MLPClassifier(tol=0.01)` with no `random_state` (`src/documents/classifier.py:219,227,238`), so per the official semantics the weight/bias initialization is seeded from an unspecified source and is not reproducible across runs — exactly the Vector‑1 behavior observed above (`correspondent_weights_identical_run_to_run=False`, `max_abs_diff=0.484841`). The pinned runtime is scikit‑learn `1.0.2`, whose `MLPClassifier` carries the same `random_state=None` default (verified in‑container below).
+
+- **pytest‑xdist worker/parallel behavior** — official documentation: <https://pytest-xdist.readthedocs.io/en/stable/distribution.html>. Per the official docs, running with `-n auto` spawns one worker process per available CPU, each worker being a **separate process** with its own Python interpreter, and the default `--dist load` scheduler distributes pending tests to whichever worker is free with no guaranteed ordering. This is the documented basis for why parallelism can surface isolation bugs (shared files/DB/ports) that a serial run hides. The pinned runtime is pytest‑xdist `3.8.0`; `src/setup.cfg:10` sets `--numprocesses auto`. As observed above, at the attempted magnitude the paperless‑ngx suite showed no serial‑vs‑parallel failure difference because `DirectoriesMixin` (`src/documents/tests/utils.py:35-72`) namespaces `MODEL_FILE`/`DATA_DIR` per test and Django's `TestCase` rolls back the DB, removing the shared‑state that xdist would otherwise expose.
+
+Confirmation that the pinned scikit‑learn build carries the `random_state=None` default (run inside the container, not read from the web):
+
+```bash
+docker exec -u testuser -w /app/src paperless python3 -c "import sklearn, inspect; from sklearn.neural_network import MLPClassifier; print('sklearn', sklearn.__version__); print('random_state default =', inspect.signature(MLPClassifier).parameters['random_state'].default)"
+```
+
+```text
+sklearn 1.0.2
+random_state default = None
+```
+
+The observed default `None` at the pinned version `1.0.2` matches the official documentation, closing the loop between the external reference and the in‑repo behavior.
 
 ---
 
@@ -502,7 +1181,7 @@ The one skipped test is `test_load_classifier_cached` (`test_classifier.py:391`)
 Each item below was addressed above with its own verbatim evidence and an exact `file:line` citation.
 
 - [x] **Q1 — reuse vs. retrain mechanism.** SHA‑1 `data_hash` (`classifier.py:124`, digest `:161`); reuse short‑circuit `if self.data_hash and new_data_hash == self.data_hash:` `:163` → `return False` `:164`; retrain sets `self.data_hash = new_data_hash` `:247` → `return True` `:249`.
-- [x] **Q1 — `train()` returns `True` then `False`.** `testDatasetHashing` `PASSED` (`test_classifier.py:141-142`); probe hashes `b41ce397…` (True) → same (False) → `2f0b4d6e…` (True after mutate).
+- [x] **Q1 — `train()` returns `True` then `False`.** `testDatasetHashing` `PASSED` (`test_classifier.py:141-142`); probe hashes `b41ce397…` (True) → same (False) → `1c7c836d…` (True after mutate).
 - [x] **Q1 — `FORMAT_VERSION 7`.** Observed `Q1PROBE FORMAT_VERSION=7` (`classifier.py:63`).
 - [x] **Q1 — `load_classifier()` returns `None` when the model file is absent.** Observed `MODEL_FILE_exists=False` → `load_classifier_returns=None` (`classifier.py:30-36`).
 - [x] **Q1 — DirectoriesMixin per‑test `MODEL_FILE` isolation.** `utils.py:45,72`; DB rollback per `TestCase`.
@@ -518,8 +1197,8 @@ Each item below was addressed above with its own verbatim evidence and an exact 
 - [x] **Q4(b) — default `"PATCHT"` trigger + per‑sample lists.** `settings.py:506`; observed `patch-code-t.pdf→[0]`, `simple.pdf→[]`, `patch-code-t-middle.pdf→[1]`, `several-patcht-codes.pdf→[2, 5]`, `patch-code-t-middle_reverse.pdf→[1]`, `patch-code-t-qr.pdf→[0]`; custom cases `barcode-39-custom.pdf→[]`(PATCHT)/`[0]`(CUSTOM BARCODE), `barcode-qr-custom.pdf→[0]`, `barcode-128-custom.pdf→[0]`.
 - [x] **Q4(c) — decision site.** `if separator_barcode in current_barcodes:` `tasks.py:108`; `scan_file_for_separating_barcodes` `:96`; `barcode_reader` `:75` (`pyzbar.decode` `:82`); `consume_file` `:184` (gate `:195`, scan `:198`, split `:201`, `save_to_dir` `:210`).
 - [x] **Q4(d) — training‑data impact.** Re‑consumption → `N+1` `Document` rows → training‑set count (`classifier.py:125`) → SHA‑1 `data_hash` (`:161-164`) → retrain; empirically linked via Q1 probe's `3→4` hash change.
-- [x] **Non‑determinism — both vectors named + magnitude + which reproduced.** Vector 1 `MLPClassifier(tol=0.01)` no `random_state` (`classifier.py:219/227/238`) — confirmed real (`random_state=None`, weights differ, `max_abs_diff=0.433783`) but 0 deviations at N=100/N=200 and 0 failures over 50× each real test; Vector 2 xdist (`setup.cfg:10`) — 10/10 serial and 10/10 parallel, no difference. Diagnose‑only (nothing modified).
-- [x] **Read‑only mandate + cleanup.** Temporary `blitzy_adhoc_test_*` scripts removed; only this document added (verified via `git status`).
+- [x] **Non‑determinism — both vectors named + magnitude + which reproduced.** Vector 1 `MLPClassifier(tol=0.01)` no `random_state` (`classifier.py:219/227/238`) — confirmed real (`random_state=None`, weights differ, `max_abs_diff` varies run‑to‑run, e.g. `0.484841`) but 0 deviations at N=100/N=200 and 0 failures over 50× each real test; Vector 2 xdist (`setup.cfg:10`) — 10/10 serial and 10/10 parallel, no difference. Diagnose‑only (nothing modified).
+- [x] **Read‑only mandate + cleanup.** All three temporary `blitzy_adhoc_test_*` probe scripts removed from the container; source tree left unchanged. Proven by the pasted `git status --porcelain` / `git diff --stat` / artifact‑search output in **§ Cleanup & read‑only verification** below (both git commands return empty; no probe/log/cache artifacts remain in the source tree).
 
 ### Notes on values reported exactly as observed (not adjusted)
 
@@ -527,4 +1206,71 @@ Each item below was addressed above with its own verbatim evidence and an exact 
 - `predict_correspondent` returns a NumPy `array([1])` (not a scalar `1`).
 - The non‑determinism vectors are **real in the code** yet **did not reproduce a failure** at the magnitudes run; this is reported as observed rather than forced toward an expected "flaky" outcome. The precise real‑world trigger could not be reproduced at the attempted scale and is flagged as such.
 - Barcode logic resides in `src/documents/tasks.py` at this commit (not a separate `barcodes.py` module).
+
+---
+
+## Cleanup & read‑only verification (source tree unchanged)
+
+The investigation used three temporary probe scripts inside the container (`documents/tests/blitzy_adhoc_test_probe.py`, `documents/tests/blitzy_adhoc_test_barcode_probe.py`, `paperless_tesseract/tests/blitzy_adhoc_test_ocr_probe.py`). Per the read‑only mandate they were **deleted after evidence capture**, and no existing source file was modified. This is proven below with verbatim command output run inside the container against the source repo at `/app`.
+
+**Claim — the three temporary probe scripts were the only untracked additions, and they were removed.** Before removal, `git status --porcelain` listed exactly the three probes; the removal command deleted all three:
+
+```bash
+docker exec -u testuser -w /app/src paperless bash -c '
+  rm -v documents/tests/blitzy_adhoc_test_barcode_probe.py \
+        documents/tests/blitzy_adhoc_test_probe.py \
+        paperless_tesseract/tests/blitzy_adhoc_test_ocr_probe.py'
+```
+
+```text
+removed 'documents/tests/blitzy_adhoc_test_barcode_probe.py'
+removed 'documents/tests/blitzy_adhoc_test_probe.py'
+removed 'paperless_tesseract/tests/blitzy_adhoc_test_ocr_probe.py'
+```
+
+**Claim — after cleanup, `git status --porcelain` is empty (working tree clean, nothing added or modified).** Producing command and its (empty) output:
+
+```bash
+docker exec -u testuser -w /app paperless git status --porcelain
+```
+
+```text
+```
+
+(No lines printed — the working tree is clean.)
+
+**Claim — `git diff --stat` is empty (no tracked source file was modified).** Producing command and its (empty) output:
+
+```bash
+docker exec -u testuser -w /app paperless git diff --stat
+```
+
+```text
+```
+
+(No lines printed — zero files changed.)
+
+**Claim — no temporary probe scripts, logs, or coverage/cache artifacts remain in the source tree.** Producing command and its (empty) output:
+
+```bash
+docker exec -u testuser -w /app paperless bash -c \
+  'find /app/src \( -name "blitzy_adhoc_test_*" -o -name "*_probe.py" -o -name ".pytest_cache" -o -name "htmlcov" -o -name ".coverage" \) 2>/dev/null'
+```
+
+```text
+```
+
+(No lines printed — the git‑ignored `src/.pytest_cache` produced by test runs was also removed; the only git‑ignored runtime file, `/app/data/log/paperless.log`, lives under `/data/` — excluded by `.gitignore:83` and outside the source tree, and is a runtime log, not a repository file.)
+
+**Claim — the source repo remains at the pristine pinned commit `542221a38`.** Producing command and output:
+
+```bash
+docker exec -u testuser -w /app paperless git rev-parse --short HEAD
+```
+
+```text
+542221a38
+```
+
+Both git commands return empty and the artifact search finds nothing, confirming the paperless‑ngx source repository is left **exactly** as found (read‑only mandate satisfied). The sole artifact produced by this task is this documentation file, `blitzy/documentation/paperless-ngx_542221a38dff.md`, which is added in the **destination** repository — not in the source tree verified above.
 
