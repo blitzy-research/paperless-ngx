@@ -5,9 +5,11 @@
 
 **How the evidence was produced.** The full stack was built and run at the pinned commit inside the provided Docker image `paperless-ngx-ready:542221a38dff` (derived from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01`), which pins Python 3.9 — `Dockerfile:L18` `FROM python:3.9-slim-bullseye as main-app`. A separate `redis:6` container provided the broker + channel layer. Every behavioral claim below is paired with **one verbatim observed line** and the **command that produced it**, and every literal (string, config key, path, cadence, number) carries a `file:line` citation. Each quoted log line is labelled with its **sink**: `stdout`, `data/log/paperless.log`, or `data/log/mail.log`.
 
-> **Read-only / clean-tree statement.** No existing source file was modified. All observation was performed in a throwaway container and with temporary capture files kept **outside** the repository tree. The only file added to the repository is this document. `git status --porcelain` at the end shows exactly one new entry: `?? blitzy/documentation/paperless-ngx_542221a38dff.md`.
+> **Read-only / clean-tree statement.** No existing source file was modified. All observation was performed in a throwaway container and with temporary capture files kept **outside** the repository tree. The only change introduced to the repository is this one document, committed on the working branch; every temporary artifact (the throwaway observation container and the host-side capture files) was created outside the repository tree and removed afterward. This is verified with the commands captured in §6: `git diff --name-status 542221a38dff..HEAD` shows exactly one entry — `A blitzy/documentation/paperless-ngx_542221a38dff.md` — and, with the deliverable committed, `git status --porcelain` is empty (a clean working tree).
 
 > **Three citation corrections** (the plan's prose drifted; the runtime-verified lines below are authoritative, re-verified with `grep -n`): the Redis reconnection string is at `docker/wait-for-redis.py:L41` (not L44); `PAPERLESS_WORKER_TIMEOUT` default `1800` is at `src/paperless/settings.py:L440` (not L444); the root console handler is `src/paperless/settings.py:L407` with the `loggers` block at `L408`–`L410` (not L406–L411).
+
+> **Citation convention.** Two kinds of `file:line` citations appear in this document. **(1) Repository files** are cited by their repo-relative path (for example `src/paperless/settings.py:L407`, `docker/wait-for-redis.py:L41`, `docker/docker-entrypoint.sh:L77`); these resolve in the source tree at the pinned commit `542221a38dff`. **(2) Installed dependency-package internals** are cited with a `django_q/` prefix (for example `django_q/cluster.py:L410`, `django_q/conf.py:L207`, `django_q/humanhash.py:L364`) — these are **not** repository files but source lines of the pinned dependency **`django-q==1.3.9`** (`requirements.txt:L37`; verified at runtime `import django_q; django_q.VERSION == (1, 3, 9)`), installed in this image at the runtime path `/usr/local/lib/python3.9/site-packages/django_q/`. django-q emits every `[Q]` log line quoted below, so its cluster/scheduler internals are cited to explain those lines; the official django-q 1.3 documentation is used only for interpretation (noted where it appears).
 
 ---
 
@@ -41,9 +43,45 @@ On a normal container boot the entrypoint prints a banner and then runs the prep
 
 - `docker/docker-entrypoint.sh:L77` `echo "Paperless-ngx docker container starting..."`
 - `docker/docker-prepare.sh:L66` `do_work()` runs, in order: DBHOST check (`L67`) → `wait_for_redis` (`L71`) → `migrations` (`L73`) → `search_index` (`L75`) → `superuser` (`L77`); invoked at `L81`.
-- `migrations()` prints `docker/docker-prepare.sh:L44` `echo "Apply database migrations..."`.
+- `migrations()` prints `docker/docker-prepare.sh:L44` `echo "Apply database migrations..."` then runs `python3 manage.py migrate` (`docker/docker-prepare.sh:L45`).
 
-`python3 manage.py migrate` is what **materializes the four django-q `Schedule` rows** (Section 3). In this environment the image already carries a migrated `db.sqlite3`, so migrations were a no-op; the four schedules were verified present (below). The three programs were then launched directly (the image places the repository at `/app`, not `/usr/src/paperless`, so the stock command in `docker/supervisord.conf:L11` — `gunicorn -c /usr/src/paperless/gunicorn.conf.py …` — was run against the real path `-c /app/gunicorn.conf.py`; the process identities are otherwise identical to the supervisord programs).
+**Observed — the entrypoint banner (sink `stdout`).** Running the real entrypoint in the observation container prints the banner verbatim, then the stock `initialize()` step stops under `set -e` because this prepared image runs as `testuser` and has no `paperless` OS user (it bakes the repo at `/app` and runs as `testuser` instead of performing the stock root→`paperless` remap). Reported exactly as observed:
+
+```text
+$ docker exec pl-idle-obs bash -lc 'cd /app/src && bash /app/docker/docker-entrypoint.sh /bin/true'
+Paperless-ngx docker container starting...
+id: ‘paperless’: no such user
+```
+
+The banner line (`docker/docker-entrypoint.sh:L77`) is emitted before the stop; the missing-`paperless`-user abort is an artifact of this prepared image and does not affect the idle observation, which launches the three programs directly (below).
+
+**Observed — the prepare/migration path (sink `stdout`).** Running the real prepare script reproduces the `wait_for_redis` → `migrations` sequence verbatim. (To run the stock script unchanged, two throwaway-container symlinks were created — `/usr/src/paperless → /app` and `/sbin/wait-for-redis.py → /app/docker/wait-for-redis.py` — because the image places the repo at `/app`; these are container-filesystem links, not repository changes.)
+
+```text
+$ docker exec -u testuser -w /app/src -e PAPERLESS_REDIS=redis://paperless-redis:6379 \
+    pl-idle-obs bash -lc 'bash /app/docker/docker-prepare.sh'
+Waiting for Redis: redis://paperless-redis:6379
+Connected to Redis broker: redis://paperless-redis:6379
+Apply database migrations...
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
+Running migrations:
+  No migrations to apply.
+Search index out of date. Updating...
+```
+
+This surfaces both required startup banners as **observed output**: the Redis-readiness line `Connected to Redis broker: …` (`docker/wait-for-redis.py:L41`) and the migration banner `Apply database migrations...` (`docker/docker-prepare.sh:L44`). `No migrations to apply.` confirms the baked `db.sqlite3` already carries every migration — so the four django-q `Schedule` rows already exist (proven in §1.3). A direct `python3 manage.py migrate` reproduces the same no-op:
+
+```text
+$ docker exec -u testuser -w /app/src -e PAPERLESS_REDIS=redis://paperless-redis:6379 \
+    pl-idle-obs bash -lc 'python3 manage.py migrate'
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
+Running migrations:
+  No migrations to apply.
+```
+
+`python3 manage.py migrate` is what **materializes the four django-q `Schedule` rows** (Section 3). As the observed `No migrations to apply.` above confirms, the image already carries a fully-migrated `db.sqlite3`, so migration was a no-op and the four schedules were already present (verified in §1.3). The three programs were then launched directly (the image places the repository at `/app`, not `/usr/src/paperless`, so the stock command in `docker/supervisord.conf:L11` — `gunicorn -c /usr/src/paperless/gunicorn.conf.py …` — was run against the real path `-c /app/gunicorn.conf.py`; the process identities are otherwise identical to the supervisord programs).
 
 **Launch commands (workdir `/app/src`, user `testuser`), stdout captured to `/tmp/obs/*.log` (outside the repo):**
 
@@ -73,17 +111,24 @@ The schedule-type codes are django-q's: `H`=HOURLY, `D`=DAILY, `W`=WEEKLY, `I`=M
 
 ### 1.4 Definition of "idle" and the three proofs
 
-**Idle** here means: all three programs RUNNING **and** migrations applied **and** the consumption directory empty **and** the task queue drained. (Note: the image shipped with two leftover PDFs baked into `/app/consume`; they were removed before starting the consumer so the system is genuinely document-free. Removing runtime data inside a throwaway container is not a source-file change.)
+**Idle** here means: all three programs RUNNING **and** migrations applied **and** the consumption directory empty **and** the task queue drained. (Note: the image bakes two leftover sample PDFs into `/app/consume` — `patch-code-t-middle_document_0.pdf` and `patch-code-t-middle_document_1.pdf` (8156 bytes each) — which were removed before starting the consumer so the system is genuinely document-free. Removing runtime data inside a throwaway container is not a source-file change.)
 
 **(a) All three programs RUNNING** — command + verbatim (sink `stdout`):
 
 ```text
-$ docker exec pl-idle-obs bash -lc 'ps -eo pid,ppid,user,args | grep -E "gunicorn|manage.py" | grep -v grep'
-     95       0 testuser python3 -u manage.py qcluster
-    102       0 testuser python3 -u manage.py document_consumer
-    109       0 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
-    119     109 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
-    124     109 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+$ docker exec pl-idle-obs bash -lc 'ps axf -o pid,ppid,user,args | grep -E "qcluster|document_consumer|gunicorn" | grep -v grep'
+    115       0 testuser bash -lc gunicorn -c /app/gunicorn.conf.py paperless.asgi:application > /tmp/obs/gunicorn.log 2>&1
+    122     115 testuser  \_ /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    126     122 testuser      \_ /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    130     122 testuser      \_ /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    107       0 testuser bash -lc python3 -u manage.py document_consumer > /tmp/obs/consumer.log 2>&1
+    114     107 testuser  \_ python3 -u manage.py document_consumer
+     99       0 testuser bash -lc python3 -u manage.py qcluster > /tmp/obs/qcluster.log 2>&1
+    106      99 testuser  \_ python3 -u manage.py qcluster
+    142     106 testuser      \_ python3 -u manage.py qcluster
+    144     142 testuser          \_ python3 -u manage.py qcluster
+    148     142 testuser          \_ python3 -u manage.py qcluster
+    ...            (13 children of PID 142 in total: 11 workers + monitor + pusher; full qcluster tree in §3.1)
 ```
 
 **(b) Consumption directory empty** (sustained; `src/paperless/settings.py:L78` `CONSUMPTION_DIR`) — command + verbatim (sink `stdout`):
@@ -91,7 +136,7 @@ $ docker exec pl-idle-obs bash -lc 'ps -eo pid,ppid,user,args | grep -E "gunicor
 ```text
 $ docker exec pl-idle-obs bash -lc 'ls -la /app/consume'
 total 12
-drwxr-sr-x 1 testuser testuser 4096 Jul  1 22:08 .
+drwxr-sr-x 1 testuser testuser 4096 Jul  1 23:53 .
 drwxr-sr-x 1 testuser testuser 4096 Jul  1 21:23 ..
 ```
 
@@ -153,48 +198,48 @@ The ASGI application itself routes both protocols even while idle — `src/paper
 The `qcluster` program is not one process; the **sentinel/guard** forks a pool of workers plus a monitor and a pusher. **Command + verbatim forest** (sink `stdout`):
 
 ```text
-$ docker exec pl-idle-obs bash -lc 'ps axf -o pid,ppid,user,args | grep qcluster | head'
-     95       0 testuser python3 -u manage.py qcluster
-    133      95 testuser  \_ python3 -u manage.py qcluster
-    146     133 testuser      \_ python3 -u manage.py qcluster
-    147     133 testuser      \_ python3 -u manage.py qcluster
-    148     133 testuser      \_ python3 -u manage.py qcluster
-    149     133 testuser      \_ python3 -u manage.py qcluster
-    150     133 testuser      \_ python3 -u manage.py qcluster
-    151     133 testuser      \_ python3 -u manage.py qcluster
-    ...            (13 children of PID 133 in total)
+$ docker exec pl-idle-obs bash -lc 'ps axf -o pid,ppid,user,args | grep "manage.py qcluster" | grep -v grep | head'
+     99       0 testuser bash -lc python3 -u manage.py qcluster > /tmp/obs/qcluster.log 2>&1
+    106      99 testuser  \_ python3 -u manage.py qcluster
+    142     106 testuser      \_ python3 -u manage.py qcluster
+    144     142 testuser          \_ python3 -u manage.py qcluster
+    148     142 testuser          \_ python3 -u manage.py qcluster
+    151     142 testuser          \_ python3 -u manage.py qcluster
+    152     142 testuser          \_ python3 -u manage.py qcluster
+    153     142 testuser          \_ python3 -u manage.py qcluster
+    ...            (13 children of PID 142 in total)
 ```
 
 These roles are confirmed by the django-q startup lines the cluster emitted (sink `stdout`, `/tmp/obs/qcluster.log`). All `[Q]` strings are library-emitted by **django-q 1.3.9** (`requirements.txt:L37` `django-q==1.3.9`; verified at runtime: `import django_q; django_q.VERSION == (1, 3, 9)`):
 
 ```text
-22:08:58 [Q] INFO Q Cluster hotel-social-mississippi-cardinal starting.
-22:08:58 [Q] INFO Process-1:1 ready for work at 139
-22:08:58 [Q] INFO Process-1:2 ready for work at 140
-22:08:58 [Q] INFO Process-1:3 ready for work at 141
-22:08:58 [Q] INFO Process-1:4 ready for work at 142
-22:08:58 [Q] INFO Process-1:5 ready for work at 143
-22:08:58 [Q] INFO Process-1:6 ready for work at 144
-22:08:58 [Q] INFO Process-1:7 ready for work at 145
-22:08:58 [Q] INFO Process-1:8 ready for work at 146
-22:08:58 [Q] INFO Process-1:9 ready for work at 147
-22:08:58 [Q] INFO Process-1:10 ready for work at 148
-22:08:58 [Q] INFO Process-1:11 ready for work at 149
-22:08:58 [Q] INFO Process-1:12 monitoring at 150
-22:08:58 [Q] INFO Process-1 guarding cluster hotel-social-mississippi-cardinal
-22:08:58 [Q] INFO Process-1:13 pushing tasks at 151
-22:08:58 [Q] INFO Q Cluster hotel-social-mississippi-cardinal running.
+23:53:56 [Q] INFO Q Cluster apart-maine-zebra-charlie starting.
+23:53:56 [Q] INFO Process-1:1 ready for work at 144
+23:53:56 [Q] INFO Process-1:2 ready for work at 148
+23:53:56 [Q] INFO Process-1:3 ready for work at 151
+23:53:56 [Q] INFO Process-1:4 ready for work at 152
+23:53:56 [Q] INFO Process-1:5 ready for work at 153
+23:53:56 [Q] INFO Process-1:6 ready for work at 154
+23:53:56 [Q] INFO Process-1:7 ready for work at 155
+23:53:56 [Q] INFO Process-1:8 ready for work at 156
+23:53:56 [Q] INFO Process-1:9 ready for work at 157
+23:53:56 [Q] INFO Process-1:10 ready for work at 158
+23:53:56 [Q] INFO Process-1:11 ready for work at 159
+23:53:56 [Q] INFO Process-1:12 monitoring at 160
+23:53:56 [Q] INFO Process-1 guarding cluster apart-maine-zebra-charlie
+23:53:56 [Q] INFO Process-1:13 pushing tasks at 161
+23:53:56 [Q] INFO Q Cluster apart-maine-zebra-charlie running.
 ```
 
 Reading the tree against those lines:
 
-- **11 worker processes** — `Process-1:1 … Process-1:11 ready for work at 139…149`. This equals `TASK_WORKERS`, verified at runtime `TASK_WORKERS = 11` (`src/paperless/settings.py:L438` = `TASK_WORKERS`; `L455` `"workers": TASK_WORKERS`). django-q emits this line from `cluster.py:L410` template `"{name} ready for work at {pid}"`.
-- **1 monitor** — `Process-1:12 monitoring at 150` (`cluster.py:L378`). It writes task results back to the DB/broker.
-- **1 pusher** — `Process-1:13 pushing tasks at 151` (`cluster.py:L342`). It pulls queued tasks off Redis into the worker pool.
-- **1 sentinel / guard** — `Process-1 guarding cluster …` (`cluster.py:L256`); this is PID `133`, the parent of the pool. The **scheduler runs inside this guard loop** — there is no separate scheduler process (`cluster.py:L262` `def guard`).
-- **Cluster ready** — `Q Cluster … running.` (`cluster.py:L261`) is the completion marker.
+- **11 worker processes** — `Process-1:1 … Process-1:11 ready for work` at observed PIDs `144, 148, 151, 152, 153, 154, 155, 156, 157, 158, 159`. This equals `TASK_WORKERS`, verified at runtime `TASK_WORKERS = 11` (`src/paperless/settings.py:L438` = `TASK_WORKERS`; `L455` `"workers": TASK_WORKERS`). django-q emits this line from `django_q/cluster.py:L410` template `"{name} ready for work at {pid}"`.
+- **1 monitor** — `Process-1:12 monitoring at 160` (`django_q/cluster.py:L378`). It writes task results back to the DB/broker.
+- **1 pusher** — `Process-1:13 pushing tasks at 161` (`django_q/cluster.py:L342`). It pulls queued tasks off Redis into the worker pool.
+- **1 sentinel / guard** — `Process-1 guarding cluster …` (`django_q/cluster.py:L256`); this is PID `142`, the parent of the worker pool (forked from the `manage.py qcluster` master, PID `106`). The **scheduler runs inside this guard loop** — there is no separate scheduler process (`django_q/cluster.py:L253` `def guard`).
+- **Cluster ready** — `Q Cluster … running.` (`django_q/cluster.py:L261`) is the completion marker.
 
-> **Observed nuance — cluster display name is NOT `paperless`.** The startup/running lines show `hotel-social-mississippi-cardinal`, even though `Q_CLUSTER["name"]="paperless"` (`src/paperless/settings.py:L450`). This is not a misconfiguration: in django-q 1.3.9 the *displayed* name is `Cluster.name` → `humanize(self.cluster_id.hex)` (`cluster.py:L110`–`L111`; `humanhash.py:L364`), a **random human-readable id generated per cluster run**; the startup line uses it (`cluster.py:L79` `f"Q Cluster {self.name} starting."`) as does the running line (`cluster.py:L261`). `Q_CLUSTER["name"]="paperless"` is the *internal* cluster identifier (Redis key / stat identity), not the log display name. A second cluster start later in this run produced a *different* random name (`edward-berlin-stairway-hot`, §5.3), confirming the behavior. Reported exactly as observed.
+> **Observed nuance — cluster display name is NOT `paperless`.** The startup/running lines show `apart-maine-zebra-charlie`, even though `Q_CLUSTER["name"]="paperless"` (`src/paperless/settings.py:L450`). This is not a misconfiguration: in django-q 1.3.9 the *displayed* name is `Cluster.name` → `humanize(self.cluster_id.hex)` (`django_q/cluster.py:L110`–`L111`; `django_q/humanhash.py:L364`), a **random human-readable id generated per cluster run**; the startup line uses it (`django_q/cluster.py:L79` `f"Q Cluster {self.name} starting."`) as does the running line (`django_q/cluster.py:L261`). `Q_CLUSTER["name"]="paperless"` is the *internal* cluster identifier (Redis key / stat identity), not the log display name. A second cluster start later in this run produced a *different* random name (`pip-lactose-sink-jupiter`, §5.3), confirming the behavior. Reported exactly as observed.
 
 ### 3.2 Why `[Q]` lines look different from Paperless's own log lines
 
@@ -211,18 +256,18 @@ Paperless's own loggers instead use the verbose format `"[{asctime}] [{levelname
 All four are created by data migrations and were dumped live in §1.3. **All four were also observed executing** in the initial catch-up burst (their pre-baked `next_run` values were overdue and `catch_up=False`, so each fired exactly once shortly after cluster start) — command + verbatim (sink `stdout`, `/tmp/obs/qcluster.log`):
 
 ```text
-22:09:28 [Q] INFO Enqueued 1
-22:09:28 [Q] INFO Process-1 created a task from schedule [Train the classifier]
-22:09:28 [Q] INFO Process-1:1 processing [foxtrot-ohio-black-illinois]
-22:09:28 [Q] INFO Enqueued 1
-22:09:28 [Q] INFO Process-1 created a task from schedule [Optimize the index]
-22:09:28 [Q] INFO Process-1:2 processing [oxygen-romeo-comet-sweet]
-22:09:28 [Q] INFO Enqueued 1
-22:09:28 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
-22:09:28 [Q] INFO Process-1:3 processing [item-indigo-music-victor]
-22:09:28 [Q] INFO Enqueued 1
-22:09:28 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:09:28 [Q] INFO Process-1:4 processing [moon-comet-yellow-aspen]
+23:54:25 [Q] INFO Enqueued 1
+23:54:25 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+23:54:25 [Q] INFO Process-1:1 processing [mike-sixteen-xray-steak]
+23:54:25 [Q] INFO Enqueued 1
+23:54:25 [Q] INFO Process-1 created a task from schedule [Optimize the index]
+23:54:25 [Q] INFO Process-1:2 processing [oranges-mexico-hamper-alaska]
+23:54:25 [Q] INFO Enqueued 1
+23:54:25 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
+23:54:25 [Q] INFO Process-1:3 processing [equal-arizona-edward-october]
+23:54:25 [Q] INFO Enqueued 1
+23:54:25 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+23:54:25 [Q] INFO Process-1:4 processing [pizza-queen-mars-neptune]
 ```
 
 | # | Schedule name (verbatim) | Task function | Cadence | Migration `file:line` |
@@ -237,12 +282,17 @@ All four are created by data migrations and were dumped live in §1.3. **All fou
 ```text
 $ python3 manage.py shell -c "from django_q.models import Task
 for t in Task.objects.all().order_by('started'):
-    print(t.func,'| success='+str(t.success),'| result='+repr(t.result))"
-documents.tasks.train_classifier              | success=True | result=None
-documents.tasks.index_optimize                | success=True | result=None
-documents.tasks.sanity_check                  | success=True | result='No issues detected.'
-paperless_mail.tasks.process_mail_accounts    | success=True | result='No new documents were added.'
+    print(str(t.started)[:19],'|',t.func,'| success='+str(t.success),'| result='+repr(t.result))"
+2026-07-01 23:54:25 | documents.tasks.train_classifier           | success=True | result=None
+2026-07-01 23:54:25 | documents.tasks.index_optimize             | success=True | result=None
+2026-07-01 23:54:25 | documents.tasks.sanity_check               | success=True | result='No issues detected.'
+2026-07-01 23:54:25 | paperless_mail.tasks.process_mail_accounts | success=True | result='No new documents were added.'
+2026-07-01 23:57:26 | paperless_mail.tasks.process_mail_accounts | success=True | result='No new documents were added.'
+2026-07-02 00:07:27 | paperless_mail.tasks.process_mail_accounts | success=True | result='No new documents were added.'
+2026-07-02 00:17:29 | paperless_mail.tasks.process_mail_accounts | success=True | result='No new documents were added.'
 ```
+
+The four rows dated `23:54:25` are the one-time catch-up burst (all four schedules); the three later `process_mail_accounts` rows (`23:57:26`, `00:07:27`, `00:17:29`) are the recurring 10-minute mail checks measured in §4. Every idle result is a success no-op.
 
 - `train_classifier` returns `None` and logs nothing on a fresh install: it **early-returns** when no Tag/DocumentType/Correspondent has `MATCH_AUTO` (`src/documents/tasks.py:L48`, condition `L50-L52`).
 - `index_optimize` returns `None`; it commits a Whoosh optimize (`src/documents/tasks.py:L32`, `writer.commit(optimize=True)` `L35`).
@@ -271,11 +321,11 @@ $ python3 manage.py shell -c "from django.conf import settings; print(settings.Q
 This corresponds to `catch_up: False` (`L451`), `name: "paperless"` (`L450`), `timeout` (`L454` = `PAPERLESS_WORKER_TIMEOUT` default `1800`, `src/paperless/settings.py:L440`), and `workers` (`L455` = `TASK_WORKERS`, `L438`). The recycle is visible immediately after the catch-up burst (sink `stdout`):
 
 ```text
-22:09:28 [Q] INFO recycled worker Process-1:1
-22:09:28 [Q] INFO Process-1:14 ready for work at 176
+23:54:26 [Q] INFO recycled worker Process-1:1
+23:54:26 [Q] INFO Process-1:14 ready for work at 294
 ```
 
-The worker index keeps climbing (`Process-1:14`, `:15`, …) while the **pool size stays fixed at 11** — recycling replaces a worker rather than growing the pool.
+The worker index keeps climbing (`Process-1:14`, `:15`, …) while the **pool size stays fixed at 11** — recycling replaces a worker rather than growing the pool. Observed verbatim, the four catch-up workers were each replaced: `recycled worker Process-1:1 → Process-1:14 ready for work at 294`, `:3 → :15 at 295`, `:2 → :16 at 296`, `:4 → :17 at 297`.
 
 
 ---
@@ -284,71 +334,127 @@ The worker index keeps climbing (`Process-1:14`, `:15`, …) while the **pool si
 
 ### 4.1 How the frequency was measured
 
-The idle stack was kept running from **22:08:57 to ~22:48** (~**39 minutes**, well over the 20-minute minimum). Cadence was derived from the timestamps django-q prints on each `[Q]` line (`%H:%M:%S`, §3.2). The single most important empirical finding: **between scheduled task fires, `stdout` is completely silent.** The `qcluster.log` line count was frozen for the entire gap between fires:
+The idle stack was kept running from cluster start **23:53:56 to the Redis interrupt at 00:17:45** — **~24 minutes** of continuous idle observation, well over the 20-minute minimum, during which the 10-minute mail task recurred **three** times (`23:57:26`, `00:07:27`, `00:17:29` — see §4.2). Cadence was derived from the timestamps django-q prints on each `[Q]` line (`%H:%M:%S`, §3.2). The single most important empirical finding: **between scheduled task fires, `stdout` is completely silent.**
+
+To prove this, `qcluster.log`'s line count was sampled once per minute for the whole window with an explicit background sampler (the exact command that produced the timeline, sink `stdout`):
 
 ```text
-# line count of /tmp/obs/qcluster.log, sampled over time (sink stdout)
-22:09:29  -> 45 lines   (after startup + catch-up burst)
-22:12:37  -> 45 lines   (no change: 3 min silent)
-22:17:29  -> 52 lines   (mail fire #1 appended 7 lines)
-22:23:40  -> 52 lines   (no change: 6 min silent)
-22:27:31  -> 59 lines   (mail fire #2)
-22:34:15  -> 59 lines   (no change)
-22:37:32  -> 66 lines   (mail fire #3)
+$ docker exec -d pl-idle-obs bash -lc \
+    'for i in $(seq 1 44); do printf "%s -> %s lines\n" \
+       "$(date +%H:%M:%S)" "$(wc -l < /tmp/obs/qcluster.log)" \
+       >> /tmp/obs/linecount_samples.txt; sleep 60; done'
+$ docker exec pl-idle-obs bash -lc 'cat /tmp/obs/linecount_samples.txt'
+23:54:25 -> 16 lines
+23:55:25 -> 45 lines
+23:56:25 -> 45 lines
+23:57:25 -> 45 lines
+23:58:25 -> 52 lines
+23:59:25 -> 52 lines
+00:00:25 -> 52 lines
+00:01:25 -> 52 lines
+00:02:25 -> 52 lines
+00:03:25 -> 52 lines
+00:04:25 -> 52 lines
+00:05:25 -> 52 lines
+00:06:25 -> 52 lines
+00:07:25 -> 52 lines
+00:08:25 -> 59 lines
+00:09:25 -> 59 lines
+00:10:25 -> 59 lines
+00:11:25 -> 59 lines
+00:12:25 -> 59 lines
+00:13:25 -> 59 lines
+00:14:25 -> 59 lines
+00:15:25 -> 59 lines
+00:16:25 -> 59 lines
+00:17:25 -> 59 lines
 ```
 
-Consequently the **~30-second django-q scheduler poll produces no log line** when nothing is due. That poll is real but silent: the guard loop calls `scheduler()` only when its accumulator crosses 30 s — `cluster.py:L283-L286` `counter += cycle; if counter >= 30 and Conf.SCHEDULER: counter = 0; scheduler(...)`, with `cycle = Conf.GUARD_CYCLE = 0.5` (`django_q/conf.py:L90`) — and `scheduler()` only emits a line (`created a task from schedule …`, `cluster.py:L669`) when a schedule's `next_run < now`.
+Reading this timeline: the count jumps `16 → 45` as the startup lines plus the one-time catch-up burst land, then sits **frozen at 45** for three minutes, jumps to **52** (the `23:57:26` mail fire appended exactly **7** lines, sampled at `23:58:25`), stays frozen for ten minutes, jumps to **59** (the `00:07:27` mail fire, +7, sampled at `00:08:25`), and again stays frozen for ten minutes. Each mail fire adds exactly 7 lines; nothing else is written between fires (samples lag a fire by up to ~60 s because sampling is at `:25` past each minute).
+
+Consequently the **~30-second django-q scheduler poll produces no log line** when nothing is due. That poll is real but silent: the guard loop calls `scheduler()` only when its accumulator crosses 30 s — `django_q/cluster.py:L283-L286` `counter += cycle; if counter >= 30 and Conf.SCHEDULER: counter = 0; scheduler(...)`, with `cycle = Conf.GUARD_CYCLE = 0.5` (`django_q/conf.py:L90`) — and `scheduler()` only emits a line (`created a task from schedule …`, `django_q/cluster.py:L669`) when a schedule's `next_run < now`.
 
 ### 4.2 The measured periodic-log inventory
 
-| Exact message string (verbatim) | Sink | Measured frequency | What it indicates | Evidence (verbatim line + command) |
+Each row's own producing command + verbatim evidence is given immediately below the table (E1–E4); no row relies on another section for its proof.
+
+| Exact message string (verbatim) | Sink | Measured frequency | What it indicates | Evidence |
 |---|---|---|---|---|
-| `Process-1 created a task from schedule [Check all e-mail accounts]` (plus the `Enqueued 1` / `processing` / `Processed` / `recycled worker` / `ready for work` burst) | `stdout` | **~10 min** — deltas `22:17:29→22:27:31 = 602 s` and `22:27:31→22:37:32 = 601 s` | The 10-minute mail check ran; it is the **only** recurring idle heartbeat on stdout, and proves scheduler + pusher + worker + monitor + recycle are all alive | two fire blocks + `grep` command below in §4.2 |
-| `recycled worker Process-1:N` → `Process-1:M ready for work at <pid>` | `stdout` | **once per task execution** (`recycle=1`) | Cluster self-maintenance: worker replaced after each task | fire blocks below (§4.2); also §3.5 |
-| `Q Cluster <name> running.` | `stdout` | **once per cluster start** (not periodic) | Cluster reached ready state | startup block in §3.1; restart block in §5.3 |
-| `Using inotify to watch directory for changes: /app/src/../consume` | `stdout` **and** `data/log/paperless.log` | **once at start** (not periodic), then silent | Consumer is ready and watching in inotify mode | `paperless.log` dump in §4.4; restart in §5.3 |
-| `Server is ready. Spawning workers` | `stdout` | **once per gunicorn start** (not periodic) | Web server ready | gunicorn block in §5.3 (`gunicorn.conf.py:L18`) |
-| (~30 s django-q scheduler poll) | — | **~30 s, but emits NO line** when nothing is due | Scheduler is alive; silent unless a schedule is due | frozen line-count timeline in §4.1 |
+| `Process-1 created a task from schedule [Check all e-mail accounts]` (with its `Enqueued 1` / `processing` / `Processed` / `recycled worker` / `ready for work` burst) | `stdout` | **~10 min** — consecutive-recurring deltas `23:57:26→00:07:27 = 601 s` and `00:07:27→00:17:29 = 602 s` | The **only** recurring idle heartbeat on stdout; proves scheduler + pusher + worker + monitor + recycle are all alive | **E1** |
+| `recycled worker Process-1:N` → `Process-1:M ready for work at <pid>` | `stdout` | **once per task execution** (`recycle=1`) | Cluster self-maintenance: a worker is replaced after each task | **E1** (in each fire block) |
+| `Q Cluster <name> running.` | `stdout` | **once per cluster start** (not periodic) | Cluster reached ready state | **E2** |
+| `Using inotify to watch directory for changes: /app/src/../consume` | `stdout` **and** `data/log/paperless.log` | **once at start** (not periodic), then silent | Consumer is ready and watching in inotify mode | **E3** |
+| `Server is ready. Spawning workers` | `stdout` | **once per gunicorn start** (not periodic) | Web server ready | **E4** |
+| (~30 s django-q scheduler poll) | — | **~30 s, but emits NO line** when nothing is due | Scheduler is alive; silent unless a schedule is due | frozen line-count timeline, §4.1 |
 
-**Evidence — two consecutive recurring mail fires (measured ~10 min apart), sink `stdout` (`/tmp/obs/qcluster.log`):**
-
-```text
-22:17:29 [Q] INFO Enqueued 1
-22:17:29 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:17:29 [Q] INFO Process-1:5 processing [grey-connecticut-bacon-december]
-22:17:29 [Q] INFO Process-1:5 stopped doing work
-22:17:29 [Q] INFO Processed [grey-connecticut-bacon-december]
-22:17:30 [Q] INFO recycled worker Process-1:5
-22:17:30 [Q] INFO Process-1:18 ready for work at 378
-```
-
-```text
-22:27:31 [Q] INFO Enqueued 1
-22:27:31 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:27:31 [Q] INFO Process-1:6 processing [october-vegan-hawaii-kilo]
-22:27:31 [Q] INFO Process-1:6 stopped doing work
-22:27:31 [Q] INFO Processed [october-vegan-hawaii-kilo]
-22:27:31 [Q] INFO recycled worker Process-1:6
-22:27:31 [Q] INFO Process-1:19 ready for work at 429
-```
-
-**Command used to extract every mail-fire timestamp** (sink `stdout`):
+**E1 — the recurring 10-minute mail heartbeat.** Command listing every schedule fire (sink `stdout`, `/tmp/obs/qcluster.log`):
 
 ```text
 $ docker exec pl-idle-obs bash -lc "grep 'created a task from schedule' /tmp/obs/qcluster.log"
-22:09:28 [Q] INFO Process-1 created a task from schedule [Train the classifier]
-22:09:28 [Q] INFO Process-1 created a task from schedule [Optimize the index]
-22:09:28 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
-22:09:28 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:17:29 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:27:31 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:37:32 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+23:54:25 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+23:54:25 [Q] INFO Process-1 created a task from schedule [Optimize the index]
+23:54:25 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
+23:54:25 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+23:57:26 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+00:07:27 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+00:17:29 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
 ```
+
+The four `23:54:25` lines are the one-time catch-up burst; the three `Check all e-mail accounts` lines at `23:57:26`, `00:07:27`, `00:17:29` are the recurring heartbeat — **deltas `601 s` and `602 s` ≈ 10 min** (the `23:54:25→23:57:26` gap of `181 s` is *not* the cadence: it is the phase-lock artifact discussed in §4.2.1). Two consecutive full fire blocks, verbatim (sink `stdout`), showing the whole per-fire burst including the `recycle=1` replacement:
+
+```text
+23:57:26 [Q] INFO Enqueued 1
+23:57:26 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+23:57:26 [Q] INFO Process-1:5 processing [oranges-four-monkey-bacon]
+23:57:26 [Q] INFO Process-1:5 stopped doing work
+23:57:26 [Q] INFO Processed [oranges-four-monkey-bacon]
+23:57:26 [Q] INFO recycled worker Process-1:5
+23:57:26 [Q] INFO Process-1:18 ready for work at 373
+```
+
+```text
+00:07:27 [Q] INFO Enqueued 1
+00:07:27 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+00:07:27 [Q] INFO Process-1:6 processing [rugby-leopard-hot-emma]
+00:07:27 [Q] INFO Process-1:6 stopped doing work
+00:07:27 [Q] INFO Processed [rugby-leopard-hot-emma]
+00:07:28 [Q] INFO recycled worker Process-1:6
+00:07:28 [Q] INFO Process-1:19 ready for work at 603
+```
+
+**E2 — cluster ready marker.** Command (sink `stdout`, `/tmp/obs/qcluster.log`):
+
+```text
+$ docker exec pl-idle-obs bash -lc "grep 'Q Cluster' /tmp/obs/qcluster.log"
+23:53:56 [Q] INFO Q Cluster apart-maine-zebra-charlie starting.
+23:53:56 [Q] INFO Q Cluster apart-maine-zebra-charlie running.
+```
+
+**E3 — consumer readiness.** Command (sink `data/log/paperless.log`):
+
+```text
+$ docker exec pl-idle-obs bash -lc 'grep inotify /app/data/log/paperless.log'
+[2026-07-01 23:53:56,076] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
+```
+
+**E4 — web-server readiness.** Command (sink `stdout`, `/tmp/obs/gunicorn.log`):
+
+```text
+$ docker exec pl-idle-obs bash -lc 'cat /tmp/obs/gunicorn.log'
+[2026-07-01 23:53:55 +0000] [122] [INFO] Starting gunicorn 20.1.0
+[2026-07-01 23:53:55 +0000] [122] [INFO] Listening at: http://0.0.0.0:8000 (122)
+[2026-07-01 23:53:55 +0000] [122] [INFO] Using worker: paperless.workers.ConfigurableWorker
+[2026-07-01 23:53:55 +0000] [122] [INFO] Server is ready. Spawning workers
+```
+
+#### 4.2.1 The mail cadence is phase-locked (reported exactly as observed)
+
+The first *recurring* fire (`23:57:26`) is only `181 s` after the catch-up fire (`23:54:25`), **not** ~600 s. This is expected and is reported honestly rather than smoothed: django-q's `MINUTES` schedule advances `next_run` to a fixed minute boundary derived from the pre-baked `next_run`, so recurring fires are phase-locked to that boundary (here ≈ `:X7:2x`). The **true cadence** is therefore the delta between *consecutive recurring* fires — `601 s` and `602 s` — while the catch-up→first-recurring gap is a one-off alignment step.
 
 ### 4.3 What does NOT appear periodically within the window (reported exactly)
 
-- **Hourly `Train the classifier`** did not recur inside the first ~20 min (its `next_run` after the catch-up fire was `22:47:18`). It **was** observed firing later at `22:47:36` (§5.4). On this clean system its task body is silent (`result=None`), so the only trace is the `[Q]` `created a task from schedule [Train the classifier]` / `processing` / `Processed` wrapper lines.
-- **Daily `Optimize the index`** (`next_run 2026-07-02`) and **Weekly `Perform sanity check`** (`next_run 2026-07-08`) will not recur within any ~20-min window; their cadence is stated from the migrations (§3.3). Both were, however, observed executing once in the catch-up burst (§3.3).
+- **Hourly `Train the classifier`** did not recur within the ~24-minute window: after the `23:54:25` catch-up fire its `next_run` advances by one hour to ≈ `00:54`, which is beyond the window (idle observation ended at the Redis interrupt, `00:17:45`). On this clean system its task body is silent (`result=None`, §3.3), so even when it does fire the only trace is the `[Q]` `created a task from schedule [Train the classifier]` / `processing` / `Processed` wrapper lines.
+- **Daily `Optimize the index`** (`next_run 2026-07-02`) and **Weekly `Perform sanity check`** (`next_run 2026-07-08`) will not recur within any ~24-min window; their cadence is stated from the migrations (§3.3). Both were, however, observed executing once in the catch-up burst (§3.3).
 
 ### 4.4 The `paperless.*` application sinks while idle
 
@@ -356,19 +462,22 @@ Only two application lines were written during the whole idle window, both from 
 
 ```text
 $ docker exec pl-idle-obs bash -lc 'cat /app/data/log/paperless.log'
-[2026-07-01 22:08:58,736] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
-[2026-07-01 22:09:28,429] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
+[2026-07-01 23:53:56,076] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
+[2026-07-01 23:54:25,767] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
 ```
 
-Both of these **also** appear on `stdout`. This is by design: the root logger routes to the `console` handler (`src/paperless/settings.py:L407` `"root": {"handlers": ["console"]}`, StreamHandler `L389`, level `INFO` when `DEBUG` is off `L388`, verbose formatter `L390`/`L378`), while the `paperless` logger additionally writes to `paperless.log` (`src/paperless/settings.py:L409` `"paperless": {"handlers": ["file_paperless"], …}`, file at `L395`). Because `disable_existing_loggers` is `False` (`L375`) and no logger sets `propagate=False`, records reach **both** the file handler and (via propagation to root) the console.
+The observed `Sanity checker detected no issues.` line is emitted by `src/documents/sanity_checker.py:L27` (`logger.info("Sanity checker detected no issues.")`); the `Using inotify to watch directory for changes: …` line is emitted by `src/documents/management/commands/document_consumer.py:L200`. Both of these **also** appear on `stdout`. This is by design: the root logger routes to the `console` handler (`src/paperless/settings.py:L407` `"root": {"handlers": ["console"]}`, StreamHandler `L389`, level `INFO` when `DEBUG` is off `L388`, verbose formatter `L390`/`L378`), while the `paperless` logger additionally writes to `paperless.log` (`src/paperless/settings.py:L409` `"paperless": {"handlers": ["file_paperless"], …}`, file at `L395`). Because `disable_existing_loggers` is `False` (`L375`) and no logger sets `propagate=False`, records reach **both** the file handler and (via propagation to root) the console.
 
 > **Observed nuance — `mail.log` is never created at idle.** The `paperless_mail` logger → `mail.log` (`src/paperless/settings.py:L410`, file at `L402`) never fired, so the file does not exist. Command + verbatim (sink `stdout`):
 >
 > ```text
 > $ docker exec pl-idle-obs bash -lc 'ls -la /app/data/log'
+> total 16
+> drwxr-sr-x 1 testuser testuser 4096 Jul  1 23:53 .
+> drwxr-sr-x 1 testuser testuser 4096 Jul  2 00:17 ..
 > -rw-r--r-- 1 testuser testuser    0 Jul  1 21:41 .__mail.lock
-> -rw-r--r-- 1 testuser testuser    0 Jul  1 22:09 .__paperless.lock
-> -rw-r--r-- 1 testuser testuser  226 Jul  1 22:09 paperless.log
+> -rw-r--r-- 1 testuser testuser    0 Jul  1 23:54 .__paperless.lock
+> -rw-r--r-- 1 testuser testuser  226 Jul  1 23:54 paperless.log
 > ```
 >
 > Note also that the mail task's logger is `getLogger("paperless.mail.tasks")` (`src/paperless_mail/tasks.py:L8`) — under the `paperless.*` hierarchy, so *if* it logged, it would land in `paperless.log`, not `mail.log`. At idle it emits nothing; `"No new documents were added."` is only a `Task.result` value (§3.3), never a log line in any sink.
@@ -381,17 +490,18 @@ The interrupt/restart steps are **reversible operational actions on running comp
 
 ### 5.1 Interrupting Redis — the broker-loss symptom
 
-**Action + timing** (host clock): `docker stop paperless-redis` at `22:42:16`, `docker start paperless-redis` at `22:43:03` (~47 s outage).
+**Action + timing** (host clock): `docker stop paperless-redis` at `00:17:45`, `docker start paperless-redis` at `00:18:31` (~46 s outage).
 
 While Redis was down, the running django-q pusher lost its broker connection. **Verbatim reaction** (sink `stdout`, `/tmp/obs/qcluster.log`):
 
 ```text
-22:42:26 [Q] INFO Process-1:13 stopped pushing tasks
+00:17:46 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+00:17:55 [Q] INFO Process-1:13 stopped pushing tasks
 ```
 
-(The full traceback showed `redis.exceptions.ConnectionError: Connection closed by server.` raised from `broker.dequeue()` → `blpop`, and once the container's DNS entry disappeared, `Error -5 connecting to paperless-redis:6379. No address associated with hostname.` The `stopped pushing tasks` line is from `cluster.py:L366`.)
+(The very first loss — logged via a full traceback rather than a single `[Q]` line — was `redis.exceptions.ConnectionError: Connection closed by server.` raised from `broker.dequeue()` → `blpop` at the moment of `docker stop`; once the stopped container's DNS entry disappeared, the pusher then flooded `Error -5 connecting to paperless-redis:6379. No address associated with hostname.` roughly twice a second until Redis returned. The `stopped pushing tasks` line is from `django_q/cluster.py:L366`.)
 
-> **Reported exactly — the `documents/tasks.py:L231` hint did NOT appear.** The code has `logger.warning("OSError. It could be, the broker cannot be reached.")` (`src/documents/tasks.py:L231`), but that lives inside `sanity_check`'s handler and only fires if a *document* task is running during broker loss. No document task was in flight during the interrupt, so it never triggered. Command + verbatim (sink `stdout`):
+> **Reported exactly — the `src/documents/tasks.py:L231` hint did NOT appear.** The code has `logger.warning("OSError. It could be, the broker cannot be reached.")` (`src/documents/tasks.py:L231`), but that lives inside `sanity_check`'s handler and only fires if a *document* task is running during broker loss. No document task was in flight during the interrupt, so it never triggered. Command + verbatim (sink `stdout`):
 >
 > ```text
 > $ docker exec pl-idle-obs bash -lc 'grep -rn "the broker cannot be reached" /tmp/obs/*.log /app/data/log/*.log || echo ABSENT'
@@ -411,15 +521,15 @@ Connected to Redis broker: redis://paperless-redis:6379
 - `"Waiting for Redis: {REDIS_URL}"` — `docker/wait-for-redis.py:L21`
 - `"Connected to Redis broker: {REDIS_URL}"` — **`docker/wait-for-redis.py:L41`** (corrected line; the plan text said L44). Related constants: `MAX_RETRY_COUNT=5` (`:L16`), `RETRY_SLEEP_SECONDS=5` (`:L17`); failure paths `"Redis ping #{attempt} failed, waiting {RETRY_SLEEP_SECONDS}s"` (`:L31`) and `"Failed to connect to: {REDIS_URL}"` (`:L38`).
 
-**The running cluster self-healed without a restart** — the guard reincarnated the dead pusher and it resumed once Redis returned. Verbatim (sink `stdout`):
+**The running cluster self-healed without a restart** — the guard reincarnated the dead pusher and it resumed once Redis returned. First self-heal cycle, verbatim (sink `stdout`):
 
 ```text
-22:43:05 [Q] INFO Process-1:21 stopped pushing tasks
-22:43:06 [Q] ERROR reincarnated pusher Process-1:21 after sudden death
-22:43:06 [Q] INFO Process-1:22 pushing tasks at 642
+00:17:55 [Q] INFO Process-1:13 stopped pushing tasks
+00:17:55 [Q] ERROR reincarnated pusher Process-1:13 after sudden death
+00:17:55 [Q] INFO Process-1:21 pushing tasks at 863
 ```
 
-`Process-1:22 pushing tasks at 642` (a fresh pusher PID) confirms the broker path is operational again.
+Reported exactly: the guard kept reincarnating the pusher (`Process-1:21`→`:22`→`:23`→`:24`→`:25`, fresh PIDs `863`…`871`) because each newborn also failed while Redis was still down; after `docker start paperless-redis` (`00:18:31`) the reincarnated pusher held. A fresh `Process-1:NN pushing tasks at <pid>` line (from `django_q/cluster.py:L342`) confirms the broker path is operational again.
 
 ### 5.3 Restarting the three programs — each readiness marker
 
@@ -428,57 +538,54 @@ Each program was stopped (via `pkill` inside the container's isolated PID namesp
 **Scheduler / qcluster** — verbatim (sink `stdout`, `/tmp/obs/qcluster_restart.log`):
 
 ```text
-22:44:06 [Q] INFO Q Cluster edward-berlin-stairway-hot starting.
-22:44:06 [Q] INFO Process-1:12 monitoring at 706
-22:44:06 [Q] INFO Process-1 guarding cluster edward-berlin-stairway-hot
-22:44:06 [Q] INFO Process-1:13 pushing tasks at 707
-22:44:06 [Q] INFO Q Cluster edward-berlin-stairway-hot running.
+00:18:59 [Q] INFO Q Cluster pip-lactose-sink-jupiter starting.
+00:18:59 [Q] INFO Process-1:12 monitoring at 962
+00:18:59 [Q] INFO Process-1 guarding cluster pip-lactose-sink-jupiter
+00:18:59 [Q] INFO Process-1:13 pushing tasks at 963
+00:18:59 [Q] INFO Q Cluster pip-lactose-sink-jupiter running.
 ```
 
-The completion marker `Q Cluster edward-berlin-stairway-hot running.` (`cluster.py:L261`) confirms the cluster is operational again — and its **different random name** (vs. `hotel-social-mississippi-cardinal`) re-confirms the §3.1 finding that the display name is a per-run humanized id, not `Q_CLUSTER["name"]`.
+The completion marker `Q Cluster pip-lactose-sink-jupiter running.` (`django_q/cluster.py:L261`) confirms the cluster is operational again — and its **different random name** (vs. `apart-maine-zebra-charlie`) re-confirms the §3.1 finding that the display name is a per-run humanized id, not `Q_CLUSTER["name"]`.
 
 **Consumer** — verbatim (sink `stdout`, `/tmp/obs/consumer_restart.log`):
 
 ```text
-[2026-07-01 22:44:29,350] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
+[2026-07-02 00:18:59,593] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
 ```
 
 Re-emits the readiness line from `src/documents/management/commands/document_consumer.py:L200`.
 
-**Web server / gunicorn** — verbatim (sink `stdout`, `/tmp/obs/gunicorn_restart.log`):
+**Web server / gunicorn** — reported exactly as observed. In this run the `pkill` did **not** terminate the original gunicorn (its master, PID `122`, kept running and holding the listening socket), so the *relaunched* gunicorn could not bind `:8000` and gave up after retrying. Verbatim (sink `stdout`, `/tmp/obs/gunicorn_restart.log`):
 
 ```text
-[2026-07-01 22:44:38 +0000] [766] [INFO] Starting gunicorn 20.1.0
-[2026-07-01 22:44:38 +0000] [766] [INFO] Listening at: http://0.0.0.0:8000 (766)
-[2026-07-01 22:44:38 +0000] [766] [INFO] Using worker: paperless.workers.ConfigurableWorker
-[2026-07-01 22:44:38 +0000] [766] [INFO] Server is ready. Spawning workers
+[2026-07-02 00:18:59 +0000] [936] [INFO] Starting gunicorn 20.1.0
+[2026-07-02 00:18:59 +0000] [936] [ERROR] Connection in use: ('0.0.0.0', 8000)
+[2026-07-02 00:18:59 +0000] [936] [ERROR] Retrying in 1 second.
+[2026-07-02 00:19:00 +0000] [936] [ERROR] Connection in use: ('0.0.0.0', 8000)
+[2026-07-02 00:19:00 +0000] [936] [ERROR] Retrying in 1 second.
+[2026-07-02 00:19:04 +0000] [936] [ERROR] Can't connect to ('0.0.0.0', 8000)
 ```
 
-`Server is ready. Spawning workers` is the `when_ready(server)` hook — `gunicorn.conf.py:L17`–`L18`.
+Because the original web process never went down, the endpoint stayed continuously operational — verified live after the perturbation (sink `stdout`):
+
+```text
+$ docker exec -u testuser -w /app/src pl-idle-obs bash -lc \
+    "python3 -c \"import urllib.request; print('HTTP', urllib.request.urlopen('http://127.0.0.1:8000/',timeout=5).status)\""
+HTTP 200
+```
+
+The web layer's readiness marker `Server is ready. Spawning workers` — the `when_ready(server)` hook (`gunicorn.conf.py:L17`–`L18`) — was emitted by the *original* gunicorn at startup and is captured verbatim in §4.2 (evidence **E4**). So the web layer's "operational again" proof is that it never lost service: the restart attempt merely found `:8000` still held while the endpoint kept answering `HTTP 200`.
 
 ### 5.4 Proof the whole stack is operational again
 
-At the first ~30 s scheduler poll after the restarts (and after the Redis blip), **both** then-due schedules fired and completed — verbatim (sink `stdout`, `/tmp/obs/qcluster_restart.log`):
-
-```text
-22:47:36 [Q] INFO Enqueued 1
-22:47:36 [Q] INFO Process-1 created a task from schedule [Train the classifier]
-22:47:36 [Q] INFO Process-1:1 processing [east-golf-twenty-floor]
-22:47:36 [Q] INFO Enqueued 1
-22:47:36 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-22:47:36 [Q] INFO Process-1:2 processing [diet-edward-vermont-music]
-22:47:36 [Q] INFO Processed [diet-edward-vermont-music]
-22:47:36 [Q] INFO Processed [east-golf-twenty-floor]
-```
-
-The queue drained back to zero afterward — command + verbatim (sink `stdout`):
+The observation harness was stopped (`00:20:29`) before the next 10-minute mail fire was due (≈ `00:27`), so **no post-restart scheduled fire was captured in this run** — reported honestly rather than asserted. The end-to-end operational proof is therefore the set of readiness markers already captured above plus a drained task queue. Immediately after recovery the queue was empty — command + verbatim (sink `stdout`):
 
 ```text
 $ python3 manage.py shell -c "from django_q.models import OrmQ; print('OrmQ queued now:', OrmQ.objects.count())"
 OrmQ queued now: 0
 ```
 
-This is the recovery signature end-to-end: **Redis reconnected → cluster running → consumer watching → gunicorn serving → scheduled tasks firing and draining again.**
+This is the recovery signature end-to-end: **Redis reconnected (§5.2, `Connected to Redis broker: …`) → cluster running (§5.3, `Q Cluster pip-lactose-sink-jupiter running.`) → consumer watching (§5.3, `Using inotify to watch directory for changes: …`) → web serving (§5.3, `HTTP 200`) → task queue drained (`OrmQ queued now: 0`).**
 
 
 ---
@@ -493,19 +600,26 @@ Re-reading the original question and confirming every distinct sub-question and 
   - [x] `Optimize the index` — DAILY (`src/documents/migrations/1001_auto_20201109_1636.py:L15-L19`) — §3.3.
   - [x] `Perform sanity check` — WEEKLY (`src/documents/migrations/1004_sanity_check_schedule.py:L10-L14`) — §3.3.
   - [x] `Check all e-mail accounts` — every 10 MINUTES (`src/paperless_mail/migrations/0002_auto_20201117_1334.py:L10-L15`) — §3.3, §4.2.
-- [x] **"the actual log entries that appear periodically … the specific log messages, their frequency, and what they indicate"** → the O3 table with **measured** cadences (mail burst deltas 602 s and 601 s ≈ 10 min; scheduler ~30 s but silent) — §4.1, §4.2, each row backed by a verbatim line with its sink.
-- [x] **"if you briefly interrupt and restart part of the system, what specific log messages confirm everything has reconnected and is operational again?"** → the Redis interrupt + `Connected to Redis broker: …` (`docker/wait-for-redis.py:L41`), cluster self-heal (`reincarnated pusher …` → `… pushing tasks at 642`), `Q Cluster … running.`, `Using inotify to watch directory for changes: …`, `Server is ready. Spawning workers`, and the end-to-end task-firing proof — §5.1–§5.4.
+- [x] **"the actual log entries that appear periodically … the specific log messages, their frequency, and what they indicate"** → the O3 table with **measured** cadences (mail deltas 601 s and 602 s ≈ 10 min; scheduler ~30 s but silent) — §4.1, §4.2, each row backed by a verbatim line with its sink.
+- [x] **"if you briefly interrupt and restart part of the system, what specific log messages confirm everything has reconnected and is operational again?"** → the Redis interrupt + `Connected to Redis broker: …` (`docker/wait-for-redis.py:L41`), cluster self-heal (`reincarnated pusher …` → `… pushing tasks at 863`), `Q Cluster … running.`, `Using inotify to watch directory for changes: …`, `Server is ready. Spawning workers`, and the end-to-end operational proof (`HTTP 200` + drained queue) — §5.1–§5.4.
 - [x] **"What components or processes keep running continuously … even when no documents are being processed?"** → the three Supervisord programs (gunicorn / consumer / scheduler) plus Redis and the database — §2.1, §2.2.
 - [x] **Idle-only scope** — every quoted heartbeat is from the document-free state (empty consume dir, drained queue); no ingestion/OCR line is reported as idle behavior.
-- [x] **Measured, not inferred, frequency** — the run exceeded ~39 minutes; the 10-minute mail task recurred at 22:17:29 / 22:27:31 / 22:37:32 (three recurring fires, two clean ~600 s deltas).
-- [x] **Read-only & cleanup** — no source file was modified; all temporary capture lived outside the repo tree; the working tree ends clean with only this new document.
+- [x] **Measured, not inferred, frequency** — the idle window was ~24 minutes (`23:53:56`→`00:17:45`); the 10-minute mail task recurred at 23:57:26 / 00:07:27 / 00:17:29 (three recurring fires; consecutive-recurring deltas 601 s and 602 s), with the catch-up→first-recurring 181 s gap reported honestly as a phase-lock artifact (§4.2.1).
+- [x] **Read-only & cleanup** — no source file was modified (verified: `git diff --name-status 542221a38dff..HEAD` lists **only** this document, and no other tracked file differs from the pinned commit); every temporary artifact (the throwaway observation container and the host-side capture files) lived outside the repo tree and was removed. With the deliverable committed, `git status --porcelain` is empty. Command + verbatim output:
+
+```text
+$ git diff --name-status 542221a38dff06361e07976452f9aea24d210542..HEAD
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+$ git status --porcelain
+(no output — working tree clean once the deliverable is committed)
+```
 
 ### Anticipated-vs-observed corrections (reported exactly as observed)
 
-- The cluster's displayed name is a **random humanized id** (`hotel-social-mississippi-cardinal`, later `edward-berlin-stairway-hot`), **not** `paperless`; `Q_CLUSTER["name"]="paperless"` (`src/paperless/settings.py:L450`) is the internal identifier only — §3.1.
+- The cluster's displayed name is a **random humanized id** (`apart-maine-zebra-charlie`, later `pip-lactose-sink-jupiter`), **not** `paperless`; `Q_CLUSTER["name"]="paperless"` (`src/paperless/settings.py:L450`) is the internal identifier only — §3.1.
 - `"No new documents were added."` is a **`Task.result` value**, not a stdout/file log line; `mail.log` is never created at idle — §3.3, §4.4.
 - The ~30-second scheduler poll is real but **emits no log line** when nothing is due — §4.1.
-- The `documents/tasks.py:L231` "OSError…" broker-loss hint did **not** appear (no document task was in flight during the Redis interrupt) — §5.1.
+- The `src/documents/tasks.py:L231` "OSError…" broker-loss hint did **not** appear (no document task was in flight during the Redis interrupt) — §5.1.
 
 ---
 
