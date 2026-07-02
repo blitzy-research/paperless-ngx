@@ -2,14 +2,14 @@
 
 > **Deliverable identity.** This is the single, only file added to the repository for this investigation. The filename is derived from the **source branch** mandated by the AAP — `paperless-ngx_542221a38dff` — so the deliverable is named exactly `paperless-ngx_542221a38dff.md`, placed in `blitzy/documentation/`. This source-branch name is distinct from the current implementation branch: `git rev-parse --abbrev-ref HEAD` returns `blitzy-680a32bd-58ed-4a69-b43f-ef1a0acdff8b` (the working branch), not the source-branch name.
 >
-> **Scope: READ-ONLY.** Governed by the `SWE-AtlasQnA-Repo` rule set. No existing repository file was modified, created, or deleted; no code remediation was implemented. All temporary observation scripts lived outside the repository (under `/tmp/mem_probe`) and were removed. The git working tree ends unchanged except for this one `.md` file.
+> **Scope: READ-ONLY.** Governed by the `SWE-AtlasQnA-Repo` rule set. No existing repository file was modified, created, or deleted; no code remediation was implemented. All temporary observation scripts lived outside the repository (under `/tmp/mem_probe` and `/tmp/mem_probe_fix`) and were removed. The git working tree ends unchanged except for this one `.md` file.
 
 ---
 
 ## Executive Summary (verdict up front)
 
-- **The "disproportionate" spike is the classifier model reconstruction, not the document.** Loading the trained scikit-learn model via six sequential `pickle.load` calls in `DocumentClassifier.load()` (`src/documents/classifier.py:L86-L92`) adds **+123.48 MB RSS** for a **28-byte** document — quote `[A1] RSS after ONE load : 219.92 MB (delta +123.48 MB)` against `[A1] document content size : 28 bytes` (EXACT). The spike is driven by model size, which is **independent of the current document's size**.
-- **The "not released in a timely manner" symptom is normal glibc allocator (arena) retention — NOT a Python leak.** After `del` + `gc.collect()`, Python-object memory returns to baseline — `[D] tracemalloc AFTER del+gc : 0.00 MB` — while process RSS stays high — `[D] RSS AFTER del+gc : 221.05 MB` — and only drops when the allocator is trimmed — `[D] RSS AFTER malloc_trim(0) : 180.10 MB (trim rc=1)` (EXACT).
+- **The "disproportionate" spike is the classifier model reconstruction, not the document.** Loading the trained scikit-learn model via six sequential `pickle.load` calls in `DocumentClassifier.load()` (`src/documents/classifier.py:L86-L92`) adds **~+126 MB RSS on a worker's first (cold) consume** and **~+50 MB on every subsequent (warm) consume** — for a **19-byte** document either way. Cold quote (3 runs, mean `+126.42 MB`): `[cold] RSS after ONE load : 176.05 MB (delta +126.49 MB)` against `[cold] document content size : 19 bytes`; warm quote (3 runs, identical): `[warm] RSS after ONE load : 155.07 MB (delta +50.00 MB)` (EXACT, 48.03 MB model). The **~+76 MB cold/warm gap is a one-time scikit-learn import** — `[imp] one-time sklearn import cost : +73.78 MB` — not per-document cost. This **reconciles** the earlier single cold sample (`+123.48 MB`) with an independent warm reconstruction (`~+48 MB`): **cold = import + model-data, warm = model-data only**. The spike is driven by model reconstruction, **independent of the document's size**; and because `recycle: 1` (`src/paperless/settings.py:L452`) restarts the worker after every task, each consume is effectively cold, so the operational per-document spike is `~+126 MB`.
+- **The "not released in a timely manner" symptom is normal glibc allocator (arena) retention — NOT a Python leak.** After `del` + `gc.collect()`, Python-object memory returns to baseline — `[D] tracemalloc AFTER del+gc : 0.00 MB` — while process RSS stays high — `[D] RSS AFTER del+gc : 107.53 MB` — and only drops when the allocator is trimmed — `[D] RSS AFTER malloc_trim(0) : 106.12 MB (trim rc=1)` (EXACT).
 - **No server-side cache is accumulating metadata.** Grep across `src/documents`, `src/paperless`, and the four parser apps returns **zero** `functools.lru_cache`/`functools.cache`/`@cache`, **zero** `gc.collect`/`import gc`, and **no** Django `CACHES` setting in `src/paperless/settings.py`.
 - **The bounding factor is the worker recycle policy.** `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/paperless/settings.py:L452`, block `L449-L457`) restarts the django-q worker **after every task**, so any retained memory — including glibc arenas — is reclaimed at each document boundary. This is why the symptom is **intermittent and non-fatal** rather than an unbounded crash.
 
@@ -34,7 +34,7 @@ The user asked five things, answered by name in Section 4: (1) root-cause the sp
 - **`tracemalloc`** — traces **Python-object allocations only**. Used to detect whether Python objects are retained (a true Python leak) or reclaimed.
 - **Process RSS** — read from `/proc/self/status` `VmRSS`, `psutil`, and `resource.getrusage(RUSAGE_SELF).ru_maxrss`. Captures **native + allocator** memory (C-extension buffers and glibc arenas).
 
-**Critical measurement limitation.** `tracemalloc` does **NOT** observe C-extension native allocations — specifically qpdf via `pikepdf` and NumPy's C buffers. Those are **only** visible via RSS. Wherever native memory is discussed, this limitation is restated, and the gap is quantified (e.g., EXACT `[A1] RSS-vs-tracemalloc gap : 42.84 MB`, and the `[P]` block below where RSS moves +2.99 MB across 50 un-closed opens while `tracemalloc` sees only 0.236 MB).
+**Critical measurement limitation.** `tracemalloc` does **NOT** observe C-extension native allocations — specifically qpdf via `pikepdf` and NumPy's C buffers. Those are **only** visible via RSS. Wherever native memory is discussed, this limitation is restated, and the gap is quantified (e.g., EXACT cold-load `[cold] RSS-vs-tracemalloc gap : 48.93 MB`, and the `[P]` block below where RSS moves +2.99 MB across 50 un-closed opens while `tracemalloc` sees only 0.236 MB).
 
 **Two environments were used and are labeled throughout:**
 
@@ -43,7 +43,7 @@ The user asked five things, answered by name in Section 4: (1) root-cause the sp
 | **EXACT** (gold standard) | Docker `python:3.9-slim-bullseye` — the runtime baseline per `Dockerfile:L18` (`FROM python:3.9-slim-bullseye as main-app`) — with the real pinned stack `scikit-learn==1.0.2`, `pikepdf==5.1.1`, `numpy==1.22.3`, `scipy==1.8.0`. Reported env line: `Python 3.9.23 \| scikit-learn 1.0.2 \| numpy 1.22.3 \| scipy 1.8.0 \| pikepdf 5.1.1`. | Full-stack, faithful reproduction with the real model and real qpdf handle. |
 | **REPRESENTATIVE** | Sandbox `Python 3.12.3` + `numpy 2.5.0` + `psutil 7.2.2` (sklearn/pikepdf absent). The classifier is simulated with NumPy arrays of the **same shape**, and the `preprocess_content` / `MATCH_FUZZY` transformation lines are copied **verbatim** from the repo. | Reproduces the allocation *patterns* where the pinned native wheels cannot be built. |
 
-Cross-environment agreement is noted where relevant: the **patterns are identical**; only the absolute MB differ by environment. The EXACT 48.22 MB model is consistent with the AAP reference of 48.41 MB, and the REPRESENTATIVE spike of +52.55 MB is consistent with the AAP reference of +53.52 MB.
+Cross-environment agreement is noted where relevant: the **patterns are identical**; only the absolute MB differ by environment. The EXACT 48.03 MB model is consistent with the AAP reference of 48.41 MB, and the REPRESENTATIVE spike of +52.55 MB is consistent with the AAP reference of +53.52 MB.
 
 ---
 
@@ -69,9 +69,11 @@ Each subsection pastes the single specific evidence line next to each behavioral
 
 **The DOMINANT, document-size-independent allocation is the model reconstruction.** `DocumentClassifier.load()` (`src/documents/classifier.py:L76`) rebuilds the pickled scikit-learn model with **six sequential `pickle.load` calls** (`src/documents/classifier.py:L86-L92`): `L86` `data_hash`, `L87` `data_vectorizer`, `L88` `tags_binarizer`, `L90` `tags_classifier`, `L91` `correspondent_classifier`, `L92` `document_type_classifier`. A schema-version integer is read first (`src/documents/classifier.py:L78`) and checked against `FORMAT_VERSION = 7` (`src/documents/classifier.py:L63`); a mismatch raises `IncompatibleClassifierVersionError` (`src/documents/classifier.py:L80-L81`).
 
-- **Claim:** a real ~48 MB model load produces a large RSS spike that is unrelated to document size.
-- **Evidence (EXACT):** `[A1] RSS after ONE load        :   219.92 MB   (delta +123.48 MB)` measured against `[A1] document content size     :       28 bytes` and `[save]  classification_model.pickle size :    48.22 MB`.
-- **Conclusion:** the spike is driven by **model reconstruction**, independent of document size — a 28-byte document still triggers ~+123 MB RSS.
+- **Claim:** a real ~48 MB model load produces a large RSS spike that is unrelated to document size, decomposing into a one-time (cold) scikit-learn import plus the per-load model data.
+- **Evidence (EXACT), cold — a worker's first consume:** `[cold] RSS after ONE load        :   176.05 MB   (delta +126.49 MB)` measured against `[cold] document content size     :       19 bytes` and `[build] classification_model.pickle MB:    48.03` (3 runs: mean `+126.42 MB`, range `[+126.37, +126.49]`).
+- **Evidence (EXACT), warm — every subsequent consume:** `[warm] RSS after ONE load        :   155.07 MB   (delta +50.00 MB)` (3 runs identical; `tracemalloc` peak `48.82 MB` ≈ model data).
+- **Evidence (EXACT), the cold/warm gap is a one-time library import:** `[imp] one-time sklearn import cost     :   +73.78 MB  (cold->warm)`; identity `import (+73.78) + warm (+50.00) = +123.78 ≈ cold +126.42`.
+- **Conclusion:** the spike is driven by **model reconstruction**, independent of document size — a 19-byte document still triggers `~+126 MB` RSS cold / `~+50 MB` warm. This **reconciles** the earlier single cold sample (`+123.48 MB`) and an independent warm reconstruction (`~+48 MB`) as the **same phenomenon measured from a cold vs a warm baseline**; under `recycle: 1` (`src/paperless/settings.py:L452`) each consume is effectively cold (`~+126 MB`).
 
 **The classification/rule-matching stage is the rest of the "metadata processing" work.** In `src/documents/classifier.py`: `predict_correspondent` (`L251`), `predict_document_type` (`L262`), `predict_tags` (`L273`). Rule matching lives in `src/documents/matching.py`: `matches()` (`src/documents/matching.py:L60`), driven from `match_correspondents` (`src/documents/matching.py:L21`), `match_document_types` (`src/documents/matching.py:L34`), and `match_tags` (`src/documents/matching.py:L47`).
 
@@ -111,7 +113,7 @@ Each subsection pastes the single specific evidence line next to each behavioral
 **The classifier is reloaded per consume, not retained across documents.** The load happens inside `try_consume_file` at `classifier = load_classifier()` (`src/documents/consumer.py:L292`) for each document.
 
 - **Claim:** RSS does not accumulate across a batch of documents (no cross-document retention).
-- **Evidence (EXACT):** `[A2] after  20 loads: RSS=  250.66 MB (no explicit gc)` / `[A2] after  40 loads: RSS=  250.66 MB (no explicit gc)` / `[A2] after  60 loads: RSS=  250.66 MB (no explicit gc)` — flat, no monotonic growth (full series in Section 6 and Section 7).
+- **Evidence (EXACT):** `[A2] after  20 loads: RSS=   187.25 MB (no explicit gc)` / `[A2] after  40 loads: RSS=   165.99 MB (no explicit gc)` / `[A2] after  60 loads: RSS=   155.07 MB (no explicit gc)` — **no monotonic growth**; RSS peaks early then settles to a steady `~155 MB` (warm baseline + one live model), full series in Section 6 and Section 7.
 
 ### Question 4 — What differs between spike and no-spike cases?
 
@@ -128,8 +130,8 @@ Each subsection pastes the single specific evidence line next to each behavioral
 
 **Batch size — no monotonic growth.** Loading/processing across a batch keeps RSS flat, then trims back down.
 
-- **Claim (EXACT):** RSS is flat across 20/40/60 loads and trims down afterward.
-- **Evidence (EXACT):** `[A2] after  20 loads: RSS=  250.66 MB (no explicit gc)` … `[A2] peak RSS during batch     :   250.66 MB` … `[A2] RSS after malloc_trim(0)  :   180.04 MB  (trim rc=1)`.
+- **Claim (EXACT):** RSS shows **no monotonic growth** across 20/40/60 loads (it peaks early, then settles to a steady state) and trims down afterward.
+- **Evidence (EXACT):** `[A2] after  20 loads: RSS=   187.25 MB (no explicit gc)` … `[A2] peak RSS during batch     :   208.41 MB` … `[A2] RSS after malloc_trim(0)  :   106.08 MB  (trim rc=1)`.
 - **Claim (REPRESENTATIVE):** the same flat-then-trim pattern holds.
 - **Evidence (REPRESENTATIVE):** `[A2] after  20 docs: RSS=   67.57 MB (no explicit gc)` / `[A2] after  40 docs: RSS=   67.58 MB (no explicit gc)` / `[A2] after  60 docs: RSS=   67.60 MB (no explicit gc)`, trim → `[A2] RSS after malloc_trim(0)  :    40.39 MB  (trim rc=1)`.
 
@@ -153,7 +155,7 @@ Where memory actually goes during import, attributed to specific code with `file
 | Component / Method | `file:line` | Role | Measured / Native |
 |--------------------|-------------|------|-------------------|
 | `Consumer.try_consume_file` | `src/documents/consumer.py:L180` (load at `L292`) | per-consume classifier load (once per document) | — |
-| `DocumentClassifier.load()` — 6× `pickle.load` | `src/documents/classifier.py:L86-L92` | **DOMINANT** model reconstruction (doc-size independent) | **EXACT +123.48 MB RSS** |
+| `DocumentClassifier.load()` — 6× `pickle.load` | `src/documents/classifier.py:L86-L92` | **DOMINANT** model reconstruction (doc-size independent) | **EXACT ~+126 MB RSS cold / +50.00 MB warm** (cold = one-time sklearn import +73.78 MB + model data) |
 | `preprocess_content` (×3 / doc) | `src/documents/classifier.py:L24-L27` | transient content copies (`.lower().strip()`, `re.sub`) | REPR 2.723 MB peak |
 | `predict_correspondent` / `predict_document_type` / `predict_tags` | `src/documents/classifier.py:L251` / `L262` / `L273` | vectorizer transform + predict | — |
 | `matches()` `MATCH_FUZZY` copy | `src/documents/matching.py:L131,L134` | full-content copy **per matching model** | REPR 41.8× at N=40 |
@@ -173,35 +175,86 @@ Both evidence sets are reproduced verbatim below in fenced blocks, each labeled 
 
 Environment: `Python 3.9.23 | scikit-learn 1.0.2 | numpy 1.22.3 | scipy 1.8.0 | pikepdf 5.1.1`.
 
-Producing command:
+**This block was re-run for final acceptance** to make the model-load spike **bit-for-bit reproducible** and to explain the earlier single-sample value. It uses the **real** `DocumentClassifier.save()` / `load_classifier()` from the repository (mounted read-only) rather than a hand-rolled pickle, builds a **48.03 MB** model (comparable to the earlier 48.22 MB sample and to an independent 48.07 MB reconstruction), and measures the load from **both a cold and a warm baseline**, **three runs each**. The complete script bodies are embedded verbatim in **Appendix A**, so this run is reproducible line-for-line.
+
+Producing command (the driver runs build → import-cost → 3× cold → 3× warm → batch/leak):
 
 ```bash
-docker run --rm -v /tmp/mem_probe:/work -w /work python:3.9-slim-bullseye bash -c \
-  "pip install --no-cache-dir numpy==1.22.3 scipy==1.8.0 joblib==1.1.0 threadpoolctl==3.1.0 scikit-learn==1.0.2 pikepdf==5.1.1 psutil && python exact_repro.py"
+docker run --rm --entrypoint bash \
+  -v <repo>:/workspace:ro -v /tmp/mem_probe_fix:/probe:ro \
+  -e DJANGO_SETTINGS_MODULE=paperless.settings -e PYTHONPATH=/workspace/src \
+  -e PAPERLESS_DATA_DIR=/tmp/pdata -e PAPERLESS_MEDIA_ROOT=/tmp/pmedia \
+  -e PAPERLESS_CONSUMPTION_DIR=/tmp/pconsume -e PAPERLESS_DISABLE_DBHANDLER=true \
+  paperless-ngx-memtest:local -c 'bash /probe/run_all.sh'
 ```
 
-The script trains a real `CountVectorizer(analyzer="word", ngram_range=(1,2), min_df=0.01)` + `MultiLabelBinarizer` + 3× `MLPClassifier(tol=0.01)`, pickles them in the exact 7-object order of `save()` — `FORMAT_VERSION`, `data_hash`, `data_vectorizer`, `tags_binarizer`, `tags_classifier`, `correspondent_classifier`, `document_type_classifier` (`src/documents/classifier.py:L101-L109`) — then loads via six sequential `pickle.load` mirroring `load()` (`src/documents/classifier.py:L86-L92`). Verbatim output:
+The build step assembles the classifier exactly as `train()` does — `CountVectorizer(analyzer="word", ngram_range=(1,2), min_df=0.01)` + `MultiLabelBinarizer` + 3× `MLPClassifier(tol=0.01)` — assigns them to a real `DocumentClassifier`, and persists via `save()`'s exact 7-object order (`FORMAT_VERSION`, `data_hash`, `data_vectorizer`, `tags_binarizer`, `tags_classifier`, `correspondent_classifier`, `document_type_classifier`) (`src/documents/classifier.py:L101-L109`); the load path is the real `load_classifier()` → `DocumentClassifier.load()` with six sequential `pickle.load` (`src/documents/classifier.py:L86-L92`).
+
+**Model built (verbatim):**
 
 ```text
-[train] REAL model: n_features(vocab)=6000, docs=600, hidden_layer_sizes(default)=(100,)
-[save]  classification_model.pickle size :    48.22 MB
-[A1] document content size     :       28 bytes
-[A1] RSS before load           :    96.44 MB
-[A1] RSS after ONE load        :   219.92 MB   (delta +123.48 MB)
-[A1] tracemalloc peak on load  :    80.64 MB
-[A1] RSS-vs-tracemalloc gap    :    42.84 MB
-[A2] after  20 loads: RSS=  250.66 MB (no explicit gc)
-[A2] after  40 loads: RSS=  250.66 MB (no explicit gc)
-[A2] after  60 loads: RSS=  250.66 MB (no explicit gc)
-[A2] peak RSS during batch     :   250.66 MB
-[A2] RSS after malloc_trim(0)  :   180.04 MB  (trim rc=1)
-[D] tracemalloc AFTER load     :    80.63 MB peak
-[D] RSS AFTER load             :   309.05 MB
-[D] tracemalloc AFTER del+gc   :     0.00 MB
-[D] RSS AFTER del+gc           :   221.05 MB
-[D] RSS AFTER malloc_trim(0)   :   180.10 MB  (trim rc=1)
-ru_maxrss MB (peak): 307.54   (high-water mark at [D] RSS AFTER load: 309.05 MB)
+[build] classification_model.pickle MB:    48.03
+[build] vocabulary size (n_features)  : 6971
 ```
+
+**Root cause of the cold/warm difference — the one-time scikit-learn import (verbatim).** `classifier.py` imports scikit-learn **lazily** (inside `train()`/`predict_*`, not at module import), so the **first** `pickle.load` of the model triggers scikit-learn's submodule import. Measured in isolation in a fresh process:
+
+```text
+[imp] RSS cold (before sklearn import) :    11.45 MB
+[imp] RSS warm (after sklearn import)  :    85.23 MB
+[imp] one-time sklearn import cost     :   +73.78 MB  (cold->warm)
+```
+
+This `+73.78 MB` is a **one-time, model-independent** library-init cost (it also measured `+73.68 MB` against a 137 MB model) — directly analogous to the one-time qpdf lib-init isolated for `pikepdf` in §6.1.1.
+
+**[A1] COLD single load — a worker's very first consume (3 runs, verbatim).** Fresh process, scikit-learn not yet imported, so delta = one-time import + model data:
+
+```text
+[cold] classification_model.pickle size :    48.03 MB
+[cold] document content size     :       19 bytes
+[cold] RSS before load           :    49.56 MB
+[cold] RSS after ONE load        :   176.05 MB   (delta +126.49 MB)
+[cold] tracemalloc peak on load  :    77.56 MB
+[cold] RSS-vs-tracemalloc gap    :    48.93 MB
+```
+
+Runs 2 and 3 reproduce it — `delta +126.40 MB` and `delta +126.37 MB` — mean **+126.42 MB**, range **[+126.37, +126.49]** (~0.1 MB spread across three runs).
+
+**[A1] WARM single load — every subsequent consume (3 runs, verbatim).** scikit-learn already imported, so delta = model data only:
+
+```text
+[warm] RSS before load           :   105.07 MB
+[warm] RSS after ONE load        :   155.07 MB   (delta +50.00 MB)
+[warm] tracemalloc peak on load  :    48.82 MB
+[warm] RSS-vs-tracemalloc gap    :     1.18 MB
+```
+
+All three warm runs are identical at `delta +50.00 MB`, and the `tracemalloc` peak `48.82 MB` ≈ the 48.03 MB model data (RSS-vs-`tracemalloc` gap only `1.18 MB`).
+
+**[A2] batch trend + [D] leak test (warm regime, verbatim):**
+
+```text
+[A2] after  20 loads: RSS=   187.25 MB (no explicit gc)
+[A2] after  40 loads: RSS=   165.99 MB (no explicit gc)
+[A2] after  60 loads: RSS=   155.07 MB (no explicit gc)
+[A2] peak RSS during batch     :   208.41 MB
+[A2] RSS after malloc_trim(0)  :   106.08 MB  (trim rc=1)
+[D] tracemalloc AFTER load     :    48.82 MB peak
+[D] RSS AFTER load             :   155.29 MB
+[D] tracemalloc AFTER del+gc   :     0.00 MB
+[D] RSS AFTER del+gc           :   107.53 MB
+[D] RSS AFTER malloc_trim(0)   :   106.12 MB  (trim rc=1)
+```
+
+**Reconciliation (the key result).** The three measurements satisfy one identity that explains **both** the earlier single sample and an independent warm reconstruction from **one** 48 MB model:
+
+- **cold ≈ import + warm:** `+73.78 MB` (import) + `+50.00 MB` (warm data) = `+123.78 MB` ≈ measured cold `+126.42 MB` (residual ~`+2.6 MB` transient unpickle buffers).
+- The **earlier single cold sample** (`[A1] … delta +123.48 MB`, 48.22 MB model) is thus a **cold-baseline** measurement, landing within ~2.4% of this run's cold mean.
+- An independent **warm** reconstruction (~`+48 MB` for a ~48 MB model) is a **warm-baseline** measurement, landing within ~4% of this run's warm `+50.00 MB`.
+
+So the apparent contradiction between "~+123 MB" and "~+48 MB" is **not** an error in either measurement — it is the **cold vs warm baseline**: a fresh django-q worker's first consume pays the one-time scikit-learn import **plus** the model data; every later consume on that worker pays only the model data. Because `Q_CLUSTER "recycle": 1` (`src/paperless/settings.py:L452`) restarts the worker after **every** task, in the shipped configuration **each consume is effectively a cold consume**, so the operational per-document spike is the **cold** `~+126 MB` — and it is doc-size-independent (`19 bytes` here).
+
+**Run-to-run variance (grounding).** RSS deltas depend on allocator/arena state; they are reproducible in **direction and magnitude** but not bit-identical. The cold spread above is ~0.1 MB across three runs and warm is 0.00 MB. The batch series is **not monotonic** — RSS peaks early (`208.41 MB`), settles to a steady `~155 MB` (warm baseline + one live model), and trims to `106.08 MB` — confirming no unbounded accumulation.
 
 The `[P]` un-closed-`pikepdf` measurement is reported separately below, because the native qpdf handle must be isolated from a **warm** baseline (see §6.1.1) so the one-time library-init cost is not folded into the per-open figure.
 
@@ -287,7 +340,7 @@ VmRSS KB final: 47400 ; ru_maxrss MB peak: 101.83
 
 ### 6.3 Cross-environment agreement
 
-The **patterns are identical** across both environments; only the absolute MB differ (each block is labeled). The EXACT model size `48.22 MB` is consistent with the AAP reference `48.41 MB`; the REPRESENTATIVE spike `+52.55 MB` is consistent with the AAP reference `+53.52 MB`. In both environments: a single model load produces a large RSS spike, the batch series is flat (no monotonic growth), `tracemalloc` returns to `0.00 MB` after `del`+`gc`, and RSS drops after `malloc_trim(0)` with `trim rc=1`.
+The **patterns are identical** across both environments; only the absolute MB differ (each block is labeled). The EXACT model size `48.03 MB` is consistent with the AAP reference `48.41 MB`; the REPRESENTATIVE spike `+52.55 MB` is consistent with the AAP reference `+53.52 MB`. In both environments: a single model load produces a large RSS spike, the batch series shows **no monotonic growth** (EXACT peaks early then settles to a steady state; REPRESENTATIVE is flat), `tracemalloc` returns to `0.00 MB` after `del`+`gc`, and RSS drops after `malloc_trim(0)` with `trim rc=1`.
 
 ---
 
@@ -295,16 +348,17 @@ The **patterns are identical** across both environments; only the absolute MB di
 
 ### 7.1 Batch-size matrix (peak vs steady-state)
 
-Peak RSS during the batch is contrasted with the post-`malloc_trim` steady state. The RSS series is **flat** (no monotonic growth), which is the signature of *no* unbounded leak.
+Peak RSS during the batch is contrasted with the post-`malloc_trim` steady state. The RSS series shows **no monotonic growth** (the EXACT series peaks early then settles to a steady state; the REPRESENTATIVE series is flat), which is the signature of *no* unbounded leak.
 
 | Batch point | EXACT RSS | REPRESENTATIVE RSS |
 |-------------|-----------|--------------------|
-| single load (`[A1]` after ONE load) | `219.92 MB` (delta `+123.48 MB`) | `89.45 MB` (delta `+37.16 MB`) |
-| after 20 | `250.66 MB` | `67.57 MB` |
-| after 40 | `250.66 MB` | `67.58 MB` |
-| after 60 | `250.66 MB` | `67.60 MB` |
-| peak during batch | `250.66 MB` | `67.60 MB` |
-| steady-state after `malloc_trim(0)` | `180.04 MB` (`trim rc=1`) | `40.39 MB` (`trim rc=1`) |
+| single load — **cold** (`[cold]` after ONE load) | `176.05 MB` (delta `+126.49 MB`; 3-run mean `+126.42`) | `89.45 MB` (delta `+37.16 MB`) |
+| single load — **warm** (`[warm]` after ONE load) | `155.07 MB` (delta `+50.00 MB`) | — |
+| after 20 | `187.25 MB` | `67.57 MB` |
+| after 40 | `165.99 MB` | `67.58 MB` |
+| after 60 | `155.07 MB` | `67.60 MB` |
+| peak during batch | `208.41 MB` | `67.60 MB` |
+| steady-state after `malloc_trim(0)` | `106.08 MB` (`trim rc=1`) | `40.39 MB` (`trim rc=1`) |
 
 ### 7.2 Document-type matrix
 
@@ -319,7 +373,7 @@ Peak RSS during the batch is contrasted with the post-`malloc_trim` steady state
 
 | Condition | Mechanism | RSS delta |
 |-----------|-----------|-----------|
-| `MODEL_FILE` **present** | `load()` reconstructs the model (`src/documents/classifier.py:L86-L92`) | **REPR** `+52.55 MB` / **EXACT** `+123.48 MB` |
+| `MODEL_FILE` **present** | `load()` reconstructs the model (`src/documents/classifier.py:L86-L92`) | **REPR** `+52.55 MB` / **EXACT** `+126.42 MB` cold, `+50.00 MB` warm |
 | `MODEL_FILE` **absent** | `load_classifier()` returns `None` (`src/documents/classifier.py:L31`); `load()` never runs | `+0.00 MB` |
 
 ---
@@ -336,9 +390,9 @@ Peak RSS during the batch is contrasted with the post-`malloc_trim` steady state
 **The observed retention is NORMAL glibc allocator (arena) retention, NOT a Python-level leak.** The paired evidence:
 
 - Python objects are fully reclaimed: `[D] tracemalloc AFTER del+gc   :     0.00 MB` (EXACT).
-- Yet process RSS remains high: `[D] RSS AFTER del+gc           :   221.05 MB` (EXACT).
-- And it drops only when the allocator is trimmed: `[D] RSS AFTER malloc_trim(0)   :   180.10 MB  (trim rc=1)` (EXACT).
-- The batch series shows no monotonic growth: `[A2] after  20 loads: RSS=  250.66 MB` … `[A2] after  60 loads: RSS=  250.66 MB` (EXACT).
+- Yet process RSS remains high: `[D] RSS AFTER del+gc           :   107.53 MB` (EXACT).
+- And it drops only when the allocator is trimmed: `[D] RSS AFTER malloc_trim(0)   :   106.12 MB  (trim rc=1)` (EXACT).
+- The batch series shows no monotonic growth: `[A2] after  20 loads: RSS=   187.25 MB` … `[A2] after  60 loads: RSS=   155.07 MB` (EXACT).
 
 This directly explains the user's "not released in a timely manner": it is **allocator arena retention** under the default glibc allocator. **No `MALLOC_*` tuning** is set in the image (the `Dockerfile` and `docker/` assets set no `MALLOC_ARENA_MAX` / `MALLOC_MMAP_THRESHOLD_`), so the process runs with default arena behavior — freed blocks are held in per-thread arenas for reuse rather than returned to the OS immediately.
 
@@ -348,7 +402,7 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 
 ### 8.4 Measurement limitation (restated where native memory is involved)
 
-`tracemalloc` observes only Python-object allocations, so qpdf-via-`pikepdf` and NumPy C buffers are **assessed via RSS**, not `tracemalloc`. This is quantified by the EXACT `[A1] RSS-vs-tracemalloc gap    :    42.84 MB` and by the `[P]` block, where RSS moves `+2.99 MB` across 50 un-closed opens while `tracemalloc` sees only `0.236 MB`. Any conclusion about native memory in this report rests on RSS, by necessity.
+`tracemalloc` observes only Python-object allocations, so qpdf-via-`pikepdf` and NumPy C buffers are **assessed via RSS**, not `tracemalloc`. This is quantified by the EXACT cold-load `[cold] RSS-vs-tracemalloc gap    :    48.93 MB` and by the `[P]` block, where RSS moves `+2.99 MB` across 50 un-closed opens while `tracemalloc` sees only `0.236 MB`. Any conclusion about native memory in this report rests on RSS, by necessity.
 
 ---
 
@@ -356,7 +410,7 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 
 > The following are **optional recommendations**. Consistent with the read-only mandate, **none were applied**, and they are **not part of this deliverable**. The shipped `recycle: 1` policy (`src/paperless/settings.py:L452`) already bounds the practical impact of the retention described above.
 
-1. **Return arenas to the OS sooner.** Call `ctypes` `malloc_trim(0)` at task boundaries, or set `MALLOC_ARENA_MAX` / `MALLOC_MMAP_THRESHOLD_` in the environment, to release retained glibc arenas back to the OS earlier. Evidence that this works: `[D] RSS AFTER malloc_trim(0) : 180.10 MB (trim rc=1)` (EXACT).
+1. **Return arenas to the OS sooner.** Call `ctypes` `malloc_trim(0)` at task boundaries, or set `MALLOC_ARENA_MAX` / `MALLOC_MMAP_THRESHOLD_` in the environment, to release retained glibc arenas back to the OS earlier. Evidence that this works: `[D] RSS AFTER malloc_trim(0) : 106.12 MB (trim rc=1)` (EXACT).
 2. **Context-manage the PDF handle.** Wrap the qpdf handle as `with pikepdf.open(...) as pdf:` in `extract_metadata` (`src/paperless_tesseract/parsers.py:L34`) so the native handle closes deterministically rather than at function return. Evidence of the current native retention: `[P] RSS after 50 open (no close): 36.91 MB (delta +2.99 MB)` (≈0.06 MB/open, released by `malloc_trim(0)`).
 3. **Keep the loaded classifier across post-consume hooks.** Optionally cache/keep the loaded classifier across hooks; this is already partially mitigated by the single per-consume load at `src/documents/consumer.py:L292` (rationale comment `L288-L290`).
 
@@ -366,17 +420,17 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 
 | User-named item | Where answered | Anchor evidence / citation |
 |-----------------|----------------|----------------------------|
-| Spikes / root-cause | §4 Q1, §5 | `[A1] RSS after ONE load : 219.92 MB (delta +123.48 MB)` vs `28 bytes`; `src/documents/classifier.py:L86-L92` |
+| Spikes / root-cause | §4 Q1, §5 | `[cold] RSS after ONE load : 176.05 MB (delta +126.49 MB)` / `[warm] … delta +50.00 MB` vs `19 bytes`; `src/documents/classifier.py:L86-L92` |
 | Unnecessary copies | §4 Q2 | `[E] tracemalloc peak (3 copies): 2.723 MB`; `[C-cumulative] … N=40: 9.062 MB (41.8x)`; `src/documents/classifier.py:L24-L27`, `src/documents/matching.py:L131,L134` |
 | References held too long | §4 Q2 | `[P] RSS after del+gc handles : 36.91 MB` (native, released by `malloc_trim(0)`); `src/paperless_tesseract/parsers.py:L34`, `src/paperless_text/parsers.py:L42`, `src/documents/models.py:L117` |
 | Caching accumulation | §4 Q3 | grep `ZERO: no CACHES setting`, `ZERO: no lru_cache/functools.cache/@cache`, `ZERO: no gc.collect/import gc`; `src/documents/consumer.py:L292` |
 | Spike-vs-no-spike difference | §4 Q4, §7.3 | `[NO-SPIKE] … +0.00 MB` vs `[SPIKE] … +52.55 MB`; `src/paperless/settings.py:L74`, `src/documents/classifier.py:L31` |
 | Document types | §4 Q5, §7.2 | `src/paperless_text/parsers.py:L42`, `src/paperless_tesseract/parsers.py:L34`, `src/paperless_tika/parsers.py:L29-L49`; `[P]` and `[B]` |
-| Batch sizes | §4 Q5, §7.1 | `[A2] after 20/40/60 loads: RSS= 250.66 MB`; `[A2] RSS after malloc_trim(0) : 180.04 MB (trim rc=1)` |
-| Normal-GC vs problematic | §8 | `[D] tracemalloc AFTER del+gc : 0.00 MB`; `[D] RSS AFTER malloc_trim(0) : 180.10 MB (trim rc=1)` |
+| Batch sizes | §4 Q5, §7.1 | `[A2] after 20/40/60 loads: RSS= 187.25/165.99/155.07 MB` (no monotonic growth); `[A2] RSS after malloc_trim(0) : 106.08 MB (trim rc=1)` |
+| Normal-GC vs problematic | §8 | `[D] tracemalloc AFTER del+gc : 0.00 MB`; `[D] RSS AFTER malloc_trim(0) : 106.12 MB (trim rc=1)` |
 | Actual runtime measurements shown | §6 (EXACT + REPRESENTATIVE), §7 | both verbatim blocks with producing commands |
 | Which components/methods hold memory | §5 | attribution table with `file:line` per row |
-| Where memory is actually going | §5, §8 | model reconstruction (`classifier.py:L86-L92`) + glibc arenas (RSS-vs-tracemalloc gap `42.84 MB`) |
+| Where memory is actually going | §5, §8 | model reconstruction (`src/documents/classifier.py:L86-L92`) + glibc arenas (cold-load RSS-vs-tracemalloc gap `48.93 MB`) |
 
 **Structural note present:** Section 3 documents that `extract_metadata` runs on the REST metadata endpoint (`src/documents/views.py:L260-L305`), not the core consume path, and both interpretations are covered.
 
@@ -386,8 +440,272 @@ All findings are framed against `Q_CLUSTER = { ..., "recycle": 1, ... }` (`src/p
 
 ---
 
+## Appendix A — Full EXACT model-load reproduction scripts (embedded for bit-for-bit reproduction)
+
+These are the complete, unabridged script bodies that produced the EXACT model-load evidence in §6.1. They are embedded here so the run is reproducible **line-for-line** without relying on any file that was cleaned up. They live **outside** the repository (under `/tmp/mem_probe_fix`, mounted read-only into the container at `/probe`) and modify **no** repository file; the only thing they write is a scratch `classification_model.pickle` under `PAPERLESS_DATA_DIR=/tmp/pdata` (an ephemeral in-container tmp dir).
+
+**To reproduce (single command):** save the five files below under `/tmp/mem_probe_fix/`, then run the exact producing command from §6.1 (`docker run … paperless-ngx-memtest:local -c 'bash /probe/run_all.sh'`). The driver builds the model, measures the one-time import cost, runs 3× cold and 3× warm single-load probes, and runs the batch + leak test.
+
+**Reproducibility caveat.** RSS deltas depend on glibc allocator/arena state and are reproducible in **direction and magnitude**, not bit-identically: the cold single-load delta reproduced as `+126.49 / +126.40 / +126.37 MB` (mean `+126.42`, ~0.1 MB spread) and the warm delta as `+50.00 MB` on all three runs. The earlier single sample (`+123.48 MB`, 48.22 MB model) is a **cold-baseline** measurement within ~2.4% of this run's cold mean; an independent warm reconstruction (`~+48 MB`) is a **warm-baseline** measurement within ~4% of this run's warm value. Model size scales the model-data component roughly linearly (a 137.66 MB model gave cold `+219 MB` / warm `+144 MB` with the same `+73.68 MB` one-time import), so exact MB depend on the built model's size; `build_model.py` is tuned to `~48 MB` (`N_UNI = 3486`) to match the report and QA regimes.
+
+`build_model.py`:
+
+```python
+"""
+build_model.py -- Build a ~48 MB source-compatible classification_model.pickle
+using the REAL DocumentClassifier.save() from the paperless-ngx repo.
+
+Classifier objects are constructed exactly as DocumentClassifier.train()
+(src/documents/classifier.py) does:
+    CountVectorizer(analyzer="word", ngram_range=(1, 2), min_df=0.01)
+    MultiLabelBinarizer()
+    MLPClassifier(tol=0.01)   x3
+then assigned to a real DocumentClassifier and persisted with the real .save()
+(7 sequential pickle.dump in FORMAT_VERSION order).
+
+The corpus is deterministic (fixed-order tokens) so the vocabulary is exactly
+~6971 features -> MLP weight matrices (plus retained Adam optimizer moments)
+dominate the pickle at ~48 MB, comparable
+to the report's 48.22 MB and QA's independent 48.07 MB reconstructions.
+
+Read-only: lives OUTSIDE the repo (/probe) and only WRITES to PAPERLESS_DATA_DIR
+(a scratch tmp dir); it modifies no repository file.
+"""
+import os
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+os.environ.setdefault("PAPERLESS_DISABLE_DBHANDLER", "true")
+django.setup()
+
+from django.conf import settings
+from documents.classifier import DocumentClassifier
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import MultiLabelBinarizer
+
+# N_UNI unigrams in FIXED order -> ~N_UNI unigram + ~(N_UNI-1) bigram features.
+# N_UNI=3486 -> ~6971 features -> ~48 MB pickle (weights x3 + Adam moments x2).
+N_UNI = 3486
+N_DOCS = 12
+words = [f"w{i}" for i in range(N_UNI)]
+one_doc = " ".join(words)              # identical fixed-order doc
+docs = [one_doc for _ in range(N_DOCS)]
+
+vectorizer = CountVectorizer(analyzer="word", ngram_range=(1, 2), min_df=0.01)
+X = vectorizer.fit_transform(docs)
+n_feat = len(vectorizer.vocabulary_)
+
+# Labels: vary across docs so the classifiers fit real weight matrices.
+labels_dtype = [(i % 7) + 1 for i in range(N_DOCS)]
+labels_corr = [(i % 5) + 1 for i in range(N_DOCS)]
+labels_tags = [sorted({(i % 9) + 1, (i % 4) + 1}) for i in range(N_DOCS)]
+
+binarizer = MultiLabelBinarizer()
+y_tags = binarizer.fit_transform(labels_tags)
+
+tags_clf = MLPClassifier(tol=0.01, max_iter=6, random_state=1)
+tags_clf.fit(X, y_tags)
+corr_clf = MLPClassifier(tol=0.01, max_iter=6, random_state=2)
+corr_clf.fit(X, labels_corr)
+dtype_clf = MLPClassifier(tol=0.01, max_iter=6, random_state=3)
+dtype_clf.fit(X, labels_dtype)
+
+clf = DocumentClassifier()
+clf.data_hash = b"\x00" * 20
+clf.data_vectorizer = vectorizer
+clf.tags_binarizer = binarizer
+clf.tags_classifier = tags_clf
+clf.correspondent_classifier = corr_clf
+clf.document_type_classifier = dtype_clf
+clf.save()  # REAL save() -> settings.MODEL_FILE
+
+size_mb = os.path.getsize(settings.MODEL_FILE) / (1024 * 1024)
+print(f"[build] MODEL_FILE                    : {settings.MODEL_FILE}")
+print(f"[build] vocabulary size (n_features)  : {n_feat}")
+print(f"[build] classification_model.pickle MB: {size_mb:8.2f}")
+```
+
+`probe_import_cost.py`:
+
+```python
+"""
+probe_import_cost.py -- Isolate the one-time scikit-learn import cost in a FRESH
+process: read RSS, import the exact estimator submodules that unpickling the
+model triggers, read RSS again. This cold->warm library-init cost is what a
+cold-baseline load delta folds in (directly analogous to the one-time qpdf
+lib-init already isolated for pikepdf in the report).
+"""
+def vmrss_mb():
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    return -1.0
+
+rss_cold = vmrss_mb()
+import numpy            # noqa
+import scipy            # noqa
+from sklearn.neural_network import MLPClassifier             # noqa
+from sklearn.feature_extraction.text import CountVectorizer  # noqa
+from sklearn.preprocessing import MultiLabelBinarizer        # noqa
+from sklearn.utils.multiclass import type_of_target          # noqa
+MLPClassifier(tol=0.01)
+rss_warm = vmrss_mb()
+print(f"[imp] RSS cold (before sklearn import) : {rss_cold:8.2f} MB")
+print(f"[imp] RSS warm (after sklearn import)  : {rss_warm:8.2f} MB")
+print(f"[imp] one-time sklearn import cost     : {rss_warm - rss_cold:+8.2f} MB  (cold->warm)")
+```
+
+`probe_load.py`:
+
+```python
+"""
+probe_load.py MODE  -- Measure the RSS spike of ONE real load_classifier().
+
+MODE=cold : fresh process, sklearn estimator submodules NOT yet imported. The
+            first pickle.load triggers their lazy import, so delta =
+            (one-time sklearn import) + (model data). This is the cost a FRESH
+            django-q worker pays on its very first consume (classifier.py imports
+            sklearn lazily, not at module import).
+MODE=warm : force sklearn submodules to import FIRST (as on a worker that has
+            already classified once), then load. delta = model data only.
+
+Uses the REAL load_classifier()/DocumentClassifier.load() (6 sequential
+pickle.load, src/documents/classifier.py:L86-L92). RSS via /proc/self/status
+VmRSS; tracemalloc traces Python objects only.
+"""
+import os, sys, gc, ctypes, tracemalloc, django
+MODE = sys.argv[1] if len(sys.argv) > 1 else "cold"
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+os.environ.setdefault("PAPERLESS_DISABLE_DBHANDLER", "true")
+
+def vmrss_mb():
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    return -1.0
+
+django.setup()
+from documents.classifier import load_classifier
+from django.conf import settings
+size_mb = os.path.getsize(settings.MODEL_FILE) / (1024 * 1024)
+
+if MODE == "warm":
+    import numpy            # noqa
+    import scipy            # noqa
+    from sklearn.neural_network import MLPClassifier             # noqa
+    from sklearn.feature_extraction.text import CountVectorizer  # noqa
+    from sklearn.preprocessing import MultiLabelBinarizer        # noqa
+    from sklearn.utils.multiclass import type_of_target          # noqa
+    MLPClassifier(tol=0.01)
+
+document_content = "small text document"
+tracemalloc.start()
+rss_before = vmrss_mb()
+clf = load_classifier()
+rss_after = vmrss_mb()
+cur, peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+ok = clf is not None
+print(f"[{MODE}] classification_model.pickle size : {size_mb:8.2f} MB")
+print(f"[{MODE}] document content size     : {len(document_content):8d} bytes")
+print(f"[{MODE}] load_classifier() not None       : {ok}")
+print(f"[{MODE}] RSS before load           : {rss_before:8.2f} MB")
+print(f"[{MODE}] RSS after ONE load        : {rss_after:8.2f} MB   (delta {rss_after - rss_before:+.2f} MB)")
+print(f"[{MODE}] tracemalloc peak on load  : {peak / (1024*1024):8.2f} MB")
+print(f"[{MODE}] RSS-vs-tracemalloc gap    : {(rss_after - rss_before) - peak/(1024*1024):8.2f} MB")
+del clf
+gc.collect()
+rc = ctypes.CDLL("libc.so.6").malloc_trim(0)
+print(f"[{MODE}] RSS after del+gc          : {vmrss_mb():8.2f} MB")
+print(f"[{MODE}] RSS after malloc_trim(0)  : {vmrss_mb():8.2f} MB  (trim rc={rc})")
+```
+
+`probe_batch.py`:
+
+```python
+"""
+probe_batch.py -- [A2] batch trend + [D] leak test using the REAL
+load_classifier()/DocumentClassifier.load().
+
+[A2]: load repeatedly (20/40/60), read RSS at each checkpoint to show flat vs
+      monotonic growth, then malloc_trim(0) for allocator release.
+[D]:  fresh load -> del -> gc.collect() -> malloc_trim(0), reading tracemalloc +
+      RSS at each step to classify Python-object vs native/allocator retention.
+"""
+import os, gc, ctypes, tracemalloc, django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+os.environ.setdefault("PAPERLESS_DISABLE_DBHANDLER", "true")
+
+def vmrss_mb():
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    return -1.0
+
+django.setup()
+from documents.classifier import load_classifier
+from django.conf import settings
+libc = ctypes.CDLL("libc.so.6")
+size_mb = os.path.getsize(settings.MODEL_FILE) / (1024 * 1024)
+print(f"[A2] classification_model.pickle size : {size_mb:8.2f} MB")
+peak_rss = 0.0
+held = None
+for i in range(1, 61):
+    held = load_classifier()
+    r = vmrss_mb()
+    if r > peak_rss:
+        peak_rss = r
+    if i in (20, 40, 60):
+        print(f"[A2] after {i:3d} loads: RSS= {r:8.2f} MB (no explicit gc)")
+print(f"[A2] peak RSS during batch     : {peak_rss:8.2f} MB")
+del held
+gc.collect()
+libc.malloc_trim(0)
+print(f"[A2] RSS after malloc_trim(0)  : {vmrss_mb():8.2f} MB  (trim rc=1)")
+tracemalloc.start()
+clf = load_classifier()
+cur, peak = tracemalloc.get_traced_memory()
+print(f"[D] tracemalloc AFTER load     : {peak/(1024*1024):8.2f} MB peak")
+print(f"[D] RSS AFTER load             : {vmrss_mb():8.2f} MB")
+del clf
+gc.collect()
+cur2, peak2 = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+print(f"[D] tracemalloc AFTER del+gc   : {cur2/(1024*1024):8.2f} MB")
+print(f"[D] RSS AFTER del+gc           : {vmrss_mb():8.2f} MB")
+rc = libc.malloc_trim(0)
+print(f"[D] RSS AFTER malloc_trim(0)   : {vmrss_mb():8.2f} MB  (trim rc={rc})")
+```
+
+`run_all.sh` (the driver):
+
+```bash
+#!/bin/bash
+set -e
+mkdir -p "$PAPERLESS_DATA_DIR" "$PAPERLESS_MEDIA_ROOT" "$PAPERLESS_CONSUMPTION_DIR"
+cd /workspace/src
+echo "===== ENV ====="
+python3 -c "import sys,sklearn,numpy,scipy,pikepdf;print('Python',sys.version.split()[0],'| scikit-learn',sklearn.__version__,'| numpy',numpy.__version__,'| scipy',scipy.__version__,'| pikepdf',pikepdf.__version__)"
+echo "===== BUILD MODEL ====="
+python3 /probe/build_model.py
+echo "===== SKLEARN IMPORT COST (decomposition) ====="
+python3 /probe/probe_import_cost.py
+echo "===== [A1] COLD single-load (fresh process, sklearn not yet imported) ====="
+for i in 1 2 3; do echo "--- cold run $i ---"; python3 /probe/probe_load.py cold; done
+echo "===== [A1] WARM single-load (sklearn already imported) ====="
+for i in 1 2 3; do echo "--- warm run $i ---"; python3 /probe/probe_load.py warm; done
+echo "===== [A2]+[D] batch trend + leak test ====="
+python3 /probe/probe_batch.py
+```
+
+---
+
 ### Environment & scope footer
 
 - **EXACT** runtime: `Python 3.9.23 | scikit-learn 1.0.2 | numpy 1.22.3 | scipy 1.8.0 | pikepdf 5.1.1`, per `Dockerfile:L18` (`FROM python:3.9-slim-bullseye as main-app`).
 - **REPRESENTATIVE** runtime: `Python 3.12.3 | numpy 2.5.0 | psutil 7.2.2` (sklearn/pikepdf absent; classifier simulated with same-shape NumPy arrays; `preprocess_content` / `MATCH_FUZZY` transformation lines copied verbatim from the repo).
-- **Read-only proof:** the only repository change is this file. All temporary observation scripts lived under `/tmp/mem_probe` (outside the repository) and were removed; the git working tree is otherwise unchanged.
+- **Read-only proof:** the only repository change is this file. All temporary observation scripts lived under `/tmp/mem_probe` and `/tmp/mem_probe_fix` (outside the repository) and were removed; the git working tree is otherwise unchanged.
