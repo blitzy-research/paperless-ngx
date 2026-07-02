@@ -195,6 +195,8 @@ $ docker exec pl-idle-obs bash -lc 'ps -eo pid,args | grep -E "manage.py qcluste
     109 /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
 ```
 
+> **On the PID values in this document.** The absolute PIDs shown here — and in §1.4a, §3.1, and §5 — come from **separate `ps`/log snapshots** captured across the investigation's multiple idle bring-ups (and, in §5, across program restarts). They are **not stable identifiers** and legitimately differ between snapshots (for example the qcluster master reads `95` in this snapshot versus `106` in the §1.4a process tree, and the sentinel `133` here versus `142` in §3.1). What is invariant across every run — and what the answers below actually rely on — is the **process structure** (one gunicorn master + 2 workers; one consumer; one qcluster master → one sentinel/guard → 11 workers + 1 monitor + 1 pusher = 13 children) and the **verbatim log strings**; both were reproduced identically on re-runs, while only the PIDs (and the random cluster display name, §3.1) changed.
+
 ### 2.2 The two external always-on services
 
 - **Redis** — the single most important dependency: it is **both** the django-q broker (`src/paperless/settings.py:L456`) **and** the Channels layer backend `channels_redis.core.RedisChannelLayer` (`src/paperless/settings.py:L178` `CHANNEL_LAYERS`, `L180` backend, `L182` hosts, `L183` `"capacity": 2000`, `L184` `"expiry": 15`). Its liveness was shown by `PING -> True` in §1.1; Section 5 shows what happens when it is interrupted.
@@ -347,7 +349,6 @@ This corresponds to `catch_up: False` (`L451`), `name: "paperless"` (`L450`), `t
 
 The worker index keeps climbing (`Process-1:14`, `:15`, …) while the **pool size stays fixed at 11** — recycling replaces a worker rather than growing the pool. Observed verbatim, the four catch-up workers were each replaced: `recycled worker Process-1:1 → Process-1:14 ready for work at 294`, `:3 → :15 at 295`, `:2 → :16 at 296`, `:4 → :17 at 297`.
 
-
 ---
 
 ## Section 4 — O3: Periodic "healthy/ready" log entries — message + measured frequency + meaning
@@ -473,7 +474,7 @@ The first *recurring* fire (`23:57:26`) is only `181 s` after the catch-up fire 
 
 ### 4.3 What does NOT appear periodically within the window (reported exactly)
 
-- **Hourly `Train the classifier`** did not recur within the ~24-minute window: after the `23:54:25` catch-up fire its `next_run` advances by one hour to ≈ `00:54`, which is beyond the window (idle observation ended at the Redis interrupt, `00:17:45`). On this clean system its task body is silent (`result=None`, §3.3), so even when it does fire the only trace is the `[Q]` `created a task from schedule [Train the classifier]` / `processing` / `Processed` wrapper lines.
+- **Hourly `Train the classifier`** did not recur within *this* ~24-minute window: like the mail task (§4.2.1), its `next_run` is **phase-locked to the same pre-baked `:47` minute boundary** — django-q advances it to the *next occurrence* of that boundary, **not** to catch-up + 1 h — so after the `23:54:25` catch-up fire it advances to ≈ `00:47`, which is beyond the window (idle observation ended at the Redis interrupt, `00:17:45`). (The `:47` boundary is the schedule's observed `next_run` minute — the same base that yields the mail fires at `:57`/`:07`/`:17` in §3.3; verified live by inspecting `Schedule.next_run`, which reads `…:47:18` for this HOURLY row and steps by exactly one hour after each fire.) Consequently, whether the hourly task recurs inside a ~24-minute window depends on where the catch-up lands relative to the `:47` boundary: here the `:54` catch-up left the next fire `~53 min` out, whereas a catch-up shortly *before* the boundary makes it recur within ~10 min. On this clean system its task body is silent (`result=None`, §3.3), so even when it does fire the only trace is the `[Q]` `created a task from schedule [Train the classifier]` / `processing` / `Processed` wrapper lines.
 - **Daily `Optimize the index`** (`next_run 2026-07-02`) and **Weekly `Perform sanity check`** (`next_run 2026-07-08`) will not recur within any ~24-min window; their cadence is stated from the migrations (§3.3). Both were, however, observed executing once in the catch-up burst (§3.3).
 
 ### 4.4 The `paperless.*` application sinks while idle
@@ -617,7 +618,6 @@ OrmQ queued now: 0
 ```
 
 This is the recovery signature end-to-end: **Redis reconnected (§5.2, `Connected to Redis broker: …`) → cluster running (§5.3, `Q Cluster pip-lactose-sink-jupiter running.`) → consumer watching (§5.3, `Using inotify to watch directory for changes: …`) → web ready and serving (§5.3, `Server is ready. Spawning workers` after a clean restart + `HTTP 200`) → task queue drained (`OrmQ queued now: 0`).**
-
 
 ---
 
