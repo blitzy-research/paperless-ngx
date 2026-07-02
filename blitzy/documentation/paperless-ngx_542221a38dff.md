@@ -15,6 +15,19 @@
 
 ## Section 1 — O1: Setup and reaching a stable idle state
 
+**Provenance — exact commit *and* branch of the running code.** The stack was run from a checkout on branch **`paperless-ngx_542221a38dff`** at the pinned commit **`542221a38dff06361e07976452f9aea24d210542`**, with a **clean working tree** (no tracked file modified). Command + verbatim output, captured inside the running container at `/app` (sink `stdout`):
+
+```text
+$ git rev-parse HEAD
+542221a38dff06361e07976452f9aea24d210542
+$ git rev-parse --abbrev-ref HEAD
+paperless-ngx_542221a38dff
+$ git status --porcelain
+(no output — clean working tree)
+```
+
+`git rev-parse --abbrev-ref HEAD` returning `paperless-ngx_542221a38dff` is also what names this document (`blitzy/documentation/paperless-ngx_542221a38dff.md`); every log line, cadence, and literal quoted below was observed against exactly this commit on this branch.
+
 ### 1.1 What "the system" is, and what must be up first
 
 Paperless-ngx runs as **three long-lived application processes** supervised together, plus **two external services** that must already be up. The container image declares the supervisor entrypoint:
@@ -297,7 +310,14 @@ The four rows dated `23:54:25` are the one-time catch-up burst (all four schedul
 - `train_classifier` returns `None` and logs nothing on a fresh install: it **early-returns** when no Tag/DocumentType/Correspondent has `MATCH_AUTO` (`src/documents/tasks.py:L48`, condition `L50-L52`).
 - `index_optimize` returns `None`; it commits a Whoosh optimize (`src/documents/tasks.py:L32`, `writer.commit(optimize=True)` `L35`).
 - `sanity_check` returns the literal `"No issues detected."` (`src/documents/tasks.py:L267`); it *also* emitted a Paperless app line (see §4).
-- `process_mail_accounts` returns the literal `"No new documents were added."` (`src/paperless_mail/tasks.py:L22`) and, with zero mail accounts configured, never enters its loop body (`src/paperless_mail/tasks.py:L11`), so it logs nothing.
+- `process_mail_accounts` returns the literal `"No new documents were added."` (`src/paperless_mail/tasks.py:L22`) and, with **zero mail accounts configured**, never enters its loop body `for account in MailAccount.objects.all():` (`src/paperless_mail/tasks.py:L13`), so it logs nothing. The zero-account precondition is confirmed live — command + verbatim output (sink `stdout` via `manage.py shell`; the `MailAccount` model is `src/paperless_mail/models.py:L6`):
+
+```text
+$ python3 manage.py shell -c "from paperless_mail.models import MailAccount; print('MailAccount_count=', MailAccount.objects.count())"
+MailAccount_count= 0
+```
+
+Because the count is `0`, the `for` loop at `src/paperless_mail/tasks.py:L13` iterates zero times, `total_new_documents` stays `0` (`:L12`), and control falls straight to the `else` branch returning `"No new documents were added."` (`:L21`–`:L22`) — no `MailAccountHandler` is ever constructed and nothing is logged.
 
 ### 3.4 Always-on but idle-silent watchers
 
@@ -555,7 +575,9 @@ The completion marker `Q Cluster pip-lactose-sink-jupiter running.` (`django_q/c
 
 Re-emits the readiness line from `src/documents/management/commands/document_consumer.py:L200`.
 
-**Web server / gunicorn** — reported exactly as observed. In this run the `pkill` did **not** terminate the original gunicorn (its master, PID `122`, kept running and holding the listening socket), so the *relaunched* gunicorn could not bind `:8000` and gave up after retrying. Verbatim (sink `stdout`, `/tmp/obs/gunicorn_restart.log`):
+**Web server / gunicorn** — reported exactly as observed, in two parts: (a) the original in-run restart attempt, and (b) a clean restart that captures the readiness marker directly.
+
+**(a) First attempt — same-PID-namespace `pkill` did not stop the master.** In the initial perturbation the `pkill` did **not** terminate the original gunicorn (its master, PID `122`, kept running and holding the listening socket), so the *relaunched* gunicorn could not bind `:8000` and gave up after retrying. Verbatim (sink `stdout`, `/tmp/obs/gunicorn_restart.log`):
 
 ```text
 [2026-07-02 00:18:59 +0000] [936] [INFO] Starting gunicorn 20.1.0
@@ -566,7 +588,7 @@ Re-emits the readiness line from `src/documents/management/commands/document_con
 [2026-07-02 00:19:04 +0000] [936] [ERROR] Can't connect to ('0.0.0.0', 8000)
 ```
 
-Because the original web process never went down, the endpoint stayed continuously operational — verified live after the perturbation (sink `stdout`):
+Because the original web process never went down, the endpoint stayed continuously operational throughout — verified live after the perturbation (sink `stdout`):
 
 ```text
 $ docker exec -u testuser -w /app/src pl-idle-obs bash -lc \
@@ -574,7 +596,16 @@ $ docker exec -u testuser -w /app/src pl-idle-obs bash -lc \
 HTTP 200
 ```
 
-The web layer's readiness marker `Server is ready. Spawning workers` — the `when_ready(server)` hook (`gunicorn.conf.py:L17`–`L18`) — was emitted by the *original* gunicorn at startup and is captured verbatim in §4.2 (evidence **E4**). So the web layer's "operational again" proof is that it never lost service: the restart attempt merely found `:8000` still held while the endpoint kept answering `HTTP 200`.
+**(b) Clean restart — the master was fully stopped first, so gunicorn's own readiness marker was captured post-restart.** To capture the web server's `when_ready` marker directly (rather than infer continuity from `HTTP 200`), gunicorn was cleanly restarted on a fresh idle bring-up of the same pinned image/branch: the master was sent `SIGTERM`, and its exit was confirmed to have released `:8000` (`socket.connect_ex(("127.0.0.1",8000))` returned `111` = ECONNREFUSED = free) **before** relaunching. The fresh master then bound the port and emitted the `when_ready(server)` marker — `gunicorn.conf.py:L17`–`L18` `server.log.info("Server is ready. Spawning workers")`. Verbatim (sink `stdout`, `/tmp/obs/gunicorn_restart.log`):
+
+```text
+[2026-07-02 03:21:04 +0000] [213] [INFO] Starting gunicorn 20.1.0
+[2026-07-02 03:21:04 +0000] [213] [INFO] Listening at: http://0.0.0.0:8000 (213)
+[2026-07-02 03:21:04 +0000] [213] [INFO] Using worker: paperless.workers.ConfigurableWorker
+[2026-07-02 03:21:04 +0000] [213] [INFO] Server is ready. Spawning workers
+```
+
+The fresh master (**PID `213`**, distinct from the original) confirms this is a genuine post-restart start; immediately afterward the endpoint again answered `HTTP 200`. Its `03:21:04` timestamp is later than the `00:18`–`00:20` Redis-interrupt run above because this clean restart was a follow-up capture on a fresh idle container from the same image at branch `paperless-ngx_542221a38dff` — reported honestly rather than back-dated into the earlier run. The same `Server is ready. Spawning workers` marker also appears once at each original program start in §4.2 (evidence **E4**).
 
 ### 5.4 Proof the whole stack is operational again
 
@@ -585,7 +616,7 @@ $ python3 manage.py shell -c "from django_q.models import OrmQ; print('OrmQ queu
 OrmQ queued now: 0
 ```
 
-This is the recovery signature end-to-end: **Redis reconnected (§5.2, `Connected to Redis broker: …`) → cluster running (§5.3, `Q Cluster pip-lactose-sink-jupiter running.`) → consumer watching (§5.3, `Using inotify to watch directory for changes: …`) → web serving (§5.3, `HTTP 200`) → task queue drained (`OrmQ queued now: 0`).**
+This is the recovery signature end-to-end: **Redis reconnected (§5.2, `Connected to Redis broker: …`) → cluster running (§5.3, `Q Cluster pip-lactose-sink-jupiter running.`) → consumer watching (§5.3, `Using inotify to watch directory for changes: …`) → web ready and serving (§5.3, `Server is ready. Spawning workers` after a clean restart + `HTTP 200`) → task queue drained (`OrmQ queued now: 0`).**
 
 
 ---
