@@ -62,7 +62,7 @@ Because Python `3.9.23` is within Django `4.0.4`'s officially supported range (P
 
 **Restated symptom.** With a couple of common filters enabled (e.g. tag filters, or the inbox filter), paging through the documents list misbehaves even though nobody is editing anything and the chosen sort order never changes: the **same document appears on two neighbouring pages**, or a document **vanishes from one page and reappears on another**. The user proposes three hypotheses (H1, H2, H3, preserved verbatim in Section 3) and adds that the effect "gets stranger" for non-admin users whose visibility is supposedly shaped by sharing rules.
 
-**Root cause, in one paragraph.** The documents API uses **offset / page-number pagination** — `StandardPagination` with `page_size = 25` `[src/paperless/views.py:8-11]` — layered on top of the **non-unique** default sort key `Document.Meta.ordering = ("-created",)` `[src/documents/models.py:207-208]`, which carries **no unique tiebreaker**. `DocumentViewSet.get_queryset()` returns `Document.objects.distinct()` `[src/documents/views.py:198-199]`, and the filter backends apply the tag many-to-many filters (`tags__id__in` / `tags__id__all` / the inbox filter, wired as `is_in_inbox`) `[src/documents/filters.py:52,54-58,63-70,96]` **on top of that already-distinct base queryset**. The tag JOIN *does* multiply rows (**H1** — confirmed), but `SELECT DISTINCT` collapses those duplicates **inside the very same statement that is then sliced** by `LIMIT/OFFSET`, so on the real endpoint the `count` and rows are already de-duplicated (**H2** — in the ORM path de-duplication is *not* "before" pagination; it co-occurs with the slice). The instability the user actually sees is **H3**: because rows that **tie on `created`** have a **database-defined order that `ORDER BY … created DESC` does not constrain**, two separate `LIMIT/OFFSET` page queries are free to observe *different* tied-row orders, so adjacent pages can **overlap** (a document appears twice) or **gap** (a document is skipped). The Angular frontend trusts the server-provided `count` `[src-ui/src/app/data/results.ts:1-5]` and performs **no client-side de-duplication** `[src-ui/src/app/services/document-list-view.service.ts:133-161]`, so it faithfully mirrors whatever instability the backend emits. In short: **the true root cause is H3** (unstable ordering on tied sort keys); **H1 is confirmed but its duplicates are collapsed within each query**; and **H2's premise does not hold on the documents queryset**, because the base queryset is `Document.objects.distinct()` and de-duplication therefore happens inside the sliced statement, not before it.
+**Root cause, in one paragraph.** The documents API uses **offset / page-number pagination** — `StandardPagination` with `page_size = 25` `[src/paperless/views.py:8-11]` — layered on top of the **non-unique** default sort key `Document.Meta.ordering = ("-created",)` `[src/documents/models.py:207-208]`, which carries **no unique tiebreaker**. `DocumentViewSet.get_queryset()` returns `Document.objects.distinct()` `[src/documents/views.py:198-199]`, and the filter backends apply the tag many-to-many filters (`tags__id__in` / `tags__id__all` / the inbox filter, wired as `is_in_inbox`) `[src/documents/filters.py:52,54-58,63-70,96]` **on top of that already-distinct base queryset**. The tag JOIN _does_ multiply rows (**H1** — confirmed), but `SELECT DISTINCT` collapses those duplicates **inside the very same statement that is then sliced** by `LIMIT/OFFSET`, so on the real endpoint the `count` and rows are already de-duplicated (**H2** — in the ORM path de-duplication is _not_ "before" pagination; it co-occurs with the slice). The instability the user actually sees is **H3**: because rows that **tie on `created`** have a **database-defined order that `ORDER BY … created DESC` does not constrain**, two separate `LIMIT/OFFSET` page queries are free to observe _different_ tied-row orders, so adjacent pages can **overlap** (a document appears twice) or **gap** (a document is skipped). The Angular frontend trusts the server-provided `count` `[src-ui/src/app/data/results.ts:1-5]` and performs **no client-side de-duplication** `[src-ui/src/app/services/document-list-view.service.ts:133-161]`, so it faithfully mirrors whatever instability the backend emits. In short: **the true root cause is H3** (unstable ordering on tied sort keys); **H1 is confirmed but its duplicates are collapsed within each query**; and **H2's premise does not hold on the documents queryset**, because the base queryset is `Document.objects.distinct()` and de-duplication therefore happens inside the sliced statement, not before it.
 
 ---
 
@@ -73,6 +73,7 @@ Because Python `3.9.23` is within Django `4.0.4`'s officially supported range (P
 ```text
 32: api_router.register(r"documents", UnifiedSearchViewSet)
 ```
+
 `[src/paperless/urls.py:32]`
 
 **The dual-path branch.** `UnifiedSearchViewSet.filter_queryset` decides between a full-text path and an ORM browse path based on `_is_search_request()`, which is true when `query` or `more_like_id` is present in the query params `[src/documents/views.py:388-392]`:
@@ -92,9 +93,11 @@ Because Python `3.9.23` is within Django `4.0.4`'s officially supported range (P
 ...
 411:             return super(UnifiedSearchViewSet, self).filter_queryset(queryset)
 ```
+
 `[src/documents/views.py:394-411]`
 
 ### Path A — Whoosh full-text path (only when searching)
+
 When the request carries `query`/`more_like_id`, the view returns `index.DelayedFullTextQuery` `[src/documents/views.py:399]` or `index.DelayedMoreLikeThisQuery` `[src/documents/views.py:401]`. Each page is a **separate `search_page` call**, with the page number derived from the requested offset:
 
 ```text
@@ -106,17 +109,20 @@ When the request carries `query`/`more_like_id`, the view returns `index.Delayed
 217:             reverse=reverse,
 218:         )
 ```
+
 `[src/documents/index.py:203-237]`
 
 Its sort defaults to **relevance score** when the client sends no ordering, because `_get_query_sortedby` returns `None, False` in that case `[src/documents/index.py:166-167]`; its `sort_fields_map` also has **no unique tiebreaker** (and no `id`) `[src/documents/index.py:171-179]`. Filtering is done by `_get_query_filter` `[src/documents/index.py:132-163]`. So the full-text path has its **own** paging mechanism, distinct from SQL `LIMIT/OFFSET`.
 
 ### Path B — ORM browse path (the common case — no `query`)
+
 Otherwise the view falls through to `super().filter_queryset(queryset)` `[src/documents/views.py:411]` over the `DocumentViewSet` queryset:
 
 ```text
 198:     def get_queryset(self):
 199:         return Document.objects.distinct()
 ```
+
 `[src/documents/views.py:198-199]`
 
 ordered by the model default `("-created",)` `[src/documents/models.py:207-208]`, sliced by `StandardPagination` (`page_size = 25`, `page_size_query_param = "page_size"`, `max_page_size = 100000`) `[src/paperless/views.py:8-11]`, with filter backends `(DjangoFilterBackend, SearchFilter, OrderingFilter)` `[src/documents/views.py:184]`. **This ORM browse path is where the user's symptom lives**, and everything in Section 3 concerns it (with an explicit contrast to Path A where relevant).
@@ -127,7 +133,7 @@ ordered by the model default `("-created",)` `[src/documents/models.py:207-208]`
 
 All evidence below was produced with the **evidence harness** above (real `Document`/`Tag` models, real `DocumentFilterSet`, real `UnifiedSearchViewSet`), executed in the mandated Docker image against the tie-heavy dataset. The production table is `documents_document` (confirmed at runtime in Section 4), so the SQL quoted below is the **actual** endpoint SQL, not an analogue.
 
-### H1 — *"producing duplicates that get collapsed somewhere later."* → **CONFIRMED (the duplicates are collapsed inside each query)**
+### H1 — _"producing duplicates that get collapsed somewhere later."_ → **CONFIRMED (the duplicates are collapsed inside each query)**
 
 The tag M2M filters JOIN the tag table and multiply rows. The `in_list` branch applies `.distinct()` `[src/documents/filters.py:52]`, the else-branch chains one `filter(tags__id=…)` per tag `[src/documents/filters.py:54-58]`, and `InboxFilter` — wired as the `is_in_inbox` query parameter `[src/documents/filters.py:96]` — returns `qs.filter(tags__is_inbox_tag=True)` with **no local `.distinct()`** `[src/documents/filters.py:63-70]`. **But the endpoint's base queryset is `Document.objects.distinct()`** `[src/documents/views.py:198-199]`, so the filter is applied **on top of an already-distinct queryset**. Produced by:
 
@@ -152,9 +158,9 @@ ctrl.count(): 4
 ctrl titles: ['doc1', 'doc1', 'doc2', 'doc3']
 ```
 
-`doc1` matches two inbox tags, so the JOIN multiplies it. In the **un-distinct control** that surfaces as **4** rows with `doc1` twice (`['doc1', 'doc1', 'doc2', 'doc3']`) — the raw duplication H1 describes. On the **real endpoint** the same filter runs on `Document.objects.distinct()`, so the duplicate is **collapsed within the same query**: `count(): 3`, and `doc1` appears **once** (`['doc1', 'doc2', 'doc3']`). So the backend *does* generate duplicate rows (H1 confirmed), but they are de-duplicated inside each endpoint query — the `count: 4` control is **not** endpoint behavior.
+`doc1` matches two inbox tags, so the JOIN multiplies it. In the **un-distinct control** that surfaces as **4** rows with `doc1` twice (`['doc1', 'doc1', 'doc2', 'doc3']`) — the raw duplication H1 describes. On the **real endpoint** the same filter runs on `Document.objects.distinct()`, so the duplicate is **collapsed within the same query**: `count(): 3`, and `doc1` appears **once** (`['doc1', 'doc2', 'doc3']`). So the backend _does_ generate duplicate rows (H1 confirmed), but they are de-duplicated inside each endpoint query — the `count: 4` control is **not** endpoint behavior.
 
-### H2 — *"pagination happening before any de-duplication."* → **NO for the documents queryset** (dedup co-occurs with the slice); nuance for Whoosh
+### H2 — _"pagination happening before any de-duplication."_ → **NO for the documents queryset** (dedup co-occurs with the slice); nuance for Whoosh
 
 Because `get_queryset()` returns `Document.objects.distinct()` `[src/documents/views.py:198-199]`, **every** ORM filter branch — including `InboxFilter`, which has no local `.distinct()` — produces a `SELECT DISTINCT` statement, and `StandardPagination` appends `LIMIT/OFFSET` **to that same statement**. So de-duplication is part of the very query that is sliced; it does **not** happen "before" pagination. The actual executed SQL for the real `is_in_inbox=true` request, page 1 (`page_size=2`), captured with `CaptureQueriesContext`. Produced by:
 
@@ -172,10 +178,11 @@ SELECT DISTINCT "documents_document"."id", "documents_document"."correspondent_i
 ```
 
 `SELECT DISTINCT` and `LIMIT 2` are in the **same** statement — de-duplication co-occurs with the slice, so H2's premise does **not** hold for the documents queryset (this is exactly the `InboxFilter` branch, running on the already-distinct base). Two honest nuances:
+
 - **Whoosh full-text path:** there is no SQL `DISTINCT` at all; each page is an independent `search_page` call `[src/documents/index.py:203-237]`, so ORM de-duplication is simply not a concern there.
 - **The un-distinct control** (H1 above) is the only shape where JOIN-inflated rows would be paginated without de-duplication — but that shape is **not** what `/api/documents/` runs, precisely because `get_queryset()` is `Document.objects.distinct()`.
 
-### H3 — *"ordering quietly unstable when rows tie on the primary sort key."* → **CONFIRMED — this is the true root cause**
+### H3 — _"ordering quietly unstable when rows tie on the primary sort key."_ → **CONFIRMED — this is the true root cause**
 
 The generated SQL orders by `created DESC` with **no unique tiebreaker**. The base documents queryset — produced by `print(str(Document.objects.distinct().query))`:
 
@@ -183,7 +190,7 @@ The generated SQL orders by `created DESC` with **no unique tiebreaker**. The ba
 SELECT DISTINCT "documents_document"."id", "documents_document"."correspondent_id", "documents_document"."title", "documents_document"."document_type_id", "documents_document"."content", "documents_document"."mime_type", "documents_document"."checksum", "documents_document"."archive_checksum", "documents_document"."created", "documents_document"."modified", "documents_document"."storage_type", "documents_document"."added", "documents_document"."filename", "documents_document"."archive_filename", "documents_document"."archive_serial_number" FROM "documents_document" ORDER BY "documents_document"."created" DESC
 ```
 
-The operative clause is `ORDER BY "documents_document"."created" DESC` — **no tiebreaker**. On SQLite with a **static** dataset, repeated identical queries happen to return the *same* tied-row order, so pages are disjoint (this is why the two page fetches in Section 6 do not overlap). Produced by:
+The operative clause is `ORDER BY "documents_document"."created" DESC` — **no tiebreaker**. On SQLite with a **static** dataset, repeated identical queries happen to return the _same_ tied-row order, so pages are disjoint (this is why the two page fetches in Section 6 do not overlap). Produced by:
 
 ```python
 runs = [list(Document.objects.distinct().order_by("-created").values_list("title", flat=True)) for _ in range(3)]
@@ -248,13 +255,14 @@ document(s) skipped across those two pages: ['doc2']
 
 ## Section 4 — The permission / "sharing rules" angle (honest finding)
 
-The user's premise is that the anomaly depends on what a non-admin user is *allowed* to see. **Reported exactly as observed, this premise does not hold in v1.7.0: there is no object-level / per-user document access control in this version.**
+The user's premise is that the anomaly depends on what a non-admin user is _allowed_ to see. **Reported exactly as observed, this premise does not hold in v1.7.0: there is no object-level / per-user document access control in this version.**
 
 - The documents endpoint is guarded **only** by authentication, not by any per-object rule:
 
 ```text
 183:     permission_classes = (IsAuthenticated,)
 ```
+
 `[src/documents/views.py:183]`
 
 - The **only** per-user queryset filter anywhere near this area applies to **saved views**, not documents:
@@ -264,9 +272,10 @@ The user's premise is that the anomaly depends on what a non-admin user is *allo
 462:         user = self.request.user
 463:         return SavedView.objects.filter(user=user)
 ```
+
 `[src/documents/views.py:461-463]`
 
-- `AutoLoginMiddleware` resolves an identity via `User.objects.get(username=settings.AUTO_LOGIN_USERNAME)` `[src/paperless/auth.py:12]`, and `AngularApiAuthenticationOverride` falls back to `User.objects.filter(is_staff=True).first()` `[src/paperless/auth.py:29]`. Both establish *who the user is*; **neither filters the documents queryset by user or role.**
+- `AutoLoginMiddleware` resolves an identity via `User.objects.get(username=settings.AUTO_LOGIN_USERNAME)` `[src/paperless/auth.py:12]`, and `AngularApiAuthenticationOverride` falls back to `User.objects.filter(is_staff=True).first()` `[src/paperless/auth.py:29]`. Both establish _who the user is_; **neither filters the documents queryset by user or role.**
 - A repository-wide search found **no `django-guardian`**, **no `get_objects_for_user` / `has_perms` object-permission checks**, and **no `owner` field** on the `Document` model. Confirmed at runtime by real model introspection — produced by:
 
 ```python
@@ -281,7 +290,7 @@ Document.Meta.ordering: ('-created',)
 has owner field: False
 ```
 
-**Conclusion:** in paperless-ngx v1.7.0, admin vs non-admin does **not** change the returned document set — the glitch is **pagination instability, not visibility**. The reason it can *feel* "stranger" for some users is incidental: different users have different active filters and tag sets, which changes how many tied / JOIN-multiplied rows straddle a page boundary, and therefore how often the instability surfaces. It is not per-user access control.
+**Conclusion:** in paperless-ngx v1.7.0, admin vs non-admin does **not** change the returned document set — the glitch is **pagination instability, not visibility**. The reason it can _feel_ "stranger" for some users is incidental: different users have different active filters and tag sets, which changes how many tied / JOIN-multiplied rows straddle a page boundary, and therefore how often the instability surfaces. It is not per-user access control.
 
 ---
 
@@ -305,6 +314,7 @@ The Angular list view mirrors the backend one-to-one and adds no compensation:
 4:   results: T[]
 5: }
 ```
+
 `[src-ui/src/app/data/results.ts:1-5]`
 
 - `reload()` **replaces** the visible rows and only resets to page 1 when a **non-first** page returns 404 `[src-ui/src/app/services/document-list-view.service.ts:133-161]`:
@@ -341,6 +351,7 @@ but the UI's `DOCUMENT_SORT_FIELDS` offers **only non-unique fields — with no 
 23:   { field: 'modified', name: $localize`Modified` },
 24: ]
 ```
+
 `[src-ui/src/app/services/rest/document.service.ts:16-24]`
 
 Full-text search adds only `score` `[src-ui/src/app/services/rest/document.service.ts:26-31]` (`field: 'score'` at `:29`) — still not a unique tiebreaker. So a user **cannot** manually pick a stable ordering from the UI, and the frontend does no client-side de-duplication — the net result is that it **faithfully renders whatever unstable slice the backend returns**.
@@ -422,7 +433,7 @@ print("control count():", ctrl.count(), "| titles:", [d.title for d in ctrl])
 control count(): 4 | titles: ['doc1', 'doc1', 'doc2', 'doc3']
 ```
 
-Here — and **only** here, off the real endpoint — the JOIN inflates the count to **4** and `doc1` appears twice. Paginating *this* un-distinct shape is what would place a JOIN-multiplied row on two pages; the real endpoint avoids it via `.distinct()`.
+Here — and **only** here, off the real endpoint — the JOIN inflates the count to **4** and `doc1` appears twice. Paginating _this_ un-distinct shape is what would place a JOIN-multiplied row on two pages; the real endpoint avoids it via `.distinct()`.
 
 ### Reproducing the user's exact symptom on the endpoint is H3, not H1
 
@@ -464,7 +475,7 @@ layout2 (id,title): [(11, 'doc5'), (12, 'doc4'), (13, 'doc3'), (14, 'doc2'), (15
 both layouts strictly ascending by id ? True
 ```
 
-**Database backends.** paperless-ngx defaults to **SQLite** (`db.sqlite3`) `[src/paperless/settings.py:299-300]`, switching to **PostgreSQL** when `PAPERLESS_DBHOST` is set `[src/paperless/settings.py:304-311]`. **Both** leave the order of tied rows unspecified without a tiebreaker — so the fix is backend-independent. (Note that SQLite may *happen* to return a stable order for repeated *identical* queries — as observed in Section 3, H3 — but the `ORDER BY` still guarantees nothing about tied rows: the same query over the same logical data returned two different orders across physical layouts, and PostgreSQL is non-deterministic across separate `LIMIT/OFFSET` slices even with no edits.)
+**Database backends.** paperless-ngx defaults to **SQLite** (`db.sqlite3`) `[src/paperless/settings.py:299-300]`, switching to **PostgreSQL** when `PAPERLESS_DBHOST` is set `[src/paperless/settings.py:304-311]`. **Both** leave the order of tied rows unspecified without a tiebreaker — so the fix is backend-independent. (Note that SQLite may _happen_ to return a stable order for repeated _identical_ queries — as observed in Section 3, H3 — but the `ORDER BY` still guarantees nothing about tied rows: the same query over the same logical data returned two different orders across physical layouts, and PostgreSQL is non-deterministic across separate `LIMIT/OFFSET` slices even with no edits.)
 
 > These remedies are **recommendations only**. In keeping with the read-only scope of this investigation, **no source file was modified** — the sole change to the repository is this document.
 
