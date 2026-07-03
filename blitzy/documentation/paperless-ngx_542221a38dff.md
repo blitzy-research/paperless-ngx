@@ -546,7 +546,7 @@ The dispatcher is `def matches(matching_model, document)` `[src/documents/matchi
 | 5 | `MATCH_FUZZY` = **5** | `:25` | `matching.py:127` | Uses `from fuzzywuzzy import fuzz` `[:128]`; strips punctuation; returns `True` iff `fuzz.partial_ratio(match, text) >= 90` `[:135]` |
 | 6 | `MATCH_AUTO` = **6** | `:26` | `matching.py:147` | Returns `False` here — *"this is done elsewhere"* `[:148]`; the actual decision comes from the **ML classifier** (see §5.4) |
 
-An unrecognized algorithm raises `NotImplementedError("Unsupported matching algorithm")` `[matching.py:151]`.
+An unrecognized algorithm raises `NotImplementedError("Unsupported matching algorithm")` `[matching.py:152]`.
 
 ### 5.3 Observed auto-assignment (three algorithms at once)
 
