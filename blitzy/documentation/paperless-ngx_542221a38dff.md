@@ -30,7 +30,7 @@ async_task("documents.tasks.consume_file", ...)
 - REST upload → `src/documents/views.py:523-524`
 - IMAP e-mail attachment → `src/paperless_mail/mail.py:336-337`
 
-That task, `consume_file` `[src/documents/tasks.py:184]`, runs on the **Django-Q** worker cluster and calls `Consumer().try_consume_file(...)` `[src/documents/consumer.py:180]`, which performs the ordered processing stages (duplicate check → parser dispatch → OCR/text extraction → metadata derivation → **atomic** DB persistence → file storage). Persisting the row fires the `document_consumption_finished` signal `[src/documents/signals/__init__.py:4]` **inside** the same atomic block, which triggers the auto-organization handlers (correspondent, document type, tags, inbox tags) and the full-text index update.
+That task, `consume_file` `[src/documents/tasks.py:184]`, runs on the **Django-Q** worker cluster and calls `Consumer().try_consume_file(...)` `[src/documents/consumer.py:180]`, which performs the ordered processing stages (duplicate check → parser dispatch → **pre-consume script** `[consumer.py:235]` → OCR/text extraction → metadata derivation → **archive-path retrieval** `[consumer.py:276]` → **atomic** DB persistence → file storage → **post-consume script** `[consumer.py:371]`). Persisting the row fires the `document_consumption_finished` signal `[src/documents/signals/__init__.py:4]` **inside** the same atomic block, which triggers the auto-organization handlers (correspondent, document type, tags, inbox tags) and the full-text index update.
 
 I proved the convergence at runtime: three documents were created through the three distinct entry points, and all three produced a Django-Q `Task` row whose `func` is `documents.tasks.consume_file` (full evidence in [§2](#2--q1--how-a-document-enters-paperless-ngx-ingestion-entry-points)):
 
@@ -51,15 +51,19 @@ flowchart TD
     W["Django-Q worker cluster (manage.py qcluster)<br/>consume_file  tasks.py:184"] --> D
     D["Consumer.try_consume_file()  consumer.py:180"] --> E["Pre-checks: file exists / directories / duplicate checksum"]
     E --> F["Parser dispatch by MIME type  consumer.py:219-223"]
-    F --> G["parse() → OCR / text extraction  consumer.py:261"]
+    F --> PRE["run_pre_consume_script()  consumer.py:235<br/>(no-op unless PRE_CONSUME_SCRIPT set)"]
+    PRE --> G["parse() → OCR / text extraction  consumer.py:261"]
     G --> H["thumbnail + get_text + get_date  consumer.py:265-272"]
-    H --> I["load_classifier()  consumer.py:292"]
+    H --> AR["get_archive_path()  consumer.py:276<br/>(archive path: None for text, PDF/A path for OCR'd PDF)"]
+    AR --> I["load_classifier()  consumer.py:292"]
     I --> J["with transaction.atomic():  consumer.py:298"]
     J --> K["_store() → Document.objects.create()  consumer.py:379"]
     K --> L["document_consumption_finished.send()  consumer.py:306<br/>(fires INSIDE the atomic block)"]
     L --> M["Auto-organize (signal handlers, apps.py:22-27):<br/>add_inbox_tags · set_correspondent · set_document_type · set_tags"]
     M --> N["set_log_entry + add_to_index → Whoosh  handlers.py:413,428"]
     J --> O["_write() stores files + thumbnail  consumer.py:429"]
+    O --> POST["run_post_consume_script(document)  consumer.py:371<br/>(no-op unless POST_CONSUME_SCRIPT set)"]
+    POST --> Z["Document ... consumption finished  consumer.py:373<br/>return document  consumer.py:377"]
 
     S["Scheduler (same qcluster process)"] -. "HOURLY" .-> S1["train_classifier  tasks.py:48"]
     S -. "DAILY" .-> S2["index_optimize  tasks.py:32"]
@@ -141,10 +145,10 @@ HTTP_STATUS:401
 Worker pickup and task row:
 
 ```text
-# qcluster.log
+# /opt/paperless/data/log/paperless.log — emitted by the Django-Q worker executing consume_file
+# (produced by the REST curl above; it enqueued documents.tasks.consume_file, which the qcluster worker consumed)
 [2026-07-02 23:22:22,032] [INFO] [paperless.consumer] Consuming rest_invoice.txt
-[2026-07-02 23:22:22,...]  [INFO] [paperless.consumer] Document 2026-07-02 rest_invoice consumption finished
-23:22:22 [Q] INFO Processed [rest_invoice.txt]
+[2026-07-02 23:22:22,673] [INFO] [paperless.consumer] Document 2026-07-02 rest_invoice consumption finished
 ```
 
 ```text
@@ -165,10 +169,10 @@ HANDLE_MESSAGE_RETURN = 1
 ```
 
 ```text
-# qcluster.log
+# /opt/paperless/data/log/paperless.log — emitted by the Django-Q worker executing consume_file
+# (produced by driving MailAccountHandler().handle_message(msg, rule), which enqueued documents.tasks.consume_file)
 [2026-07-02 23:23:35,704] [INFO] [paperless.consumer] Consuming email_invoice.txt
-[2026-07-02 23:23:35,...]  [INFO] [paperless.consumer] Document 2026-07-02 Email Invoice Test consumption finished
-23:23:36 [Q] INFO Processed [email_invoice.txt]
+[2026-07-02 23:23:36,261] [INFO] [paperless.consumer] Document 2026-07-02 Email Invoice Test consumption finished
 ```
 
 ```text
@@ -197,11 +201,11 @@ func=documents.tasks.consume_file | task_name='email_invoice.txt'  | success=Tru
 
 ## 3 · Q2 — Processing stages & background execution
 
-**Short answer.** Once enqueued, a file is processed by the background task `consume_file` `[src/documents/tasks.py:184]`, which runs `Consumer.try_consume_file()` `[src/documents/consumer.py:180]`. The ordered stages are: pre-checks (existence, directories, duplicate checksum) → parser dispatch by MIME → parse (OCR/text) → thumbnail + text + date → load classifier → **atomic DB persist** → `document_consumption_finished` signal (fires *inside* the atomic block) → auto-organize + full-text index → file storage. Background execution is **Django-Q** (a multiprocessing task queue), run as `manage.py qcluster`, using **Redis** as the broker. Three periodic jobs are scheduled: **train classifier (hourly), optimize index (daily), sanity check (weekly)**.
+**Short answer.** Once enqueued, a file is processed by the background task `consume_file` `[src/documents/tasks.py:184]`, which runs `Consumer.try_consume_file()` `[src/documents/consumer.py:180]`. The ordered stages are: pre-checks (existence, directories, duplicate checksum) → parser dispatch by MIME → **pre-consume script** (`consumer.py:235`; no-op unless `PRE_CONSUME_SCRIPT` is set) → parse (OCR/text) → thumbnail + text + date → **archive-path retrieval** (`consumer.py:276`; `None` for text, a PDF/A path for OCR'd PDFs) → load classifier → **atomic DB persist** → `document_consumption_finished` signal (fires *inside* the atomic block) → auto-organize + full-text index → file storage → **post-consume script** (`consumer.py:371`; no-op unless `POST_CONSUME_SCRIPT` is set) → finish. Background execution is **Django-Q** (a multiprocessing task queue), run as `manage.py qcluster`, using **Redis** as the broker. Three periodic jobs are scheduled: **train classifier (hourly), optimize index (daily), sanity check (weekly)**.
 
 ### 3.1 The ordered pipeline stages (observed)
 
-To surface the internal stage sequence I ran the canonical `consume_file` synchronously with the `paperless` logger raised to `DEBUG`. This does **not** alter the pipeline — it only makes the pipeline's *existing* stage log lines visible. (The async convergence itself was already proven in [§2](#24--convergence-proof); this foreground run is purely to expose the ordered DEBUG lines.) Command:
+To surface the internal stage sequence I ran the canonical `consume_file` synchronously with the `paperless` logger raised to `DEBUG`. This does **not** alter the pipeline — it only makes the pipeline's *existing* stage log lines visible. (The async convergence itself was already proven in [§2.4](#24-convergence-proof); this foreground run is purely to expose the ordered DEBUG lines.) Command:
 
 ```bash
 python manage.py shell < /tmp/obs/pipeline_trace.py   # calls documents.tasks.consume_file(<file>)
@@ -215,7 +219,7 @@ Observed ordered output (document id 4 created), each line mapped to its source 
 [DEBUG] [paperless.consumer] Parser: TextDocumentParser
 [DEBUG] [paperless.consumer] Parsing pipeline_sample.txt...
 [DEBUG] [paperless.consumer] Generating thumbnail for pipeline_sample.txt...
-[DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 ...
+[DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /opt/paperless/tmp/paperless-in11ynii/thumb.png -out /opt/paperless/tmp/paperless-in11ynii/thumb_optipng.png
 [DEBUG] [paperless.consumer] Document classification model does not exist (yet), not performing automatic matching.
 [DEBUG] [paperless.consumer] Saving record to database
 [DEBUG] [paperless.consumer] Deleting file /opt/paperless/tmp/pipeline_sample.txt
@@ -228,20 +232,60 @@ Observed ordered output (document id 4 created), each line mapped to its source 
 | 1 | Enter pipeline / progress `STARTING` | `Consuming pipeline_sample.txt` | `try_consume_file` `[consumer.py:180]`; `Consuming {filename}` `[consumer.py:215]`; progress `[consumer.py:202]` |
 | 2 | Pre-checks (exists / dirs / **duplicate checksum**) | *(no error → passed)* | `pre_check_file_exists` `[:211]`, `pre_check_directories` `[:212]`, `pre_check_duplicate` `[:213]` |
 | 3 | MIME detection | `Detected mime type: text/plain` | `magic.from_file(...)` `[consumer.py:219]` |
-| 4 | Parser dispatch by MIME | `Parser: TextDocumentParser` | `get_parser_class_for_mime_type(mime_type)` `[consumer.py:223]` (see `src/documents/parsers.py`) |
-| 5 | Parse (OCR / text extraction) | `Parsing pipeline_sample.txt...` | `document_parser.parse(...)` `[consumer.py:261]` |
-| 6 | Thumbnail generation | `Generating thumbnail for ...` / `optipng ...` | `get_optimised_thumbnail(...)` `[consumer.py:265]` |
-| 7 | Extract text & date | *(text/date read)* | `get_text()` `[:271]`, `get_date()` `[:272]`, `parse_date` fallback `[:275]` |
-| 8 | Load ML classifier | `Document classification model does not exist (yet)...` | `load_classifier()` `[consumer.py:292]` |
-| 9 | **Atomic DB persist** | `Saving record to database` | `with transaction.atomic():` `[consumer.py:298]` → `_store(...)` `[consumer.py:379]` → `Document.objects.create(...)` |
-| 10 | `document_consumption_finished` signal | *(triggers §3.4 handlers)* | `document_consumption_finished.send(...)` `[consumer.py:306]` (**inside** the atomic block) |
-| 11 | Store files + thumbnail | *(files written)* | `_write(...)` `[consumer.py:429]` |
-| 12 | Delete source, finish | `Deleting file ...` / `... consumption finished` | `os.unlink(self.path)` `[consumer.py:350]`; finish log; `return document` `[consumer.py:377]` |
-| 13 | Return success | `Success. New document id 4 created` | `return "Success. New document id {} created"...` `[tasks.py:247]` |
+| 4 | Parser dispatch by MIME (then `document_consumption_started` signal `[:229]`) | `Parser: TextDocumentParser` | `get_parser_class_for_mime_type(mime_type)` `[consumer.py:223]` (see `src/documents/parsers.py`) |
+| 5 | **Run pre-consume script** | *(no line in the canonical run — `PRE_CONSUME_SCRIPT` is unset, so the guard returns immediately);* non-canonical demo (§3.1.1): `Executing pre-consume script /tmp/obs/pre_consume.sh` | `run_pre_consume_script()` `[consumer.py:235]` (def `[:121]`, guard `[:122-123]`, log `[:132]`) |
+| 6 | Parse (OCR / text extraction) | `Parsing pipeline_sample.txt...` | `document_parser.parse(...)` `[consumer.py:261]` |
+| 7 | Thumbnail generation | `Generating thumbnail for ...` / `optipng ...` | `get_optimised_thumbnail(...)` `[consumer.py:265]` |
+| 8 | Extract text & date | *(text/date read)* | `get_text()` `[:271]`, `get_date()` `[:272]`, `parse_date` fallback `[:275]` |
+| 9 | **Get archive path** | *(no distinct line; for text it returns `None`, so `archive_filename`/`archive_checksum` stay `None` — see §4.2);* non-canonical PDF demo (§3.1.1): OCRmyPDF wrote `archive.pdf` → `archive_filename='0000006.pdf'` | `archive_path = document_parser.get_archive_path()` `[consumer.py:276]` |
+| 10 | Load ML classifier | `Document classification model does not exist (yet)...` | `load_classifier()` `[consumer.py:292]` |
+| 11 | **Atomic DB persist** | `Saving record to database` | `with transaction.atomic():` `[consumer.py:298]` → `_store(...)` `[consumer.py:379]` → `Document.objects.create(...)` |
+| 12 | `document_consumption_finished` signal | *(triggers §3.4 handlers)* | `document_consumption_finished.send(...)` `[consumer.py:306]` (**inside** the atomic block) |
+| 13 | Store files + thumbnail (+ archive if present), delete source | `Deleting file ...` | `_write(...)` `[consumer.py:429]`; `os.unlink(self.path)` `[consumer.py:350]` |
+| 14 | Parser cleanup | *(temp parse dir removed)* | `document_parser.cleanup()` (finally) `[consumer.py:369]` |
+| 15 | **Run post-consume script** | *(no line in the canonical run — `POST_CONSUME_SCRIPT` is unset, so the guard returns immediately);* non-canonical demo (§3.1.1): `Executing post-consume script /tmp/obs/post_consume.sh` | `run_post_consume_script(document)` `[consumer.py:371]` (def `[:143]`, guard `[:144-145]`, log `[:154-157]`) |
+| 16 | Finish | `... consumption finished` | finish log `[consumer.py:373]`; `return document` `[consumer.py:377]` |
+| 17 | Return success | `Success. New document id 4 created` | `return "Success. New document id {} created"...` `[tasks.py:247]` |
+
+> **Stages 5, 9, and 15 are the pre-consume script, archive-path retrieval, and post-consume script.** In the canonical default configuration the two script stages are **silent no-ops** — `PRE_CONSUME_SCRIPT` and `POST_CONSUME_SCRIPT` are `None` `[src/paperless/settings.py:570-571]`, so each method returns at its guard (`if not settings.PRE_CONSUME_SCRIPT: return` `[consumer.py:122-123]`; the same for post `[:144-145]`). That is why the canonical DEBUG trace above contains **no** `Executing …-consume script` line. Their positive behavior is demonstrated in §3.1.1.
+
+### 3.1.1 Positive evidence for stages 5, 9 & 15 (non-canonical)
+
+Because stages 5 and 15 are no-ops under the default configuration, I proved their positive behavior in a **non-canonical** run: I set `PAPERLESS_PRE_CONSUME_SCRIPT` / `PAPERLESS_POST_CONSUME_SCRIPT` to two temporary scripts and consumed a **PDF** (which simultaneously exercises stage 9, since an OCR'd PDF produces a PDF/A archive). Only those two settings differ from canonical; every stage and its ordering are the genuine pipeline. Command:
+
+```bash
+PAPERLESS_PRE_CONSUME_SCRIPT=/tmp/obs/pre_consume.sh \
+PAPERLESS_POST_CONSUME_SCRIPT=/tmp/obs/post_consume.sh \
+python manage.py shell < /tmp/obs/stages_demo.py    # synchronous consume_file(simple-digital.pdf)
+```
+
+Observed output (ordered; the two `[…-consume demo script]` lines are the scripts' own stdout):
+
+```text
+[2026-07-03 00:48:21,342] [INFO] [paperless.consumer] Consuming stage_demo.pdf
+[2026-07-03 00:48:21,344] [INFO] [paperless.consumer] Executing pre-consume script /tmp/obs/pre_consume.sh
+[pre-consume demo script] invoked on: /opt/paperless/tmp/stage_demo.pdf
+[DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/opt/paperless/tmp/stage_demo.pdf', 'output_file': '/opt/paperless/tmp/paperless-m9xu395f/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/opt/paperless/tmp/paperless-m9xu395f/sidecar.txt'}
+[2026-07-03 00:48:22,762] [INFO] [paperless.consumer] Executing post-consume script /tmp/obs/post_consume.sh
+[post-consume demo script] invoked for document id:  title: 
+[2026-07-03 00:48:22,911] [INFO] [paperless.consumer] Document 2026-07-03 stage_demo consumption finished
+=== CONSUME RESULT: Success. New document id 6 created
+mime_type        = 'application/pdf'
+filename         = '0000006.pdf'
+archive_filename = '0000006.pdf'
+archive_checksum = '9909fd9b11bffc5469cdcc1e426e649e'
+```
+
+Cause → effect:
+- **Stage 5 (pre-consume script)** — `Executing pre-consume script /tmp/obs/pre_consume.sh` is emitted by `self.log("info", f"Executing pre-consume script …")` `[consumer.py:132]`, reached only because the guard `if not settings.PRE_CONSUME_SCRIPT` `[consumer.py:122-123]` was now false; the script's own `[pre-consume demo script] invoked on: …` line proves `Popen((settings.PRE_CONSUME_SCRIPT, self.path)).wait()` `[consumer.py:135]` actually ran it, before parser instantiation.
+- **Stage 9 (archive path)** — `get_archive_path()` `[consumer.py:276]` returned a real path for the PDF, so OCRmyPDF wrote `archive.pdf` (`output_type: 'pdfa'`) and the stored document has `archive_filename='0000006.pdf'` and `archive_checksum='9909fd9b…'` **populated** — contrast the text example in §4.2, where both are `None`.
+- **Stage 15 (post-consume script)** — `Executing post-consume script /tmp/obs/post_consume.sh` is emitted by `[consumer.py:154-157]`, after the atomic block and parser cleanup.
+
+The temporary scripts and the demo document (`id 6`) were deleted afterward; the DB is back to the five canonical documents. This run is **non-canonical** only in that two script settings were set.
 
 ### 3.2 The atomicity boundary
 
-**(inferred from reading `[src/documents/consumer.py:298,306]`)** The row creation (`_store` → `Document.objects.create`) and the `document_consumption_finished.send(...)` call both occur **inside the same** `with transaction.atomic():` block `[consumer.py:298]`. Consequently the document row plus its derived fields are committed together, and the post-persistence organization is triggered by the signal rather than by inline code. The observed `Saving record to database` line (stage 9 above) marks entry into this block.
+**(inferred from reading `[src/documents/consumer.py:298,306]`)** The row creation (`_store` → `Document.objects.create`) and the `document_consumption_finished.send(...)` call both occur **inside the same** `with transaction.atomic():` block `[consumer.py:298]`. Consequently the document row plus its derived fields are committed together, and the post-persistence organization is triggered by the signal rather than by inline code. The observed `Saving record to database` line (stage 11 above) marks entry into this block.
 
 ### 3.3 Background execution technology — Django-Q
 
@@ -253,23 +297,61 @@ Framework behavior confirmed via the official Django-Q documentation and the `Ko
 - A worker cluster is started with `python manage.py qcluster`.
 - It supports multiple **brokers** (Redis, the Django ORM, SQS, etc.); paperless-ngx uses **Redis** by default.
 - The cluster is composed of a **sentinel** (spawns/health-checks/reincarnates processes), a **pusher** (pulls task packages off the broker into an internal queue), **workers** (execute tasks), a **monitor** (saves results to the DB), and a **scheduler** (fires scheduled tasks).
-- Crucially — <cite index="10-24,10-25">unlike Celery, Django-Q tasks don't need decorators; any importable function can be queued as a task</cite>. This is exactly why paperless enqueues by dotted-path string `async_task("documents.tasks.consume_file", ...)` rather than via a decorated task object.
+- Crucially, unlike Celery, Django-Q tasks do not require decorators — any importable function can be queued as a task by passing the function (or its dotted-path string) to `async_task(func, ...)`, whose `func` parameter the official docs describe as "The task function to execute" ([Django-Q *Tasks* documentation](https://django-q.readthedocs.io/en/latest/tasks.html); source repo [`Koed00/django-q`](https://github.com/Koed00/django-q)). This is exactly why paperless enqueues by dotted-path string `async_task("documents.tasks.consume_file", ...)` rather than via a decorated task object.
 
-Observed `qcluster` startup banner (canonical config). The random cluster codename (`seventeen-paris-violet-shade`) matches Django-Q's documented naming convention:
+Observed `qcluster` startup banner (canonical config). To confirm the worker count is a stable magnitude rather than a one-off, I booted the cluster **twice** in the default configuration (no `PAPERLESS_TASK_WORKERS` override), each boot terminated with `SIGTERM` after ~13 s. Both boots are pasted **verbatim** below (every `Process-1:N` line included — no elision). Producing command, run from `<repo>/src` with the canonical venv/env active (`source /opt/paperless/activate.sh`):
 
-```text
-# qcluster.log (from: python manage.py qcluster)
-23:18:29 [Q] INFO Q Cluster seventeen-paris-violet-shade starting.
-23:18:29 [Q] INFO Process-1:1 ready for work at 48058
-...  (Process-1:1 through Process-1:11 — 11 workers)
-23:18:29 [Q] INFO Process-1:11 ready for work at 48068
-23:18:29 [Q] INFO Process-1:12 monitoring at 48069
-23:18:29 [Q] INFO Process-1 guarding cluster seventeen-paris-violet-shade
-23:18:29 [Q] INFO Process-1:13 pushing tasks at 48070
-23:18:29 [Q] INFO Q Cluster seventeen-paris-violet-shade running.
+```bash
+timeout --signal=TERM 14 python manage.py qcluster    # canonical; PAPERLESS_TASK_WORKERS unset
 ```
 
-**Worker count = 11 (observed, stable across 2 boots — see [R10 magnitude note](#r10--magnitudetiming)).** The relevant `Q_CLUSTER` values, read from the running settings:
+**Boot #1** — cluster codename `four-beer-equal-alanine`; exactly 11 workers `Process-1:1` … `Process-1:11` reach *ready for work*, then `Process-1:12` monitors and `Process-1:13` pushes (verbatim, `/tmp/obs/qcluster_boot1.log`):
+
+```text
+00:42:47 [Q] INFO Q Cluster four-beer-equal-alanine starting.
+00:42:47 [Q] INFO Process-1:1 ready for work at 82504
+00:42:47 [Q] INFO Process-1:2 ready for work at 82505
+00:42:47 [Q] INFO Process-1:3 ready for work at 82506
+00:42:47 [Q] INFO Process-1:4 ready for work at 82507
+00:42:47 [Q] INFO Process-1:5 ready for work at 82508
+00:42:47 [Q] INFO Process-1:6 ready for work at 82509
+00:42:47 [Q] INFO Process-1:7 ready for work at 82510
+00:42:47 [Q] INFO Process-1:8 ready for work at 82511
+00:42:47 [Q] INFO Process-1:9 ready for work at 82512
+00:42:47 [Q] INFO Process-1:10 ready for work at 82513
+00:42:47 [Q] INFO Process-1:11 ready for work at 82514
+00:42:47 [Q] INFO Process-1:12 monitoring at 82515
+00:42:47 [Q] INFO Process-1 guarding cluster four-beer-equal-alanine
+00:42:47 [Q] INFO Process-1:13 pushing tasks at 82516
+00:42:47 [Q] INFO Q Cluster four-beer-equal-alanine running.
+00:43:00 [Q] INFO Q Cluster four-beer-equal-alanine stopping.
+00:43:00 [Q] INFO Q Cluster four-beer-equal-alanine has stopped.
+```
+
+**Boot #2** — cluster codename `fix-bravo-sierra-eleven`; again exactly 11 workers `Process-1:1` … `Process-1:11` reach *ready for work*, then `Process-1:12` monitors and `Process-1:13` pushes (verbatim, `/tmp/obs/qcluster_boot2.log`):
+
+```text
+00:43:09 [Q] INFO Q Cluster fix-bravo-sierra-eleven starting.
+00:43:09 [Q] INFO Process-1:1 ready for work at 82787
+00:43:09 [Q] INFO Process-1:2 ready for work at 82788
+00:43:09 [Q] INFO Process-1:3 ready for work at 82789
+00:43:09 [Q] INFO Process-1:4 ready for work at 82790
+00:43:09 [Q] INFO Process-1:5 ready for work at 82791
+00:43:09 [Q] INFO Process-1:6 ready for work at 82792
+00:43:09 [Q] INFO Process-1:7 ready for work at 82793
+00:43:09 [Q] INFO Process-1:8 ready for work at 82794
+00:43:10 [Q] INFO Process-1:9 ready for work at 82795
+00:43:10 [Q] INFO Process-1:10 ready for work at 82796
+00:43:10 [Q] INFO Process-1:11 ready for work at 82797
+00:43:10 [Q] INFO Process-1:12 monitoring at 82798
+00:43:10 [Q] INFO Process-1 guarding cluster fix-bravo-sierra-eleven
+00:43:10 [Q] INFO Process-1:13 pushing tasks at 82799
+00:43:10 [Q] INFO Q Cluster fix-bravo-sierra-eleven running.
+00:43:23 [Q] INFO Q Cluster fix-bravo-sierra-eleven stopping.
+00:43:23 [Q] INFO Q Cluster fix-bravo-sierra-eleven has stopped.
+```
+
+**Worker count = 11 — observed identically on both boots** (`grep -c 'ready for work'` returned `11` for each log), confirming the magnitude is stable across ≥2 runs (see [R10 magnitude note](#73-r10--magnitudetiming)). The random cluster codenames (`four-beer-equal-alanine`, `fix-bravo-sierra-eleven`) are Django-Q's per-boot generated names and differ each run, but the worker pool size does not. The relevant `Q_CLUSTER` values, read from the running settings:
 
 ```text
 TASK_WORKERS      = 11
@@ -362,7 +444,7 @@ Redis must be reachable at startup (`[docker/wait-for-redis.py]`); confirmed wit
 # curl -s -o /dev/null -w "HTTP %{http_code}" http://localhost:8000/api/  =>  HTTP 200
 ```
 
-**Q2 summary:** ordered stages of `try_consume_file()` as tabled above; DB persistence is atomic and fires the auto-organize/index signal inside the transaction; background execution is **Django-Q** (`manage.py qcluster`, **Redis** broker, 11 workers observed); three scheduled jobs — **train classifier hourly, optimize index daily, sanity check weekly**.
+**Q2 summary:** ordered stages of `try_consume_file()` as tabled above — including the **pre-consume script** (`consumer.py:235`), **archive-path retrieval** (`consumer.py:276`), and **post-consume script** (`consumer.py:371`), the two script stages being silent no-ops unless `PRE_CONSUME_SCRIPT`/`POST_CONSUME_SCRIPT` are configured (shown positively in §3.1.1); DB persistence is atomic and fires the auto-organize/index signal inside the transaction; background execution is **Django-Q** (`manage.py qcluster`, **Redis** broker, 11 workers observed, stable across two boots); three scheduled jobs — **train classifier hourly, optimize index daily, sanity check weekly**.
 
 ---
 
@@ -400,7 +482,7 @@ Redis must be reachable at startup (`[docker/wait-for-redis.py]`); confirmed wit
 
 ### 4.2 Observed runtime example
 
-I fetched the real `Document pk=1` (the `folder_invoice` consumed via the watched folder in [§2.1](#21--the-usual-path--watched-consumption-folder)) and printed every field. Command:
+I fetched the real `Document pk=1` (the `folder_invoice` consumed via the watched folder in [§2.1](#21-the-usual-path--watched-consumption-folder)) and printed every field. Command:
 
 ```bash
 python manage.py shell < /tmp/obs/metadata_example.py   # Document.objects.get(pk=1)
@@ -533,16 +615,57 @@ The classifier trained a document-type model (uses scikit-learn `MLPClassifier`;
 
 ### 5.5 The practical filter / search workflow
 
-Once organizers are assigned, users retrieve documents via the REST API filter set `DocumentFilterSet` `[src/documents/filters.py:81]`. Observed queries (verbatim status + count):
+Once organizers are assigned, users retrieve documents via the REST API filter set `DocumentFilterSet` `[src/documents/filters.py:81]`. All four queries below were run against the live API (gunicorn on `:8000`) on the doc-1…5 baseline. Each query's **producing command** and its **raw response body + HTTP status** are pasted verbatim (the `-w "\nHTTP_STATUS:%{http_code}"` flag appends the status; the admin token is redacted per secret-handling policy — the real token is never written to this document).
 
-```text
-# curl -H "Authorization: Token <redacted>" http://localhost:8000/api/documents/?...
+**(a) Filter by correspondent** — `correspondent__id` `[filters.py:110]`:
 
-?correspondent__id=1   -> count=1 results=['q4_match']                 HTTP_STATUS:200   # filters.py:110
-?document_type__id=1   -> count=1 results=['q4_match']                 HTTP_STATUS:200   # filters.py:115
-?tags__id__all=1       -> count=1 results=['q4_match']                 HTTP_STATUS:200   # filters.py:90
-?query=consulting      -> count=2 results=['q4_match','folder_invoice'] HTTP_STATUS:200  # Whoosh full-text
+```bash
+curl -s -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: Token <redacted>" \
+     "http://localhost:8000/api/documents/?correspondent__id=1"
 ```
+
+```json
+{"count":1,"next":null,"previous":null,"results":[{"id":5,"correspondent":1,"document_type":1,"title":"q4_match","content":"INVOICE\nFrom: ACME Corporation\nThis invoice is for consulting services delivered in Q3.\nTotal amount due: 3200.00 USD\n","tags":[1,2],"created":"2026-07-02T23:33:18.782689Z","modified":"2026-07-02T23:33:20.449781Z","added":"2026-07-02T23:33:20.424462Z","archive_serial_number":null,"original_file_name":"2026-07-02 ACME Corporation q4_match.txt","archived_file_name":null}]}
+HTTP_STATUS:200
+```
+
+**(b) Filter by document type** — `document_type__id` `[filters.py:115]`:
+
+```bash
+curl -s -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: Token <redacted>" \
+     "http://localhost:8000/api/documents/?document_type__id=1"
+```
+
+```json
+{"count":1,"next":null,"previous":null,"results":[{"id":5,"correspondent":1,"document_type":1,"title":"q4_match","content":"INVOICE\nFrom: ACME Corporation\nThis invoice is for consulting services delivered in Q3.\nTotal amount due: 3200.00 USD\n","tags":[1,2],"created":"2026-07-02T23:33:18.782689Z","modified":"2026-07-02T23:33:20.449781Z","added":"2026-07-02T23:33:20.424462Z","archive_serial_number":null,"original_file_name":"2026-07-02 ACME Corporation q4_match.txt","archived_file_name":null}]}
+HTTP_STATUS:200
+```
+
+**(c) Filter by tag (match-all)** — `tags__id__all` `[filters.py:90]`:
+
+```bash
+curl -s -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: Token <redacted>" \
+     "http://localhost:8000/api/documents/?tags__id__all=1"
+```
+
+```json
+{"count":1,"next":null,"previous":null,"results":[{"id":5,"correspondent":1,"document_type":1,"title":"q4_match","content":"INVOICE\nFrom: ACME Corporation\nThis invoice is for consulting services delivered in Q3.\nTotal amount due: 3200.00 USD\n","tags":[1,2],"created":"2026-07-02T23:33:18.782689Z","modified":"2026-07-02T23:33:20.449781Z","added":"2026-07-02T23:33:20.424462Z","archive_serial_number":null,"original_file_name":"2026-07-02 ACME Corporation q4_match.txt","archived_file_name":null}]}
+HTTP_STATUS:200
+```
+
+**(d) Full-text search** — Whoosh index `[src/documents/index.py]` via the `query` param:
+
+```bash
+curl -s -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: Token <redacted>" \
+     "http://localhost:8000/api/documents/?query=consulting"
+```
+
+```json
+{"count":2,"next":null,"previous":null,"results":[{"id":5,"correspondent":1,"document_type":1,"title":"q4_match","content":"INVOICE\nFrom: ACME Corporation\nThis invoice is for consulting services delivered in Q3.\nTotal amount due: 3200.00 USD\n","tags":[1,2],"created":"2026-07-02T23:33:18.782689Z","modified":"2026-07-02T23:33:20.449781Z","added":"2026-07-02T23:33:20.424462Z","archive_serial_number":null,"original_file_name":"2026-07-02 ACME Corporation q4_match.txt","archived_file_name":null,"__search_hit__":{"score":1.0,"highlights":"INVOICE\nFrom: ACME Corporation\nThis invoice is for <span class=\"match term0\">consulting</span> services delivered in Q3.\nTotal amount due: 3200.00","rank":0}},{"id":1,"correspondent":null,"document_type":2,"title":"folder_invoice","content":"INVOICE\nFrom: ACME Corporation\nInvoice Number: ACME-2024-0042\nThis is an invoice document for consulting services rendered.\nTotal amount due: 1500.00 USD\n","tags":[],"created":"2026-07-02T23:21:34.197098Z","modified":"2026-07-02T23:34:43.904532Z","added":"2026-07-02T23:21:35.872032Z","archive_serial_number":null,"original_file_name":"2026-07-02 folder_invoice.txt","archived_file_name":null,"__search_hit__":{"score":0.8720864127345083,"highlights":"ACME-2024-0042\nThis is an invoice document for <span class=\"match term0\">consulting</span> services rendered.\nTotal amount due: 1500.00 USD","rank":1}}]}
+HTTP_STATUS:200
+```
+
+Summary of the four responses: `?correspondent__id=1` → `"count":1` (`filters.py:110`); `?document_type__id=1` → `"count":1` (`filters.py:115`); `?tags__id__all=1` → `"count":1` (`filters.py:90`); `?query=consulting` → `"count":2` (Whoosh full-text). All returned `HTTP_STATUS:200`.
 
 - The **structured filters** (`correspondent__id` `[filters.py:110]`, `document_type__id` `[filters.py:115]`, `tags__id__all` `[filters.py:90]`) each return **1** — only `q4_match` was auto-assigned those organizers. Related tag filters also exist: `tags__id__none` `[filters.py:92]`, `tags__id__in` `[filters.py:94]`. Organizer filter sets: `CorrespondentFilterSet` `[filters.py:18]`, `TagFilterSet` `[filters.py:24]`, `DocumentTypeFilterSet` `[filters.py:30]`.
 - The **full-text search** `?query=consulting` returns **2** — both `q4_match` and `folder_invoice` contain the word "consulting" in their indexed content (Whoosh index, `[src/documents/index.py]`). This works even though `folder_invoice` has no assigned organizers, illustrating the complementary roles: structured organizers for *categorization*, full-text index for *content search*.
@@ -570,11 +693,14 @@ Each named sub-item of the four question groups, mapped to where it is answered,
 | **Q2** — pipeline entry | §3.1 | `consume_file` `tasks.py:184`; `try_consume_file` `consumer.py:180` | Observed DEBUG trace |
 | Q2 — duplicate check | §3.1 | `pre_check_duplicate` `consumer.py:213` | (inferred from reading) |
 | Q2 — parser dispatch | §3.1 | `get_parser_class_for_mime_type` `consumer.py:223` | Observed `Parser: TextDocumentParser` |
+| Q2 — **pre-consume script** | §3.1, §3.1.1 | `run_pre_consume_script()` `consumer.py:235` | Non-canonical demo `Executing pre-consume script`; canonical no-op (`settings.py:570`) |
 | Q2 — OCR/text | §3.1 | `parse(...)` `consumer.py:261` | Observed `Parsing ...` |
 | Q2 — thumbnail | §3.1 | `get_optimised_thumbnail` `consumer.py:265` | Observed `Generating thumbnail ...` |
+| Q2 — **archive path** | §3.1, §3.1.1 | `get_archive_path()` `consumer.py:276` | Observed: `archive_filename` populated for PDF demo; `None` for text (§4.2) |
 | Q2 — load classifier | §3.1 | `load_classifier()` `consumer.py:292` | Observed `...model does not exist (yet)...` |
 | Q2 — atomic persist | §3.2 | `with transaction.atomic():` `consumer.py:298` | Observed `Saving record to database`; atomicity (inferred from reading) |
 | Q2 — signal fire | §3.4 | `document_consumption_finished.send(...)` `consumer.py:306` | (inferred from reading) + handler effects observed |
+| Q2 — **post-consume script** | §3.1, §3.1.1 | `run_post_consume_script(document)` `consumer.py:371` | Non-canonical demo `Executing post-consume script`; canonical no-op (`settings.py:571`) |
 | Q2 — background tech = **Django-Q** | §3.3 | `Q_CLUSTER` `settings.py:449`; `django-q==1.3.9` `requirements.txt:37` | Observed qcluster banner + web-confirmed |
 | Q2 — qcluster command | §3.3, §3.6 | `python3 manage.py qcluster` `supervisord.conf:28-29` | Observed banner |
 | Q2 — Redis broker | §3.3 | `redis://localhost:6379` `settings.py:456` | Observed `redis-cli ping → PONG` |
@@ -659,7 +785,7 @@ curl -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?
 
 ### 7.3 R10 — magnitude/timing
 
-- **Worker count = 11**, observed at the scale of two full `qcluster` boots. Boot #1 (cluster `seventeen-paris-violet-shade`) and boot #2 (cluster `asparagus-maryland-utah-arkansas`) each showed initial workers `Process-1:1` … `Process-1:11` plus one monitor and one pusher → **stable across ≥2 runs**. Derivation: `floor(sqrt(multiprocessing.cpu_count()))` with `cpu_count()=128` → `floor(sqrt(128))=11`, and `PAPERLESS_TASK_WORKERS` was unset (no override).
+- **Worker count = 11**, observed at the scale of two full `qcluster` boots (each run ~13 s, terminated with `SIGTERM`). Boot #1 (cluster `four-beer-equal-alanine`) and boot #2 (cluster `fix-bravo-sierra-eleven`) each showed initial workers `Process-1:1` … `Process-1:11` (11 `ready for work` lines — `grep -c 'ready for work'` returned `11` for both logs) plus one monitor (`Process-1:12`) and one pusher (`Process-1:13`) → **stable across ≥2 runs**. Both startup banners are pasted **verbatim** in §3.3. Derivation: `floor(sqrt(multiprocessing.cpu_count()))` with `cpu_count()=128` → `floor(sqrt(128))=11`, and `PAPERLESS_TASK_WORKERS` was unset (no override).
 - **Scheduled-job cadences** `H`/`D`/`W` (hourly/daily/weekly) were read directly from the persisted `Schedule` table (deterministic seed data from migrations `1001` and `1004`), not sampled over time.
 
 ### 7.4 Non-canonical / labeled values
@@ -668,6 +794,7 @@ curl -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?
 |-------|-------------|-------|
 | IMAP transport | No live IMAP server in-sandbox; message object synthetic. **The real `handle_message()` enqueue path was still exercised** — only the network fetch is stubbed. | §2.3 |
 | DEBUG pipeline trace (synchronous foreground run) | Canonical `consume_file` invoked directly to surface existing DEBUG stage lines; async convergence itself was proven separately in §2. Not a bypass — same code path. | §3.1 |
+| Pre-/post-consume script stage demo | `PAPERLESS_PRE_CONSUME_SCRIPT`/`PAPERLESS_POST_CONSUME_SCRIPT` set to two temporary scripts to prove stages 5 & 15 positively (they are silent no-ops under the default config where both are `None` `[settings.py:570-571]`). Only these two settings differ from canonical; every stage and its ordering are the genuine pipeline. | §3.1.1 |
 | Classifier prediction on *unseen* text → null class | Deliberately tiny 4-sample training set; reported exactly as observed. Prediction on *training* content correctly returned `[2]`. | §5.4 |
 
 *End of document.*
