@@ -8,7 +8,7 @@
 
 - **H1 — "backend duplicates collapsed later?"** *Partly true, but not the cause.* The join-producing filters **do** materialize duplicate rows (observed raw counts 10 and 20 vs. distinct 5 and 10), but they are collapsed by `SELECT DISTINCT` **inside** the query, **before** the page slice. Duplicates therefore never survive into a page. See §3.
 - **H2 — "pagination applied before de-duplication?"** *False.* The emitted SQL shows filtering + `SELECT DISTINCT` (+ `ORDER BY`) in the inner query and `LIMIT`/`OFFSET` applied **last**. De-duplication happens first, the slice happens after. See §4.
-- **H3 — "ordering quietly unstable on ties?"** *This is the real latent defect, but it did **not**, by itself, reproduce the symptom on a static dataset in this build.* The code's `ORDER BY "created" DESC` carries **no unique tiebreaker**, so the relative order of rows tied on `created` is **unspecified / implementation-dependent** — observed to differ across engine and query plan. **However**, driving the real endpoint over a **static** tied dataset (nobody editing) produced **stable** pages on canonical **SQLite** *and* on **PostgreSQL**, because `get_queryset()`'s `.distinct()` over *all* columns inadvertently pulls the unique `id` into the sort key. See §5.
+- **H3 — "ordering quietly unstable on ties?"** *This is the real latent defect, but it did **not**, by itself, reproduce the symptom on a static dataset in this build.* The code's `ORDER BY "created" DESC` carries **no unique tiebreaker**, so the relative order of rows tied on `created` is **unspecified / implementation-dependent** — observed to differ across engine and query plan. **However**, driving the real endpoint over a **static** tied dataset (nobody editing) produced **stable** pages — no duplicates, no omissions — on canonical **SQLite** (verified at **both 60 and 260** tied rows) *and* on **PostgreSQL**, because `get_queryset()`'s `.distinct()` over *all* columns inadvertently pulls the unique `id` into the sort key. In other words there was **no static `ordering=-created` reproduction in the canonical configuration**; the missing tiebreaker is a latent/engine-dependent risk and the actual trigger is a *shifting* result set (§6). See §5.
 - **What the user actually sees was reproduced through the real endpoint as offset-pagination over a *shifting* result set** — a document ingested or removed by the **background consumer** (not the user editing the rows they are viewing) between two page requests makes a document appear on two neighbouring pages, or disappear. H3's missing tiebreaker **amplifies** this. See §6.
 - **The "sharing rules / what the user is allowed to see" premise is false at this commit.** There is no per-document access-control layer (no django-guardian, no `owner` field, `IsAuthenticated` only); a non-superuser receives the **identical** rows in the **identical** order as the superuser. The only genuinely user-dependent variable is per-user `SavedView` **sort** settings, which merely pick a *different but equally tie-prone* `ORDER BY`. See §7.
 
@@ -405,6 +405,28 @@ total_ids_returned=60 unique=60 DUPLICATES=[] OMISSIONS=[]
 
 **Observed truth (stated exactly as measured, even though H3 was the leading hypothesis):** on canonical **SQLite**, the static tied dataset paginates **stably** across two passes — `DUPLICATES=[] OMISSIONS=[]` both times. The pure H3 tie-instability does **not**, on its own, produce the haunted anomaly here. Why: although the *specified* `ORDER BY` is `created DESC` only, SQLite's single deterministic plan over static data yields a repeatable tie order, so `OFFSET` slices a repeatable sequence.
 
+**Scale escalation (canonical SQLite) — 260 tied rows across 11 pages, still stable.** To rule out that the static stability is merely an artifact of a small tie block (60 rows / 3 pages), the tied set was grown to **260** documents — all sharing the identical `created=2020-01-01T00:00:00Z` — and both full page-walks were repeated through the real `GET /api/documents/` endpoint, after which the dataset was restored to the 60-row baseline. Verbatim:
+
+```text
+BASELINE_COUNT=60 TIED_CREATED=2020-01-01 00:00:00+00:00
+SEEDED=200 NEW_MIN=61 NEW_MAX=260 TOTAL_NOW=260
+########## PASS 1 ordering=-created [SQLite, 260 tied rows, live HTTP]
+count=260 n_pages=11 total_returned=260 unique=260 DUPLICATES=[] N_MISSING=0
+########## PASS 2 ordering=-created [SQLite, 260 tied rows, live HTTP]
+count=260 n_pages=11 total_returned=260 unique=260 DUPLICATES=[] N_MISSING=0
+RESTORE: count=60 min_id=1 max_id=60 ids_1..60=True
+```
+
+**Cause → effect:** growing the rows tied on `created` more than fourfold — spanning **11** page boundaries instead of 3 — introduced **not one** cross-page duplicate or omission on canonical SQLite (`DUPLICATES=[] N_MISSING=0`, stable across both passes). The static-dataset stability is therefore **not** a small-sample artifact; it is a property of SQLite's single deterministic plan combined with the `.distinct()`-supplied `id` in the sort key (§5.5).
+
+**Acceptance resolution (evidence-driven — reported exactly as observed, not adjusted toward the leading hypothesis).** Stating the outcome plainly so there is no ambiguity: on the **canonical** build (SQLite, Python 3.9, default configuration), **there was no static duplicate/omission reproduction under `ordering=-created`** — the pages were verified **stable at both 60 and 260 tied rows** across two full page-walks each. The consequences, each grounded in the observations above and in §5.1/§5.3/§6:
+
+- **The missing unique tiebreaker is a latent, engine-/plan-dependent risk, not the demonstrated static trigger in this build.** The emitted clause is `ORDER BY "documents_document"."created" DESC` with no `id` (§5.1); the same rows demonstrably order differently across sort column, engine, and plan (§5.3, §5.5), so the *specification* is unstable even though the canonical *run* came out stable.
+- **The trigger that actually reproduces the user's symptom is offset pagination over a *shifting* result set** — a background insert/removal between two independent per-page requests (§6), which produced an observed duplicate `[36]` and omission `[35]` through the real endpoint.
+- **A fix is still warranted** (append `id` as a tiebreaker and/or move to keyset/cursor pagination, §10.1) to remove the latent hazard and shrink the result-set-shift window — but this investigation reports what the canonical build actually does, and it does **not** manifest the static tie anomaly.
+
+> **Note on the SQLite-vs-other-engine question:** because the outcome is decided by the query plan (§5.5), a static reproduction cannot be manufactured on the canonical SQLite backend by adding rows alone (verified above at 260). A different engine/plan *could* expose it, but only a configuration that both (a) is not the default and (b) evades the `.distinct()`-supplied `id` tiebreaker — such a run would be **non-canonical** and is enumerated as the latent hazard in §5.5, not presented as the default-configuration behaviour.
+
 ### 5.5 PostgreSQL (non-canonical **backend**, actually run) — also stable, and the EXPLAIN shows why
 
 To test whether a different engine/plan exposes the latent instability, PostgreSQL **13.23** was installed and run **inside the same canonical Python 3.9 container** (this is a non-canonical *database backend*; the default remains SQLite). Version, verbatim:
@@ -489,7 +511,7 @@ req 5: first5=[501, 502, 503, 504, 505] last5=[996, 997, 998, 999, 1000]
 ALL_5_IDENTICAL=True
 ```
 
-**H3 verdict (observed):** the *specification* is unstable — the code's `ORDER BY` has **no unique tiebreaker**, and the same rows demonstrably order differently across sort column, engine, and plan (§5.3, §5.5). But on a **static** dataset through the real endpoint, pages were **stable** on both canonical SQLite and PostgreSQL because `.distinct()` over all columns accidentally supplies `id` in the sort key. So **H3 is a real *latent* defect and an amplifier, not the demonstrated static no-edit trigger in this build.** The trigger that actually reproduces the user's symptom is in §6.
+**H3 verdict (observed):** the *specification* is unstable — the code's `ORDER BY` has **no unique tiebreaker**, and the same rows demonstrably order differently across sort column, engine, and plan (§5.3, §5.5). But on a **static** dataset through the real endpoint, pages were **stable** on canonical SQLite (verified at **both 60 and 260** tied rows across two full page-walks each, §5.4) *and* on PostgreSQL, because `.distinct()` over all columns accidentally supplies `id` in the sort key. So **H3 is a real *latent* defect and an amplifier, not the demonstrated static no-edit trigger in this build** — there was **no static `ordering=-created` duplicate/omission reproduction in the canonical configuration**, and no amount of added tied rows manufactured one (§5.4). The missing tiebreaker is an engine-/plan-dependent hazard; the trigger that actually reproduces the user's symptom is offset pagination over a shifting result set, reproduced in §6.
 
 ---
 
@@ -629,7 +651,7 @@ Every item the question names, addressed with cause → effect and grounded in c
 |---|------------|-----------------|--------------------------|
 | 1 | **H1** — backend duplicates collapsed later | §3 | Real, but not the cause: joins multiply rows (raw 10/20) and `SELECT DISTINCT` (`src/documents/views.py:L198-L199`) collapses them **before** the slice → duplicates never reach a page. |
 | 2 | **H2** — pagination before de-duplication | §4 | **False**: emitted SQL puts filter/`DISTINCT`/`ORDER BY` inner and `LIMIT`/`OFFSET` last → de-dup first, then slice. |
-| 3 | **H3** — unstable ordering on ties | §5, §6.3 | **Latent defect + amplifier, not the static trigger here**: `ORDER BY created DESC` has **no unique tiebreaker** so tie order is unspecified (differs by sort/engine/plan), but `.distinct()` over all columns accidentally adds `id` to the sort key → static pages came out **stable** on SQLite and PostgreSQL. |
+| 3 | **H3** — unstable ordering on ties | §5, §6.3 | **Latent defect + amplifier, not the static trigger here**: `ORDER BY created DESC` has **no unique tiebreaker** so tie order is unspecified (differs by sort/engine/plan), but `.distinct()` over all columns accidentally adds `id` to the sort key → **no static `ordering=-created` duplicate/omission reproduction in canonical SQLite**, verified stable at both **60** and **260** tied rows (§5.4) and on PostgreSQL. The reproduced trigger is a shifting result set (§6). |
 | 4 | `TagsFilter` `tags__id__in` | §3.1 | One M2M join + own `.distinct()` (`src/documents/filters.py:L51-L52`); collapses `count=10` (raw 20). |
 | 5 | `TagsFilter` `tags__id__all` | §3.2 | Repeated joins (aliased `T4`) (`src/documents/filters.py:L54-L58`); relies on queryset `DISTINCT`; `count=10`. |
 | 6 | `InboxFilter` true-branch | §3.3 | `qs.filter(tags__is_inbox_tag=True)` (`src/documents/filters.py:L65-L66`), **no local `.distinct()`**; collapses `count=5` (raw 10) via queryset `DISTINCT` only. |
@@ -646,7 +668,7 @@ Every item the question names, addressed with cause → effect and grounded in c
 | 17 | Permission premise (R5) | §7 | **False**: no guardian, no `owner`, `IsAuthenticated` only, identical non-admin rows; perception attributed to per-user `SavedView` sort (`src/documents/models.py:L323`, `src/documents/models.py:L333`, `src/documents/models.py:L339`). |
 | 18 | Frontend contract (R4) | §8 | Independent per-page requests; `ordering=-created` default; `DOCUMENT_SORT_FIELDS` excludes `id` (`src-ui/src/app/services/rest/document.service.ts:L16-L24`). |
 | 19 | Whoosh sibling | §9 | `search_page` relevance-score paging (`src/documents/index.py:L203`, `src/documents/index.py:L210-L218`); out of scenario. |
-| 20 | Engine dependence / SQLite vs PostgreSQL | §5.4, §5.5 | SQLite static walk stable (observed); PostgreSQL 13.23 (non-canonical backend) static walk **also** stable (observed) — EXPLAIN shows `.distinct()` supplies `id` in the `Sort Key`; the no-tiebreaker query is only latently stable. |
+| 20 | Engine dependence / SQLite vs PostgreSQL | §5.4, §5.5 | SQLite static walk stable (observed at 60 and 260 tied rows); PostgreSQL 13.23 (non-canonical backend) static walk **also** stable (observed) — EXPLAIN shows `.distinct()` supplies `id` in the `Sort Key`; the no-tiebreaker query is only latently stable. |
 | 21 | The actual no-user-edit trigger | §6 | Reproduced through the real endpoint: background ingestion/removal shifts the result set under `LIMIT`/`OFFSET` → duplicate `[36]` / omission `[35]`. |
 
 ### 10.1 Recommendations (described only — **not** applied; this is a read-only investigation)
@@ -656,35 +678,44 @@ Every item the question names, addressed with cause → effect and grounded in c
 3. **Expose `id` (or a stable proxy) as a UI sort option** (`DOCUMENT_SORT_FIELDS`, `src-ui/src/app/services/rest/document.service.ts:L16-L24`) so users are not confined to tie-prone columns.
 4. **Give `InboxFilter` its own `.distinct()`** (or otherwise not rely solely on the queryset-level `DISTINCT`, `src/documents/filters.py:L65-L66`) to remove the latent fragility in §3.3.
 
-### 10.2 Clean-repo guarantee (verbatim `git status`)
+### 10.2 Read-only guarantee (verbatim `git` evidence)
 
-All temporary observation scripts lived under the container's `/tmp` and the host `/tmp` — never in the repository tree; the `runserver` processes were stopped; the seeded data lived only in the **git-ignored** dev database (`data/db.sqlite3`) and the PostgreSQL cluster's own data directory (`/var/lib/postgresql/13/main`, outside the repository mount). The only change to the repository is this document.
+This is a read-only investigation: the **only** change to the repository is the addition of this one document. All temporary observation scripts lived under the container's `/tmp` and the host `/tmp` — never in the repository tree; the `runserver` process artifacts (`/tmp/paperless-qna-runserver.log`, `/tmp/paperless-qna-runserver.pid`) live under `/tmp`, outside the repository; and the seeded data lived only in the **git-ignored** dev database (`data/db.sqlite3`) and, for the non-canonical PostgreSQL contrast (§5.5), the cluster's own data directory (`/var/lib/postgresql/13/main`, outside the repository mount).
 
-**Authoritative per-file proof** — expanding untracked files individually with `--untracked-files=all` shows the single untracked path is exactly this answer document:
+The evidence below is anchored to the **frozen upstream source commit `542221a38`** (full hash `542221a38dff06361e07976452f9aea24d210542`), which is immutable; it therefore stays true no matter how many additional documentation commits advance the branch tip.
+
+**Authoritative proof — this document is the single delta versus the source commit.** The branch is a documentation commit built directly on top of that source commit (confirmed by the merge-base), and the *only* path that differs between the source commit and the branch tip is this answer document:
 
 ```text
+$ git merge-base HEAD 542221a38
+542221a38dff06361e07976452f9aea24d210542
+
+$ git diff --name-status 542221a38 HEAD
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+```
+
+The leading `A` means *added*: the document does not exist at the source commit and exists at the branch tip; no source file appears in this diff.
+
+**No source, dependency, or configuration file was touched** — restricting the same source-relative diff to everything *except* the new `blitzy/` tree returns nothing:
+
+```text
+$ git diff --stat 542221a38 HEAD -- ':!blitzy'
+$
+```
+
+**The deliverable is committed and tracked** — it is a normal tracked file, not a stray untracked artifact — and once committed the working tree is clean, so `git status` reports no pending changes and does **not** list the document as untracked:
+
+```text
+$ git ls-files -- blitzy/documentation/paperless-ngx_542221a38dff.md
+blitzy/documentation/paperless-ngx_542221a38dff.md
+
 $ git status --porcelain --untracked-files=all
-?? blitzy/documentation/paperless-ngx_542221a38dff.md
+$
 ```
 
-The same is confirmed by a pathspec-scoped status:
+**The only file physically present under `blitzy/` is this document:**
 
 ```text
-$ git status --porcelain -- blitzy/documentation/paperless-ngx_542221a38dff.md
-?? blitzy/documentation/paperless-ngx_542221a38dff.md
-```
-
-For completeness: the **default** `git status --porcelain` **collapses** the wholly-new top-level `blitzy/` directory into a single entry, because Git does not descend into an entirely-untracked directory:
-
-```text
-$ git status --porcelain
-?? blitzy/
-```
-
-There are **no** tracked modifications, and the only file physically present under `blitzy/` is this document:
-
-```text
-$ git diff --stat
 $ find blitzy -type f
 blitzy/documentation/paperless-ngx_542221a38dff.md
 $ find blitzy -type d
@@ -692,4 +723,4 @@ blitzy
 blitzy/documentation
 ```
 
-No existing source file was modified, created, or deleted; no dependency or configuration file was touched. Branch `blitzy-0fc6e9a3-9036-45e1-a62a-761d59ff2fdb`, HEAD `542221a38`, no submodules (`.gitmodules` absent).
+No existing source file was modified, created, or deleted; no dependency or configuration file was touched. Branch `blitzy-0fc6e9a3-9036-45e1-a62a-761d59ff2fdb`; the branch tip is a documentation commit that adds this file on top of the frozen upstream source commit `542221a38` (verified as the merge-base above); no submodules (`.gitmodules` absent).
