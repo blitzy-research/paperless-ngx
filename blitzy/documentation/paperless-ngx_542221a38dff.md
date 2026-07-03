@@ -2,7 +2,9 @@
 
 > **Scope & provenance.** This is an evidence-based technical explainer of how documents move through **paperless-ngx** on branch `paperless-ngx_542221a38dff` (HEAD commit `542221a38dff06361e07976452f9aea24d210542`). Every behavioral claim below was produced by **actually building and running the system first**, then pasting the verbatim observed output next to the claim. The runtime was the **default canonical configuration**: **Python 3.9.25**, the **Redis** broker at `redis://localhost:6379`, and the default **SQLite** database (`/opt/paperless/data/db.sqlite3`). The exact commands used are listed in the [Environment & commands appendix](#7--environment--commands-appendix).
 >
-> **Conventions.** Code citations use `path:line` and resolve at commit `542221a38dff`. Observed output is shown in fenced blocks with the command that produced it. Statements derived only from reading source (not run) are explicitly marked **(inferred from reading)**. Values obtained from anything other than the real canonical code path are explicitly marked **non-canonical**.
+> **Conventions.** Code citations use `path:line` and resolve at commit `542221a38dff`. Observed output is shown in fenced blocks with the command that produced it. Statements derived only from reading source (not run) are explicitly marked **(inferred from reading)**. Values obtained from anything other than the real canonical code path are explicitly marked **non-canonical**. Runtime values that are inherently *per-run* (auto-increment primary keys, MD5 checksums, wall-clock timestamps, Django-Q cluster codenames) are labeled **run-specific** where they appear; a re-run reproduces the *classification/shape* of the result, not the identical literal.
+>
+> **Repository provenance & commit model.** This document is the **single** artifact added to the repository; **no existing source file is modified**. The source tree is byte-for-byte identical to the checkpoint source commit `542221a38dff06361e07976452f9aea24d210542`, so `git diff 542221a38dff06361e07976452f9aea24d210542..HEAD --name-status` reports exactly one line — `A blitzy/documentation/paperless-ngx_542221a38dff.md` — and every `path:line` citation below resolves against the unchanged source at that commit. Because the deliverable is itself a commit, the branch `HEAD` is necessarily **one commit ahead** of `542221a38dff` (a source commit cannot simultaneously contain a file added on top of it); the two trees differ **only** by this file.
 
 ---
 
@@ -89,7 +91,7 @@ This is the typical way documents enter: a long-lived watcher process (`manage.p
 
 > Note: in this canonical runtime the watcher uses **inotify**, not polling, because `PAPERLESS_CONSUMER_POLLING` is `0`. The `PollingObserver(timeout=settings.CONSUMER_POLLING)` `[src/documents/management/commands/document_consumer.py:187]` branch is the fallback used only when polling is enabled.
 
-Dropping a file triggers the enqueue. Command and observed output:
+Dropping a file triggers the enqueue. Command and observed output *(the `/tmp/obs/samples/folder_invoice.txt` sample was created outside the repo and deleted after use per the cleanup policy — a self-contained, runnable-today equivalent that creates its own uniquely-marked sample is in [§7.2.1](#721-self-contained-reproducible-commands-runnable-today) under "Q1 folder path")*:
 
 ```bash
 cp /tmp/obs/samples/folder_invoice.txt /opt/paperless/consume/folder_invoice.txt
@@ -120,7 +122,7 @@ func=documents.tasks.consume_file | task_name='folder_invoice.txt' | success=Tru
 
 The HTTP upload endpoint is `class PostDocumentView(GenericAPIView)` `[src/documents/views.py:491]`, whose `def post(self, request, ...)` `[:497]` enqueues `async_task(` `[:523]` with `"documents.tasks.consume_file"` `[:524]`. It requires authentication (`permission_classes = (IsAuthenticated,)` `[:493]`).
 
-Command and observed response (token redacted per secret-handling policy):
+Command and observed response (token redacted per secret-handling policy) *(the `/tmp/obs/samples/rest_invoice.txt` sample was deleted after use — a self-contained, runnable-today equivalent that creates its own sample is in [§7.2.1](#721-self-contained-reproducible-commands-runnable-today) under "Q1 REST upload")*:
 
 ```bash
 curl -F "document=@/tmp/obs/samples/rest_invoice.txt" \
@@ -205,7 +207,7 @@ func=documents.tasks.consume_file | task_name='email_invoice.txt'  | success=Tru
 
 ### 3.1 The ordered pipeline stages (observed)
 
-To surface the internal stage sequence I ran the canonical `consume_file` synchronously with the `paperless` logger raised to `DEBUG`. This does **not** alter the pipeline — it only makes the pipeline's *existing* stage log lines visible. (The async convergence itself was already proven in [§2.4](#24-convergence-proof); this foreground run is purely to expose the ordered DEBUG lines.) Command:
+To surface the internal stage sequence I ran the canonical `consume_file` synchronously with the `paperless` logger raised to `DEBUG`. This does **not** alter the pipeline — it only makes the pipeline's *existing* stage log lines visible. (The async convergence itself was already proven in [§2.4](#24-convergence-proof); this foreground run is purely to expose the ordered DEBUG lines.) Command *(the `/tmp/obs/pipeline_trace.py` script was deleted after use — a self-contained, runnable-today equivalent that writes its own uniquely-marked sample, avoiding the duplicate-checksum guard, is in [§7.2.1](#721-self-contained-reproducible-commands-runnable-today) under "Q2 ordered pipeline stages")*:
 
 ```bash
 python manage.py shell < /tmp/obs/pipeline_trace.py   # calls documents.tasks.consume_file(<file>)
@@ -258,6 +260,8 @@ PAPERLESS_PRE_CONSUME_SCRIPT=/tmp/obs/pre_consume.sh \
 PAPERLESS_POST_CONSUME_SCRIPT=/tmp/obs/post_consume.sh \
 python manage.py shell < /tmp/obs/stages_demo.py    # synchronous consume_file(simple-digital.pdf)
 ```
+
+> *The `/tmp/obs/*.sh` scripts and `stages_demo.py` above were created outside the repo and deleted after use. A **self-contained, runnable-today** equivalent — which writes the two demo scripts and copies a repository PDF fixture to `/tmp` under a unique name (never modifying the repo) — is in [§7.2.1](#721-self-contained-reproducible-commands-runnable-today) under "Q2 non-canonical pre/post-consume + archive demo". Re-running it reproduces the same ordered stage lines (`Executing pre-consume script …` → OCRmyPDF `output_type: 'pdfa'` → `Executing post-consume script …` → `Success. New document id N created`), with run-specific pk/paths.*
 
 Observed output (ordered; the two `[…-consume demo script]` lines are the scripts' own stdout):
 
@@ -482,16 +486,14 @@ Redis must be reachable at startup (`[docker/wait-for-redis.py]`); confirmed wit
 
 ### 4.2 Observed runtime example
 
-I fetched the real `Document pk=1` (the `folder_invoice` consumed via the watched folder in [§2.1](#21-the-usual-path--watched-consumption-folder)) and printed every field. Command:
+This subsection shows two complementary captures: **(A)** the original **point-in-time snapshot** of `Document pk=1` (the `folder_invoice` consumed via the watched folder in [§2.1](#21-the-usual-path--watched-consumption-folder)), taken **immediately after that first consumption on the then-fresh database**, and **(B)** a **self-contained, re-runnable current-state capture** that anyone can reproduce today. Both illustrate the same required/optional/derived classification; capture (A) additionally documents a real *time-evolution* of a mutable row (see the timeline note below).
 
-```bash
-python manage.py shell < /tmp/obs/metadata_example.py   # Document.objects.get(pk=1)
-```
+#### (A) Original point-in-time snapshot — `Document pk=1` (historical)
 
-Verbatim output:
+> **This is a historical snapshot, not a live-reproducible command.** It was captured at `2026-07-02 23:21:35`, seconds after `folder_invoice` became the very first document in a fresh database — *before* any `Correspondent`/`DocumentType`/`Tag` or trained classifier existed. As documented in the [before/after timeline](#before-after-timeline-why-pk1-later-changed) below, `pk=1` was **later mutated** (its `document_type` and `modified` fields changed) by the §5.4 classifier demonstration, so fetching `pk=1` *today* no longer returns these exact values. The historical capturing command was `python manage.py shell < /tmp/obs/metadata_example.py` (which ran `Document.objects.get(pk=1)`; that `/tmp/obs` script was deleted after use — see the [reproducible capture (B)](#b-reproducible-current-state-capture-self-contained) for a runnable equivalent). Verbatim output as captured at `23:21:35`:
 
 ```text
-=== RUNTIME METADATA EXAMPLE: Document pk=1 (consumed via watched folder) ===
+=== RUNTIME METADATA EXAMPLE: Document pk=1 (consumed via watched folder) — SNAPSHOT @ 2026-07-02 23:21:35, fresh DB, pre-organizer/pre-classifier ===
 pk                    = 1
 title                 = 'folder_invoice'
 correspondent_id      = None
@@ -510,14 +512,83 @@ storage_type          = 'unencrypted'
 archive_serial_number = None
 ```
 
-What this example demonstrates about each class:
+What this snapshot demonstrates about each class (values as at `23:21:35`):
 
 - **Derived (populated though never user-supplied):** `content` (154 chars extracted by `TextDocumentParser`), `mime_type = 'text/plain'` (libmagic), `checksum = 'a3f16230…'` (MD5 of the original), and `filename = '0000001.txt'` (storage path from `generate_filename`).
 - **Derived-conditional → empty here:** `archive_checksum = None` and `archive_filename = None`. A `text/plain` file produces **no** archive (PDF/A) version, so these two derived fields are correctly `None`. (They would be populated for, e.g., an OCR'd PDF.)
 - **Always populated (defaults):** `created`, `added`, `modified` (all timestamps around `23:21:3x`), and `storage_type = 'unencrypted'`.
-- **Optional → empty here:** `correspondent_id = None`, `document_type_id = None`, `tags = []`, and `archive_serial_number = None` — this document was consumed before any organizers existed, so nothing matched. `title = 'folder_invoice'` shows the optional-but-auto-derived behavior: no user title was supplied, so it was derived from the filename stem.
+- **Optional → empty *at this instant*:** `correspondent_id = None`, `document_type_id = None`, `tags = []`, and `archive_serial_number = None` — this document was consumed **before any organizers or classifier existed**, so nothing matched *yet*. `title = 'folder_invoice'` shows the optional-but-auto-derived behavior: no user title was supplied, so it was derived from the filename stem.
 
-**Q3 summary:** 15 stored fields; nothing is user-required; `checksum`/`mime_type`/`content`/`filename` are derived; `created`/`added`/`modified`/`storage_type` are always populated by defaults; `correspondent`/`document_type`/`tags`/`archive_serial_number`/`title` are optional; `archive_checksum`/`archive_filename` are derived-conditional (empty for the text example, as observed).
+<a id="before-after-timeline-why-pk1-later-changed"></a>
+**Before/after timeline — why `pk=1` later changed (and why this is *not* an inconsistency).** The snapshot above is a *point in time*. `pk=1` is a **mutable row**, and the investigation itself changed it in a later step. Specifically, the [§5.4 classifier demonstration](#54-the-match_auto-ml-classifier) created the `AutoInvoice` **`MATCH_AUTO`** document type (`pk=2`) and **explicitly assigned it to two documents — `pk=1` and `pk=2` — as classifier *training labels***, then trained the model. That assignment set `document_type_id = 2` on both rows and advanced their `modified` timestamps to `23:34:43`. Verbatim proof, captured live from the current database (`Document.objects.filter(document_type_id=2)`):
+
+```text
+Docs with document_type=2 (AutoInvoice — the two MATCH_AUTO training labels):
+  pk=1 title='folder_invoice'  created=2026-07-02T23:21:34.197098+00:00  modified=2026-07-02T23:34:43.904532+00:00
+  pk=2 title='rest_invoice'    created=2026-07-02T23:22:21.895612+00:00  modified=2026-07-02T23:34:43.909284+00:00
+```
+
+Both rows were re-saved within 5 ms of each other at `23:34:43` — a single batch label assignment, exactly as the §5.4 text ("assigned it to two documents as training labels") describes. This is **precisely why** the later [§5.5 full-text search evidence](#55-the-practical-filter--search-workflow) shows `pk=1` carrying `"document_type":2` and `"modified":"2026-07-02T23:34:43.904532Z"`: that evidence was captured *after* §5.4, whereas the snapshot in (A) was captured *before* it. The two captures are consistent once ordered on the timeline; the difference is the expected time-evolution of a mutable row, not a defect. (Note also that `Meta.ordering = []` on `DocumentType` means `matches()`-based auto-assignment orders candidates by `id`; the `document_type=2` value on `pk=1`/`pk=2` came from the **explicit training-label assignment**, not from generic re-matching, which for `pk=1`'s invoice content would have preferred `Invoice` `id=1`.)
+
+<a id="b-reproducible-current-state-capture-self-contained"></a>
+#### (B) Reproducible current-state capture (self-contained)
+
+Unlike (A), this capture is **runnable today** and does not depend on any deleted `/tmp/obs` script. It ingests a **uniquely-marked** neutral document through the canonical watched folder and dumps its fields. The primary key, checksum, filename number and timestamps are **run-specific** (they differ each run); the field **classification** (which fields are derived / always-populated / optional) is invariant. Run from `<repo>/src` with `source /opt/paperless/activate.sh`, the consumer + qcluster running:
+
+```bash
+MARK="REPROMETA$(date +%s)"                      # unique per-run marker
+printf 'Reproducible metadata example %s. Neutral sample text about weather, mountains and a gentle breeze. No business keywords here.\n' "$MARK" \
+  > "/opt/paperless/consume/${MARK}.txt"          # drop into the watched folder
+python manage.py shell -c "
+import time
+from documents.models import Document
+d=None
+for _ in range(40):
+    d=Document.objects.filter(content__contains='${MARK}').first()
+    if d: break
+    time.sleep(1)
+print('pk                    =', d.pk)
+print('title                 =', repr(d.title))
+print('correspondent_id      =', d.correspondent_id)
+print('document_type_id      =', d.document_type_id)
+print('tags                  =', list(d.tags.values_list('name', flat=True)))
+print('mime_type             =', repr(d.mime_type))
+print('checksum              =', repr(d.checksum))
+print('archive_checksum      =', d.archive_checksum)
+print('filename              =', repr(d.filename))
+print('archive_filename      =', d.archive_filename)
+print('created/added/modified all set =', all([d.created, d.added, d.modified]))
+print('storage_type          =', repr(d.storage_type))
+print('archive_serial_number =', d.archive_serial_number)
+"
+```
+
+Verbatim output from this run (`MARK=REPROMETA1783049964`; **run-specific** `pk=20`):
+
+```text
+pk                    = 20
+title                 = 'REPROMETA1783049964'
+correspondent_id      = None
+document_type_id      = None
+tags                  = ['Inbox', 'QA Runtime Inbox 1783048225']
+mime_type             = 'text/plain'
+checksum              = '40c2c62009a499651d1e8ca374c035d5'
+archive_checksum      = None
+filename              = '0000020.txt'
+archive_filename      = None
+created/added/modified all set = True
+storage_type          = 'unencrypted'
+archive_serial_number = None
+```
+
+Reading of (B), confirming the same classification as (A):
+
+- **Derived → populated:** `mime_type='text/plain'`, `checksum='40c2c62009…'`, `filename='0000020.txt'`, and `content` (144 chars). *(Run-specific literals; the classification is invariant.)*
+- **Derived-conditional → empty:** `archive_checksum=None`, `archive_filename=None` — again a `text/plain` input has no PDF/A archive.
+- **Always populated:** `created`/`added`/`modified` (`all set = True`) and `storage_type='unencrypted'`.
+- **Optional:** `correspondent_id=None` (no correspondent matched the neutral text), `document_type_id=None` (`match_document_types()` returned `[]` — the classifier predicts the null class for non-invoice content), and `archive_serial_number=None`. **`tags` is *not* empty here:** it holds `['Inbox', 'QA Runtime Inbox 1783048225']`, the two `is_inbox_tag=True` tags, which `add_inbox_tags` `[handlers.py:30]` attaches to **every** newly consumed document regardless of content. Those inbox tags simply did not *exist yet* when `pk=1` was consumed in (A), which is why (A) showed `tags = []` and (B) does not — another illustration of the point-in-time nature of these captures.
+
+**Q3 summary:** 15 stored fields; nothing is user-required; `checksum`/`mime_type`/`content`/`filename` are derived; `created`/`added`/`modified`/`storage_type` are always populated by defaults; `correspondent`/`document_type`/`tags`/`archive_serial_number`/`title` are optional; `archive_checksum`/`archive_filename` are derived-conditional (empty for a text input, as observed in both (A) and (B)). Optional fields are populated *when* a matching organizer, classifier label, or inbox tag applies — which is exactly why `pk=1` legitimately differs between its `23:21:35` snapshot (A) and its post-§5.4 state seen in §5.5.
 
 ---
 
@@ -592,7 +663,9 @@ Cause → effect mapping:
 - `match_document_types` `[matching.py:34]` → `classifier.predict_document_type(...)` `[:36]`
 - `match_tags` `[matching.py:47]` → `classifier.predict_tags(...)` `[:49]`
 
-I created a `MATCH_AUTO` document type, assigned it to two documents as training labels, and ran the classifier training task `train_classifier` `[src/documents/tasks.py:48]`. Verbatim output:
+I created a `MATCH_AUTO` document type, assigned it to two documents as training labels, and ran the classifier training task `train_classifier` `[src/documents/tasks.py:48]`.
+
+> **First-run-only transcript (state-dependent — not replayable once the model is trained).** The block below is the **one-time** output produced the *first* time the model was trained, when `classification_model.pickle` did not yet exist and the training data was new. `train_classifier` only re-vectorizes and re-fits when the training data has **changed**; once a model is persisted and the labels are unchanged, subsequent runs short-circuit with `Training data unchanged.` (see the reproducible steady-state block that follows). The `4 documents … 1 document type(s)` line reflects the tiny hand-built training set that existed at that moment. Verbatim first-run output:
 
 ```text
 [DEBUG] [paperless.classifier] Gathering data from database...
@@ -603,19 +676,31 @@ I created a `MATCH_AUTO` document type, assigned it to two documents as training
 CLASSIFIER_LOADED FORMAT_VERSION = 7
 ```
 
-Prediction, via `predict_document_type` `[classifier.py:262]`:
+**Reproducible steady-state (runnable today).** With a trained model already present and its training data unchanged, `train_classifier()` short-circuits and returns `None`, while the persisted model still loads (`FORMAT_VERSION = 7`) and reproduces its predictions. This block **is** re-runnable now. Command and verbatim output:
 
-```text
-PREDICT on doc1 training content -> [2] (AutoInvoice pk=2)   # classifier learned the label
-predict_correspondent -> None                                # predict_correspondent [classifier.py:251]
-predict_tags          -> []                                  # predict_tags [classifier.py:273]
+```bash
+python manage.py shell < /tmp/repro_classifier.py   # train_classifier(); load_classifier(); predict_* on pk=1
 ```
 
-The classifier trained a document-type model (uses scikit-learn `MLPClassifier`; `scikit-learn==1.0.2` `[requirements.txt:88]`), persisted it to `classification_model.pickle`, and then predicted the `AutoInvoice` document type (`pk=2`) for the training content. `predict_correspondent` returned `None` and `predict_tags` returned `[]` because no `MATCH_AUTO` correspondent or tag existed, so those sub-classifiers were not trained. (On *unseen* text the document-type prediction returned the null class with this deliberately tiny 4-sample training set — reported exactly as observed.)
+```text
+[DEBUG] [paperless.classifier] Gathering data from database...
+[DEBUG] [paperless.tasks] Training data unchanged.
+train_classifier() returned: None
+CLASSIFIER_LOADED FORMAT_VERSION = 7
+predict_document_type(pk=1 content) -> [2]
+predict_correspondent(pk=1 content) -> None
+predict_tags(pk=1 content) -> []
+```
+
+(The self-contained body of `/tmp/repro_classifier.py` is listed in the [commands appendix §7.2](#72-exact-commands-used); it imports `train_classifier`, `load_classifier`, and `DocumentClassifier` and runs the three `predict_*` calls — no `/tmp/obs` dependency.)
+
+Reading of both blocks: the classifier trained a document-type model (scikit-learn `MLPClassifier`; `scikit-learn==1.0.2` `[requirements.txt:88]`), persisted it to `classification_model.pickle`, and predicts the `AutoInvoice` document type (`pk=2`) for the invoice training content — `predict_document_type` `[classifier.py:262]` returns `array([2])`, printed as `[2]`. `predict_correspondent` `[classifier.py:251]` returned `None` and `predict_tags` `[classifier.py:273]` returned `[]` because no `MATCH_AUTO` **correspondent** or **tag** existed, so those sub-classifiers were never fitted. The prediction is **content-sensitive**: on *unseen non-invoice* text the document-type prediction returns the null class (this is exactly why the neutral document in [§4.2(B)](#b-reproducible-current-state-capture-self-contained) received `document_type_id = None`), reported precisely as observed with this deliberately tiny training set.
 
 ### 5.5 The practical filter / search workflow
 
-Once organizers are assigned, users retrieve documents via the REST API filter set `DocumentFilterSet` `[src/documents/filters.py:81]`. All four queries below were run against the live API (gunicorn on `:8000`) on the doc-1…5 baseline. Each query's **producing command** and its **raw response body + HTTP status** are pasted verbatim (the `-w "\nHTTP_STATUS:%{http_code}"` flag appends the status; the admin token is redacted per secret-handling policy — the real token is never written to this document).
+Once organizers are assigned, users retrieve documents via the REST API filter set `DocumentFilterSet` `[src/documents/filters.py:81]`. Each query's **producing command** and its **raw response body + HTTP status** are pasted verbatim (the `-w "\nHTTP_STATUS:%{http_code}"` flag appends the status; the admin token is redacted per secret-handling policy — the real token is never written to this document).
+
+> **DB-state precondition for the counts in (a)–(d) below.** The four captures in (a)–(d) are a **point-in-time baseline** taken when the database held exactly the **five documents `pk=1…5`** created earlier in this investigation, with `correspondent id=1`, `document_type id=1`, and `tag id=1` each assigned to precisely one of them. The `"count"` values are therefore **baseline-dependent global counts**: as more documents/organizers are added to the same database over time, `?correspondent__id=1` and friends will legitimately return **larger** counts (the *filtering* is still correct — there are simply more matching rows). For a capture whose counts are **deterministic regardless of accumulated DB state**, see **[(e) reproducible with unique per-run fixtures](#e-reproducible-with-unique-per-run-fixtures-deterministic-on-any-db-state)** immediately after (d). The (a)–(d) evidence is retained as the original baseline observation; do not expect its exact counts to reproduce on a database that has since grown.
 
 **(a) Filter by correspondent** — `correspondent__id` `[filters.py:110]`:
 
@@ -669,6 +754,48 @@ Summary of the four responses: `?correspondent__id=1` → `"count":1` (`filters.
 
 - The **structured filters** (`correspondent__id` `[filters.py:110]`, `document_type__id` `[filters.py:115]`, `tags__id__all` `[filters.py:90]`) each return **1** — only `q4_match` was auto-assigned those organizers. Related tag filters also exist: `tags__id__none` `[filters.py:92]`, `tags__id__in` `[filters.py:94]`. Organizer filter sets: `CorrespondentFilterSet` `[filters.py:18]`, `TagFilterSet` `[filters.py:24]`, `DocumentTypeFilterSet` `[filters.py:30]`.
 - The **full-text search** `?query=consulting` returns **2** — both `q4_match` and `folder_invoice` contain the word "consulting" in their indexed content (Whoosh index, `[src/documents/index.py]`). This works even though `folder_invoice` has no assigned organizers, illustrating the complementary roles: structured organizers for *categorization*, full-text index for *content search*.
+
+<a id="e-reproducible-with-unique-per-run-fixtures-deterministic-on-any-db-state"></a>
+**(e) Reproducible with unique per-run fixtures (deterministic on any DB state).** To make the filter/search counts reproducible **regardless of how many other rows the database holds**, this capture creates three **uniquely-named** organizers and **one** uniquely-marked document, so a filter keyed on those unique ids (or a search for the unique marker) matches **exactly one** document by construction. This is the recommended way to reproduce the workflow. Setup (run from `<repo>/src`, canonical venv/env, consumer + qcluster running):
+
+```bash
+EPOCH=$(date +%s); FILTMARK="REPROFILT${EPOCH}"        # unique per-run marker
+# create unique correspondent (LITERAL), document type (LITERAL) and tag (ANY), all matching $FILTMARK
+python manage.py shell -c "
+from documents.models import Correspondent, DocumentType, Tag, MatchingModel as M
+c=Correspondent.objects.create(name='RC_${FILTMARK}', match='${FILTMARK}', matching_algorithm=M.MATCH_LITERAL)
+t=DocumentType.objects.create(name='RT_${FILTMARK}', match='${FILTMARK}', matching_algorithm=M.MATCH_LITERAL)
+g=Tag.objects.create(name='RG_${FILTMARK}', match='${FILTMARK}', matching_algorithm=M.MATCH_ANY)
+print('UNIQUE_IDS correspondent=%d document_type=%d tag=%d' % (c.id, t.id, g.id))
+"
+# consume one uniquely-marked document (correspondent + tag auto-assign via matching)
+printf 'Reproducible filter and search example %s. Unique per-run fixture content.\n' "$FILTMARK" \
+  > "/opt/paperless/consume/${FILTMARK}.txt"
+# (the unique document_type is then assigned explicitly as a stated per-run fixture, so the
+#  MATCH_AUTO classifier candidate cannot pre-empt it; correspondent/tag need no such step)
+```
+
+Observed unique ids for this run: `correspondent=4  document_type=5  tag=14`, assigned to the single consumed document `pk=21`. The four queries (token redacted) and their verbatim counts:
+
+```text
+GET /api/documents/?correspondent__id=4        -> count=1  ids=[21]  HTTP_STATUS:200
+GET /api/documents/?document_type__id=5        -> count=1  ids=[21]  HTTP_STATUS:200
+GET /api/documents/?tags__id__all=14           -> count=1  ids=[21]  HTTP_STATUS:200
+GET /api/documents/?query=REPROFILT1783049964  -> count=1  ids=[21]  HTTP_STATUS:200
+```
+
+Because the marker `REPROFILT1783049964` and the organizer ids `4/5/14` are unique to this run, each query resolves to **exactly one** document (`pk=21`) **no matter how many other documents exist** — the count is deterministic by construction. A fresh re-run mints a new `$FILTMARK` and new ids but still yields `count=1`. This is the reproducible counterpart to the baseline (a)–(d): the *filtering behavior* is identical; only the fixtures are made unique so the assertion is stable. (The unique document also receives the two `is_inbox_tag` tags via `add_inbox_tags`, but `?tags__id__all=14` keys on the **unique** tag id, so it still returns exactly one.)
+
+> **Observed edge case — invalid filter-value handling differs by filter type (documented, not modified).** While exercising the filters I observed an asymmetry in how invalid (non-numeric) ids are handled, which is worth recording for anyone relying on these filters. The **standard integer** lookups `correspondent__id` / `document_type__id` (declared via `ID_KWARGS = ["in", "exact"]` `[src/documents/filters.py:13]`, used at `[:110]`/`[:115]`) **validate** the value and reject a non-numeric id with **HTTP 400**; the **custom** `tags__id__all` filter (`class TagsFilter(Filter)` `[src/documents/filters.py:36]`) instead **catches the `ValueError` and returns the queryset unfiltered** — `try: tag_ids = [int(x) for x in value.split(",")] except ValueError: return qs` `[src/documents/filters.py:44-46]` — so a non-numeric tag id is silently ignored (all documents returned) rather than rejected. Verbatim observed contrast:
+>
+> ```text
+> GET /api/documents/?tags__id__all=abc        -> HTTP_STATUS:200   count=20  (invalid id ignored → all docs)
+> GET /api/documents/?correspondent__id=not-an-id -> HTTP_STATUS:400   {"correspondent__id":["Enter a number."]}
+> ```
+>
+> (The `count` on the first line equals the **total number of documents in the collection at capture time** — i.e. the filter matched *everything* — so the exact integer is a drifting global count; the reproducible, drift-free assertion is the **status/behavior asymmetry itself**: `tags__id__all=<non-numeric>` → `200` returning *all* documents, versus `correspondent__id=<non-numeric>` → `400`. Re-running today returns the same `200` vs `400` pair with `count` equal to whatever the current total is.)
+>
+> This is **pre-existing behavior of paperless-ngx itself** (rooted in `TagsFilter.filter` `[src/documents/filters.py:44-46]`), reported here **exactly as observed**. It is **not** changed by this deliverable: the task is read-only, so no `src/**` file — including `filters.py` — is modified (per AAP §0.5.2, which lists "no edits to any file under `src/**`" and "security changes … none are in scope").
 
 **Practical workflow (cause → effect):** define an organizer with a `match` rule and algorithm → on consume, the `document_consumption_finished` signal invokes `set_correspondent`/`set_document_type`/`set_tags`, which call `matching.match_*` (or the classifier for `MATCH_AUTO`) → the document acquires a correspondent, type, and tags → `add_inbox_tags` flags new documents for triage → `add_to_index` makes both content and organizers searchable → the user narrows the collection with `/api/documents/?correspondent__id=…&document_type__id=…&tags__id__all=…` or full-text `?query=…`.
 
@@ -741,47 +868,206 @@ Each named sub-item of the four question groups, mapped to where it is answered,
 
 ### 7.2 Exact commands used
 
+This appendix is split into two parts. **[§7.2.1](#721-self-contained-reproducible-commands-runnable-today)** gives **self-contained, runnable-today** commands: each one *creates* the sample file or observation script it needs (via `printf`/heredoc under `/tmp`, outside the repository) before using it, so nothing depends on any previously-deleted artifact. **[§7.2.2](#722-historical-commands-as-originally-run--not-replayable-as-written)** preserves, for provenance, the **original** command list exactly as first run during the investigation — those commands referenced temporary scripts/samples under `/tmp/obs` that were **deleted after use per the read-only cleanup policy**, so they are **historical** and will not run as written today; each has a runnable equivalent in §7.2.1.
+
+#### 7.2.0 Environment & services (common preamble)
+
 ```bash
 # Activate canonical venv + env; run manage.py from <repo>/src
 source /opt/paperless/activate.sh
 cd <repo>/src
 
-# Database (already migrated in the image → "No migrations to apply")
+# Broker (idempotent) + database (already migrated in the image → "No migrations to apply")
+redis-server --daemonize yes --save "" --appendonly no   # redis-cli ping → PONG
 python manage.py migrate
 
 # Start the three canonical long-lived processes (production topology)
 python manage.py qcluster            # Django-Q worker + scheduler cluster
 python manage.py document_consumer   # consumption-folder watcher
 gunicorn -c <repo>/gunicorn.conf.py paperless.asgi:application   # ASGI API on :8000
+```
 
-# Q1 — folder path (the usual one)
+<a id="721-self-contained-reproducible-commands-runnable-today"></a>
+#### 7.2.1 Self-contained reproducible commands (runnable today)
+
+Every block below creates its own inputs first, uses a **unique per-run marker** where a deterministic assertion is wanted, and leaves no dependency on `/tmp/obs`. Run them after the §7.2.0 preamble (consumer + qcluster + gunicorn up). The API token is redacted; substitute a real token (`python manage.py shell -c "from rest_framework.authtoken.models import Token; from django.contrib.auth.models import User; print(Token.objects.get_or_create(user=User.objects.filter(is_superuser=True).first())[0].key)"`).
+
+```bash
+# ---- Q1 folder path (the usual one): create a uniquely-marked sample, drop it in the watched folder
+MARK="REPROFOLDER$(date +%s)"
+printf 'Folder ingestion sample %s. Consulting services invoice content.\n' "$MARK" \
+  > "/opt/paperless/consume/${MARK}.txt"          # consumer logs: "Adding …/${MARK}.txt to the task queue."
+
+# ---- Q1 REST upload: create a sample, POST it to the canonical endpoint
+REPOCH=$(date +%s)
+printf 'REST upload sample REPROREST%s. Invoice-like content for consulting services.\n' "$REPOCH" \
+  > "/tmp/repro_rest_${REPOCH}.txt"
+curl -s -w "\nHTTP_STATUS:%{http_code}\n" \
+     -F "document=@/tmp/repro_rest_${REPOCH}.txt" \
+     -H "Authorization: Token <redacted>" \
+     http://localhost:8000/api/documents/post_document/         # → "OK"  HTTP_STATUS:200
+rm -f "/tmp/repro_rest_${REPOCH}.txt"
+
+# ---- Q1 IMAP (real handle_message enqueue path; synthetic transport = NON-CANONICAL):
+#      self-contained probe creates a temp MailAccount/MailRule + synthetic message, then deletes them
+cat > /tmp/repro_mail_probe.py <<'PY'
+import logging, types
+from paperless_mail.models import MailAccount, MailRule
+from paperless_mail.mail import MailAccountHandler
+lg = logging.getLogger('paperless_mail'); lg.setLevel(logging.DEBUG)
+h = logging.StreamHandler(); h.setFormatter(logging.Formatter('[%(levelname)s] [%(name)s] %(message)s')); lg.addHandler(h)
+acct = MailAccount.objects.create(name='repro-probe-account', imap_server='localhost',
+        imap_port=993, imap_security=MailAccount.ImapSecurity.SSL, username='u', password='p')
+rule = MailRule.objects.create(name='repro-probe-rule', account=acct, folder='INBOX',
+        assign_title_from=MailRule.TitleSource.FROM_SUBJECT,
+        assign_correspondent_from=MailRule.CorrespondentSource.FROM_NOTHING,
+        attachment_type=MailRule.AttachmentProcessing.ATTACHMENTS_ONLY)
+try:
+    att = types.SimpleNamespace(content_disposition='attachment', filename='repro_email.txt',
+            payload=b'Email attachment sample REPRO. Neutral content for the mail path probe.')
+    msg = types.SimpleNamespace(attachments=[att], subject='Repro Email Test', from_='sender@example.test')
+    print('HANDLE_MESSAGE_RETURN =', MailAccountHandler().handle_message(msg, rule))
+finally:
+    rule.delete(); acct.delete()
+PY
+python manage.py shell < /tmp/repro_mail_probe.py     # → "Consuming attachment repro_email.txt …"  HANDLE_MESSAGE_RETURN = 1
+rm -f /tmp/repro_mail_probe.py
+
+# ---- Q2 ordered pipeline stages (synchronous, DEBUG logging): self-contained trace.
+#      A unique marker in the content guarantees the file is never rejected by the duplicate-checksum
+#      guard ("Not consuming …: It is a duplicate."), so this reproduces on any DB state.
+cat > /tmp/repro_pipeline_trace.py <<'PY'
+import logging, os, time
+from django.conf import settings
+lg = logging.getLogger('paperless'); lg.setLevel(logging.DEBUG)
+h = logging.StreamHandler(); h.setFormatter(logging.Formatter('[%(levelname)s] [%(name)s] %(message)s')); lg.addHandler(h)
+from documents.tasks import consume_file
+mark = "REPROPIPE%d" % int(time.time())           # unique per-run marker → never a duplicate
+src = os.path.join(settings.SCRATCH_DIR, mark + ".txt")
+open(src, 'w').write("Pipeline trace sample %s. Neutral text content for synchronous stage tracing." % mark)
+print('=== CONSUME_FILE RESULT:', repr(consume_file(src)))
+PY
+python manage.py shell < /tmp/repro_pipeline_trace.py    # ordered DEBUG stage lines → "Success. New document id N created"
+rm -f /tmp/repro_pipeline_trace.py
+
+# ---- Q2 scheduled jobs (deterministic seed data)
+python manage.py shell -c "from django_q.models import Schedule; [print(s.func, s.schedule_type, s.name) for s in Schedule.objects.all()]"
+#   → documents.tasks.train_classifier H   /   documents.tasks.index_optimize D
+#     documents.tasks.sanity_check W        /   paperless_mail.tasks.process_mail_accounts I
+
+# ---- Q2 NON-CANONICAL pre/post-consume + archive demo (§3.1.1): proves stages 5, 9, 15 positively.
+#      Only PAPERLESS_PRE/POST_CONSUME_SCRIPT differ from canonical; a repo PDF fixture is copied to
+#      /tmp under a unique name (the repository is never modified). Run after the §7.2.0 preamble.
+EPOCH=$(date +%s); DEMO="/tmp/repro_stage_${EPOCH}.pdf"
+cp "$(find . -path '*documents/tests/samples*' -name '*.pdf' | head -1)" "$DEMO"   # read-only copy of a repo fixture
+printf '\n%%%% repro-unique-%s\n' "$EPOCH" >> "$DEMO"   # append a unique PDF comment → unique checksum, still valid PDF (avoids the duplicate guard)
+printf '#!/usr/bin/env bash\necho "[pre-consume demo script] invoked on: $1"\n'  > /tmp/repro_pre_consume.sh
+printf '#!/usr/bin/env bash\necho "[post-consume demo script] invoked for document id: $DOCUMENT_ID title: $DOCUMENT_TITLE"\n' > /tmp/repro_post_consume.sh
+chmod +x /tmp/repro_pre_consume.sh /tmp/repro_post_consume.sh
+cat > /tmp/repro_stages_demo.py <<PY
+import logging, shutil, os
+from django.conf import settings
+lg = logging.getLogger('paperless'); lg.setLevel(logging.DEBUG)
+h = logging.StreamHandler(); h.setFormatter(logging.Formatter('[%(levelname)s] [%(name)s] %(message)s')); lg.addHandler(h)
+from documents.tasks import consume_file
+src = os.path.join(settings.SCRATCH_DIR, "repro_stage_${EPOCH}.pdf")
+shutil.copy("${DEMO}", src)
+print("=== CONSUME RESULT:", consume_file(src))
+PY
+PAPERLESS_PRE_CONSUME_SCRIPT=/tmp/repro_pre_consume.sh \
+PAPERLESS_POST_CONSUME_SCRIPT=/tmp/repro_post_consume.sh \
+python manage.py shell < /tmp/repro_stages_demo.py    # → pre-consume … OCRmyPDF pdfa … post-consume … Success. New document id N created
+rm -f /tmp/repro_pre_consume.sh /tmp/repro_post_consume.sh /tmp/repro_stages_demo.py "$DEMO"
+
+# ---- Q3 metadata runtime example: self-contained current-state capture (see §4.2(B) for the full field dump)
+MARK="REPROMETA$(date +%s)"
+printf 'Reproducible metadata example %s. Neutral sample text about weather, mountains and a gentle breeze. No business keywords here.\n' "$MARK" \
+  > "/opt/paperless/consume/${MARK}.txt"
+python manage.py shell -c "
+import time
+from documents.models import Document
+d=None
+for _ in range(40):
+    d=Document.objects.filter(content__contains='${MARK}').first()
+    if d: break
+    time.sleep(1)
+print('pk=',d.pk,'mime_type=',d.mime_type,'checksum=',d.checksum,'filename=',d.filename)
+print('correspondent_id=',d.correspondent_id,'document_type_id=',d.document_type_id,'asn=',d.archive_serial_number)
+print('archive_checksum=',d.archive_checksum,'archive_filename=',d.archive_filename)
+print('created/added/modified all set =', all([d.created,d.added,d.modified]),'storage_type=',d.storage_type)
+"
+
+# ---- Q4 classifier steady-state + prediction (see §5.4 for verbatim output): self-contained demo
+cat > /tmp/repro_classifier.py <<'PY'
+import logging
+from documents.tasks import train_classifier
+from documents.classifier import load_classifier, DocumentClassifier
+from documents.models import Document
+lg = logging.getLogger('paperless'); lg.setLevel(logging.DEBUG)
+h = logging.StreamHandler(); h.setFormatter(logging.Formatter('[%(levelname)s] [%(name)s] %(message)s')); lg.addHandler(h)
+print("train_classifier() returned:", repr(train_classifier()))
+clf = load_classifier()
+print("CLASSIFIER_LOADED FORMAT_VERSION =", DocumentClassifier.FORMAT_VERSION)
+d1 = Document.objects.get(pk=1)
+print("predict_document_type(pk=1 content) ->", clf.predict_document_type(d1.content))
+print("predict_correspondent(pk=1 content) ->", clf.predict_correspondent(d1.content))
+print("predict_tags(pk=1 content) ->", clf.predict_tags(d1.content))
+PY
+python manage.py shell < /tmp/repro_classifier.py     # → "Training data unchanged." … FORMAT_VERSION = 7 … [2]/None/[]
+rm -f /tmp/repro_classifier.py
+
+# ---- Q4 organizers + deterministic API filtering/search (unique per-run fixtures → count=1; see §5.5(e))
+EPOCH=$(date +%s); FILTMARK="REPROFILT${EPOCH}"
+python manage.py shell -c "
+from documents.models import Correspondent, DocumentType, Tag, MatchingModel as M
+c=Correspondent.objects.create(name='RC_${FILTMARK}', match='${FILTMARK}', matching_algorithm=M.MATCH_LITERAL)
+t=DocumentType.objects.create(name='RT_${FILTMARK}', match='${FILTMARK}', matching_algorithm=M.MATCH_LITERAL)
+g=Tag.objects.create(name='RG_${FILTMARK}', match='${FILTMARK}', matching_algorithm=M.MATCH_ANY)
+print('UNIQUE_IDS correspondent=%d document_type=%d tag=%d' % (c.id, t.id, g.id))
+"
+printf 'Reproducible filter and search example %s. Unique per-run fixture content.\n' "$FILTMARK" \
+  > "/opt/paperless/consume/${FILTMARK}.txt"
+# after consumption, assign the unique document_type explicitly, then query (substitute the unique ids printed above):
+curl -s -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?correspondent__id=<CID>"     # count=1
+curl -s -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?document_type__id=<TID>"     # count=1
+curl -s -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?tags__id__all=<GID>"         # count=1
+curl -s -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?query=${FILTMARK}"           # count=1
+```
+
+<a id="722-historical-commands-as-originally-run--not-replayable-as-written"></a>
+#### 7.2.2 Historical commands (as originally run — **not replayable as written**)
+
+> **These are provenance records, not runnable instructions.** The scripts/samples they reference lived under `/tmp/obs` (outside the repository) and were **deleted after use** per the read-only cleanup policy, so re-running these exact lines today fails with `No such file or directory` (for the `cp`/`<` commands) or `curl: (26)` (for the upload). Each has a self-contained, runnable equivalent in **[§7.2.1](#721-self-contained-reproducible-commands-runnable-today)**. They are retained verbatim so the original observation trail is auditable.
+
+```bash
+# Q1 — folder path (the usual one)                      [historical → §7.2.1 "Q1 folder path"]
 cp /tmp/obs/samples/folder_invoice.txt /opt/paperless/consume/
 
-# Q1 — REST upload
+# Q1 — REST upload                                       [historical → §7.2.1 "Q1 REST upload"]
 curl -F "document=@/tmp/obs/samples/rest_invoice.txt" \
      -H "Authorization: Token <redacted>" \
      http://localhost:8000/api/documents/post_document/
 
-# Q1 — IMAP (real handle_message enqueue; synthetic transport = non-canonical)
+# Q1 — IMAP (real handle_message enqueue; synthetic transport) [historical → §7.2.1 "Q1 IMAP"]
 python manage.py shell < /tmp/obs/mail_probe.py
 
-# Q2 — surface ordered pipeline stages (synchronous, DEBUG logging)
+# Q2 — ordered pipeline stages (synchronous, DEBUG logging)    [historical → §7.2.1 "Q2 ordered pipeline"]
 python manage.py shell < /tmp/obs/pipeline_trace.py
 
-# Q2 — scheduled jobs
+# Q2 — scheduled jobs (still runnable — no /tmp/obs dependency)
 python manage.py shell -c "from django_q.models import Schedule; [print(s.func, s.schedule_type, s.name) for s in Schedule.objects.all()]"
 
-# Q3 — metadata runtime example
+# Q3 — metadata runtime example                          [historical → §7.2.1 "Q3 metadata"]
 python manage.py shell < /tmp/obs/metadata_example.py
 
-# Q4 — create organizers + classifier demo, and API filtering
+# Q4 — organizers + classifier demo + API filtering       [historical → §7.2.1 "Q4 …"]
 python manage.py shell < /tmp/obs/make_organizers.py
 cp /tmp/obs/samples/q4_match.txt /opt/paperless/consume/
 python manage.py shell < /tmp/obs/classifier_demo.py
 curl -H "Authorization: Token <redacted>" "http://localhost:8000/api/documents/?correspondent__id=1"
 ```
 
-> All temporary scripts and sample inputs were created under `/tmp/obs` (outside the repository) and deleted after use. Every intermediate DB row created for observation lives in `/opt/paperless/data/db.sqlite3` (outside the repository). The repository working tree is unchanged apart from this document.
+> All temporary scripts and sample inputs were created **outside** the repository (originally under `/tmp/obs`; the runnable equivalents in §7.2.1 use `/tmp` and `/opt/paperless/consume`) and were deleted after use. Every intermediate DB row created for observation lives in `/opt/paperless/data/db.sqlite3` (outside the repository). The repository working tree is unchanged apart from this document.
 
 ### 7.3 R10 — magnitude/timing
 
