@@ -100,11 +100,60 @@ OCR_LANGUAGE = os.getenv("PAPERLESS_OCR_LANGUAGE", "eng")
 
 **Services launched for end-to-end observation** (the exact invocation commands):
 
-- Migrations applied to the SQLite DB: `python3 manage.py migrate` (creates the schema and the Django-Q `Schedule` rows — see Q3).
+- Migrations applied to the SQLite DB: `python3 manage.py migrate` (creates the schema and the Django-Q `Schedule` rows — see Q3); the complete output is captured immediately below.
 - **Django-Q worker cluster:** `python3 manage.py qcluster` — **required** for enqueued `consume_file`
   jobs to actually execute (`docker/supervisord.conf:28-29`, `[program:scheduler] command=python3 manage.py qcluster`).
 - **ASGI web server (HTTP upload + WebSocket):** `gunicorn -c /app/gunicorn.conf.py paperless.asgi:application`
   (`docker/supervisord.conf:10-11`).
+
+**Command (apply migrations in the canonical Python 3.9 container):**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  PAPERLESS_REDIS=redis://paperless-broker:6379 HOME=/tmp TIKA_LOG_PATH=/tmp \
+  DJANGO_SETTINGS_MODULE=paperless.settings python3 manage.py migrate'
+```
+
+**Output (unedited):**
+
+```
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
+Running migrations:
+  No migrations to apply.
+```
+
+The image ships with the SQLite schema already migrated, so a canonical re-run reports
+`No migrations to apply.` — the schema (including the `documents_document` table used in Q4) and the
+Django-Q `Schedule` rows created by the migrations are already present. Those exact scheduled-job rows
+are confirmed at runtime (tying the migration result to Q3):
+
+**Command (dump the runtime Django-Q `Schedule` rows created by the migrations):**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  DJANGO_SETTINGS_MODULE=paperless.settings python3 - <<PY
+import django; django.setup()
+from django_q.models import Schedule
+print("django_q Schedule row count =", Schedule.objects.count())
+for s in Schedule.objects.order_by("func").all():
+    print(f"  func={s.func!r}  schedule_type={s.schedule_type!r}  minutes={s.minutes}  name={s.name!r}")
+PY'
+```
+
+**Output (unedited):**
+
+```
+django_q Schedule row count = 4
+  func='documents.tasks.index_optimize'  schedule_type='D'  minutes=None  name='Optimize the index'
+  func='documents.tasks.sanity_check'  schedule_type='W'  minutes=None  name='Perform sanity check'
+  func='documents.tasks.train_classifier'  schedule_type='H'  minutes=None  name='Train the classifier'
+  func='paperless_mail.tasks.process_mail_accounts'  schedule_type='I'  minutes=10  name='Check all e-mail accounts'
+```
+
+The four `Schedule` rows (`train_classifier` hourly `H`, `index_optimize` daily `D`, `sanity_check`
+weekly `W`, `process_mail_accounts` every `I`=10 minutes) are the scheduled background jobs registered
+by the migrations — enumerated in detail in Q3.
 
 All observation processes ran as the non-root user `testuser` (uid 1000), matching paperless-ngx's
 single-user runtime model. Runtime artifacts (SQLite rows, Whoosh index, thumbnails/media) are
@@ -223,20 +272,26 @@ running gunicorn server:
 **Command:**
 
 ```bash
-# obtain a token via POST /api/token/ (local test superuser), then POST the file to the upload endpoint
+# obtain a token via POST /api/token/ (local test superuser), then POST the file to the upload
+# endpoint. The observation script is written so the token VALUE is never printed — it prints only
+# non-secret metadata (token length + HTTP status codes + response body), so the output below is
+# complete and unedited with nothing removed.
 docker exec -u testuser -w /app/src paperless-app python3 /tmp/obs/q1_http_upload.py
 ```
 
-**Output (unedited — the auth token is redacted at capture time):**
+**Output (unedited):**
 
 ```
-### token obtained (len=40) -> [REDACTED]
+### auth token acquired via POST /api/token/ -> HTTP 200 (token is a 40-char DRF key; value intentionally NOT printed)
 ### POST /api/documents/post_document/ -> HTTP 200
 ### response body: "OK"
 ```
 
 The endpoint returned HTTP **200** with body `"OK"` — exactly the `Response("OK")` at `views.py:535`,
-confirming the upload was accepted and enqueued via `async_task` at `views.py:523`.
+confirming the upload was accepted and enqueued via `async_task` at `views.py:523`. The token
+acquisition (`POST /api/token/` → HTTP 200) is shown by its status code and length only; the script
+was deliberately written not to print the secret value, so the block above is complete and unedited
+(no field was redacted after capture).
 
 ### Path 3 — IMAP / e-mail (`paperless_mail`)
 
@@ -277,9 +332,12 @@ All three human/machine-facing entry points converge on a single asynchronous jo
 pipeline (Q2). This convergence means the ingestion *transport* (folder / HTTP / e-mail) is
 decoupled from the processing *pipeline*. The **consume-directory watcher is the usual path**
 because it is the always-running background program a scanner or file drop naturally targets
-(`docker/supervisord.conf:19-20`), requiring no API client or credentials — corroborated by
-`docs/usage_overview.rst`, which presents the consumption directory as the primary way documents
-enter the system. The **bulk** path is distinct: `bulk_edit.py` enqueues
+(`docker/supervisord.conf:19-20`), requiring no API client or credentials — corroborated verbatim by
+`docs/usage_overview.rst:88-91`, whose "The consumption directory" section (`:85-86`) opens with
+*"The primary method of getting documents into your database is by putting them in the consumption
+directory."* (`docs/usage_overview.rst:88`), while the HTTP/Web-UI and IMAP methods are documented as
+secondary sections further down (`:105` "Web UI Upload", `:128` "IMAP (Email)"). The **bulk** path is
+distinct: `bulk_edit.py` enqueues
 `bulk_update_documents` (`bulk_edit.py:18,31,47,63,87`) to re-apply metadata to *existing*
 documents, not to ingest new ones.
 
@@ -296,8 +354,9 @@ separation (default **OFF**) and then constructs a `Consumer` and calls `try_con
 parser → parse/OCR → generate thumbnail → extract text & date → load classifier → atomically persist
 → fire the six post-consume handlers (metadata + full-text index) → move files into managed storage →
 run post-consume script → mark SUCCESS**. Progress is streamed as milestones **STARTING 0 → WORKING
-20 (parsing) → 70 (thumbnail) → 90 (parse date) → 95 (save) → SUCCESS 100**. A document becomes
-searchable/"available" only after the `add_to_index` handler runs.
+20 (parsing) → 70 (thumbnail) → 90 (parse date) → 95 (save) → SUCCESS 100** on the happy path, or a
+terminal **FAILED 100** on any validation/parse failure (emitted by `_fail`, `consumer.py:78-79`).
+A document becomes searchable/"available" only after the `add_to_index` handler runs.
 
 ### The observed progress milestones (real WebSocket status channel)
 
@@ -333,6 +392,48 @@ These map exactly to the `_send_progress(...)` calls in `consumer.py`: `STARTING
 `WORKING 90 parse_date` at `:274` (only when the parser returned no date), `WORKING 95 save_document`
 at `:294`, and `SUCCESS 100 finished` (with the new `document_id`) at `:375`.
 
+### The `FAILED` terminal milestone (real WebSocket status channel)
+
+`SUCCESS 100` is not the only terminal state. Whenever any validation or processing step fails,
+`Consumer._fail` (`consumer.py:78-79`) calls `self._send_progress(100, 100, "FAILED", message)`
+**before** it raises `ConsumerError`, so the UI's progress bar always reaches a terminal state. We
+subscribed to the same `status_updates` group and enqueued a consume of an **unsupported** file (a
+`.zip`, which has no parser — see Q2 parser dispatch and edge case 2) through the **real**
+`async_task` → Django-Q worker path; the worker emitted `STARTING 0` and then the terminal
+`FAILED 100`:
+
+**Command:**
+
+```bash
+# subscribe to 'status_updates', enqueue consume_file for an unsupported .zip, receive milestones
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  PAPERLESS_REDIS=redis://paperless-broker:6379 HOME=/tmp TIKA_LOG_PATH=/tmp \
+  DJANGO_SETTINGS_MODULE=paperless.settings PYTHONPATH=/app/src \
+  python3 /tmp/obs/q2_failed.py'
+```
+
+**Output (unedited):**
+
+```
+### Subscribed to Channels group 'status_updates' (channels_redis RedisChannelLayer)
+23:22:47 [Q] INFO Enqueued 1
+### Enqueued async_task('documents.tasks.consume_file', <unsupported .zip>) -> Django-Q worker will process & FAIL it
+### Progress milestones received over the REAL WebSocket status channel (filtered to this file):
+    STATUS   PROG  MESSAGE                  document_id
+    STARTING 0     new_file                 None
+    FAILED   100   unsupported_type         None
+### terminal milestone observed: True
+```
+
+The `FAILED 100 unsupported_type` milestone is emitted by `_send_progress(100, 100, "FAILED", message)`
+inside `_fail` (`consumer.py:78-79`); here `message` is the constant
+`MESSAGE_UNSUPPORTED_TYPE = "unsupported_type"` (`consumer.py:44`), set by the unsupported-MIME
+`_fail` call at `consumer.py:224-225`. This completes the milestone set: the pipeline always ends in
+exactly one terminal milestone — `SUCCESS 100 finished` on success (`consumer.py:375`) or
+`FAILED 100 <message>` on any failure (`consumer.py:79`). The result was **stable across two runs**
+(both emitted identical `STARTING 0 new_file` → `FAILED 100 unsupported_type`). The same terminal
+`FAILED 100` is emitted for every other `_fail` path (duplicate `document_already_exists`, file not
+found, pre/post-consume script errors), since all of them route through `_fail` (`consumer.py:78-81`).
 
 ### The ordered pipeline trace (DEBUG log, document 17)
 
@@ -883,26 +984,88 @@ docker exec -u testuser paperless-app python3 /tmp/obs/q4_ddl.py
 
 ### Classification, with the field definitions
 
-**REQUIRED (strict — `null=False`, `blank=False`, `editable=False`, no default):**
+**REQUIRED (strict — `null=False`, `blank=False`, `editable=False`, no default).** The full,
+unabbreviated field definitions, pasted directly from source:
+
+**Command:**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app sed -n '126p'     documents/models.py
+docker exec -u testuser -w /app/src paperless-app sed -n '135,141p' documents/models.py
+```
+
+**Output (unedited):**
 
 ```
-    mime_type = models.CharField(_("mime type"), max_length=256, editable=False)   # models.py:126
-    checksum = models.CharField(                                                    # models.py:135
-        _("checksum"), max_length=32, editable=False, unique=True, ...)
+    mime_type = models.CharField(_("mime type"), max_length=256, editable=False)
+```
+
+```
+    checksum = models.CharField(
+        _("checksum"),
+        max_length=32,
+        editable=False,
+        unique=True,
+        help_text=_("The checksum of the original document."),
+    )
 ```
 
 - **`mime_type`** — `models.py:126`. DDL: `"mime_type" varchar(256) NOT NULL`.
-- **`checksum`** — `models.py:135`. DDL: `"checksum" varchar(32) NOT NULL UNIQUE`.
+- **`checksum`** — `models.py:135-141`. DDL: `"checksum" varchar(32) NOT NULL UNIQUE`.
 
-**Important nuance (reported exactly as observed).** A bare `Document(title=…).save()` **succeeds**
-with `mime_type=''` and `checksum=''` (Part 6) because Django `CharField` has
-`empty_strings_allowed=True`, so unset values become `''` (and empty strings satisfy `NOT NULL` in
-SQLite). The *hard* database-level guarantee is the **`checksum` UNIQUE constraint**: inserting a
-second row with an existing checksum raises `django.db.utils.IntegrityError: UNIQUE constraint failed:
-documents_document.checksum` (Part 5) — the very constraint the duplicate check (Q1 edge case) guards.
+**Missing-required-field demonstration — DB-level `NOT NULL` enforcement (runtime).** The two
+required columns are enforced by the database as `NOT NULL`. Because a Django `CharField` coerces an
+*unset* value to `''` before the INSERT (Part 6), the enforcement is demonstrated directly at the DB
+layer with a **raw SQL insert** that sets `mime_type` / `checksum` to a genuine `NULL`:
+
+**Command:**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  PAPERLESS_REDIS=redis://paperless-broker:6379 HOME=/tmp TIKA_LOG_PATH=/tmp \
+  DJANGO_SETTINGS_MODULE=paperless.settings PYTHONPATH=/app/src \
+  python3 /tmp/obs/q4_notnull.py'
+```
+
+**Output (unedited):**
+
+```
+========================================================================
+F1 — DB-level NOT NULL enforcement on required columns (raw SQL insert with NULL)
+========================================================================
+  Document.objects.count() BEFORE = 12
+  -- raw INSERT with mime_type = NULL (unique checksum so it is NOT a duplicate):
+  mime_type=NULL: django.db.utils.IntegrityError: NOT NULL constraint failed: documents_document.mime_type
+  -- raw INSERT with checksum = NULL (valid mime_type):
+  checksum=NULL: django.db.utils.IntegrityError: NOT NULL constraint failed: documents_document.checksum
+  Document.objects.count() AFTER  = 12  (unchanged => both NULL inserts were rejected)
+```
+
+Both `NULL` inserts are rejected with
+`django.db.utils.IntegrityError: NOT NULL constraint failed: documents_document.mime_type` (resp.
+`…checksum`), and the row count is **unchanged before/after** (12 → 12), confirming nothing was
+inserted. This is the direct DB-level proof that `mime_type` and `checksum` are the required columns.
+
+**Important nuance (reported exactly as observed).** Two distinct layers govern the two required
+columns, and the runtime example exercises **both** — the direct answer ("`mime_type` and `checksum`
+are the required fields") holds at the DB layer, with the ORM adding a coercion subtlety:
+
+- **ORM layer.** A bare `Document(title=…).save()` **succeeds** with `mime_type=''` and `checksum=''`
+  (Part 6) because Django `CharField` has `empty_strings_allowed=True`, so *unset* values are coerced
+  to `''` *before* the INSERT — and an empty string satisfies a `NOT NULL` column. So a naive ORM
+  `.save()` does **not** raise on the missing required fields; it silently substitutes `''`.
+- **DB layer.** The `documents_document.mime_type` and `.checksum` columns are nonetheless `NOT NULL`
+  (see the DDL above). A **raw SQL insert** that sets either to a genuine `NULL` is rejected with
+  `django.db.utils.IntegrityError: NOT NULL constraint failed: documents_document.mime_type`
+  (resp. `…checksum`) — the missing-required-field demonstration above (both inserts rejected, row
+  count unchanged 12 → 12). Additionally, `checksum` is `UNIQUE`, so inserting a second row with an
+  existing checksum raises `django.db.utils.IntegrityError: UNIQUE constraint failed:
+  documents_document.checksum` (Part 5) — the very constraint the duplicate check (Q1 edge case) guards.
+
 In the *real* pipeline, `Consumer._store` always sets `mime_type` (from `magic.from_file`) and
 `checksum` (md5 of the file), so these are never empty for an actually-consumed document. **(inferred
-from `_store` reading; the empty-string save above is the directly observed behavior.)**
+from `_store` reading; the empty-string save, the `NOT NULL` rejections, and the `UNIQUE` rejection
+above are all directly observed behavior.)**
 
 **DERIVED (populated during pipeline execution):**
 
@@ -1188,15 +1351,27 @@ on disk (if `True`, `pre_check_duplicate` would `os.unlink` it first, `consumer.
 ### 2. Unsupported MIME type (no parser)
 
 If `get_parser_class_for_mime_type` returns `None`, the consumer calls
-`_fail(MESSAGE_UNSUPPORTED_TYPE, …)` (`consumer.py:224-225`). We fed it a ZIP:
+`_fail(MESSAGE_UNSUPPORTED_TYPE, …)` (`consumer.py:224-225`). We fed the **real**
+`Consumer.try_consume_file()` a `.zip`:
+
+**Command:**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  PAPERLESS_REDIS=redis://paperless-broker:6379 HOME=/tmp TIKA_LOG_PATH=/tmp \
+  DJANGO_SETTINGS_MODULE=paperless.settings PYTHONPATH=/app/src \
+  python3 /tmp/obs/edge2_unsupported.py'
+```
 
 **Output (unedited):**
 
 ```
 EDGE 2 — Unsupported MIME (no parser) -> _fail MESSAGE_UNSUPPORTED_TYPE (consumer.py:224-225)
   magic.from_file(zip, mime=True) = application/zip
+[2026-07-06 23:31:32,449] [INFO] [paperless.consumer] Consuming edge_unsupported.zip
+[2026-07-06 23:31:32,449] [DEBUG] [paperless.consumer] Detected mime type: application/zip
+[2026-07-06 23:31:32,467] [ERROR] [paperless.consumer] Unsupported mime type application/zip
   ConsumerError RAISED: edge_unsupported.zip: Unsupported mime type application/zip
-[2026-07-06 22:38:13,348] [ERROR] [paperless.consumer] Unsupported mime type application/zip
 ```
 
 `application/zip` has no registered parser (Q2), so consumption fails with
@@ -1205,23 +1380,86 @@ because Tika is disabled.)
 
 ### 3. Missing / incompatible classifier → rule-only fallback
 
-`load_classifier()` (`classifier.py:30`) returns `None` when the model file is absent
-(`classifier.py:31-36`), so matching falls back to rule-only (Q5):
+`load_classifier()` (`classifier.py:30`) returns `None` in **all three** bad-model cases the AAP
+names — **missing**, **version-incompatible**, and **corrupt** — after which matching falls back to
+rule-only (Q5). We exercised all three in the canonical runtime. The model file lives in `DATA_DIR`
+(`settings.MODEL_FILE`, `settings.py:74`), never in the source tree; for the incompatible/corrupt
+cases the code itself deletes the bad file (`os.unlink`, `classifier.py:48`), so the canonical
+"no model" state is restored automatically (verified by the `FINAL … = False` line).
+
+**Command:**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  PAPERLESS_REDIS=redis://paperless-broker:6379 HOME=/tmp TIKA_LOG_PATH=/tmp \
+  DJANGO_SETTINGS_MODULE=paperless.settings PYTHONPATH=/app/src \
+  python3 /tmp/obs/edge3_classifier.py'
+```
 
 **Output (unedited):**
 
 ```
-EDGE 3 — Missing/incompatible classifier -> load_classifier() None -> rule-only (classifier.py:30-36)
-  settings.MODEL_FILE = /app/src/../data/classification_model.pickle
-  os.path.isfile(MODEL_FILE) = False
-[DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-  load_classifier() returned: None
+EDGE 3 — load_classifier() variants (classifier.py:30). settings.MODEL_FILE = /app/src/../data/classification_model.pickle
+FORMAT_VERSION (required) = 7
+
+--- (a) MISSING model file -> None (classifier.py:31-36) ---
+  [MISSING] os.path.isfile(MODEL_FILE) BEFORE = False
+[2026-07-06 23:31:33,426] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+  [MISSING] load_classifier() returned = None
+  [MISSING] os.path.isfile(MODEL_FILE) AFTER  = False  (deleted by classifier.py:48 on bad model)
+
+--- (b) INCOMPATIBLE version: schema_version=999 != 7 -> IncompatibleClassifierVersionError (classifier.py:80-83 -> caught :42-48) ---
+  [INCOMPATIBLE] os.path.isfile(MODEL_FILE) BEFORE = True
+[2026-07-06 23:31:33,427] [ERROR] [paperless.classifier] Unrecoverable error while loading document classification model, deleting model file.
+Traceback (most recent call last):
+  File "/app/src/documents/classifier.py", line 40, in load_classifier
+    classifier.load()
+  File "/app/src/documents/classifier.py", line 81, in load
+    raise IncompatibleClassifierVersionError(
+documents.classifier.IncompatibleClassifierVersionError: Cannot load classifier, incompatible versions.
+  [INCOMPATIBLE] load_classifier() returned = None
+  [INCOMPATIBLE] os.path.isfile(MODEL_FILE) AFTER  = False  (deleted by classifier.py:48 on bad model)
+
+--- (c) CORRUPT payload: correct version=7 then garbage -> ClassifierModelCorruptError (classifier.py:93-94 -> caught :42-48) ---
+  [CORRUPT] os.path.isfile(MODEL_FILE) BEFORE = True
+[2026-07-06 23:31:33,427] [ERROR] [paperless.classifier] Unrecoverable error while loading document classification model, deleting model file.
+Traceback (most recent call last):
+  File "/app/src/documents/classifier.py", line 86, in load
+    self.data_hash = pickle.load(f)
+_pickle.UnpicklingError: invalid load key, '\x00'.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/classifier.py", line 40, in load_classifier
+    classifier.load()
+  File "/app/src/documents/classifier.py", line 94, in load
+    raise ClassifierModelCorruptError()
+documents.classifier.ClassifierModelCorruptError
+  [CORRUPT] load_classifier() returned = None
+  [CORRUPT] os.path.isfile(MODEL_FILE) AFTER  = False  (deleted by classifier.py:48 on bad model)
+
+FINAL os.path.isfile(MODEL_FILE) (canonical state restored) = False
 ```
 
-The model file does not exist in the canonical config, so `load_classifier()` returns `None` and
-emits the DEBUG line above. **(inferred)** `load_classifier` also returns `None` on
-`ClassifierModelCorruptError`/`IncompatibleClassifierVersionError` (`classifier.py:42-48`), deleting
-the bad model file — not exercised here since no such file exists.
+All three variants return `None` (→ rule-only matching), with the observed **before/during/after**
+state transitions:
+
+- **(a) Missing** — `settings.MODEL_FILE` absent → `load_classifier()` short-circuits to `None` at
+  `classifier.py:31-36`, emitting the DEBUG line. This is the canonical default (no trained model).
+- **(b) Version-incompatible** — a model whose pickled `schema_version` (`999`) differs from
+  `DocumentClassifier.FORMAT_VERSION` (`7`) makes `load()` raise `IncompatibleClassifierVersionError`
+  (`classifier.py:80-83`); `load_classifier` catches it at `classifier.py:42`, logs the "Unrecoverable
+  error … deleting model file." exception, calls `os.unlink` (`classifier.py:48`), and returns `None`
+  (file `True → False`).
+- **(c) Corrupt** — a model with the correct version but a garbage payload makes the inner
+  `pickle.load` fail (`classifier.py:86`), which `load()` converts to `ClassifierModelCorruptError`
+  (`classifier.py:93-94`); the same `except` block (`classifier.py:42-48`) logs, deletes the file, and
+  returns `None`.
+
+The `FINAL … = False` line confirms the bad model file was removed by the code and the canonical
+"no model" state was restored. Corroborated by `docs/advanced_usage.rst:78-79` (auto-matching only
+runs when a compatible model exists).
 
 ### 4. Inbox exclusion for auto-matching
 
@@ -1234,19 +1472,28 @@ Covered in Q5: `Document.objects.exclude(tags__is_inbox_tag=True)` (`classifier.
 `run_pre_consume_script` (`consumer.py:121`) and `run_post_consume_script` (`consumer.py:143`) each
 early-return when their setting is unset; when set, they `Popen` the configured script.
 
+**Command:**
+
+```bash
+docker exec -u testuser -w /app/src paperless-app bash -c '
+  PAPERLESS_REDIS=redis://paperless-broker:6379 HOME=/tmp TIKA_LOG_PATH=/tmp \
+  DJANGO_SETTINGS_MODULE=paperless.settings PYTHONPATH=/app/src \
+  python3 /tmp/obs/edge5_scripts.py'
+```
+
 **Output (unedited):**
 
 ```
 EDGE 5a — Pre/Post-consume scripts DEFAULT (unset) -> skipped (consumer.py:121-123 / :143-145)
   settings.PRE_CONSUME_SCRIPT  (settings.py:570) = None
   settings.POST_CONSUME_SCRIPT (settings.py:571) = None
-  run_pre_consume_script() with unset setting returned: None (early-return no-op, guard 'if not settings.PRE_CONSUME_SCRIPT: return')
-  run_post_consume_script(doc) with unset setting returned: None (early-return no-op)
+  run_pre_consume_script() returned: None (early-return no-op, guard 'if not settings.PRE_CONSUME_SCRIPT: return')
+  run_post_consume_script(doc) returned: None (early-return no-op)
 
 EDGE 5b — Post-consume script SET -> run_post_consume_script FIRES (consumer.py:143-178)
-[2026-07-06 22:38:55,852] [INFO] [paperless.consumer] Executing post-consume script /tmp/obs/post_marker.sh
+[2026-07-06 23:31:48,471] [INFO] [paperless.consumer] Executing post-consume script /tmp/obs/post_marker.sh
   marker file created by script: True
-  marker contents: POST-CONSUME FIRED pk=13 file=2026-07-06 edge_dup.png
+  marker contents: POST-CONSUME FIRED pk=4 file=2026-07-06 watcher_doc.png
 ```
 
 In the canonical config both scripts are unset (`settings.py:570-571`, both `None`), so the methods
@@ -1263,20 +1510,20 @@ script wrote its marker file. *(The temporary script was removed afterward.)*
 | **Q1** every ingestion path enumerated | ✅ | consume-dir watcher, HTTP upload, IMAP/mail — all shown enqueuing `consume_file` |
 | **Q1** the *usual* path identified | ✅ | consume-dir watcher (always-on `[program:consumer]`), rationale given |
 | **Q1** bulk / scheduled variants named | ✅ | `bulk_update_documents` (`bulk_edit.py`), `process_mail_accounts` |
-| **Q2** ordered stages + progress milestones | ✅ | STARTING 0 → WORKING 20/70/90/95 → SUCCESS 100 (live channel) + DEBUG trace |
+| **Q2** ordered stages + progress milestones | ✅ | STARTING 0 → WORKING 20/70/90/95 → SUCCESS 100, plus terminal FAILED 100 (all on the live channel) + DEBUG trace |
 | **Q2** six post-consume handlers (each by name) | ✅ | `add_inbox_tags`, `set_correspondent`, `set_document_type`, `set_tags`, `set_log_entry`, `add_to_index` — all fired |
-| **Q2** parsers by MIME (each named) | ✅ | Raterised/Text/Tika, with Tika gated off |
+| **Q2** parsers by MIME (each named) | ✅ | Rasterised/Text/Tika, with Tika gated off |
 | **Q3** framework = Django-Q, not Celery | ✅ | grep exit 1, no `celery.py`; `Q_CLUSTER`; broker Redis 6.0.20 |
 | **Q3** per-document + 4 scheduled jobs | ✅ | `consume_file`; train_classifier/index_optimize/sanity_check/process_mail_accounts |
 | **Q3** real-time channel | ✅ | `RedisChannelLayer` |
 | **Q4** required vs optional vs derived | ✅ | field introspection table + SQLite DDL + definitions |
-| **Q4** runtime example (user directive) | ✅ | real `Document` saved, all fields printed, serializer JSON, IntegrityError |
+| **Q4** runtime example (user directive) | ✅ | real `Document` saved, all fields printed, serializer JSON, DB-level `NOT NULL` + `UNIQUE` IntegrityError enforcement |
 | **Q5** tags | ✅ | `finance` matched via `MATCH_ANY`; `set_tags` + `add_inbox_tags` |
 | **Q5** correspondents | ✅ | `Wayne Enterprises` matched; `match_correspondents` |
 | **Q5** document types | ✅ | `Invoice` matched; `match_document_types` |
 | **Q5** six algorithms + fuzzy threshold + AUTO subtlety | ✅ | all six run; 94→True/89→False; MATCH_AUTO returns False in `matches()` |
 | **Q5** inbox exclusion | ✅ | exclude→4/5 docs; `classifier.py:125-126` + docs |
-| **Edge** duplicate / unsupported MIME / no classifier / inbox / pre-post scripts | ✅ | each exercised with unedited output |
+| **Edge** duplicate / unsupported MIME / classifier (missing+incompatible+corrupt) / inbox / pre-post scripts | ✅ | each exercised with command + unedited output |
 
 **Method note.** Every command above was run inside the canonical Python 3.9 container with Redis +
 Tesseract + default SQLite and the Django-Q `qcluster` worker active. All temporary observation
