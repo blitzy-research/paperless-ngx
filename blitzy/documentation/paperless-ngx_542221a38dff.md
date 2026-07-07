@@ -1576,4 +1576,3 @@ script wrote its marker file. *(The temporary script was removed afterward.)*
 Tesseract + default SQLite and the Django-Q `qcluster` worker active. All temporary observation
 scripts were created outside the repository (`/tmp`) and removed on completion; the only file added
 to the repository is this document.
-
