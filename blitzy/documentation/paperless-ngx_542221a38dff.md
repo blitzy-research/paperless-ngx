@@ -896,7 +896,7 @@ ls: cannot access '/tmp/pl/media/documents/archive/0000009.pdf': No such file or
 
 **Interpretation — tracing the exact fallback path in `RasterisedDocumentParser.parse()`:**
 1. First OCR attempt with `skip_text=True` runs; the sidecar is used but is empty (`Using text from sidecar file`, `src/paperless_tesseract/parsers.py:107`).
-2. Because no text was found, the code raises `NoTextFoundException` and catches it, logging `No text was found in the original document. Attempting force OCR to get the text.` (`src/paperless_tesseract/parsers.py:263-267`).
+2. Because no text was found (`if not self.text:`), the code raises `NoTextFoundException` (`src/paperless_tesseract/parsers.py:266-267`) and catches it, logging the full line `Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.` (`src/paperless_tesseract/parsers.py:276-281`). The logged message is the f-string prefix `Encountered an error while running OCR: ` (`:279`) concatenated with the exception's own text `No text was found in the original document` (`:267`) — matching the captured `[WARNING]` line above verbatim.
 3. A **second** OCR attempt runs with the safe fallback `force_ocr=True` (`Fallback: Calling OCRmyPDF with args: {… 'force_ocr': True …}`, `src/paperless_tesseract/parsers.py:296-297`), rasterizing the whole page.
 4. Still no text is recognized, so the last-resort branch logs `No text was found in …, the content will be empty.` and sets `self.text = ""` (`src/paperless_tesseract/parsers.py:318-327`).
 5. Consumption **finishes normally** — `Document … consumption finished`. The empty result is *not* an error. **[observed-at-runtime, grounded]**
