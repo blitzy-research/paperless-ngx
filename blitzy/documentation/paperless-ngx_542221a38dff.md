@@ -214,8 +214,7 @@ When a request targets a page beyond the last available page, the API returns **
 
 ```
 if (activeListViewState.currentPage != 1 && error.status == 404) {
-  // this happens when applying a filter: the current page might not be
-  // available anymore due to the reduced result set.
+  // this happens when applying a filter: the current page might not be available anymore due to the reduced result set.
   activeListViewState.currentPage = 1
   this.reload()
 }
