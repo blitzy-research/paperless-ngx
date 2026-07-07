@@ -70,21 +70,32 @@ export DJANGO_SETTINGS_MODULE=paperless.settings
 export PYTHONPATH=/app/src
 ```
 
-**Versions & Django init (command + raw output):**
+**Interpreter version — exact command + complete raw output:**
 
 ```
-$ python3 -c "import django,sklearn,pikepdf,psutil,numpy,scipy; print(...)"
+$ python3 --version
+Python 3.9.23
+```
+
+**Versions & Django init — exact commands + complete raw output** (the commands are copy‑pasteable
+verbatim; single quotes inside the `python3 -c "…"` string produce the output shown, with no elision):
+
+```
+$ python3 -c "import django, sklearn, pikepdf, psutil, numpy, scipy; print('django', django.__version__, '| sklearn', sklearn.__version__, '| pikepdf', pikepdf.__version__, '| psutil', psutil.__version__, '| numpy', numpy.__version__, '| scipy', scipy.__version__)"
 django 4.0.4 | sklearn 1.0.2 | pikepdf 5.1.1 | psutil 7.2.2 | numpy 1.22.3 | scipy 1.8.0
 
-$ python3 -c "import django; django.setup(); from django.conf import settings; print(...)"
+$ python3 -c "import django; django.setup(); from django.conf import settings; print('DATA_DIR=  ' + str(settings.DATA_DIR)); print('MODEL_FILE=' + str(settings.MODEL_FILE)); print('DEBUG=     ' + str(settings.DEBUG)); print('SCRATCH_DIR=' + str(settings.SCRATCH_DIR)); print('DB=        ' + settings.DATABASES['default']['NAME'])"
 DATA_DIR=  /tmp/blitzy_probe/data
 MODEL_FILE=/tmp/blitzy_probe/data/classification_model.pickle
-DEBUG=     False        # canonical default, settings.py:50
+DEBUG=     False
 SCRATCH_DIR=/tmp/blitzy_probe/scratch
 DB=        /tmp/blitzy_probe/data/db.sqlite3
 ```
 
-**Database migrate (command + head/tail of raw output):**
+`DEBUG=False` is the canonical default — `DEBUG = __get_boolean("PAPERLESS_DEBUG", "NO")` [`settings.py:50`].
+
+**Database migrate — exact command + complete, unedited output** (95 lines: 3 header lines + 92
+`Applying … OK` lines; nothing is elided):
 
 ```
 $ cd /app/src && python3 manage.py migrate --no-input
@@ -93,10 +104,99 @@ Operations to perform:
 Running migrations:
   Applying contenttypes.0001_initial... OK
   Applying auth.0001_initial... OK
-  ...
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying contenttypes.0002_remove_content_type_name... OK
+  Applying auth.0002_alter_permission_name_max_length... OK
+  Applying auth.0003_alter_user_email_max_length... OK
+  Applying auth.0004_alter_user_username_opts... OK
+  Applying auth.0005_alter_user_last_login_null... OK
+  Applying auth.0006_require_contenttypes_0002... OK
+  Applying auth.0007_alter_validators_add_error_messages... OK
+  Applying auth.0008_alter_user_username_max_length... OK
+  Applying auth.0009_alter_user_last_name_max_length... OK
+  Applying auth.0010_alter_group_name_max_length... OK
+  Applying auth.0011_update_proxy_permissions... OK
+  Applying auth.0012_alter_user_first_name_max_length... OK
+  Applying authtoken.0001_initial... OK
+  Applying authtoken.0002_auto_20160226_1747... OK
+  Applying authtoken.0003_tokenproxy... OK
+  Applying django_q.0001_initial... OK
+  Applying django_q.0002_auto_20150630_1624... OK
+  Applying django_q.0003_auto_20150708_1326... OK
+  Applying django_q.0004_auto_20150710_1043... OK
+  Applying django_q.0005_auto_20150718_1506... OK
+  Applying django_q.0006_auto_20150805_1817... OK
+  Applying django_q.0007_ormq... OK
+  Applying django_q.0008_auto_20160224_1026... OK
+  Applying django_q.0009_auto_20171009_0915... OK
+  Applying django_q.0010_auto_20200610_0856... OK
+  Applying django_q.0011_auto_20200628_1055... OK
+  Applying django_q.0012_auto_20200702_1608... OK
+  Applying django_q.0013_task_attempt_count... OK
+  Applying django_q.0014_schedule_cluster... OK
+  Applying documents.0001_initial... OK
+  Applying documents.0002_auto_20151226_1316... OK
+  Applying documents.0003_sender... OK
+  Applying documents.0004_auto_20160114_1844... OK
+  Applying documents.0005_auto_20160123_0313... OK
+  Applying documents.0006_auto_20160123_0430... OK
+  Applying documents.0007_auto_20160126_2114... OK
+  Applying documents.0008_document_file_type... OK
+  Applying documents.0009_auto_20160214_0040... OK
+  Applying documents.0010_log... OK
+  Applying documents.0011_auto_20160303_1929... OK
+  Applying documents.0012_auto_20160305_0040... OK
+  Applying documents.0013_auto_20160325_2111... OK
+  Applying documents.0014_document_checksum... OK
+  Applying documents.0015_add_insensitive_to_match... OK
+  Applying documents.0016_auto_20170325_1558... OK
+  Applying documents.0017_auto_20170512_0507... OK
+  Applying documents.0018_auto_20170715_1712... OK
+  Applying documents.0019_add_consumer_user... OK
+  Applying documents.0020_document_added... OK
+  Applying documents.0021_document_storage_type... OK
+  Applying documents.0022_auto_20181007_1420... OK
+  Applying documents.0023_document_current_filename... OK
+  Applying documents.1000_update_paperless_all... OK
+  Applying documents.1001_auto_20201109_1636... OK
+  Applying documents.1002_auto_20201111_1105... OK
+  Applying documents.1003_mime_types... OK
+  Applying documents.1004_sanity_check_schedule... OK
+  Applying documents.1005_checksums... OK
+  Applying documents.1006_auto_20201208_2209... OK
+  Applying documents.1007_savedview_savedviewfilterrule... OK
+  Applying documents.1008_auto_20201216_1736... OK
+  Applying documents.1009_auto_20201216_2005... OK
+  Applying documents.1010_auto_20210101_2159... OK
+  Applying documents.1011_auto_20210101_2340... OK
+  Applying documents.1012_fix_archive_files... OK
+  Applying documents.1013_migrate_tag_colour... OK
+  Applying documents.1014_auto_20210228_1614... OK
+  Applying documents.1015_remove_null_characters... OK
+  Applying documents.1016_auto_20210317_1351... OK
+  Applying documents.1017_alter_savedviewfilterrule_rule_type... OK
+  Applying documents.1018_alter_savedviewfilterrule_value... OK
+  Applying paperless_mail.0001_initial... OK
+  Applying paperless_mail.0002_auto_20201117_1334... OK
+  Applying paperless_mail.0003_auto_20201118_1940... OK
+  Applying paperless_mail.0004_mailrule_order... OK
+  Applying paperless_mail.0005_help_texts... OK
+  Applying paperless_mail.0006_auto_20210101_2340... OK
+  Applying paperless_mail.0007_auto_20210106_0138... OK
+  Applying paperless_mail.0008_auto_20210516_0940... OK
+  Applying paperless_mail.0009_mailrule_assign_tags... OK
+  Applying paperless_mail.0010_auto_20220311_1602... OK
+  Applying paperless_mail.0011_remove_mailrule_assign_tag... OK
+  Applying paperless_mail.0012_alter_mailrule_assign_tags... OK
+  Applying paperless_mail.0009_alter_mailrule_action_alter_mailrule_folder... OK
+  Applying paperless_mail.0013_merge_20220412_1051... OK
+  Applying paperless_mail.0014_alter_mailrule_action... OK
   Applying sessions.0001_initial... OK
-# 103 lines total; DB created at /tmp/blitzy_probe/data/db.sqlite3 (331776 bytes)
 ```
+
+The resulting SQLite DB is **331776 bytes** at `/tmp/blitzy_probe/data/db.sqlite3`.
 
 The three memory instruments are combined in a temporary helper (`memprobe.py`, deleted at the end):
 `psutil.Process().memory_info().rss`, `resource.getrusage(RUSAGE_SELF).ru_maxrss`,
@@ -245,13 +345,42 @@ a leak; it is a single object (~408 KB Python heap, Q3) living ~milliseconds lon
 
 ### Q1c — `pikepdf.open()` in metadata extraction is never closed (native memory)
 
-`RasterisedDocumentParser.extract_metadata` [`paperless_tesseract/parsers.py:26`] does, for PDFs:
+`RasterisedDocumentParser.extract_metadata` [`paperless_tesseract/parsers.py:26‑55`] is quoted
+verbatim below (every line, no elision). The memory‑relevant call is `pdf = pikepdf.open(...)` at
+`:34`, which uses **no** `with` block and has **no** matching `pdf.close()`, so the opened PDF is
+released only when the `pdf` object is later garbage‑collected:
 
-```
-pdf = pikepdf.open(document_path)      # parsers.py:34  — no `with`, no later pdf.close()
-meta = pdf.open_metadata()             # parsers.py:35
-for key, value in meta.items(): ...    # iterate XMP
-return result                          # pdf is only released when GC eventually collects it
+```python
+    def extract_metadata(self, document_path, mime_type):
+
+        result = []
+        if mime_type == "application/pdf":
+            import pikepdf
+
+            namespace_pattern = re.compile(r"\{(.*)\}(.*)")
+
+            pdf = pikepdf.open(document_path)
+            meta = pdf.open_metadata()
+            for key, value in meta.items():
+                if isinstance(value, list):
+                    value = " ".join([str(e) for e in value])
+                value = str(value)
+                try:
+                    m = namespace_pattern.match(key)
+                    result.append(
+                        {
+                            "namespace": m.group(1),
+                            "prefix": meta.REVERSE_NS[m.group(1)],
+                            "key": m.group(2),
+                            "value": value,
+                        },
+                    )
+                except Exception as e:
+                    self.log(
+                        "warning",
+                        f"Error while reading metadata {key}: {value}. Error: " f"{e}",
+                    )
+        return result
 ```
 
 This is reached from the REST `metadata` action [`views.py:283`] via `get_metadata` [`views.py:260`] →
@@ -375,10 +504,50 @@ the plain‑text path regardless of the model. There is **no run‑to‑run nond
 
 ### Q3a — The MODEL_FILE present‑vs‑absent toggle (the primary driver), measured in fresh processes
 
-To remove any warm‑import contamination and measure the _pure_ toggle, each condition was run in its
-**own fresh Python process** (baseline captured before `django.setup()` + first consume, post captured
-after one real `Consumer().try_consume_file()`), repeated so the distribution is visible. Raw output,
-unedited:
+**Creating the model with the canonical management command.** The `present` condition's model file is
+produced by the real, AAP‑mandated command **`python3 manage.py document_create_classifier`**
+[`documents/management/commands/document_create_classifier.py`], whose `handle()` calls
+`train_classifier()` [`tasks.py:48`]. A small AUTO‑labeled corpus (one `MATCH_AUTO` correspondent
+`ACME`, document type `Invoice`, tag `finance`, and 12 labeled documents) is seeded into the scratch DB
+first, because `train_classifier()` returns early unless at least one `MATCH_AUTO`
+Tag/DocumentType/Correspondent exists [`tasks.py:49‑55`] and `DocumentClassifier.train()` raises
+`ValueError("No training data available.")` on an empty corpus [`classifier.py:159`]. How the corpus
+rows enter the DB is fixture setup and does not affect the canonical‑ness of the command that is run.
+Exact command + complete raw output (env sourced from `/tmp/blitzy_probe/env.sh`):
+
+```text
+$ cd /app/src
+$ ls -l /tmp/blitzy_probe/data/classification_model.pickle    # confirm absent first
+ls: cannot access '/tmp/blitzy_probe/data/classification_model.pickle': No such file or directory
+$ python3 manage.py document_create_classifier ; echo "exit: $?"
+[2026-07-06 23:38:42,031] [INFO] [paperless.tasks] Saving updated classifier model to /tmp/blitzy_probe/data/classification_model.pickle...
+exit: 0
+$ stat -c %s /tmp/blitzy_probe/data/classification_model.pickle
+635847
+```
+
+The command exits `0` and writes `settings.MODEL_FILE` (**635847 bytes** for this 12‑document corpus;
+the log line originates at `tasks.py:65`). That the resulting pickle is what drives the spike/no‑spike
+gate is confirmed directly — `load_classifier()` returns a real `DocumentClassifier` when the file
+exists and `None` when it is removed [`classifier.py:31`, `:36`]:
+
+```text
+$ python3 -c "import django; django.setup(); from django.conf import settings; import os; from documents.classifier import load_classifier; print('exists', os.path.isfile(settings.MODEL_FILE)); print('present ->', type(load_classifier()).__name__); os.rename(settings.MODEL_FILE, settings.MODEL_FILE + '.bak'); print('absent  ->', load_classifier()); os.rename(settings.MODEL_FILE + '.bak', settings.MODEL_FILE)"
+exists True
+present -> DocumentClassifier
+absent  -> None
+```
+
+(The `635847`‑byte size here differs from the `397540`/`397577`‑byte figures elsewhere in this document
+only because the seeded corpus text differs; both are reported exactly as observed. The absolute size is
+immaterial to the toggle — only the file's presence/absence is.)
+
+With that model file in place, to remove any warm‑import contamination and measure the _pure_ toggle,
+each condition was run in its **own fresh Python process** (baseline captured before `django.setup()` +
+first consume, post captured after one real `Consumer().try_consume_file()`), repeated so the
+distribution is visible. The per‑process driver `consume_measure_proc.py` selects the condition from its
+argument: for `present` it ensures the model exists (created by the canonical command above), for
+`absent` it removes the pickle. Raw output, unedited:
 
 ```text
 $ # inside container paperless-qna, env sourced from /tmp/blitzy_probe/env.sh
@@ -481,12 +650,17 @@ above. (The per‑task `recycle: 1` behavior of a live `qcluster` is **inferred*
   (`TikaDocumentParser`) **cannot be exercised in the canonical configuration** because
   `PAPERLESS_TIKA_ENABLED` defaults to `False`, so office documents are rejected as _unsupported mime
   type_ before any parser runs (measured below — labeled non‑canonical).
-- **Batch size** does **not** cause unbounded growth. Consuming the same file 6× in one process leaves
-  the Python heap essentially **flat** (`tracemalloc_cur` stays at ~79.9–80.0 MB across all six
-  iterations) and RSS **plateaus** (oscillating in a band, not climbing monotonically). The only
-  batch‑scaling memory is `DocumentClassifier.train()`, whose in‑memory lists grow **O(N)** with corpus
-  size — a transient training cost, not a per‑document consumption leak. In production, django‑q
-  `recycle: 1` [`settings.py:452`] resets RSS to the ~49.8 MB baseline after every task (Q3c).
+- **Batch size** does **not** cause unbounded growth — proven across the **full parser‑family × batch‑size
+  × model‑state matrix** in **Q4e** (both `TextDocumentParser` and `RasterisedDocumentParser`, batch sizes
+  1/5/20, model absent and present, two runs). In every multi‑document cell the Python heap `tracemalloc_cur`
+  **spread stays sub‑MB** (≤ ~0.5 MB over 5–20 consecutive consumes) and per‑iteration RSS deltas collapse to
+  **≈0.00 MB** after the first document, so RSS **plateaus** rather than climbing monotonically (the text‑only
+  Q4b run is one slice of this). The only large step in the matrix is a **one‑time** ~72 MB RSS / ~26 MB heap
+  cost on the *first* model‑present consume (the classifier unpickle + lazy sklearn import), amortized once per
+  process — not per document. The only genuinely batch‑scaling memory is `DocumentClassifier.train()`, whose
+  in‑memory lists grow **O(N)** with corpus size — a transient training cost, not a per‑document consumption
+  leak. In production, django‑q `recycle: 1` [`settings.py:452`] resets RSS to the ~49.8 MB baseline after
+  every task (Q3c).
 
 ### Q4a — Cross‑product: 3 parser families × {model absent, model present}, warm, ≥2 runs each
 
@@ -640,6 +814,85 @@ genuinely could not be exercised in the canonical runtime and none are reported;
 process over HTTP, so its heavy memory would live in the Tika JVM, not in the paperless Python worker —
 this last point is **(inferred)** from the code and the disabled‑by‑default setting, not measured.
 
+### Q4e — Full cross‑product: parser family × batch size × model state (the matrix Q4 explicitly asks for)
+
+Q4a measured a **single** consume per (type × model) cell and Q4b measured a **text‑only** batch. This
+subsection closes the gap by running the **complete** document‑type × batch‑size cross‑product — both
+exercisable parser families (`TextDocumentParser`, `RasterisedDocumentParser`) × batch sizes
+**single (1) / several (5) / large‑N (20)** × **model absent / present** = **12 measured cells** — in one
+warm process, and repeated as **two full runs** for stability. Each batch document carries a unique marker
+so the duplicate guard `hashlib.md5(f.read())` in `pre_check_duplicate` [`consumer.py:104`] does not reject
+it; `TikaDocumentParser` (office) remains **not exercisable** in the canonical config (Q4d), so it is a
+single honest row, not a measured batch. Raw run‑1 cell summaries, unedited (the complete per‑iteration
+transcript for every N=20 cell, and run 2, are in **Deliverable A**, experiment #13):
+
+```text
+$ python3 q4_matrix2.py     # inside container paperless-qna, env from /tmp/blitzy_probe/env.sh; PYTHONPATH=/tmp/blitzy_probe:/app/src
+WARM-UP consume txt+pdf: RSS 60.43->116.56 MB, tm_cur 2490.3->22612.7 KB (excluded from cell deltas)
+post_warmup_baseline: RSS=116.56 MB tm_cur=22610.1 KB
+sample sizes: txt=5310B pdf~=1.6KB
+=================== Q4 MATRIX: type x model x batch ===================
+CELL kind=txt model=absent N= 1 | model_present=False | RSS 116.56->118.39 MB (net +1.82) | tm_cur 22610.5->22573.5 KB (spread 0.0) | first_iter_dRSS=+1.82 last_iter_dRSS=+1.82
+CELL kind=txt model=absent N= 5 | model_present=False | RSS 118.39->118.55 MB (net +0.16) | tm_cur 22573.4->22713.1 KB (spread 31.5) | first_iter_dRSS=+0.13 last_iter_dRSS=+0.02
+CELL kind=txt model=absent N=20 | model_present=False | RSS 118.55->119.02 MB (net +0.47) | tm_cur 22712.7->22954.1 KB (spread 170.9) | first_iter_dRSS=+0.14 last_iter_dRSS=+0.00
+CELL kind=pdf model=absent N= 1 | model_present=False | RSS 119.02->119.18 MB (net +0.16) | tm_cur 22952.5->23039.3 KB (spread 0.0) | first_iter_dRSS=+0.16 last_iter_dRSS=+0.16
+CELL kind=pdf model=absent N= 5 | model_present=False | RSS 119.18->119.36 MB (net +0.18) | tm_cur 23039.2->23066.0 KB (spread 103.2) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.18
+CELL kind=pdf model=absent N=20 | model_present=False | RSS 119.36->119.57 MB (net +0.21) | tm_cur 23065.6->23263.3 KB (spread 220.0) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+CELL kind=txt model=present N= 1 | model_present=True | RSS 119.57->191.74 MB (net +72.17) | tm_cur 23261.7->49408.2 KB (spread 0.0) | first_iter_dRSS=+72.17 last_iter_dRSS=+72.17
+CELL kind=txt model=present N= 5 | model_present=True | RSS 191.74->193.32 MB (net +1.58) | tm_cur 49408.0->49545.2 KB (spread 127.0) | first_iter_dRSS=+1.37 last_iter_dRSS=+0.17
+CELL kind=txt model=present N=20 | model_present=True | RSS 193.32->194.28 MB (net +0.96) | tm_cur 49544.7->49720.9 KB (spread 167.2) | first_iter_dRSS=+0.07 last_iter_dRSS=+0.11
+CELL kind=pdf model=present N= 1 | model_present=True | RSS 194.28->194.35 MB (net +0.07) | tm_cur 49719.2->49832.1 KB (spread 0.0) | first_iter_dRSS=+0.07 last_iter_dRSS=+0.07
+CELL kind=pdf model=present N= 5 | model_present=True | RSS 194.35->194.57 MB (net +0.22) | tm_cur 49832.0->49832.7 KB (spread 104.1) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+CELL kind=pdf model=present N=20 | model_present=True | RSS 194.57->194.86 MB (net +0.29) | tm_cur 49832.2->50004.3 KB (spread 305.7) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+MATRIX DONE
+```
+
+**The measured matrix (net RSS over the batch and Python‑heap `tm_cur` spread within the batch; both runs):**
+
+| Parser family                             | Model     | Batch N | net RSS Δ over batch (run1, run2) | heap `tm_cur` spread within batch (run1, run2) | per‑document accumulation? |
+| ----------------------------------------- | --------- | ------- | --------------------------------- | ---------------------------------------------- | -------------------------- |
+| `TextDocumentParser` (text/plain, 5310 B) | absent    | 1       | +1.82, +1.87 MB                   | 0.0, 0.0 KB (single iter)                      | n/a (1 doc)                |
+| `TextDocumentParser`                      | absent    | 5       | +0.16, +0.19 MB                   | 31.5, 180.3 KB                                 | **none** (heap flat)       |
+| `TextDocumentParser`                      | absent    | 20      | +0.47, +0.73 MB                   | 170.9, 220.2 KB                                | **none** (heap flat)       |
+| `RasterisedDocumentParser` (pdf, ~1.6 KB) | absent    | 1       | +0.16, +0.00 MB                   | 0.0, 0.0 KB (single iter)                      | n/a (1 doc)                |
+| `RasterisedDocumentParser`                | absent    | 5       | +0.18, +0.15 MB                   | 103.2, 106.4 KB                                | **none** (heap flat)       |
+| `RasterisedDocumentParser`                | absent    | 20      | +0.21, +0.31 MB                   | 220.0, 196.7 KB                                | **none** (heap flat)       |
+| `TextDocumentParser`                      | present   | 1       | **+72.17, +72.06 MB**             | 0.0, 0.0 KB (single iter)                      | one‑time load (see below)  |
+| `TextDocumentParser`                      | present   | 5       | +1.58, +1.38 MB                   | 127.0, 42.1 KB                                 | **none** (heap flat)       |
+| `TextDocumentParser`                      | present   | 20      | +0.96, +1.06 MB                   | 167.2, 130.9 KB                                | **none** (heap flat)       |
+| `RasterisedDocumentParser`                | present   | 1       | +0.07, +0.28 MB                   | 0.0, 0.0 KB (single iter)                      | n/a (1 doc)                |
+| `RasterisedDocumentParser`                | present   | 5       | +0.22, +0.01 MB                   | 104.1, 504.1 KB                                | **none** (heap flat)       |
+| `RasterisedDocumentParser`                | present   | 20      | +0.29, +4.00 MB                   | 305.7, 327.8 KB                                | **none** (heap flat)       |
+| `TikaDocumentParser` (office)             | n/a       | —       | **not exercisable (canonical)**   | —                                              | — (Q4d: unsupported mime)  |
+
+**Cause → effect (answers Q4's document‑type × batch‑size question directly):**
+
+1. **Batch size does NOT accumulate — for either parser family, under either model state.** Across every
+   multi‑document cell the Python‑heap `tm_cur` **spread stays ≤ ~0.5 MB** over 5–20 consecutive consumes
+   (e.g., text‑absent‑N20 spread 170.9/220.2 KB; pdf‑present‑N20 spread 305.7/327.8 KB), and per‑iteration
+   RSS deltas collapse to **≈0.00 MB** after the first document (see the full per‑iteration transcript in
+   Deliverable A: e.g. text‑absent‑N20 climbs only 118.55→119.02 MB total over 20 docs, most iters
+   `+0.00`). The heap is fully released between documents; RSS **plateaus** rather than climbing
+   monotonically. This is the same conclusion as the text‑only Q4b, now shown to hold for **PDF** and for
+   the **model‑present** regime as well.
+2. **The only large step is a ONE‑TIME cost on the first model‑present consume, not a per‑document cost.**
+   The `txt|present|N=1` cell jumps **+72.17 / +72.06 MB RSS** and **+26 MB heap** (`tm_cur`
+   23261→49408 KB) — this is the first time in the process that `load_classifier()` unpickles the model
+   [`classifier.py:76`] **and** scikit‑learn/scipy submodules are lazily imported for prediction. Once
+   paid, the very next cells (`txt|present|N=5`, `N=20`) add only **+1.58 / +0.96 MB** with flat heap: the
+   classifier is re‑unpickled every call (no cache, Q2a) but the freed arenas are reused, so RSS does not
+   grow per document. This is exactly the ~80 MB‑RSS / ~27 MB‑heap spike of Q3a, here proven to be
+   **amortized once per process**, never per document in a batch.
+3. **Document type sets the fixed machinery cost, not the batch trend.** PDF cells carry pikepdf/QPDF +
+   OCR working set (Q4a) but still show flat heap across the batch; text cells show flat heap too. The
+   run‑to‑run RSS wobble (e.g., pdf‑present‑N20 net +0.29 vs +4.00 MB) is allocator arena churn — the heap
+   spread stays ~0.3 MB in both runs, confirming it is **not** retained objects (Deliverable C attribution
+   rule).
+4. **Stability across ≥2 runs.** The two full runs agree on every qualitative conclusion and on the
+   magnitudes to within allocator noise: the one‑time model‑present jump is +72.17 vs +72.06 MB, and every
+   batch's heap spread stays sub‑MB in both runs. The `train()` O(N) growth (Q4c) remains the only
+   genuinely batch/corpus‑proportional memory, and it is a training cost, not a consumption one.
+
 ---
 
 ## Deliverable A — Raw runtime measurements (complete, unedited, with the command that produced each)
@@ -655,23 +908,33 @@ script lived under `/tmp/blitzy_probe/` (outside the tracked tree) and was delet
 **Manifest of experiments (command → what it measures → where the raw block is embedded):**
 
 | #   | Command                                  | Measures                                                | Raw block embedded in                        |
-| --- | ---------------------------------------- | ------------------------------------------------------- | -------------------------------------------- | --- |
+| --- | ---------------------------------------- | ------------------------------------------------------- | -------------------------------------------- |
 | 1   | `python3 exp_copies.py`                  | transient `md5(f.read())` peak vs file size             | Q1a                                          |
 | 2   | `python3 exp_reflifetime.py`             | classifier reaches the 6 handlers alive (refcount)      | Q1b                                          |
 | 3   | `python3 exp_pikepdf.py`                 | `pikepdf.open()` native RSS with/without `close()`      | Q1c                                          |
 | 4   | `python3 exp_classifier.py`              | `load_classifier()` no‑cache + per‑call recover + spike | Q2a + **full block below**                   |
 | 5   | `python3 exp_debug_queries.py`           | `connection.queries` growth, `DEBUG` off vs on          | Q2b                                          |
-| 6   | `python3 consume_measure_proc.py <absent | present>`                                               | fresh‑process spike vs no‑spike distribution | Q3a |
+| 6   | `python3 consume_measure_proc.py <absent \| present>`                                            | fresh‑process spike vs no‑spike distribution | Q3a                                          |
 | 7   | `python3 consume_once_proc.py` (×3)      | `recycle: 1` per‑process baseline reset                 | Q3c                                          |
 | 8   | `python3 exp_consume_matrix.py`          | 3 parsers × model × 2 runs + batch×6                    | Q4a, Q4b                                     |
 | 9   | `python3 exp_train_growth.py`            | `train()` heap O(N) over growing corpus                 | Q4c                                          |
 | 10  | `python3 exp_tika.py`                    | office/Tika unsupported in canonical config             | Q4d                                          |
 | 11  | `python3 exp_attribution.py`             | baseline→consume→del+gc heap vs RSS verdict             | Deliverable C                                |
 | 12  | `python3 manage.py migrate --no-input`   | canonical DB init (§2)                                  | §2                                           |
+| 13  | `python3 q4_matrix2.py`                  | parser family × batch {1,5,20} × model state matrix     | Q4e + full block below                       |
 
 **Full raw output of experiment #4 (`exp_classifier.py`) — complete and unedited** (Q2a showed only the
 no‑cache excerpt; here are all five `load_classifier()` calls with their `del`+`gc.collect()` recovery,
 which also underpins Deliverable C's per‑call verdict):
+
+> **Non‑canonical note on the inline "TRAIN REAL MODEL" step below.** Within this probe the
+> `################ TRAIN REAL MODEL (document_create_classifier path) ################` step calls
+> `train_classifier()` [`tasks.py:48`] **directly** in‑process — the identical function that the
+> management command `document_create_classifier.handle()` wraps
+> [`documents/management/commands/document_create_classifier.py`] — so the model it writes is the same,
+> but the invocation is a **non‑canonical equivalent** (it prints `train_classifier() returned None`
+> because that function returns `None`). The **canonical** `python3 manage.py document_create_classifier`
+> invocation, with its own exact command and complete raw output, is shown in **§Q3a** above.
 
 ```text
 $ python3 exp_classifier.py     # inside container paperless-qna, env from /tmp/blitzy_probe/env.sh
@@ -834,6 +1097,138 @@ convert-im6.q16: no images defined `/tmp/blitzy_probe/scratch/paperless-f32kzqrg
 MATRIX DONE
 ```
 
+**Full raw output of experiment #13 (`q4_matrix2.py`) — the complete Q4e cross‑product measurement
+transcript, unedited.** Q4e shows the 12 run‑1 `CELL` summary lines; here is the **complete** run‑1
+memory transcript including the per‑iteration RSS + `tracemalloc_cur` dump for **every** N=20 cell, plus
+the run‑2 cell summaries that establish stability. The per‑consume framework log lines
+(`[paperless.consumer] Consuming …` / `… consumption finished`) and the harmless repeated ImageMagick
+PDF‑thumbnail‑fallback warnings (`convert-im6.q16: … security policy 'PDF'` → ghostscript fallback) are
+identical to those already shown and explained in experiment #8 above, and are the only lines removed
+from this memory transcript; every measured number is present and unedited. Exact command:
+`python3 q4_matrix2.py` (env `/tmp/blitzy_probe/env.sh`, `PYTHONPATH=/tmp/blitzy_probe:/app/src`).
+
+```text
+$ python3 q4_matrix2.py     # RUN 1 — complete memory transcript
+WARM-UP consume txt+pdf: RSS 60.43->116.56 MB, tm_cur 2490.3->22612.7 KB (excluded from cell deltas)
+post_warmup_baseline: RSS=116.56 MB tm_cur=22610.1 KB
+sample sizes: txt=5310B pdf~=1.6KB
+=================== Q4 MATRIX: type x model x batch ===================
+CELL kind=txt model=absent N= 1 | model_present=False | RSS 116.56->118.39 MB (net +1.82) | tm_cur 22610.5->22573.5 KB (spread 0.0) | first_iter_dRSS=+1.82 last_iter_dRSS=+1.82
+CELL kind=txt model=absent N= 5 | model_present=False | RSS 118.39->118.55 MB (net +0.16) | tm_cur 22573.4->22713.1 KB (spread 31.5) | first_iter_dRSS=+0.13 last_iter_dRSS=+0.02
+CELL kind=txt model=absent N=20 | model_present=False | RSS 118.55->119.02 MB (net +0.47) | tm_cur 22712.7->22954.1 KB (spread 170.9) | first_iter_dRSS=+0.14 last_iter_dRSS=+0.00
+    iter  1: RSS before=118.55 after=118.68 (d +0.14) tm_cur_after=22797.7 KB
+    iter  2: RSS before=118.68 after=118.69 (d +0.00) tm_cur_after=22806.4 KB
+    iter  3: RSS before=118.69 after=118.69 (d +0.00) tm_cur_after=22813.0 KB
+    iter  4: RSS before=118.69 after=118.69 (d +0.00) tm_cur_after=22821.7 KB
+    iter  5: RSS before=118.69 after=118.69 (d +0.00) tm_cur_after=22820.9 KB
+    iter  6: RSS before=118.69 after=118.79 (d +0.10) tm_cur_after=22868.0 KB
+    iter  7: RSS before=118.79 after=118.79 (d +0.00) tm_cur_after=22870.4 KB
+    iter  8: RSS before=118.79 after=118.79 (d +0.00) tm_cur_after=22871.3 KB
+    iter  9: RSS before=118.79 after=118.79 (d +0.00) tm_cur_after=22873.2 KB
+    iter 10: RSS before=118.79 after=118.79 (d +0.00) tm_cur_after=22875.8 KB
+    iter 11: RSS before=118.79 after=118.90 (d +0.11) tm_cur_after=22934.3 KB
+    iter 12: RSS before=118.90 after=118.90 (d +0.00) tm_cur_after=22938.7 KB
+    iter 13: RSS before=118.90 after=118.90 (d +0.00) tm_cur_after=22938.4 KB
+    iter 14: RSS before=118.90 after=118.90 (d +0.00) tm_cur_after=22941.7 KB
+    iter 15: RSS before=118.90 after=118.90 (d +0.00) tm_cur_after=22943.1 KB
+    iter 16: RSS before=118.90 after=119.00 (d +0.10) tm_cur_after=22964.0 KB
+    iter 17: RSS before=119.00 after=119.02 (d +0.01) tm_cur_after=22967.1 KB
+    iter 18: RSS before=119.02 after=119.02 (d +0.00) tm_cur_after=22968.6 KB
+    iter 19: RSS before=119.02 after=119.02 (d +0.00) tm_cur_after=22955.3 KB
+    iter 20: RSS before=119.02 after=119.02 (d +0.00) tm_cur_after=22956.8 KB
+CELL kind=pdf model=absent N= 1 | model_present=False | RSS 119.02->119.18 MB (net +0.16) | tm_cur 22952.5->23039.3 KB (spread 0.0) | first_iter_dRSS=+0.16 last_iter_dRSS=+0.16
+CELL kind=pdf model=absent N= 5 | model_present=False | RSS 119.18->119.36 MB (net +0.18) | tm_cur 23039.2->23066.0 KB (spread 103.2) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.18
+CELL kind=pdf model=absent N=20 | model_present=False | RSS 119.36->119.57 MB (net +0.21) | tm_cur 23065.6->23263.3 KB (spread 220.0) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+    iter  1: RSS before=119.36 after=119.36 (d +0.00) tm_cur_after=23122.2 KB
+    iter  2: RSS before=119.36 after=119.36 (d +0.00) tm_cur_after=23176.5 KB
+    iter  3: RSS before=119.36 after=119.36 (d +0.00) tm_cur_after=23230.8 KB
+    iter  4: RSS before=119.36 after=119.36 (d +0.00) tm_cur_after=23085.7 KB
+    iter  5: RSS before=119.36 after=119.43 (d +0.07) tm_cur_after=23139.7 KB
+    iter  6: RSS before=119.43 after=119.43 (d +0.00) tm_cur_after=23191.3 KB
+    iter  7: RSS before=119.43 after=119.43 (d +0.00) tm_cur_after=23231.3 KB
+    iter  8: RSS before=119.43 after=119.43 (d +0.00) tm_cur_after=23133.0 KB
+    iter  9: RSS before=119.43 after=119.43 (d +0.00) tm_cur_after=23190.5 KB
+    iter 10: RSS before=119.43 after=119.54 (d +0.11) tm_cur_after=23243.4 KB
+    iter 11: RSS before=119.54 after=119.54 (d +0.00) tm_cur_after=23150.1 KB
+    iter 12: RSS before=119.54 after=119.54 (d +0.00) tm_cur_after=23202.9 KB
+    iter 13: RSS before=119.54 after=119.54 (d +0.00) tm_cur_after=23254.2 KB
+    iter 14: RSS before=119.54 after=119.54 (d +0.00) tm_cur_after=23305.7 KB
+    iter 15: RSS before=119.54 after=119.57 (d +0.03) tm_cur_after=23170.3 KB
+    iter 16: RSS before=119.57 after=119.57 (d +0.00) tm_cur_after=23225.3 KB
+    iter 17: RSS before=119.57 after=119.57 (d +0.00) tm_cur_after=23274.5 KB
+    iter 18: RSS before=119.57 after=119.57 (d +0.00) tm_cur_after=23179.9 KB
+    iter 19: RSS before=119.57 after=119.57 (d +0.00) tm_cur_after=23232.8 KB
+    iter 20: RSS before=119.57 after=119.57 (d +0.00) tm_cur_after=23266.3 KB
+CELL kind=txt model=present N= 1 | model_present=True | RSS 119.57->191.74 MB (net +72.17) | tm_cur 23261.7->49408.2 KB (spread 0.0) | first_iter_dRSS=+72.17 last_iter_dRSS=+72.17
+CELL kind=txt model=present N= 5 | model_present=True | RSS 191.74->193.32 MB (net +1.58) | tm_cur 49408.0->49545.2 KB (spread 127.0) | first_iter_dRSS=+1.37 last_iter_dRSS=+0.17
+CELL kind=txt model=present N=20 | model_present=True | RSS 193.32->194.28 MB (net +0.96) | tm_cur 49544.7->49720.9 KB (spread 167.2) | first_iter_dRSS=+0.07 last_iter_dRSS=+0.11
+    iter  1: RSS before=193.32 after=193.39 (d +0.07) tm_cur_after=49557.2 KB
+    iter  2: RSS before=193.39 after=193.39 (d +0.00) tm_cur_after=49560.9 KB
+    iter  3: RSS before=193.39 after=193.39 (d +0.00) tm_cur_after=49563.2 KB
+    iter  4: RSS before=193.39 after=193.39 (d +0.00) tm_cur_after=49566.2 KB
+    iter  5: RSS before=193.39 after=193.51 (d +0.12) tm_cur_after=49621.2 KB
+    iter  6: RSS before=193.51 after=193.66 (d +0.14) tm_cur_after=49624.1 KB
+    iter  7: RSS before=193.66 after=193.66 (d +0.00) tm_cur_after=49629.7 KB
+    iter  8: RSS before=193.66 after=193.66 (d +0.00) tm_cur_after=49629.3 KB
+    iter  9: RSS before=193.66 after=193.66 (d +0.00) tm_cur_after=49631.8 KB
+    iter 10: RSS before=193.66 after=193.79 (d +0.13) tm_cur_after=49697.0 KB
+    iter 11: RSS before=193.79 after=193.93 (d +0.13) tm_cur_after=49699.3 KB
+    iter 12: RSS before=193.93 after=193.93 (d +0.01) tm_cur_after=49702.0 KB
+    iter 13: RSS before=193.93 after=193.93 (d +0.00) tm_cur_after=49707.8 KB
+    iter 14: RSS before=193.93 after=193.95 (d +0.01) tm_cur_after=49711.1 KB
+    iter 15: RSS before=193.95 after=194.05 (d +0.11) tm_cur_after=49710.2 KB
+    iter 16: RSS before=194.05 after=194.17 (d +0.12) tm_cur_after=49712.1 KB
+    iter 17: RSS before=194.17 after=194.17 (d +0.00) tm_cur_after=49714.2 KB
+    iter 18: RSS before=194.17 after=194.17 (d +0.00) tm_cur_after=49716.4 KB
+    iter 19: RSS before=194.17 after=194.17 (d +0.00) tm_cur_after=49718.9 KB
+    iter 20: RSS before=194.17 after=194.28 (d +0.11) tm_cur_after=49724.4 KB
+CELL kind=pdf model=present N= 1 | model_present=True | RSS 194.28->194.35 MB (net +0.07) | tm_cur 49719.2->49832.1 KB (spread 0.0) | first_iter_dRSS=+0.07 last_iter_dRSS=+0.07
+CELL kind=pdf model=present N= 5 | model_present=True | RSS 194.35->194.57 MB (net +0.22) | tm_cur 49832.0->49832.7 KB (spread 104.1) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+CELL kind=pdf model=present N=20 | model_present=True | RSS 194.57->194.86 MB (net +0.29) | tm_cur 49832.2->50004.3 KB (spread 305.7) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+    iter  1: RSS before=194.57 after=194.57 (d +0.00) tm_cur_after=49886.6 KB
+    iter  2: RSS before=194.57 after=194.57 (d +0.00) tm_cur_after=49937.3 KB
+    iter  3: RSS before=194.57 after=194.57 (d +0.00) tm_cur_after=49799.4 KB
+    iter  4: RSS before=194.57 after=194.57 (d +0.00) tm_cur_after=49702.1 KB
+    iter  5: RSS before=194.57 after=194.59 (d +0.02) tm_cur_after=49789.6 KB
+    iter  6: RSS before=194.59 after=194.59 (d +0.00) tm_cur_after=49872.1 KB
+    iter  7: RSS before=194.59 after=194.59 (d +0.00) tm_cur_after=49929.0 KB
+    iter  8: RSS before=194.59 after=194.59 (d +0.00) tm_cur_after=49764.8 KB
+    iter  9: RSS before=194.59 after=194.74 (d +0.15) tm_cur_after=49832.6 KB
+    iter 10: RSS before=194.74 after=194.74 (d +0.00) tm_cur_after=49871.8 KB
+    iter 11: RSS before=194.74 after=194.74 (d +0.00) tm_cur_after=49824.0 KB
+    iter 12: RSS before=194.74 after=194.74 (d +0.00) tm_cur_after=49879.0 KB
+    iter 13: RSS before=194.74 after=194.74 (d +0.00) tm_cur_after=49930.7 KB
+    iter 14: RSS before=194.74 after=194.86 (d +0.12) tm_cur_after=49838.5 KB
+    iter 15: RSS before=194.86 after=194.86 (d +0.00) tm_cur_after=49889.2 KB
+    iter 16: RSS before=194.86 after=194.86 (d +0.00) tm_cur_after=49940.4 KB
+    iter 17: RSS before=194.86 after=194.86 (d +0.00) tm_cur_after=49848.4 KB
+    iter 18: RSS before=194.86 after=194.86 (d +0.00) tm_cur_after=49899.6 KB
+    iter 19: RSS before=194.86 after=194.86 (d +0.00) tm_cur_after=49951.6 KB
+    iter 20: RSS before=194.86 after=194.86 (d +0.00) tm_cur_after=50007.9 KB
+MATRIX DONE
+```
+
+**Run 2 (fresh process) — cell summaries, confirming stability of every Q4e conclusion:**
+
+```text
+$ python3 q4_matrix2.py     # RUN 2 — cell summaries
+WARM-UP consume txt+pdf: RSS 60.76->117.08 MB, tm_cur 2490.3->22628.1 KB (excluded from cell deltas)
+post_warmup_baseline: RSS=117.08 MB tm_cur=22625.5 KB
+CELL kind=txt model=absent N= 1 | model_present=False | RSS 117.08->118.95 MB (net +1.87) | tm_cur 22625.8->22653.4 KB (spread 0.0) | first_iter_dRSS=+1.87 last_iter_dRSS=+1.87
+CELL kind=txt model=absent N= 5 | model_present=False | RSS 118.95->119.14 MB (net +0.19) | tm_cur 22653.3->22788.4 KB (spread 180.3) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.02
+CELL kind=txt model=absent N=20 | model_present=False | RSS 119.14->119.88 MB (net +0.73) | tm_cur 22787.9->23003.0 KB (spread 220.2) | first_iter_dRSS=+0.01 last_iter_dRSS=+0.00
+CELL kind=pdf model=absent N= 1 | model_present=False | RSS 119.88->119.88 MB (net +0.00) | tm_cur 23001.4->23080.2 KB (spread 0.0) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+CELL kind=pdf model=absent N= 5 | model_present=False | RSS 119.88->120.03 MB (net +0.15) | tm_cur 23080.1->23138.0 KB (spread 106.4) | first_iter_dRSS=+0.13 last_iter_dRSS=+0.00
+CELL kind=pdf model=absent N=20 | model_present=False | RSS 120.03->120.34 MB (net +0.31) | tm_cur 23137.6->23354.7 KB (spread 196.7) | first_iter_dRSS=+0.16 last_iter_dRSS=+0.00
+CELL kind=txt model=present N= 1 | model_present=True | RSS 120.34->192.41 MB (net +72.06) | tm_cur 23353.1->49382.9 KB (spread 0.0) | first_iter_dRSS=+72.06 last_iter_dRSS=+72.06
+CELL kind=txt model=present N= 5 | model_present=True | RSS 192.41->193.78 MB (net +1.38) | tm_cur 49382.7->49519.0 KB (spread 42.1) | first_iter_dRSS=+1.23 last_iter_dRSS=+0.01
+CELL kind=txt model=present N=20 | model_present=True | RSS 193.78->194.84 MB (net +1.06) | tm_cur 49518.5->49740.1 KB (spread 130.9) | first_iter_dRSS=+0.16 last_iter_dRSS=+0.00
+CELL kind=pdf model=present N= 1 | model_present=True | RSS 194.84->195.12 MB (net +0.28) | tm_cur 49738.5->49844.0 KB (spread 0.0) | first_iter_dRSS=+0.28 last_iter_dRSS=+0.28
+CELL kind=pdf model=present N= 5 | model_present=True | RSS 195.12->195.13 MB (net +0.01) | tm_cur 49843.8->49685.5 KB (spread 504.1) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.01
+CELL kind=pdf model=present N=20 | model_present=True | RSS 195.13->199.14 MB (net +4.00) | tm_cur 49685.0->49935.1 KB (spread 327.8) | first_iter_dRSS=+0.00 last_iter_dRSS=+0.00
+MATRIX DONE
+```
+
 ---
 
 ## Deliverable B — Which components/methods hold onto memory (named, with `file:line`)
@@ -988,7 +1383,7 @@ with its concrete value, `file:line`, observed evidence, and causal reason. `✓
 | **Q4** `TextDocumentParser` (`f.read()`)        | `paperless_text/parsers.py:40,42`                             | Q4a                     | ✓ txt RSS 46‑94 MB, heap ≤221 KB                      |
 | **Q4** `TikaDocumentParser` (office)            | `paperless_tika/parsers.py:29,30,32,50,55`                    | Q4d                     | ✓ **not exercisable** (canonical): unsupported mime   |
 | **Q4** base `extract_metadata` → `[]`           | `documents/parsers.py:304,305`                                | TL;DR, Q4d              | ✓ default returns `[]` (no metadata)                  |
-| **Q4** batch single/several/large‑N             | —                                                             | Q4b                     | ✓ heap **flat** (~80 MB); RSS plateaus, no climb      |
+| **Q4** batch single/several/large‑N (2 families, model ±) | —                                                   | Q4b, Q4e                | ✓ per‑iter heap spread ≤~0.5 MB @ N=1/5/20 (txt+pdf, model ±); one‑time +72 MB on present‑N1 |
 | **Q4** `train()` O(N) accumulation              | `classifier.py:115,125,130,137,144,156`                       | Q4c                     | ✓ 86/172/343 MB @ 25/50/100; N=200 min_df artifact    |
 | **Q4** `DEBUG` off vs on                        | `settings.py:50`                                              | Q2b, Q4                 | ✓ 0 vs bounded 9000                                   |
 | **Q4** pikepdf with vs without `close()`        | `paperless_tesseract/parsers.py:34,35`                        | Q1c                     | ✓ +33.41 MB vs +0.04 MB                               |
@@ -1024,12 +1419,16 @@ with its concrete value, `file:line`, observed evidence, and causal reason. `✓
 | `Q_CLUSTER` block                                          | `settings.py:449`                                  | Q3c, B #15                              |
 
 **Coverage pass result:** all four questions (Q1 copies/references, Q2 caching, Q3 spike vs no‑spike,
-Q4 document types/batch sizes), all three deliverables (A/B/C), the full condition cross‑product
-(MODEL_FILE present/absent × 3 parser families × batch sizes × DEBUG off/on × pikepdf with/without
-`close()` × `train()` corpus growth × `recycle:1`), and every named function/file/flag are present with a
-concrete value, a verified `file:line`, observed raw evidence, and a cause→effect explanation. Values not
-observable at runtime in the canonical config are explicitly labeled **(inferred)** (the live `qcluster`
-`recycle:1` teardown and the Tika JVM residency).
+Q4 document types/batch sizes), all three deliverables (A/B/C), and the condition cross‑product
+(MODEL_FILE present/absent × parser family × batch size × DEBUG off/on × pikepdf with/without
+`close()` × `train()` corpus growth × `recycle:1`) are present with a concrete value, a verified
+`file:line`, observed raw evidence, and a cause→effect explanation. The **batch‑size cross‑product**
+(N=1/5/20 under both model states) was measured in Q4e for the two parser families that the canonical
+mime‑routing actually exercises — `TextDocumentParser` and `RasterisedDocumentParser`; the third family,
+`TikaDocumentParser`, is **not exercisable** in the default configuration (its office mime types are not
+routed to it without a running Tika/Gotenberg service, Q4d) and is labeled as such rather than
+substituted with a synthetic stand‑in. Values not observable at runtime in the canonical config are
+explicitly labeled **(inferred)** (the live `qcluster` `recycle:1` teardown and the Tika JVM residency).
 
 ---
 
