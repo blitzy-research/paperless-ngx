@@ -949,7 +949,7 @@ output (1) and in Appendix B).
 cd src/ && pipenv run pytest paperless_tesseract/tests/test_parser.py::TestParser::test_encrypted \
     -n0 --no-cov -p no:cacheprovider -rA
 
-# 2. Form PDF, no text on the skip pass -> force-OCR recovers text (real OCR work; ~7.6s)
+# 2. Form PDF (this test sets OCR_MODE=redo), no text on the first (redo) pass -> force-OCR recovers text (real OCR work; ~7.6s)
 cd src/ && pipenv run pytest paperless_tesseract/tests/test_parser.py::TestParser::test_with_form_error_notext \
     -n0 --no-cov -p no:cacheprovider -rA
 
@@ -1013,8 +1013,8 @@ is the invoked **`ocrmypdf.ocr`** subprocess (driving Tesseract) → the encrypt
 *"OCR is impossible"* → the last‑resort branch logs *"the content will be empty."* The test
 asserts `archive_path is None` and `get_text() == ""`.
 
-**(2) `test_with_form_error_notext` (`test_parser.py:190`) — the no-text `skip` pass triggers a
-**force-OCR retry** that recovers the form's text (the ~7.6 s duration is real Tesseract work,
+**(2) `test_with_form_error_notext` (`test_parser.py:190`, decorated `@override_settings(OCR_MODE="redo")` at `test_parser.py:189`) — the no-text `redo` pass (`OCR_MODE="redo"` maps to `redo_ocr=True` at `parsers.py:159-160`, *not* `skip_text`) triggers a
+**force-OCR retry** (`force_ocr=True` via `safe_fallback`, `parsers.py:155-156`) that recovers the form's text (the ~7.6 s duration is real Tesseract work,
 proving the retry path is genuinely executed, not mocked):**
 
 ```text
