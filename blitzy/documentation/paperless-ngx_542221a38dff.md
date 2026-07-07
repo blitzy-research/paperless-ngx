@@ -722,6 +722,15 @@ MODEL_FILE present: False
 4. **Predictions confirm the real path ran.** With the model present the handlers assign correspondent
    `ACME`, document type `Invoice`, tag `finance` (`predicted_corr=2 dtype=2 tags=[2]` for text); with it
    absent all are `None`/`[]`.
+5. **The plain‑text path incurs no metadata‑extraction cost because it inherits the base no‑op.**
+   `TextDocumentParser` [`paperless_text/parsers.py:12`] defines only `get_thumbnail` [`:19`] and `parse`
+   [`:40`]; it does **not** override `extract_metadata`, so it falls back to the base
+   `DocumentParser.extract_metadata` [`documents/parsers.py:304`], whose entire body is `return []`
+   [`documents/parsers.py:305`]. That is why the text rows above show **no** metadata allocation on top of
+   the `self.text = f.read()` copy — their ≤221 KB warm heap deltas contain zero metadata work. By
+   contrast, only `RasterisedDocumentParser` overrides `extract_metadata`
+   [`paperless_tesseract/parsers.py:26`] (the unclosed `pikepdf.open()` path measured in Q1c); the base's
+   empty‑list default is what the plain‑text family (and any non‑overriding parser) returns.
 
 ### Q4b — Batch size: same text file consumed 6× in one process (warm, model absent)
 
@@ -752,8 +761,8 @@ recycled worker per `recycle: 1` [`settings.py:452`], so RSS returns to ~49.8 MB
 `DocumentClassifier.train()` [`classifier.py:115`] iterates the **whole corpus**
 `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`classifier.py:125`] and appends each
 document's text/labels into in‑memory lists — `data.append(...)` [`classifier.py:130`],
-`labels_tags.append(...)` [`classifier.py:137`], `labels_correspondent.append(...)` [`classifier.py:144`],
-`labels_document_type.append(...)` [`classifier.py:156`] — before vectorizing. Growing the corpus and
+`labels_document_type.append(...)` [`classifier.py:137`], `labels_correspondent.append(...)` [`classifier.py:144`],
+`labels_tags.append(...)` [`classifier.py:156`] — before vectorizing. Growing the corpus and
 measuring the peak Python heap during `train()`:
 
 ```text
@@ -1382,7 +1391,7 @@ with its concrete value, `file:line`, observed evidence, and causal reason. `✓
 | **Q4** `RasterisedDocumentParser` (pikepdf+OCR) | `paperless_tesseract/parsers.py`                              | Q4a                     | ✓ pdf RSS 44‑62 MB, heap ≤204 KB                      |
 | **Q4** `TextDocumentParser` (`f.read()`)        | `paperless_text/parsers.py:40,42`                             | Q4a                     | ✓ txt RSS 46‑94 MB, heap ≤221 KB                      |
 | **Q4** `TikaDocumentParser` (office)            | `paperless_tika/parsers.py:29,30,32,50,55`                    | Q4d                     | ✓ **not exercisable** (canonical): unsupported mime   |
-| **Q4** base `extract_metadata` → `[]`           | `documents/parsers.py:304,305`                                | TL;DR, Q4d              | ✓ default returns `[]` (no metadata)                  |
+| **Q4** base `extract_metadata` → `[]`           | `documents/parsers.py:304,305`                                | Q4a                     | ✓ default returns `[]` (no metadata)                  |
 | **Q4** batch single/several/large‑N (2 families, model ±) | —                                                   | Q4b, Q4e                | ✓ per‑iter heap spread ≤~0.5 MB @ N=1/5/20 (txt+pdf, model ±); one‑time +72 MB on present‑N1 |
 | **Q4** `train()` O(N) accumulation              | `classifier.py:115,125,130,137,144,156`                       | Q4c                     | ✓ 86/172/343 MB @ 25/50/100; N=200 min_df artifact    |
 | **Q4** `DEBUG` off vs on                        | `settings.py:50`                                              | Q2b, Q4                 | ✓ 0 vs bounded 9000                                   |
