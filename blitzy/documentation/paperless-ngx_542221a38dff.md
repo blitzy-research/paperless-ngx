@@ -728,8 +728,9 @@ MODEL_FILE present: False
    `DocumentParser.extract_metadata` [`documents/parsers.py:304`], whose entire body is `return []`
    [`documents/parsers.py:305`]. That is why the text rows above show **no** metadata allocation on top of
    the `self.text = f.read()` copy — their ≤221 KB warm heap deltas contain zero metadata work. By
-   contrast, only `RasterisedDocumentParser` overrides `extract_metadata`
-   [`paperless_tesseract/parsers.py:26`] (the unclosed `pikepdf.open()` path measured in Q1c); the base's
+   contrast, `RasterisedDocumentParser` overrides `extract_metadata`
+   [`paperless_tesseract/parsers.py:26`] (the unclosed `pikepdf.open()` path measured in Q1c), and the
+   `TikaDocumentParser` (disabled by default) overrides it as well [`paperless_tika/parsers.py:29`]; the base's
    empty‑list default is what the plain‑text family (and any non‑overriding parser) returns.
 
 ### Q4b — Batch size: same text file consumed 6× in one process (warm, model absent)
