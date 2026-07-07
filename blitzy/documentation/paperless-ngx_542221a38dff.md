@@ -490,27 +490,74 @@ via ghostscript and continues to SUCCESS.)*
 docker exec -w /app/src paperless-app sed -n '184,248p' documents/tasks.py
 ```
 
-**Output (unedited — key lines):**
+**Output (unedited):**
 
 ```
 def consume_file(
     path,
     override_filename=None,
-    ...
+    override_title=None,
+    override_correspondent_id=None,
+    override_document_type_id=None,
+    override_tag_ids=None,
+    task_id=None,
 ):
 
     # check for separators in current document
     if settings.CONSUMER_ENABLE_BARCODES:
-        ...
+        separators = []
+        document_list = []
+        separators = scan_file_for_separating_barcodes(path)
+        if separators:
+            logger.debug(f"Pages with separators found in: {str(path)}")
+            document_list = separate_pages(path, separators)
+        if document_list:
+            for n, document in enumerate(document_list):
+                # save to consumption dir
+                # rename it to the original filename  with number prefix
+                if override_filename:
+                    newname = f"{str(n)}_" + override_filename
+                else:
+                    newname = None
+                save_to_dir(document, newname=newname)
+            # if we got here, the document was successfully split
+            # and can safely be deleted
+            logger.debug("Deleting file {}".format(path))
+            os.unlink(path)
+            # notify the sender, otherwise the progress bar
+            # in the UI stays stuck
+            payload = {
+                "filename": override_filename,
+                "task_id": task_id,
+                "current_progress": 100,
+                "max_progress": 100,
+                "status": "SUCCESS",
+                "message": "finished",
+            }
+            try:
+                async_to_sync(get_channel_layer().group_send)(
+                    "status_updates",
+                    {"type": "status_update", "data": payload},
+                )
+            except OSError as e:
+                logger.warning("OSError. It could be, the broker cannot be reached.")
+                logger.warning(str(e))
+            return "File successfully split"
+
     # continue with consumption if no barcode was found
     document = Consumer().try_consume_file(
         path,
         override_filename=override_filename,
-        ...
+        override_title=override_title,
+        override_correspondent_id=override_correspondent_id,
+        override_document_type_id=override_document_type_id,
+        override_tag_ids=override_tag_ids,
+        task_id=task_id,
     )
 
     if document:
         return "Success. New document id {} created".format(document.pk)
+    else:
 ```
 
 `consume_file` (`tasks.py:184`) first checks `settings.CONSUMER_ENABLE_BARCODES` (`tasks.py:195`,
