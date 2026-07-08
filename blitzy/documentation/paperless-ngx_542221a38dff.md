@@ -415,6 +415,28 @@ def add_to_index(sender, document, **kwargs):
         document_consumption_finished.connect(add_to_index)
 ```
 
+Confirmed at runtime by enumerating the live signal receivers — a genuine observation of the dispatcher, not merely a reading of the source. `add_to_index` is **not** among the `post_save` receivers for `Document`, and appears **only** among the `document_consumption_finished` receivers, so a metadata edit (which fires `post_save`) triggers no indexing signal at all:
+
+```
+$ python manage.py shell <<'PY'
+from django.db.models.signals import post_save
+from documents.models import Document
+from documents.signals import document_consumption_finished
+ps = [f.__qualname__ for f in post_save._live_receivers(Document)]
+dc = [f.__qualname__ for f in document_consumption_finished._live_receivers(Document)]
+print('post_save[sender=Document]         :', ps)
+print('document_consumption_finished      :', dc)
+print('add_to_index fires on post_save?   :', 'add_to_index' in ps)
+print('add_to_index fires on consumption? :', 'add_to_index' in dc)
+PY
+post_save[sender=Document]         : ['update_filename_and_move_files']
+document_consumption_finished      : ['add_inbox_tags', 'set_correspondent', 'set_document_type', 'set_tags', 'set_log_entry', 'add_to_index']
+add_to_index fires on post_save?   : False
+add_to_index fires on consumption? : True
+```
+
+The runtime enumeration above, together with the wiring quoted from `apps.py:L27`, **observes** that no indexing signal is wired to fire on a metadata edit; the code at `src/documents/views.py:L216` (quoted in the DIRECT ANSWER above) is what performs the in‑request write. The narrower attribution that the **view handler specifically** — rather than any signal — is what indexes the edit is labeled **inferred** (from the code structure + this runtime receiver enumeration + the observed synchronous, no‑job behavior in §3.1 and §3.2), rather than proven by instrumenting the signal path itself: the observed timing alone is consistent with either a view‑handler write or a hypothetical *synchronous* `post_save` receiver (Django `post_save` fires inside the request, not as a Django‑Q job), so distinguishing the two rests on the code and the receiver wiring shown here. This mirrors the labeling of the parallel read‑derived claim in §4.4.
+
 This is why the raw‑SQL path in Q2 (which fires no signal at all) leaves the index untouched.
 
 ---
@@ -753,7 +775,7 @@ Every sub‑part and every named item, answered explicitly with its concrete val
 | Q1‑c | Watch the worker: does a single edit produce a task? | **No task** for the edit (3 runs; the `sed` new‑lines window is empty) | `views.py:L212-L217` (no `async_task`; cf. `bulk_edit.py:L87`) | §3.1–§3.2 |
 | Q1‑d | Latency, ≥2 runs, stable? | PATCH 0.149/0.149/0.160 s; search 0.109/0.110/0.110 s — **stable, sub‑second** (3 docs, 3 runs) | runtime measurement; path `views.py:L212-L217` + `:L413-L425` | §3.1–§3.2 |
 | Q1‑e | Asynchronous contrast | **Bulk edit DOES enqueue a job** — `bulk_update_documents` 0→1, task `oklahoma-yellow-nitrogen-aspen` success, worker log 113→125 | `bulk_edit.py:L87`, `tasks.py:L270-L280` | §3.3 |
-| Q1‑f | Are signals the mechanism? | **No** — `post_save` receiver moves files only; `add_to_index` wired to consumption only | `handlers.py:L310-L312`, `:L428-L431`, `apps.py:L27` | §3.4 |
+| Q1‑f | Are signals the mechanism? | **No** — runtime receiver enumeration shows `post_save[Document]` = `[update_filename_and_move_files]` (moves files only) and `add_to_index` fires only on `document_consumption_finished`; the narrower attribution to the view handler specifically is **inferred** | `handlers.py:L310-L312`, `:L428-L431`, `apps.py:L27` | §3.4 |
 | Q2‑a | Does raw SQL update make the new title searchable? | **No — stale index; new title MISS (count:0)** | `models.py:L88`,`:L106` (no `save()` override) | §4.2 |
 | Q2‑b | Old title after raw SQL? | **Still HITS (count:1)**; hit serializes the new DB title → index/DB divergence | `index.py:L240-L254` (matching), serializer reads DB | §4.2 |
 | Q2‑c | Is there a way to force reconciliation? | **Yes — `python manage.py document_index reindex`** | `document_index.py:L20-L25`, `tasks.py:L38-L45` | §4.3 |
