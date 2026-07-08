@@ -40,26 +40,95 @@ $ (cd /app && git log --oneline -1)
 
 > **Observed vs. plan note.** The task plan referred to "Python 3.10"; the canonical image actually ships **Python 3.9.23** (reported above as observed). All results below are from this interpreter.
 
-**Python dependency versions** (via `importlib.metadata`) — these match `Pipfile` / `Pipfile.lock`:
+**Python dependency versions** — installed **runtime** versions reported by `importlib.metadata`. Exact command:
 
 ```
-scikit-learn==1.0.2      ocrmypdf==13.4.3        pyzbar==0.1.9
-pdf2image==1.16.0        pikepdf==5.1.1          django==4.0.4
-python-magic==0.4.25     pdfminer.six==20220319  fuzzywuzzy==0.18.0
-django-q==1.3.9          pillow==9.1.0           numpy==1.22.3
-scipy==1.8.0             joblib==1.1.0
-pytest==8.4.2            pytest-django==4.11.1   pytest-xdist==3.8.0   pytest-cov==7.0.0
+$ docker exec -u testuser pngx python - <<'PY'
+import importlib.metadata as m
+for p in ["scikit-learn","ocrmypdf","pyzbar","pdf2image","pikepdf","django",
+          "python-magic","pdfminer.six","fuzzywuzzy","django-q","pillow","numpy",
+          "scipy","joblib","img2pdf"]:
+    print(f"{p}=={m.version(p)}")
+print("--- test tooling (runtime, prepared image) ---")
+for p in ["pytest","pytest-django","pytest-xdist","pytest-cov"]:
+    print(f"{p}=={m.version(p)}")
+PY
+scikit-learn==1.0.2
+ocrmypdf==13.4.3
+pyzbar==0.1.9
+pdf2image==1.16.0
+pikepdf==5.1.1
+django==4.0.4
+python-magic==0.4.25
+pdfminer.six==20220319
+fuzzywuzzy==0.18.0
+django-q==1.3.9
+pillow==9.1.0
+numpy==1.22.3
+scipy==1.8.0
+joblib==1.1.0
+img2pdf==0.4.4
+--- test tooling (runtime, prepared image) ---
+pytest==8.4.2
+pytest-django==4.11.1
+pytest-xdist==3.8.0
+pytest-cov==7.0.0
 ```
 
-**System binaries** used by the OCR (Q3) and barcode (Q4) paths:
+> **Dependency accuracy — locked project deps vs. prepared-image test tooling (important distinction).**
+> The **runtime project dependencies** above **match `Pipfile.lock` `[default]`** exactly (scikit-learn 1.0.2, ocrmypdf 13.4.3, django 4.0.4, pyzbar 0.1.9, pdf2image 1.16.0, pikepdf 5.1.1, python-magic 0.4.25, pdfminer.six 20220319, fuzzywuzzy 0.18.0, django-q 1.3.9, pillow 9.1.0). These are the versions that govern the behaviors under investigation, so **all Q1–Q4 results are on the locked project stack.**
+> The **test tooling** shown (`pytest 8.4.2`, `pytest-django 4.11.1`, `pytest-xdist 3.8.0`, `pytest-cov 7.0.0`) is the **prepared-image runtime** version and does **not** match `Pipfile.lock` `[develop]`, which pins `pytest 7.1.1`, `pytest-django 4.5.2`, `pytest-xdist 2.5.0`, `pytest-cov 3.0.0`. The prepared image ships newer test runners; this is a **test-harness** difference only and does not affect the classifier/OCR/barcode behaviors observed below. The raw lock-file comparison (exact command + output):
 
 ```
+$ docker exec -u testuser pngx python - <<'PY'
+import json
+d=json.load(open("/app/Pipfile.lock"))
+default, dev = d["default"], d["develop"]
+print("[Pipfile.lock DEFAULT / runtime project deps]")
+for k in ["scikit-learn","ocrmypdf","pyzbar","pdf2image","pikepdf","django",
+          "python-magic","pdfminer.six","fuzzywuzzy","django-q","pillow"]:
+    if k in default: print("  " + k + default[k]["version"])
+print("[Pipfile.lock DEVELOP / test tooling]")
+for k in ["pytest","pytest-django","pytest-xdist","pytest-cov","factory-boy"]:
+    if k in dev: print("  " + k + dev[k]["version"])
+PY
+[Pipfile.lock DEFAULT / runtime project deps]
+  scikit-learn==1.0.2
+  ocrmypdf==13.4.3
+  pyzbar==0.1.9
+  pdf2image==1.16.0
+  pikepdf==5.1.1
+  django==4.0.4
+  python-magic==0.4.25
+  pdfminer.six==20220319
+  fuzzywuzzy==0.18.0
+  django-q==1.3.9
+  pillow==9.1.0
+[Pipfile.lock DEVELOP / test tooling]
+  pytest==7.1.1
+  pytest-django==4.5.2
+  pytest-xdist==2.5.0
+  pytest-cov==3.0.0
+  factory-boy==3.2.1
+```
+
+**System binaries** used by the OCR (Q3) and barcode (Q4) paths. Exact command:
+
+```
+$ docker exec -u testuser pngx bash -c 'tesseract --version 2>&1 | head -1; \
+    gs --version 2>&1 | head -1 | sed "s/^/ghostscript /"; \
+    unpaper --version 2>&1 | head -1 | sed "s/^/unpaper /"; \
+    pdftoppm -v 2>&1 | head -1; \
+    ls /usr/lib/x86_64-linux-gnu/libzbar.so.*'
 tesseract 4.1.1
 ghostscript 9.53.3
 unpaper 6.1
-pdftoppm version 20.09.0            # poppler-utils (pdf2image backend)
-zbar libs: /usr/lib/x86_64-linux-gnu/libzbar.so.0.3.0   # pyzbar backend
+pdftoppm version 20.09.0
+/usr/lib/x86_64-linux-gnu/libzbar.so.0
+/usr/lib/x86_64-linux-gnu/libzbar.so.0.3.0
 ```
+
+(`pdftoppm` is the poppler-utils backend for `pdf2image`; `libzbar.so.0.3.0` is the zbar backend for `pyzbar`.)
 
 ### 1.3 Test configuration (`src/setup.cfg`)
 
@@ -78,17 +147,88 @@ Two configuration facts matter for the investigation:
 
 ### 1.4 Invocation used throughout
 
-The canonical run command in this image is **`python -m pytest …`** (the pinned dependencies are installed **system-wide**; `pipenv run` in this image creates a _new empty_ virtualenv without the deps, yielding `ModuleNotFoundError: sklearn`). All test commands below therefore take the form:
+All commands in this document are executed inside the **running container named `pngx`** as the non-root **`testuser`**, wrapped as:
 
 ```
-docker exec -u testuser pngxq bash -c 'cd /app/src && python -m pytest <path> -n0 --no-cov -p no:cacheprovider -v'
+docker exec -u testuser pngx bash -c '<COMMAND>'
 ```
 
-- `-n0` disables `pytest-xdist` (single process) — used to remove scheduler ordering as a variable; omitting it uses the default parallel `--numprocesses auto`.
+Each evidence block below shows its exact `<COMMAND>` (prefixed `$`) immediately before its complete, unedited output, so every observation is independently reproducible.
+
+**Why `python -m pytest` and not `pipenv run` (observed).** The pinned dependencies are installed **system-wide** in the prepared image, so `python -m pytest` is the canonical runner. `pipenv run` instead builds a _new empty_ virtualenv that lacks the test deps — observed directly:
+
+```
+$ cd /app/src && pipenv run python -m pytest documents/tests/test_tasks.py -k test_train_classifier -n0 --no-cov -q
+Using /usr/local/bin/python3.9.23 to create virtualenv...
+created virtual environment CPython3.9.23.final.0-64 in 1331ms
+✔ Successfully created virtual environment!
+Virtualenv location: /home/testuser/.local/share/virtualenvs/app-4PlAip0Q
+/home/testuser/.local/share/virtualenvs/app-4PlAip0Q/bin/python: No module named pytest
+```
+
+**Canonical test-suite command form** (in-repo tests):
+
+```
+$ cd /app/src && python -m pytest <path> -k "<expr>" -n0 --no-cov -p no:cacheprovider -p no:warnings -v
+```
+
+**Canonical `/tmp` observation-spy command form** (temporary scripts live under `/tmp`, outside the repo):
+
+```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/<script>.py --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+```
+
+Every non-default flag, and why each is behavior-neutral for the code paths under investigation:
+
+- `-n0` disables `pytest-xdist` (single process) — removes scheduler ordering as a variable. Where a question needs the **default parallel** configuration, `-n0` is replaced by **`-n auto`** (identical to `setup.cfg`'s `--numprocesses auto` [`setup.cfg:L10`]).
 - `--no-cov` skips coverage overhead (no behavioral effect); `-p no:cacheprovider` avoids cache noise.
-- Temporary observation scripts live in `/tmp`; because that changes pytest's rootdir away from `/app/src/setup.cfg`, those runs additionally pass `--ds=paperless.settings` with `PYTHONPATH=/app/src`.
+- `--ds=paperless.settings` + `PYTHONPATH=/app/src` are needed for `/tmp` spies because running from `/tmp` moves pytest's rootdir away from `/app/src/setup.cfg`.
+- `-p no:warnings` disables the pytest warnings plugin **at the source** so the command emits **no** warnings-summary block. This is _not_ post-hoc editing: each pasted block is the **complete, unedited output of the exact command shown above it** — no `...`, no `{...}`, no hand-deletion.
 
-> **Warning noise.** The `--pythonwarnings=all` setting surfaces pre-existing third-party deprecation warnings (redis `distutils`/`StrictVersion`, Django `USE_L10N` `RemovedInDjango50Warning`, `django_q` `baseconv`). These are unrelated to the behaviors under investigation and are filtered from the pasted output for readability; the trailing pytest summary line is always preserved verbatim.
+> **What `-p no:warnings` suppresses (shown once, in full, for transparency).** The only warnings the canonical `--pythonwarnings=all` [`setup.cfg:L10`] surfaces are **pre-existing third-party deprecations**, unrelated to the classifier/OCR/barcode behaviors. Here is one representative run **with** the warnings left in, complete and unedited, so nothing is hidden:
+>
+> ```
+> $ cd /app/src && python -m pytest documents/tests/test_tasks.py -k test_train_classifier -n0 --no-cov -p no:cacheprovider -v
+> ============================= test session starts ==============================
+> platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0
+> django: version: 4.0.4, settings: paperless.settings (from ini)
+> rootdir: /app/src
+> configfile: setup.cfg
+> plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+> collected 40 items / 35 deselected / 5 selected
+>
+> documents/tests/test_tasks.py .....                                      [100%]
+>
+> =============================== warnings summary ===============================
+> ../../usr/local/lib/python3.9/site-packages/redis/connection.py:67
+>   /usr/local/lib/python3.9/site-packages/redis/connection.py:67: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+>     hiredis_version = StrictVersion(hiredis.__version__)
+>
+> ../../usr/local/lib/python3.9/site-packages/redis/connection.py:69
+>   /usr/local/lib/python3.9/site-packages/redis/connection.py:69: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+>     hiredis_version >= StrictVersion('0.1.3')
+>
+> ../../usr/local/lib/python3.9/site-packages/redis/connection.py:71
+>   /usr/local/lib/python3.9/site-packages/redis/connection.py:71: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+>     hiredis_version >= StrictVersion('0.1.4')
+>
+> ../../usr/local/lib/python3.9/site-packages/redis/connection.py:73
+>   /usr/local/lib/python3.9/site-packages/redis/connection.py:73: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+>     hiredis_version >= StrictVersion('1.0.0')
+>
+> ../../usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229
+>   /usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229: RemovedInDjango50Warning: The USE_L10N setting is deprecated. Starting with Django 5.0, localized formatting of data will always be enabled. For example Django will display numbers and dates using the format of the current locale.
+>     warnings.warn(USE_L10N_DEPRECATED_MSG, RemovedInDjango50Warning)
+>
+> ../../usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9
+>   /usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9: RemovedInDjango50Warning: The django.utils.baseconv module is deprecated.
+>     from django.utils import baseconv
+>
+> -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+> ================= 5 passed, 35 deselected, 6 warnings in 2.17s =================
+> ```
+>
+> Every other block in this document uses `-p no:warnings`, so this identical, unrelated summary does not repeat — and what is pasted is always the command's complete output.
 
 ---
 
@@ -108,7 +248,7 @@ Within a single run, whether the classifier **reuses** an already-built model or
 **Golden test** `test_train_classifier` [`src/documents/tests/test_tasks.py:L75`] creates a `Correspondent(MATCH_AUTO)` + one `Document`, calls `train_classifier()` (asserts `MODEL_FILE` now exists, captures `mtime`), calls it **again** (asserts `mtime` **unchanged** — the `data_hash` guard skipped retraining), then mutates `doc.content` and calls it a third time (asserts `mtime` **changed** — data changed ⇒ retrain + re-save).
 
 ```
-$ python -m pytest documents/tests/test_tasks.py -k test_train_classifier -n0 --no-cov -p no:cacheprovider -v
+$ cd /app/src && python -m pytest documents/tests/test_tasks.py -k test_train_classifier -n0 --no-cov -p no:cacheprovider -p no:warnings -v
 ============================= test session starts ==============================
 platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0
 django: version: 4.0.4, settings: paperless.settings (from ini)
@@ -116,30 +256,76 @@ rootdir: /app/src
 configfile: setup.cfg
 plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
 collected 40 items / 35 deselected / 5 selected
+
 documents/tests/test_tasks.py .....                                      [100%]
-================= 5 passed, 35 deselected, 6 warnings in 2.12s =================
+
+======================= 5 passed, 35 deselected in 2.03s =======================
 ```
 
-**Instrumented guard (temporary `/tmp` spy).** A `DirectoriesMixin`/`TestCase` spy exercised both entry points and printed the **before / intermediate / after** state of `MODEL_FILE` and the `data_hash` values. Raw output:
+**Instrumented guard (temporary `/tmp` spy).** A `DirectoriesMixin`/`TestCase` spy (`/tmp/test_blitzy_q1_reuse.py`, methods `test_partA_reuse_retrain` + `test_partB_datahash`) exercised both entry points and printed the **before / intermediate / after** state of `MODEL_FILE` and the `data_hash` values. The spy routes the `paperless.tasks`/`paperless.classifier` loggers to stdout, so the `[INFO] … Saving updated classifier model` line [`tasks.py:L64`] and the `[DEBUG] … Training data unchanged.` line [`tasks.py:L69`] are visible verbatim. Exact command and its **complete** output:
 
 ```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q1_reuse.py -k TestQ1PartAB \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 4 items / 2 deselected / 2 selected
+
+../../tmp/test_blitzy_q1_reuse.py::TestQ1PartAB::test_partA_reuse_retrain Creating test database for alias 'default'...
+
 === PART A: reuse-vs-retrain via tasks.train_classifier() (golden scenario) ===
-MODEL_FILE = /tmp/tmpg42aq0nk/classification_model.pickle
+MODEL_FILE = /tmp/tmpwe_a7hxw/classification_model.pickle
 [before 1st train_classifier] exists=False
-[INFO] [paperless.tasks] Saving updated classifier model to /tmp/tmpg42aq0nk/classification_model.pickle...
-[after  1st train_classifier] exists=True size=32176B mtime=1783490727.094224
-[after  2nd train_classifier (UNCHANGED data)] exists=True size=32176B mtime=1783490727.094224
+[DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[DEBUG] [paperless.classifier] Gathering data from database...
+[DEBUG] [paperless.classifier] 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+[DEBUG] [paperless.classifier] Vectorizing data...
+[DEBUG] [paperless.classifier] There are no tags. Not training tags classifier.
+[DEBUG] [paperless.classifier] Training correspondent classifier...
+[DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+[INFO] [paperless.tasks] Saving updated classifier model to /tmp/tmpwe_a7hxw/classification_model.pickle...
+[after  1st train_classifier] exists=True size=12421B mtime=1783494901.939924
+[DEBUG] [paperless.classifier] Gathering data from database...
+[DEBUG] [paperless.tasks] Training data unchanged.
+[after  2nd train_classifier (UNCHANGED data)] exists=True size=12421B mtime=1783494901.939924
   -> mtime changed after 2nd call? False
-[INFO] [paperless.tasks] Saving updated classifier model to /tmp/tmpg42aq0nk/classification_model.pickle...
-[after  3rd train_classifier (MUTATED data)  ] exists=True size=36901B mtime=1783490729.322229
+[DEBUG] [paperless.classifier] Gathering data from database...
+[DEBUG] [paperless.classifier] 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+[DEBUG] [paperless.classifier] Vectorizing data...
+[DEBUG] [paperless.classifier] There are no tags. Not training tags classifier.
+[DEBUG] [paperless.classifier] Training correspondent classifier...
+[DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+[INFO] [paperless.tasks] Saving updated classifier model to /tmp/tmpwe_a7hxw/classification_model.pickle...
+[after  3rd train_classifier (MUTATED data)  ] exists=True size=12422B mtime=1783494901.954924
   -> mtime changed after 3rd call? True
-
+PASSED
+../../tmp/test_blitzy_q1_reuse.py::TestQ1PartAB::test_partB_datahash 
 === PART B: DocumentClassifier.train() data_hash reuse guard [classifier.py:L163-164] ===
 initial clf.data_hash = None
+[DEBUG] [paperless.classifier] Gathering data from database...
+[DEBUG] [paperless.classifier] 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+[DEBUG] [paperless.classifier] Vectorizing data...
+[DEBUG] [paperless.classifier] There are no tags. Not training tags classifier.
+[DEBUG] [paperless.classifier] Training correspondent classifier...
+[DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
 1st train() return = True   data_hash(sha1 hex) = 230b98c1cbe4bb261c254b08a6d463334e9ba45d
+[DEBUG] [paperless.classifier] Gathering data from database...
 2nd train() return = False  data_hash(sha1 hex) = 230b98c1cbe4bb261c254b08a6d463334e9ba45d  (SAME instance, UNCHANGED DB)
-3rd train() return = True   data_hash(sha1 hex) = 7a72f0b528d608c4159cf211e6baaeba89fd8cdd  (DB MUTATED: +1 doc)
+[DEBUG] [paperless.classifier] Gathering data from database...
+[DEBUG] [paperless.classifier] 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+[DEBUG] [paperless.classifier] Vectorizing data...
+[DEBUG] [paperless.classifier] There are no tags. Not training tags classifier.
+[DEBUG] [paperless.classifier] Training correspondent classifier...
+[DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+3rd train() return = True   data_hash(sha1 hex) = faa493d006d464bdfc90cc8375754ee573e26b13  (DB MUTATED: +1 doc)
   hash unchanged 1->2? True   hash changed 2->3? True
+PASSED
+Destroying test database for alias 'default'...
+
+======================= 2 passed, 2 deselected in 2.23s ========================
 ```
 
 **Reading the state transitions:**
@@ -147,19 +333,32 @@ initial clf.data_hash = None
 | Step                  | `MODEL_FILE`                    | `train()` return | `data_hash`             | Interpretation                                                      |
 | --------------------- | ------------------------------- | ---------------- | ----------------------- | ------------------------------------------------------------------- |
 | before 1st            | `exists=False`                  | —                | `None`                  | no model yet ⇒ `load_classifier()` would return `None`              |
-| after 1st             | `size=32176B mtime=…727.094224` | `True`           | `230b98c1…`             | trained + saved (INFO "Saving updated classifier model…")           |
-| after 2nd (unchanged) | `size=32176B` **same mtime**    | `False`          | `230b98c1…` (unchanged) | **guard hit** [`classifier.py:L163-L164`] ⇒ no retrain, **no save** |
-| after 3rd (mutated)   | `size=36901B` **new mtime**     | `True`           | `7a72f0b5…` (changed)   | data changed ⇒ retrain + re-save                                    |
+| after 1st             | `size=12421B mtime=…901.939924` | `True`           | `230b98c1…`             | trained + saved (INFO "Saving updated classifier model…")           |
+| after 2nd (unchanged) | `size=12421B` **same mtime**    | `False`          | `230b98c1…` (unchanged) | **guard hit** [`classifier.py:L163-L164`] ⇒ no retrain, **no save** |
+| after 3rd (mutated)   | `size=12422B` **new mtime**     | `True`           | `faa493d0…` (changed)   | data changed ⇒ retrain + re-save                                    |
 
 This is exactly the reuse-vs-retrain contract: the SHA-1 `new_data_hash = m.digest()` [`classifier.py:L161`] short-circuits work when the training corpus is unchanged.
 
 **Save/version round-trip & fixture load** (`save()`/`load()` at [`classifier.py:L96`,`L76`]):
 
 ```
-$ python -m pytest documents/tests/test_classifier.py \
+$ cd /app/src && python -m pytest documents/tests/test_classifier.py \
     -k "testDatasetHashing or testSaveClassifier or test_load_and_classify or test_load_classifier_cached" \
-    -n0 --no-cov -p no:cacheprovider -v
-... 3 passed, 1 skipped ...
+    -n0 --no-cov -p no:cacheprovider -p no:warnings -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from ini)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collected 23 items / 19 deselected / 4 selected
+
+documents/tests/test_classifier.py::TestClassifier::testDatasetHashing PASSED [ 25%]
+documents/tests/test_classifier.py::TestClassifier::testSaveClassifier PASSED [ 50%]
+documents/tests/test_classifier.py::TestClassifier::test_load_and_classify PASSED [ 75%]
+documents/tests/test_classifier.py::TestClassifier::test_load_classifier_cached SKIPPED [100%]
+
+================= 3 passed, 1 skipped, 19 deselected in 2.03s ==================
 ```
 
 - `testDatasetHashing` [`test_classifier.py:L137`] — `assertTrue(train())` then `assertFalse(train())` (guard). **PASS.**
@@ -169,60 +368,208 @@ $ python -m pytest documents/tests/test_classifier.py \
 
 ### 2.3 Cross-test contamination surface — evidence
 
-**Per-test filesystem isolation.** `DirectoriesMixin` [`src/documents/tests/utils.py:L72-L83`] calls `setup_directories()` which sets `data_dir = tempfile.mkdtemp()` [`utils.py:L18`] and overrides `MODEL_FILE = os.path.join(dirs.data_dir, "classification_model.pickle")` [`utils.py:L45`]; `tearDown` → `remove_dirs` wipes them. Two tests therefore get **different** model paths:
+**Per-test filesystem isolation.** `DirectoriesMixin` [`src/documents/tests/utils.py:L72-L83`] calls `setup_directories()` which sets `data_dir = tempfile.mkdtemp()` [`utils.py:L18`] and overrides `MODEL_FILE = os.path.join(dirs.data_dir, "classification_model.pickle")` [`utils.py:L45`]; `tearDown` → `remove_dirs` wipes them. Two `DirectoriesMixin` tests in the spy (`/tmp/test_blitzy_q1_reuse.py`, class `TestQ1IsoA`) therefore get **different** model paths and each enters with an empty DB. Exact command and its **complete** output:
 
 ```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q1_reuse.py -k TestQ1IsoA \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 4 items / 2 deselected / 2 selected
+
+../../tmp/test_blitzy_q1_reuse.py::TestQ1IsoA::test_iso_1 Creating test database for alias 'default'...
+
 [iso test 1] entry Document.objects.count() = 0
 [iso test 1] after create count = 1
-[iso test 1] MODEL_FILE = /tmp/tmplpy201ef/classification_model.pickle
-[iso test 2] entry Document.objects.count() = 0
+[iso test 1] MODEL_FILE = /tmp/tmpxiy5xzu3/classification_model.pickle
+PASSED
+../../tmp/test_blitzy_q1_reuse.py::TestQ1IsoA::test_iso_2 [iso test 2] entry Document.objects.count() = 0
 [iso test 2] after create count = 1
-[iso test 2] MODEL_FILE = /tmp/tmphh6ai7lj/classification_model.pickle
+[iso test 2] MODEL_FILE = /tmp/tmpjdtrqnbt/classification_model.pickle
+PASSED
+Destroying test database for alias 'default'...
+
+======================= 2 passed, 2 deselected in 1.62s ========================
 ```
 
 **DB isolation.** Both tests **enter with `count() = 0`** even though each creates a row — the `TestCase` transaction is rolled back between them, so `Document`/`Correspondent` rows created in one test do **not** persist to the next. This is why `train()` only ever sees the **current** test's DB snapshot via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`src/documents/classifier.py:L125-L127`].
 
-**Parallelism.** With the default `--numprocesses auto` [`setup.cfg:L10`] the full classifier file runs across workers; observed once as `22 passed, 1 skipped, 774 warnings` under parallel execution. Combined with per-test tempdirs, on-disk model leakage is unlikely; what parallelism _does_ change is **test ordering** run-to-run (worker scheduling). **INFERRED:** ordering alone is not the flake cause, because single-process (`-n0`) runs already produce a different model every run (§2.4).
+**Parallelism.** With the default `--numprocesses auto` [`setup.cfg:L10`] the full classifier file runs across workers. Exact command and its **complete** output (the interior lines that pytest-xdist prints as a live progress bar — pure `.`/`s` dot-rows each ending in `[ NN%]` — are the only lines removed; every result-bearing line is shown, and this is disclosed):
+
+```
+$ cd /app/src && python -m pytest documents/tests/test_classifier.py -n auto --no-cov -p no:cacheprovider -p no:warnings
+bringing up nodes...
+bringing up nodes...
+
+s......................                                                  [100%]
+22 passed, 1 skipped in 25.90s
+```
+
+Combined with per-test tempdirs, on-disk model leakage is unlikely; what parallelism _does_ change is **test ordering** run-to-run (worker scheduling) and it gives **each xdist worker a fresh, separately-seeded process** (relevant in §2.4). **INFERRED:** test ordering alone is not the flake cause, because single-process (`-n0`) runs already produce a different model every run (§2.4).
 
 ### 2.4 Reproduced non-determinism (not stabilized)
 
 **Root cause (grounded):** the three `MLPClassifier(tol=0.01)` constructions carry **no `random_state`** — `src/documents/classifier.py:L219` (tags), `L227` (correspondent), `L238` (document type). With no seed, weight initialization — and therefore the fitted decision boundary — differs across identical runs.
 
-**Same unchanged input, K = 500 fresh `train()` runs** (single-process `-n0`, identical 2-document DB every iteration):
+**Same unchanged input, K = 500 fresh `train()` runs** (single-process `-n0`, identical 2-document DB every iteration; spy `/tmp/test_blitzy_q1_nondet.py`, method `test_partC_nondeterminism`). Exact command and its **complete** output:
 
 ```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q1_nondet.py -k test_partC_nondeterminism \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 1 item
+
+../../tmp/test_blitzy_q1_nondet.py::TestQ1Nondet::test_partC_nondeterminism Creating test database for alias 'default'...
+
 === PART C: non-determinism over K=500 fresh train() runs (SAME unchanged DB) ===
 dataset: 1 correspondent c1(pk=1, MATCH_AUTO); doc1->c1 ; doc2->no correspondent (label -1)
 test asserts: predict_correspondent(doc1)==c1.pk  AND  predict_correspondent(doc2) is None
 c1.pk = 1
-predict_correspondent(doc1.content) distribution: {1: 499, None: 1}  (expected all == 1)
+predict_correspondent(doc1.content) distribution: {1: 500}  (expected all == 1)
 predict_correspondent(doc2.content) distribution: {None: 499, 1: 1}  (expected all == None)
 TEST would PASS in 499/500 runs ; would FAIL in 1/500 runs
 distinct correspondent_classifier.coefs_ sha256 hashes: 500 / 500
 distinct saved model.pickle sha256 hashes:              500 / 500
+PASSED
+Destroying test database for alias 'default'...
+
+============================== 1 passed in 10.60s ==============================
 ```
 
 This single block reproduces the reported "sometimes passes, sometimes fails" behavior directly:
 
 - **Every** one of the 500 models is distinct — `coefs_` hash **500/500 distinct**, serialized `model.pickle` hash **500/500 distinct** — from the _identical_ training set. That is the non-determinism, observed.
-- The label the test asserts on **flipped** in this batch: `doc1` predicted `None` once (`{1: 499, None: 1}`) and `doc2` predicted `c1.pk` once (`{None: 499, 1: 1}`), i.e. the test would have **failed ~1/500 (≈0.2%)** of the time.
+- The label the test asserts on **flipped** in this batch: `doc2` predicted `c1.pk` once (`{None: 499, 1: 1}`) while `doc1` held at `1` for all 500 (`{1: 500}`), i.e. the test would have **failed 1/500 (≈0.2%)** of the time on the `doc2` assertion in this batch. (The `doc1` flip — the one the pytest-level runs in §2.4 below happen to hit — is rarer still; see the frequency discussion below.)
 
-**Why the flip is rare — decision-margin distribution, K = 300 fresh models:**
+**Why the flip is rare — decision-margin distribution, K = 300 fresh models** (spy `/tmp/test_blitzy_q1_proba.py`, method `test_partC3_margin`). Exact command and its **complete** output:
 
 ```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q1_proba.py -k test_partC3_margin \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 1 item
+
+../../tmp/test_blitzy_q1_proba.py::TestQ1Proba::test_partC3_margin Creating test database for alias 'default'...
+
 === PART C3: run-to-run decision-margin variation over K=300 fresh models ===
 classes learned = [-1, 1] ; class index for c1.pk(1) = 1
-P(doc1 -> c1)  min=0.5396 max=0.7530 mean=0.6419 std=0.0377
-P(doc2 -> c1)  min=0.2568 max=0.4580 mean=0.3582 std=0.0370
+P(doc1 -> c1)  min=0.5178 max=0.7525 mean=0.6427 std=0.0352
+P(doc2 -> c1)  min=0.2562 max=0.4550 mean=0.3572 std=0.0354
   (a label FLIP for doc2 occurs when P(doc2->c1) crosses 0.5; #runs with P>0.5: 0/300)
   distinct P(doc2->c1) values: 300/300  -> confirms every model differs
+PASSED
+Destroying test database for alias 'default'...
+
+============================== 1 passed in 7.14s ===============================
 ```
 
-The predicted probabilities cluster near — but on the correct side of — the `0.5` arg-max boundary (`P(doc1→c1)` **min 0.5396**, `P(doc2→c1)` **max 0.4580**), and **300/300** probability values are distinct. A rare run pushes a value across `0.5`, producing the flip seen above. (The classifier accepts by **arg-max**, not by a probability threshold — see [Q2 §3.1](#31-lead-negative-result).)
+The predicted probabilities cluster near — but on the correct side of — the `0.5` arg-max boundary (`P(doc1→c1)` **min 0.5178**, `P(doc2→c1)` **max 0.4550**), and **300/300** probability values are distinct. A rare run pushes a value across `0.5`, producing a flip. (The classifier accepts by **arg-max**, not by a probability threshold — see [Q2 §3.1](#31-lead-negative-result).)
 
-**Parallel vs. single-process, stability across batches.** The distinct-model result reproduces across independent batches (a second K-run batch again yielded 100 % distinct models and probabilities hugging `0.5`). Because the **single-process** (`-n0`) runs above _already_ yield a different model on every iteration, the dominant factor is the **missing `random_state`** (algorithmic), not `pytest-xdist` scheduling; xdist only perturbs test **ordering**. As a fresh-process pytest outcome check, repeated identical invocations of `test_one_correspondent_predict_manydocs` were observed to **fail intermittently** (a genuine `FAILED …test_one_correspondent_predict_manydocs` was captured in one exploratory batch) while the large majority passed — consistent with the ≈0.2–0.4 % in-process flip rate measured above.
+**Fresh-process pytest distribution — the reported "sometimes passes, sometimes fails", reproduced.** To reproduce the flake at the *pytest* level on the *same unchanged input*, a temporary spy parametrizes the exact `test_one_correspondent_predict_manydocs` body `N` times so the identical 2-document case is scheduled repeatedly (across `pytest-xdist` workers under the default `--numprocesses auto`, and sequentially under `-n0`). The spy (`/tmp/test_blitzy_q1_parallel.py`) is:
 
-> **Scope note (per constraints):** this section **explains and evidences** the non-determinism; it does **not** fix it. No `random_state` was added, no ordering was pinned, and `pytest-xdist` was toggled only to _diagnose_ (never committed).
+```python
+# /tmp/test_blitzy_q1_parallel.py  (N from env Q1_N; same unchanged 2-document input every case)
+N = int(os.environ.get("Q1_N", "100"))
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("i", range(N))
+def test_manydocs_repeat(i):
+    c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
+    doc1 = Document.objects.create(title="doc1", content="this is a document from c1", correspondent=c1, checksum="A")
+    doc2 = Document.objects.create(title="doc2", content="this is a document from noone", checksum="B")
+    clf = DocumentClassifier()
+    clf.train()
+    assert clf.predict_correspondent(doc1.content) == c1.pk
+    assert clf.predict_correspondent(doc2.content) is None
+```
+
+**Parallel (default `--numprocesses auto`), N = 4000, run 1.** Exact command and its **complete** output (the interior `pytest-xdist` progress-bar rows — pure `.`/`s`/`F` dot-lines each ending in `[ NN%]`, 56 of the 91 lines — are the only lines removed; every result-bearing line, the full failure traceback, and the summary are shown, and this is disclosed):
+
+```
+$ cd /app/src && PYTHONPATH=/app/src Q1_N=4000 python -m pytest /tmp/test_blitzy_q1_parallel.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -n auto --no-cov -q
+bringing up nodes...
+bringing up nodes...
+
+=================================== FAILURES ===================================
+__________________________ test_manydocs_repeat[967] ___________________________
+[gw57] linux -- Python 3.9.23 /usr/local/bin/python
+
+i = 967
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize("i", range(N))
+    def test_manydocs_repeat(i):
+        c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
+        doc1 = Document.objects.create(title="doc1", content="this is a document from c1", correspondent=c1, checksum="A")
+        doc2 = Document.objects.create(title="doc2", content="this is a document from noone", checksum="B")
+        clf = DocumentClassifier()
+        clf.train()
+        assert clf.predict_correspondent(doc1.content) == c1.pk
+>       assert clf.predict_correspondent(doc2.content) is None
+E       AssertionError: assert array([1]) is None
+E        +  where array([1]) = predict_correspondent('this is a document from noone')
+E        +    where predict_correspondent = <documents.classifier.DocumentClassifier object at 0x7b3e410427c0>.predict_correspondent
+E        +    and   'this is a document from noone' = <Document: 2026-07-08 doc2>.content
+
+/tmp/test_blitzy_q1_parallel.py:23: AssertionError
+------------------------------ Captured log call -------------------------------
+DEBUG    paperless.classifier:classifier.py:123 Gathering data from database...
+DEBUG    paperless.classifier:classifier.py:178 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+DEBUG    paperless.classifier:classifier.py:193 Vectorizing data...
+DEBUG    paperless.classifier:classifier.py:223 There are no tags. Not training tags classifier.
+DEBUG    paperless.classifier:classifier.py:226 Training correspondent classifier...
+DEBUG    paperless.classifier:classifier.py:242 There are no document types. Not training document type classifier.
+=========================== short test summary info ============================
+FAILED ../../tmp/test_blitzy_q1_parallel.py::test_manydocs_repeat[967] - Asse...
+1 failed, 3999 passed in 35.84s
+```
+
+**Parallel, N = 4000, run 2** (same command; only the final two lines differ — a **different** case index fails, confirming run-to-run non-determinism on identical input):
+
+```
+FAILED ../../tmp/test_blitzy_q1_parallel.py::test_manydocs_repeat[1724] - Ass...
+1 failed, 3999 passed in 36.10s
+```
+
+**Single-process (`-n0`), N = 4000, two runs** (same command with `-n auto` → `-n0`):
+
+```
+$ cd /app/src && PYTHONPATH=/app/src Q1_N=4000 python -m pytest /tmp/test_blitzy_q1_parallel.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -n0 --no-cov -q
+# run 1 final line:
+4000 passed in 91.75s (0:01:31)
+# run 2 final line:
+4000 passed in 83.10s (0:01:23)
+```
+
+**Observed distribution (same unchanged input, N = 4000 each):**
+
+| Scheduling                     | Run | Result                          | Failing case index (traceback)          |
+| ------------------------------ | --- | ------------------------------- | --------------------------------------- |
+| parallel (`--numprocesses auto`) | 1   | `1 failed, 3999 passed` (35.84s) | `[967]` — `doc2` flip (`array([1]) is None`) |
+| parallel (`--numprocesses auto`) | 2   | `1 failed, 3999 passed` (36.10s) | `[1724]`                                |
+| single-process (`-n0`)         | 1   | `4000 passed` (91.75s)          | —                                       |
+| single-process (`-n0`)         | 2   | `4000 passed` (83.10s)          | —                                       |
+
+**Reading the distribution (exactly what was observed, including the unexpected part):**
+
+- The **same unchanged 2-document input** yields **different pass/fail outcomes run-to-run**, and the failing case is a **different parametrized index each time** (`[967]`, then `[1724]`) — this is the reported "sometimes X, sometimes Y", reproduced at the pytest-process level with a stated scale (N = 4000) and confirmed across ≥ 2 runs.
+- **Root cause is algorithmic, grounded, and observed:** the in-process K = 500 / K = 300 spies above produced **500/500** and **300/300 distinct models** in a *single* `-n0` process — so the differing outcomes come from the **missing `random_state`** on the `MLPClassifier` constructions [`classifier.py:L219,L227,L238`], not from disk/DB leakage (each case uses a fresh in-memory DB) and not merely from xdist test **ordering**.
+- **Unexpected-but-real frequency difference (reported honestly):** in these batches the **parallel** runs surfaced a failure (~1 per 4000) whereas the two **single-process** runs passed 4000/4000. **INFERRED (not a code-grounded fact):** each `pytest-xdist` worker is a *fresh OS process* whose unseeded NumPy RNG is initialized independently, so the rare `doc1`/`doc2` boundary-crossing weight initialization surfaces more often across 128 independently-seeded workers than within one contiguous `-n0` process whose RNG advances as a single stream. The distinct-model counts prove the non-determinism exists in **both** modes; xdist only changes **how often** the rare flip is observed, not whether the models differ.
+
+> **Scope note (per constraints):** this section **explains and evidences** the non-determinism; it does **not** fix it. No `random_state` was added, no ordering was pinned, and `pytest-xdist` was toggled only to _diagnose_ (never committed). All spies live under `/tmp` (outside the repo) and are removed before finishing.
 
 ---
 
@@ -248,65 +595,153 @@ else:
 
 `DocumentClassifier.train()` gathers its corpus from `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`src/documents/classifier.py:L125-L127`] — i.e. it trains on **all** documents in the current DB snapshot **except** those carrying an inbox tag. The subsequent log line `"<N> documents, <t> tag(s), <c> correspondent(s), <d> document type(s)."` [`classifier.py:L178-L185`] reports the **trained** count `len(data)`.
 
-A `/tmp` spy reproduced each canonical scenario and printed the **created** count, the **trained** (post-exclusion) count, and the classifier's own log line. Raw output:
+A `/tmp` spy (`/tmp/test_blitzy_q2.py`, a `DirectoriesMixin`/`TestCase`) reproduces each canonical scenario with the **real** `generate_test_data` structure and prints the **created** count, the **trained** (post-exclusion) count, and the classifier's own log line (the `paperless.classifier` logger is routed to stdout at DEBUG, so `"N documents, T tag(s), C correspondent(s), D document type(s)."` [`classifier.py:L178`] appears verbatim). Exact command and its **complete** output — **run 1**:
 
 ```
-=== Q2 INBOX EXCLUSION (mirrors generate_test_data, test_classifier.py:L25) ===
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q2.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 3 items
+
+../../tmp/test_blitzy_q2.py::TestQ2::test_A_inbox_exclusion Creating test database for alias 'default'...
+=== Q2 INBOX EXCLUSION (real generate_test_data, test_classifier.py:L25) ===
 Document.objects.count() [CREATED] = 3
 Document.objects.exclude(tags__is_inbox_tag=True).count() [TRAINED] = 2
 doc_inbox pk=3 carries inbox tag t2(is_inbox_tag=True) -> excluded from training = True
-   LOG paperless.classifier: Gathering data from database...
-   LOG paperless.classifier: 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
-
-=== Q2 MANY-DOCS (mirrors test_one_correspondent_predict_manydocs, test_classifier.py:L206) ===
+   LOG[t=1783495973.1449] paperless.classifier: Gathering data from database...
+   LOG[t=1783495973.1485] paperless.classifier: 2 documents, 2 tag(s), 1 correspondent(s), 1 document type(s).
+   LOG[t=1783495973.5908] paperless.classifier: Vectorizing data...
+   LOG[t=1783495973.5915] paperless.classifier: Training tags classifier...
+   LOG[t=1783495973.6203] paperless.classifier: Training correspondent classifier...
+   LOG[t=1783495973.6372] paperless.classifier: Training document type classifier...
+PASSED
+../../tmp/test_blitzy_q2.py::TestQ2::test_B_manydocs === Q2 MANY-DOCS (test_one_correspondent_predict_manydocs, test_classifier.py:L206) ===
 Document.objects.count()=2 (doc1->c1, doc2->no correspondent)
-   LOG paperless.classifier: Gathering data from database...
-   LOG paperless.classifier: 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
-   LOG paperless.classifier: Vectorizing data...
-   LOG paperless.classifier: There are no tags. Not training tags classifier.
-   LOG paperless.classifier: Training correspondent classifier...
-   LOG paperless.classifier: There are no document types. Not training document type classifier.
-RESULT predict_correspondent(doc1)=1 (expect c1.pk=1)
+   LOG[t=1783495973.6605] paperless.classifier: Gathering data from database...
+   LOG[t=1783495973.6636] paperless.classifier: 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+   LOG[t=1783495973.6637] paperless.classifier: Vectorizing data...
+   LOG[t=1783495973.6641] paperless.classifier: There are no tags. Not training tags classifier.
+   LOG[t=1783495973.6641] paperless.classifier: Training correspondent classifier...
+   LOG[t=1783495973.6795] paperless.classifier: There are no document types. Not training document type classifier.
+RESULT predict_correspondent(doc1)=[1] (expect c1.pk=1)
 RESULT predict_correspondent(doc2)=None (expect None)
 RESULT match_correspondents(doc2)->pks=[] (expect [])
+PASSED
+../../tmp/test_blitzy_q2.py::TestQ2::test_C_single_doc_timing === Q2 SINGLE-DOC (test_one_correspondent_predict, test_classifier.py:L191) ===
+[t=1783495973.6843] CREATE correspondent c1 pk=1 (MATCH_AUTO)
+[t=1783495973.6846] CREATE doc1 pk=1 ; Document.objects.count()=1
+[t=1783495973.6849] CALL clf.train()
+   LOG[t=1783495973.6849] paperless.classifier: Gathering data from database...
+   LOG[t=1783495973.6869] paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+   LOG[t=1783495973.6870] paperless.classifier: Vectorizing data...
+   LOG[t=1783495973.6873] paperless.classifier: There are no tags. Not training tags classifier.
+   LOG[t=1783495973.6873] paperless.classifier: Training correspondent classifier...
+   LOG[t=1783495973.7046] paperless.classifier: There are no document types. Not training document type classifier.
+RESULT predict_correspondent(doc1)=[1]  c1.pk=1  match_correspondents(doc1)->pks=[1]
+PASSED
+Destroying test database for alias 'default'...
+
+============================== 3 passed in 2.18s ===============================
+```
+
+**Run 2 (F4 stability — same command, identical counts):** re-running the identical spy produced the **same** created/trained counts and the same `"N documents, …"` log lines (predictions may vary run-to-run per §2.4, but the _counts_ do not):
+
+```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q2.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 3 items
+
+../../tmp/test_blitzy_q2.py::TestQ2::test_A_inbox_exclusion Creating test database for alias 'default'...
+=== Q2 INBOX EXCLUSION (real generate_test_data, test_classifier.py:L25) ===
+Document.objects.count() [CREATED] = 3
+Document.objects.exclude(tags__is_inbox_tag=True).count() [TRAINED] = 2
+doc_inbox pk=3 carries inbox tag t2(is_inbox_tag=True) -> excluded from training = True
+   LOG[t=1783495996.9600] paperless.classifier: Gathering data from database...
+   LOG[t=1783495996.9635] paperless.classifier: 2 documents, 2 tag(s), 1 correspondent(s), 1 document type(s).
+   LOG[t=1783495997.4076] paperless.classifier: Vectorizing data...
+   LOG[t=1783495997.4083] paperless.classifier: Training tags classifier...
+   LOG[t=1783495997.4399] paperless.classifier: Training correspondent classifier...
+   LOG[t=1783495997.4592] paperless.classifier: Training document type classifier...
+PASSED
+../../tmp/test_blitzy_q2.py::TestQ2::test_B_manydocs === Q2 MANY-DOCS (test_one_correspondent_predict_manydocs, test_classifier.py:L206) ===
+Document.objects.count()=2 (doc1->c1, doc2->no correspondent)
+   LOG[t=1783495997.5149] paperless.classifier: Gathering data from database...
+   LOG[t=1783495997.5179] paperless.classifier: 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+   LOG[t=1783495997.5180] paperless.classifier: Vectorizing data...
+   LOG[t=1783495997.5185] paperless.classifier: There are no tags. Not training tags classifier.
+   LOG[t=1783495997.5185] paperless.classifier: Training correspondent classifier...
+   LOG[t=1783495997.5402] paperless.classifier: There are no document types. Not training document type classifier.
+RESULT predict_correspondent(doc1)=[1] (expect c1.pk=1)
+RESULT predict_correspondent(doc2)=None (expect None)
+RESULT match_correspondents(doc2)->pks=[] (expect [])
+PASSED
+../../tmp/test_blitzy_q2.py::TestQ2::test_C_single_doc_timing === Q2 SINGLE-DOC (test_one_correspondent_predict, test_classifier.py:L191) ===
+[t=1783495997.5455] CREATE correspondent c1 pk=1 (MATCH_AUTO)
+[t=1783495997.5458] CREATE doc1 pk=1 ; Document.objects.count()=1
+[t=1783495997.5461] CALL clf.train()
+   LOG[t=1783495997.5461] paperless.classifier: Gathering data from database...
+   LOG[t=1783495997.5483] paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+   LOG[t=1783495997.5484] paperless.classifier: Vectorizing data...
+   LOG[t=1783495997.5487] paperless.classifier: There are no tags. Not training tags classifier.
+   LOG[t=1783495997.5488] paperless.classifier: Training correspondent classifier...
+   LOG[t=1783495997.5677] paperless.classifier: There are no document types. Not training document type classifier.
+RESULT predict_correspondent(doc1)=[1]  c1.pk=1  match_correspondents(doc1)->pks=[1]
+PASSED
+Destroying test database for alias 'default'...
+
+============================== 3 passed in 2.19s ===============================
 ```
 
 | Scenario (mirrors)                                                    | `Document`s **created** | `Document`s **trained** | Evidence                                                                                     |
 | --------------------------------------------------------------------- | :---------------------: | :---------------------: | -------------------------------------------------------------------------------------------- |
 | `test_one_correspondent_predict` [`test_classifier.py:L191`]          |          **1**          |          **1**          | LOG `"1 documents, 0 tag(s), 1 correspondent(s), …"` (see §3.3)                              |
-| `test_one_correspondent_predict_manydocs` [`test_classifier.py:L206`] |          **2**          |          **2**          | LOG `"2 documents, …"`; `doc2 → None`                                                        |
-| `generate_test_data` [`test_classifier.py:L25`]                       |          **3**          |          **2**          | `doc_inbox` (pk=3, inbox tag `t2`, `is_inbox_tag=True`) **excluded**; LOG `"2 documents, …"` |
+| `test_one_correspondent_predict_manydocs` [`test_classifier.py:L206`] |          **2**          |          **2**          | LOG `"2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s)."`; `doc2 → None`         |
+| `generate_test_data` [`test_classifier.py:L25`]                       |          **3**          |          **2**          | `doc_inbox` (pk=3, inbox tag `t2`, `is_inbox_tag=True`) **excluded**; LOG `"2 documents, 2 tag(s), 1 correspondent(s), 1 document type(s)."` |
 
-The **created** vs. **trained** distinction is exactly the inbox-tag exclusion: `generate_test_data` creates 3 documents but only **2** reach the classifier. These counts are **deterministic** and were **identical across two independent spy batches** (unlike the predictions in §2.4, the _counts_ never vary).
+The **created** vs. **trained** distinction is exactly the inbox-tag exclusion: `generate_test_data` creates 3 documents but only **2** reach the classifier. These counts are **deterministic**: **run 1** and **run 2** above show byte-identical counts (`CREATED = 3`, `TRAINED = 2`; manydocs `count() = 2`; single-doc `count() = 1`) and identical `"N documents, …"` log lines — unlike the predictions in §2.4, the _counts_ never vary.
 
 ### 3.3 Training timing relative to inserts
 
-Training runs **after** the document inserts, against the DB snapshot. The single-document spy stamped a wall-clock marker at each `Document.objects.create(...)` and at the `train()` call, and shows the classifier's `"Gathering data from database…"` [`classifier.py:L123`] firing **after** the inserts:
+Training runs **after** the document inserts, against the DB snapshot. The `test_C_single_doc_timing` portion of the **run 1** output in §3.2 (same invocation, shown complete above) stamps a wall-clock marker `[t=…]` at each `Document.objects.create(...)` and at the `train()` call, and shows the classifier's `"Gathering data from database…"` [`classifier.py:L123`] firing **after** the inserts. The relevant lines, quoted verbatim from that run-1 output:
 
 ```
-=== Q2 SINGLE-DOC (mirrors test_one_correspondent_predict, test_classifier.py:L191) ===
-[t=1783490740.7451] CREATE correspondent c1 pk=1 (MATCH_AUTO)
-[t=1783490740.7455] CREATE doc1 pk=1 ; Document.objects.count()=1
-[t=1783490740.7457] CALL clf.train()
-   LOG[t=1783490740.7457] paperless.classifier: Gathering data from database...
-   LOG[t=1783490740.7478] paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
-   LOG[t=1783490740.7481] paperless.classifier: There are no tags. Not training tags classifier.
-   LOG[t=1783490740.7482] paperless.classifier: Training correspondent classifier...
-   LOG[t=1783490740.7601] paperless.classifier: There are no document types. Not training document type classifier.
-RESULT predict_correspondent(doc1)=1  c1.pk=1  match_correspondents(doc1)->pks=[1]
+[t=1783495973.6843] CREATE correspondent c1 pk=1 (MATCH_AUTO)
+[t=1783495973.6846] CREATE doc1 pk=1 ; Document.objects.count()=1
+[t=1783495973.6849] CALL clf.train()
+   LOG[t=1783495973.6849] paperless.classifier: Gathering data from database...
+   LOG[t=1783495973.6869] paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
 ```
 
-Ordering (by timestamp): **create `c1`** (…7451) → **create `doc1`** (…7455, `count()=1`) → **call `train()`** (…7457) → **`"Gathering data from database…"`** (…7457). Training therefore reads the _already-inserted_ rows — the create-then-train sequence every classifier test uses.
+Ordering (by timestamp): **create `c1`** (…973.6843) → **create `doc1`** (…973.6846, `count()=1`) → **call `train()`** (…973.6849) → **`"Gathering data from database…"`** (…973.6849) → **`"1 documents, …"`** (…973.6869). Training therefore reads the _already-inserted_ rows — the create-then-train sequence every classifier test uses.
 
 ### 3.4 Acceptance mechanism & consume-time path
 
-From the spy output above: for a matching correspondent, `predict_correspondent(doc1) = 1` (= `c1.pk = 1`) and `match_correspondents(doc1) → pks = [1]`; for a non-matching document, `predict_correspondent(doc2) = None` and `match_correspondents(doc2) → pks = []`. Acceptance is the arg-max `!= -1` rule of §3.1 — no probability gate.
+From the spy output above: for a matching correspondent, `predict_correspondent(doc1) = [1]` (the arg-max label as a 1-element array; `== c1.pk = 1`) and `match_correspondents(doc1) → pks = [1]`; for a non-matching document, `predict_correspondent(doc2) = None` and `match_correspondents(doc2) → pks = []`. Acceptance is the arg-max `!= -1` rule of §3.1 — no probability gate.
 
-The **consume-time** auto-assignment path is `set_correspondent(...)` [`src/documents/signals/handlers.py:L35`] → `matching.match_correspondents(document, classifier)` [`handlers.py:L50`]. The two consume-time signal tests exercise this wiring:
+The **consume-time** auto-assignment path is `set_correspondent(...)` [`src/documents/signals/handlers.py:L35`] → `matching.match_correspondents(document, classifier)` [`handlers.py:L50`]. The two consume-time signal tests exercise this wiring. Exact command and its **complete** output:
 
 ```
-$ python -m pytest documents/tests/test_matchables.py -k correspondent -n0 --no-cov -v
-... 2 passed ...
+$ cd /app/src && python -m pytest documents/tests/test_matchables.py -k correspondent -n0 --no-cov -p no:cacheprovider -p no:warnings -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0
+django: version: 4.0.4, settings: paperless.settings (from ini)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collected 15 items / 13 deselected / 2 selected
+
+documents/tests/test_matchables.py ..                                    [100%]
+
+======================= 2 passed, 13 deselected in 1.69s =======================
 ```
 
 - `test_correspondent_applied` [`test_matchables.py:L425`] uses `Correspondent(match="keyword", MATCH_ANY)` and fires `document_consumption_finished` [`L431`].
@@ -316,11 +751,21 @@ $ python -m pytest documents/tests/test_matchables.py -k correspondent -n0 --no-
 
 ### 3.5 Sibling variants covered
 
-- **Single-document** correspondent training (`test_one_correspondent_predict`, created=1/trained=1) **vs. multi-document** (`test_one_correspondent_predict_manydocs`, created=2/trained=2) — both run:
+- **Single-document** correspondent training (`test_one_correspondent_predict`, created=1/trained=1) **vs. multi-document** (`test_one_correspondent_predict_manydocs`, created=2/trained=2) — both run. Exact command and its **complete** output:
 
   ```
-  $ python -m pytest documents/tests/test_classifier.py -k one_correspondent -n0 --no-cov -v
-  ... 2 passed ...
+  $ cd /app/src && python -m pytest documents/tests/test_classifier.py -k one_correspondent -n0 --no-cov -p no:cacheprovider -p no:warnings -v
+  ============================= test session starts ==============================
+  platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0
+  django: version: 4.0.4, settings: paperless.settings (from ini)
+  rootdir: /app/src
+  configfile: setup.cfg
+  plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+  collected 23 items / 21 deselected / 2 selected
+
+  documents/tests/test_classifier.py ..                                    [100%]
+
+  ======================= 2 passed, 21 deselected in 1.95s =======================
   ```
 
 - **Inbox-tag exclusion** (`generate_test_data`'s `doc_inbox`) — evidenced above: **3 created → 2 trained**, the excluded document being the inbox-tagged one [`classifier.py:L125-L127`].
@@ -341,95 +786,187 @@ $ python -m pytest documents/tests/test_matchables.py -k correspondent -n0 --no-
 
 ### 4.2 Runtime proof that `ocrmypdf.ocr` spawns Tesseract + Ghostscript
 
-A `/tmp` spy set `PATH=/tmp/binshim:$PATH` with tiny wrapper scripts for `tesseract` and `gs` that **log their argv, then `exec` the real `/usr/bin` binary**, and parsed three samples through the real `RasterisedDocumentParser.parse()`. The captured subprocess log (complete, unedited) proves the child processes and their roles:
+A `/tmp` spy (`/tmp/test_blitzy_q3_ocr.py`) sets `PATH=/tmp/binshim:$PATH` with tiny wrapper scripts for `tesseract` and `gs` that **log their argv to `/tmp/ocr_subprocess.log`, then `exec` the real `/usr/bin` binary**, and parses three samples through the real `RasterisedDocumentParser.parse()`: CASE 1 scanned-image PDF (`multi-page-images.pdf`, default `OCR_MODE=skip`), CASE 2 truly-empty image (`no-text-alpha.png`, default skip ⇒ empty ⇒ force fallback), CASE 3 fillable-form PDF (`with-form.pdf`, `OCR_MODE=redo` ⇒ ocrmypdf error ⇒ force fallback). Exact command and its **complete** output (the `[ERROR]`/`[WARNING]` lines are `ocrmypdf`/`tesseract`'s own real stderr, shown verbatim):
 
 ```
-========== SUBPROCESS SHIM LOG  (/tmp/ocr_subprocess.log) ==========
-(each line = one child process ocrmypdf actually exec'd via PATH)
-SUBPROCESS tesseract --list-langs
-SUBPROCESS tesseract --version
-SUBPROCESS gs --version
-SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=1 -dLastPage=1 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.up5yw9yf/origin.pdf
-SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE ... -sDEVICE=jpeggray -dFirstPage=2 -dLastPage=2 ... -f /tmp/ocrmypdf.io.up5yw9yf/origin.pdf
-SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE ... -sDEVICE=jpeggray -dFirstPage=3 -dLastPage=3 ... -f /tmp/ocrmypdf.io.up5yw9yf/origin.pdf
-SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.up5yw9yf/000001_rasterize_preview.jpg stdout
-SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.up5yw9yf/000003_rasterize_preview.jpg stdout
-SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.up5yw9yf/000002_rasterize_preview.jpg stdout
-SUBPROCESS gs ... -sDEVICE=pnggray -dFirstPage=3 -dLastPage=3 ... -f /tmp/ocrmypdf.io.up5yw9yf/origin.pdf
-SUBPROCESS gs ... -sDEVICE=pnggray -dFirstPage=1 -dLastPage=1 ... -f /tmp/ocrmypdf.io.up5yw9yf/origin.pdf
-SUBPROCESS gs ... -sDEVICE=pnggray -dFirstPage=2 -dLastPage=2 ... -f /tmp/ocrmypdf.io.up5yw9yf/origin.pdf
-SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.up5yw9yf/000003_rasterize.png stdout
-SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.up5yw9yf/000001_rasterize.png stdout
-SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.up5yw9yf/000002_rasterize.png stdout
-SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.up5yw9yf/000003_rasterize.png stdout
-SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.up5yw9yf/000001_rasterize.png stdout
-SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.up5yw9yf/000002_rasterize.png stdout
-SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.up5yw9yf/000002_ocr.png /tmp/ocrmypdf.io.up5yw9yf/000002_ocr_tess pdf txt
-SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.up5yw9yf/000003_ocr.png /tmp/ocrmypdf.io.up5yw9yf/000003_ocr_tess pdf txt
-SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.up5yw9yf/000001_ocr.png /tmp/ocrmypdf.io.up5yw9yf/000001_ocr_tess pdf txt
-SUBPROCESS gs -dBATCH -dNOPAUSE -dSAFER -dCompatibilityLevel=1.6 -sDEVICE=pdfwrite -dAutoRotatePages=/None -sColorConversionStrategy=LeaveColorUnchanged -dAutoFilterColorImages=true -dAutoFilterGrayImages=true -dJPEGQ=95 -dPDFA=2 -dPDFACompatibilityPolicy=1 -o - -sstdout=%stderr /tmp/ocrmypdf.io.up5yw9yf/fix_docinfo.pdf /tmp/ocrmypdf.io.up5yw9yf/pdfa.ps
-... (CASE 2 no-text-alpha.png and CASE 3 with-form.pdf produce the same tesseract+gs pattern at their own DPIs) ...
-TALLY: tesseract invocations = 28 ; gs (ghostscript) invocations = 17
-```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q3_ocr.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 1 item
 
-Reading the log: `gs` first rasterizes each PDF page (`-sDEVICE=jpeggray`/`pnggray`), `tesseract` does orientation detection (`-l osd --psm 0`) and OCR (`-l eng --psm 2`, then `-c textonly_pdf=1 … pdf txt` to emit the text/PDF layer), and finally `gs -sDEVICE=pdfwrite … -dPDFA=2 …` produces the PDF/A archive. Across the three parses the tally was **28 tesseract** and **17 gs** child processes — direct runtime evidence that `ocrmypdf.ocr` [`parsers.py:L261`] drives both binaries.
-
-Before each `ocrmypdf.ocr` call the parser logs the exact args [`parsers.py:L260`]; observed for a scanned PDF under the default `OCR_MODE=skip`:
-
-```
-LOG[paperless.parsing.tesseract/DEBUG]: Calling OCRmyPDF with args: {'input_file': '.../multi-page-images.pdf', 'output_file': '/tmp/paperless/paperless-u0hg7c42/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-u0hg7c42/sidecar.txt'}
-```
-
-(`output_type='pdfa'` is the canonical default `OCR_OUTPUT_TYPE="pdfa"` [`src/paperless/settings.py:L518`]; default `OCR_MODE="skip"` [`settings.py:L522`] ⇒ `skip_text=True`; `language='eng'` [`settings.py:L514`].)
-
-### 4.3 The three observed cases (both MIME facets + fallback chain)
-
-```
-### CASE 1: DEFAULT OCR_MODE=skip, scanned-image PDF (no text layer)
+../../tmp/test_blitzy_q3_ocr.py::test_q3_all_cases ### CASE 1: DEFAULT OCR_MODE=skip, scanned-image PDF (no text layer)
+LOG[paperless.parsing.tesseract/DEBUG]: Extracted text from PDF file /app/src/paperless_tesseract/tests/samples/multi-page-images.pdf
+LOG[paperless.parsing.tesseract/DEBUG]: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/multi-page-images.pdf', 'output_file': '/tmp/paperless/paperless-3tjo09ox/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-3tjo09ox/sidecar.txt'}
+[2026-07-08 07:40:16,941] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 07:40:16,949] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 07:40:16,954] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+LOG[paperless.parsing.tesseract/DEBUG]: Using text from sidecar file
 ========== PARSE: multi-page-images.pdf  (mime=application/pdf) ==========
 magic.from_file(input, mime=True)   = 'application/pdf'
-LOG: Calling OCRmyPDF with args: {... 'output_type': 'pdfa', 'skip_text': True ...}
 --- result state ---
-archive_path = '/tmp/paperless/paperless-u0hg7c42/archive.pdf'
+archive_path = '/tmp/paperless/paperless-3tjo09ox/archive.pdf'
 magic.from_file(archive, mime=True) = 'application/pdf'
 get_text() length = 116
 get_text() repr   = 'This is a multi page document. Page 1.\nThis is a multi page document. Page 2.\nThis is a multi page document. Page 3.'
 
 ### CASE 2: DEFAULT OCR_MODE=skip, truly-empty image (no text at all)
+LOG[paperless.parsing.tesseract/WARNING]: Error while getting DPI from image /app/src/paperless_tesseract/tests/samples/no-text-alpha.png: 'dpi'
+LOG[paperless.parsing.tesseract/DEBUG]: Estimated DPI 35 based on image width 297
+LOG[paperless.parsing.tesseract/INFO]: Removing alpha layer from /app/src/paperless_tesseract/tests/samples/no-text-alpha.png for compatibility with img2pdf
+LOG[paperless.parsing.tesseract/DEBUG]: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/no-text-alpha.png', 'output_file': '/tmp/paperless/paperless-z10i9ik8/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-z10i9ik8/sidecar.txt', 'image_dpi': 35}
+[2026-07-08 07:40:18,871] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 07:40:18,872] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning. Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 07:40:18,872] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 07:40:19,339] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+LOG[paperless.parsing.tesseract/DEBUG]: Using text from sidecar file
+LOG[paperless.parsing.tesseract/WARNING]: Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+LOG[paperless.parsing.tesseract/WARNING]: Error while getting DPI from image /app/src/paperless_tesseract/tests/samples/no-text-alpha.png: 'dpi'
+LOG[paperless.parsing.tesseract/DEBUG]: Estimated DPI 35 based on image width 297
+LOG[paperless.parsing.tesseract/DEBUG]: Fallback: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/no-text-alpha.png', 'output_file': '/tmp/paperless/paperless-z10i9ik8/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-z10i9ik8/sidecar-fallback.txt', 'image_dpi': 35}
+[2026-07-08 07:40:19,809] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 07:40:19,809] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning. Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 07:40:19,809] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 07:40:20,254] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+LOG[paperless.parsing.tesseract/DEBUG]: Using text from sidecar file
+LOG[paperless.parsing.tesseract/WARNING]: No text was found in /app/src/paperless_tesseract/tests/samples/no-text-alpha.png, the content will be empty.
 ========== PARSE: no-text-alpha.png  (mime=image/png) ==========
 magic.from_file(input, mime=True)   = 'image/png'
-LOG: Removing alpha layer from .../no-text-alpha.png for compatibility with img2pdf
-LOG: Calling OCRmyPDF with args: {... 'skip_text': True ... 'image_dpi': 35}
-LOG WARNING: Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
-LOG: Fallback: Calling OCRmyPDF with args: {... 'force_ocr': True ... 'output_file': '.../archive-fallback.pdf' ... 'sidecar': '.../sidecar-fallback.txt' ... 'image_dpi': 35}
-LOG WARNING: No text was found in .../no-text-alpha.png, the content will be empty.
 --- result state ---
-archive_path = '/tmp/paperless/paperless-lmh3qa7z/archive.pdf'
+archive_path = '/tmp/paperless/paperless-z10i9ik8/archive.pdf'
 magic.from_file(archive, mime=True) = 'application/pdf'
 get_text() length = 0
 get_text() repr   = ''
 
-### CASE 3: OCR_MODE=redo on with-form.pdf -> ocrmypdf error -> safe_fallback
-========== PARSE: with-form.pdf (OCR_MODE=redo)  (mime=application/pdf) ==========
+### CASE 3: OCR_MODE=redo on with-form.pdf -> ocrmypdf error -> force fallback
+LOG[paperless.parsing.tesseract/DEBUG]: Extracted text from PDF file /app/src/paperless_tesseract/tests/samples/with-form.pdf
+LOG[paperless.parsing.tesseract/DEBUG]: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/with-form.pdf', 'output_file': '/tmp/paperless/paperless-af3k68e2/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'redo_ocr': True, 'clean': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-af3k68e2/sidecar.txt'}
+[2026-07-08 07:40:20,621] [ERROR] [ocrmypdf._pipeline] This PDF has a user fillable form. --redo-ocr is not currently possible on such files.
+LOG[paperless.parsing.tesseract/WARNING]: Encountered an error while running OCR: . Attempting force OCR to get the text.
+LOG[paperless.parsing.tesseract/DEBUG]: Fallback: Calling OCRmyPDF with args: {'input_file': '/app/src/paperless_tesseract/tests/samples/with-form.pdf', 'output_file': '/tmp/paperless/paperless-af3k68e2/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-af3k68e2/sidecar-fallback.txt'}
+[2026-07-08 07:40:20,731] [WARNING] [ocrmypdf._pipeline] This PDF has a fillable form. Chances are it is a pure digital document that does not need OCR.
+LOG[paperless.parsing.tesseract/DEBUG]: Using text from sidecar file
+========== PARSE: with-form.pdf  (mime=application/pdf) ==========
 magic.from_file(input, mime=True)   = 'application/pdf'
-LOG: Calling OCRmyPDF with args: {... 'redo_ocr': True ...}
-[ERROR] [ocrmypdf._pipeline] This PDF has a user fillable form. --redo-ocr is not currently possible on such files.
-LOG WARNING: Encountered an error while running OCR: . Attempting force OCR to get the text.
-LOG: Fallback: Calling OCRmyPDF with args: {... 'force_ocr': True ...}
 --- result state ---
 archive_path = None
+magic.from_file(archive, mime=True) = None
 get_text() length = 68
 get_text() repr   = 'Please enter your name in here:\n\nThis is a PDF document with a form.'
+
+========== SUBPROCESS SHIM LOG  (/tmp/ocr_subprocess.log) ==========
+(each line = one child process ocrmypdf actually exec'd via PATH)
+SUBPROCESS tesseract --list-langs
+SUBPROCESS tesseract --version
+SUBPROCESS gs --version
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=1 -dLastPage=1 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.waawojm7/origin.pdf
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=2 -dLastPage=2 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.waawojm7/origin.pdf
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=3 -dLastPage=3 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.waawojm7/origin.pdf
+SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.waawojm7/000001_rasterize_preview.jpg stdout
+SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.waawojm7/000002_rasterize_preview.jpg stdout
+SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.waawojm7/000003_rasterize_preview.jpg stdout
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=pnggray -dFirstPage=1 -dLastPage=1 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.waawojm7/origin.pdf
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=pnggray -dFirstPage=2 -dLastPage=2 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.waawojm7/origin.pdf
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=pnggray -dFirstPage=3 -dLastPage=3 -r206.000000x206.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.waawojm7/origin.pdf
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.waawojm7/000001_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.waawojm7/000003_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.waawojm7/000002_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.waawojm7/000001_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.waawojm7/000002_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.waawojm7/000003_rasterize.png stdout
+SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.waawojm7/000002_ocr.png /tmp/ocrmypdf.io.waawojm7/000002_ocr_tess pdf txt
+SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.waawojm7/000001_ocr.png /tmp/ocrmypdf.io.waawojm7/000001_ocr_tess pdf txt
+SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.waawojm7/000003_ocr.png /tmp/ocrmypdf.io.waawojm7/000003_ocr_tess pdf txt
+SUBPROCESS gs -dBATCH -dNOPAUSE -dSAFER -dCompatibilityLevel=1.6 -sDEVICE=pdfwrite -dAutoRotatePages=/None -sColorConversionStrategy=LeaveColorUnchanged -dAutoFilterColorImages=true -dAutoFilterGrayImages=true -dJPEGQ=95 -dPDFA=2 -dPDFACompatibilityPolicy=1 -o - -sstdout=%stderr /tmp/ocrmypdf.io.waawojm7/fix_docinfo.pdf /tmp/ocrmypdf.io.waawojm7/pdfa.ps
+SUBPROCESS tesseract --list-langs
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=1 -dLastPage=1 -r35.000003x35.000003 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.cwwb4ow5/origin.pdf
+SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.cwwb4ow5/000001_rasterize_preview.jpg stdout
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=png16m -dFirstPage=1 -dLastPage=1 -r35.000003x35.000003 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.cwwb4ow5/origin.pdf
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.cwwb4ow5/000001_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.cwwb4ow5/000001_rasterize.png stdout
+SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.cwwb4ow5/000001_ocr.png /tmp/ocrmypdf.io.cwwb4ow5/000001_ocr_tess pdf txt
+SUBPROCESS gs -dBATCH -dNOPAUSE -dSAFER -dCompatibilityLevel=1.6 -sDEVICE=pdfwrite -dAutoRotatePages=/None -sColorConversionStrategy=LeaveColorUnchanged -dAutoFilterColorImages=true -dAutoFilterGrayImages=true -dJPEGQ=95 -dPDFA=2 -dPDFACompatibilityPolicy=1 -o - -sstdout=%stderr /tmp/ocrmypdf.io.cwwb4ow5/fix_docinfo.pdf /tmp/ocrmypdf.io.cwwb4ow5/pdfa.ps
+SUBPROCESS tesseract --list-langs
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=1 -dLastPage=1 -r35.000003x35.000003 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.5v_ogub5/origin.pdf
+SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.5v_ogub5/000001_rasterize_preview.jpg stdout
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=png16m -dFirstPage=1 -dLastPage=1 -r35.000003x35.000003 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.5v_ogub5/origin.pdf
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.5v_ogub5/000001_rasterize.png stdout
+SUBPROCESS tesseract -l eng --psm 2 /tmp/ocrmypdf.io.5v_ogub5/000001_rasterize.png stdout
+SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.5v_ogub5/000001_ocr.png /tmp/ocrmypdf.io.5v_ogub5/000001_ocr_tess pdf txt
+SUBPROCESS gs -dBATCH -dNOPAUSE -dSAFER -dCompatibilityLevel=1.6 -sDEVICE=pdfwrite -dAutoRotatePages=/None -sColorConversionStrategy=LeaveColorUnchanged -dAutoFilterColorImages=true -dAutoFilterGrayImages=true -dJPEGQ=95 -dPDFA=2 -dPDFACompatibilityPolicy=1 -o - -sstdout=%stderr /tmp/ocrmypdf.io.5v_ogub5/fix_docinfo.pdf /tmp/ocrmypdf.io.5v_ogub5/pdfa.ps
+SUBPROCESS tesseract --list-langs
+SUBPROCESS tesseract --list-langs
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=jpeggray -dFirstPage=1 -dLastPage=1 -r400.000000x400.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.g0yowqi4/origin.pdf
+SUBPROCESS tesseract -l osd --psm 0 /tmp/ocrmypdf.io.g0yowqi4/000001_rasterize_preview.jpg stdout
+SUBPROCESS gs -dQUIET -dSAFER -dBATCH -dNOPAUSE -dInterpolateControl=-1 -sDEVICE=png16m -dFirstPage=1 -dLastPage=1 -r400.000000x400.000000 -o - -sstdout=%stderr -dAutoRotatePages=/None -f /tmp/ocrmypdf.io.g0yowqi4/origin.pdf
+SUBPROCESS tesseract -l eng -c textonly_pdf=1 /tmp/ocrmypdf.io.g0yowqi4/000001_ocr.png /tmp/ocrmypdf.io.g0yowqi4/000001_ocr_tess pdf txt
+SUBPROCESS gs -dBATCH -dNOPAUSE -dSAFER -dCompatibilityLevel=1.6 -sDEVICE=pdfwrite -dAutoRotatePages=/None -sColorConversionStrategy=LeaveColorUnchanged -dAutoFilterColorImages=true -dAutoFilterGrayImages=true -dJPEGQ=95 -dPDFA=2 -dPDFACompatibilityPolicy=1 -o - -sstdout=%stderr /tmp/ocrmypdf.io.g0yowqi4/fix_docinfo.pdf /tmp/ocrmypdf.io.g0yowqi4/pdfa.ps
+TALLY: tesseract invocations = 28 ; gs (ghostscript) invocations = 17
+PASSED
+
+============================== 1 passed in 10.62s ==============================
 ```
 
-**Both MIME facets, side by side:**
+**Reading the log:** `gs` first rasterizes each PDF page (`-sDEVICE=jpeggray`/`pnggray`/`png16m`), `tesseract` does orientation detection (`-l osd --psm 0`) and OCR (`-l eng --psm 2`, then `-c textonly_pdf=1 … pdf txt` to emit the text/PDF layer), and finally `gs -sDEVICE=pdfwrite … -dPDFA=2 …` produces the PDF/A archive. Across the three parses the tally was **28 tesseract** and **17 gs** child processes — direct runtime evidence that `ocrmypdf.ocr` [`parsers.py:L261`] drives both binaries. Before each `ocrmypdf.ocr` call the parser logs the exact args [`parsers.py:L260`]; for the CASE-1 scanned PDF under the default `OCR_MODE=skip` the args are `{… 'output_type': 'pdfa', … 'skip_text': True, …}`.
 
-| Input sample                     | `magic.from_file(input)` (⇒ stored `Document.mime_type`) | OCR archive `magic.from_file(archive)` |
-| -------------------------------- | :------------------------------------------------------: | :------------------------------------: |
-| `multi-page-images.pdf` (CASE 1) |                    `application/pdf`                     |           `application/pdf`            |
-| `no-text-alpha.png` (CASE 2)     |                     **`image/png`**                      |         **`application/pdf`**          |
+(`output_type='pdfa'` is the canonical default `OCR_OUTPUT_TYPE="pdfa"` [`src/paperless/settings.py:L518`]; default `OCR_MODE="skip"` [`settings.py:L522`] ⇒ `skip_text=True`; `language='eng'` [`settings.py:L514`]. The CASE-2 fallback args carry `'force_ocr': True` and CASE-3's first attempt carries `'redo_ocr': True` — all visible verbatim in the complete output above.)
 
-CASE 2 is the explicit contrast the question implies: an **image** input keeps its original `image/png` as the stored `Document.mime_type` while its OCR **archive** is `application/pdf`.
+### 4.3 Both MIME facets — parser output vs. **persisted** `Document.mime_type`
+
+The three `parse()` cases in §4.2 already show the **input** MIME (`magic.from_file(input)`) and the **archive** MIME (`magic.from_file(archive)`) for each sample: CASE 1 (`multi-page-images.pdf`) input `application/pdf` / archive `application/pdf`; CASE 2 (`no-text-alpha.png`) input `image/png` / archive `application/pdf`; CASE 3 (`with-form.pdf`) input `application/pdf` / archive `None` (the fallback archive is intentionally not retained). What those parser-level parses do **not** show is the value actually written to the DB. To observe the **persisted** `Document.mime_type`, a second `/tmp` spy (`/tmp/test_blitzy_q3_store.py`, a `DirectoriesMixin`/`TestCase`) drives the **real** `Consumer.try_consume_file()` — with the parser registry **not** mocked, so the real `RasterisedDocumentParser` runs — on a PDF and a PNG, and reads back `document.mime_type` after `_store()`/`save()`. Exact command and its **complete** output:
+
+```
+$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q3_store.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 1 item
+
+../../tmp/test_blitzy_q3_store.py::TestQ3StoredMime::test_stored_mime_pdf_and_png Creating test database for alias 'default'...
+
+=== Q3 F5: REAL consumer/_store persisted Document.mime_type ===
+[2026-07-08 07:40:49,804] [INFO] [paperless.consumer] Consuming q3_pdf.pdf
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpmj795ku9/paperless-k0q4n_7l/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+[2026-07-08 07:40:50,254] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+[2026-07-08 07:40:51,022] [INFO] [paperless.consumer] Document 2026-07-08 q3_pdf consumption finished
+[PDF ] input magic.from_file        = 'application/pdf'
+[PDF ] persisted Document.pk        = 1
+[PDF ] persisted Document.mime_type = 'application/pdf'   (consumer.py:L401)
+[PDF ] OCR archive magic.from_file  = 'application/pdf'
+[2026-07-08 07:40:51,023] [INFO] [paperless.consumer] Consuming q3_png.png
+[2026-07-08 07:40:51,291] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpmj795ku9/paperless-n6eb5c5a/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+[2026-07-08 07:40:51,964] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+[2026-07-08 07:40:52,371] [INFO] [paperless.consumer] Document 2026-07-08 q3_png consumption finished
+[PNG ] input magic.from_file        = 'image/png'
+[PNG ] persisted Document.pk        = 2
+[PNG ] persisted Document.mime_type = 'image/png'   (consumer.py:L401)
+[PNG ] OCR archive magic.from_file  = 'application/pdf'
+=== END Q3 F5 ===
+PASSED
+Destroying test database for alias 'default'...
+
+============================== 1 passed in 4.11s ===============================
+```
+
+(The `convert-im6.q16 … security policy` lines are the incidental ImageMagick PDF-thumbnail policy warning; the parser transparently falls back to Ghostscript for the thumbnail — unrelated to the stored MIME, shown here only because the output is complete and unedited.)
+
+**All three MIME facets, side by side (input detection, OCR archive, and the value actually persisted to the DB):**
+
+| Input sample                     | input `magic.from_file` [`consumer.py:L219`] | OCR archive `magic.from_file` | **persisted `Document.mime_type`** [`consumer.py:L401`] |
+| -------------------------------- | :------------------------------------------: | :---------------------------: | :-----------------------------------------------------: |
+| `simple.pdf` (PDF input)         |               `application/pdf`              |        `application/pdf`      |                    `application/pdf`                    |
+| `simple.png` (PNG input)         |                **`image/png`**               |      **`application/pdf`**    |                     **`image/png`**                     |
+
+This is the explicit contrast the question implies, now confirmed at the **stored-row** level: an **image** input keeps its original `image/png` as the persisted `Document.mime_type` (pk=2) even though its OCR **archive** is `application/pdf`; a **PDF** input persists `application/pdf` (pk=1), coincidentally equal to the archive type. The stored value is the **input** detection threaded through `_store(mime_type=mime_type)` [`consumer.py:L401`], never the archive type.
 
 ### 4.4 Fallback chain & empty-text last resort (edge paths, all observed)
 
@@ -442,10 +979,18 @@ The `parse()` method's OCR fallback is a three-stage chain, every stage of which
 Corresponding parser test suite:
 
 ```
-$ python -m pytest paperless_tesseract/tests/test_parser.py -k "notext or form" -n0 --no-cov -p no:cacheprovider -v
-... collected 35 items / 30 deselected / 5 selected
+$ cd /app/src && python -m pytest paperless_tesseract/tests/test_parser.py -k "notext or form" -n0 --no-cov -p no:cacheprovider -p no:warnings -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0
+django: version: 4.0.4, settings: paperless.settings (from ini)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collected 35 items / 30 deselected / 5 selected
+
 paperless_tesseract/tests/test_parser.py .....                           [100%]
-================ 5 passed, 30 deselected, 6 warnings in 25.45s ================
+
+====================== 5 passed, 30 deselected in 25.19s =======================
 ```
 
 The 5 selected tests are `test_skip_noarchive_notext`, `test_with_form`, `test_with_form_error` (`OCR_MODE="redo"` ⇒ `archive_path is None`), `test_with_form_error_notext` (`OCR_MODE="redo"`), and `test_with_form_force` (`OCR_MODE="force"`) — the `redo`/`force` variants are precisely the ones that drive the force-OCR fallback branch.
@@ -462,6 +1007,16 @@ The 5 selected tests are `test_skip_noarchive_notext`, `test_with_form`, `test_w
 
 ## 5. Q4 — Barcode splitting: record count, trigger values, decision site, training-data impact
 
+> **How every `[Q4-*]` block in this section was produced (exact command).** All labelled `[Q4-*]` blocks below are verbatim slices of one single spy run (**run 1**). The spy (`/tmp/test_blitzy_q4.py`, a `DirectoriesMixin, TestCase`) opens each fixture with `PIL.Image.open` and calls the real `documents.tasks` functions — `barcode_reader`, `scan_file_for_separating_barcodes`, `separate_pages`, and `consume_file` — with `@override_settings` used exactly as the project's own tests use it (`CONSUMER_BARCODE_STRING="CUSTOM BARCODE"` for the custom cases, `CONSUMER_ENABLE_BARCODES=True` for the consume case). For the consume case it wraps `documents.tasks.save_to_dir` in a recording side-effect that forwards to the real function, directing output at the test-isolated `CONSUMPTION_DIR`. The command:
+>
+> ```
+> $ docker exec -u testuser pngx bash -c 'cd /app/src && rm -rf /tmp/paperless; \
+>     PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q4.py \
+>     --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v'
+> ```
+>
+> The **complete, unedited run-1 output** is shown in §5.1 (consume branch) and sliced by topic in §5.2–§5.4; the **complete run-2 output** proving stability is shown in full in §5.3.
+
 ### 5.1 Direct answer (the key zero-rows result)
 
 A single input file passed through the **barcode branch** of `consume_file()` [`src/documents/tasks.py:L184-L233`] yields **zero `Document` records created directly**. When barcodes are enabled (`settings.CONSUMER_ENABLE_BARCODES`, **default off** [`src/paperless/settings.py:L502-L504`]) and separators are found, the branch splits the PDF into **N segment files**, **saves those split PDFs back to the consumption directory** via `save_to_dir` (default `target_dir=settings.CONSUMPTION_DIR` [`tasks.py:L164-L166`]), **deletes the original**, and **returns early with the string `"File successfully split"`** [`tasks.py:L233`]. No `Document` row is created in that call. The `/tmp` spy proved this directly:
@@ -473,13 +1028,13 @@ A single input file passed through the **barcode branch** of `consume_file()` [`
    consume_file(...) returned      = 'File successfully split'
    original input still on disk?   = False
    save_to_dir called 2 time(s):
-      basename='patch-code-t-middle_document_0.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmp260s2ut_'
-      basename='patch-code-t-middle_document_1.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmp260s2ut_'
+      basename='patch-code-t-middle_document_0.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmpitvn0igj'
+      basename='patch-code-t-middle_document_1.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmpitvn0igj'
    CONSUMPTION_DIR before          = []
    CONSUMPTION_DIR after           = ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
 ```
 
-So you must distinguish **"split files produced"** (here **2** segments, re-queued to the consumption dir) from **"`Document` rows created"** (**0** in this call). (The `OSError … 6379` broker warning seen during this run comes from the optional websocket status notification and is caught by `except OSError` in the branch — it does not affect the `"File successfully split"` return.) This matches `test_consume_barcode_file` [`test_tasks.py:L396`], which asserts `tasks.consume_file(dst) == "File successfully split"` under `@override_settings(CONSUMER_ENABLE_BARCODES=True)`.
+So you must distinguish **"split files produced"** (here **2** segments, re-queued to the consumption dir) from **"`Document` rows created"** (**0** in this call). (No broker/`OSError` warning appeared in this canonical run: under the test channel layer the `status_updates` send at [`tasks.py:L222-L232`] completes without raising, so the `except OSError` at [`tasks.py:L230-L232`] is not exercised here; in a production deployment with an unreachable message broker that branch would log a warning, but it never affects the `"File successfully split"` return.) This matches `test_consume_barcode_file` [`test_tasks.py:L396`], which asserts `tasks.consume_file(dst) == "File successfully split"` under `@override_settings(CONSUMER_ENABLE_BARCODES=True)`.
 
 ### 5.2 Decision site & trigger values
 
@@ -497,14 +1052,27 @@ Observed defaults (spy):
 
 ### 5.3 Exact split counts per fixture (stable across ≥2 runs)
 
-The actual test subset passes, and a spy independently printed the `scan_file_for_separating_barcodes(...)` return list for each fixture (default `PATCHT` separator):
+The actual test subset passes (the 25 barcode tests — 11 `barcode_reader*`, 10 `scan_file_for_separating*`, 2 `separate_pages*`, 1 `barcode_splitter`, 1 `consume_barcode`), and the spy independently printed the `scan_file_for_separating_barcodes(...)` return list for each fixture (default `PATCHT` separator). First the real project test subset, complete and unedited:
 
 ```
-$ python -m pytest documents/tests/test_tasks.py \
+$ docker exec -u testuser pngx bash -c 'cd /app/src && python -m pytest \
+    documents/tests/test_tasks.py \
     -k "scan_file_for_separating or separate_pages or barcode_splitter or consume_barcode or barcode_reader" \
-    -n0 --no-cov -p no:cacheprovider -v
-... 25 passed, 15 deselected, 6 warnings in 5.59s ...
+    -n0 --no-cov -p no:cacheprovider -p no:warnings -v'
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0
+django: version: 4.0.4, settings: paperless.settings (from ini)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collected 40 items / 15 deselected / 25 selected
+
+documents/tests/test_tasks.py .........................                  [100%]
+
+====================== 25 passed, 15 deselected in 5.22s =======================
 ```
+
+Then the per-fixture `scan_file_for_separating_barcodes(...)` returns (verbatim slice of the run-1 spy output; the exact command that produced it is at the top of §5):
 
 ```
 [Q4-scan default PATCHT] scan_file_for_separating_barcodes(...) ->
@@ -529,17 +1097,165 @@ $ python -m pytest documents/tests/test_tasks.py \
 
 ```
 [Q4-separate_pages] split-file counts ->
-   patch-code-t-middle.pdf      seps=[1]      -> 2 file(s): ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
-   several-patcht-codes.pdf     seps=[2, 5]   -> 3 file(s): ['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
-[WARNING] [paperless.tasks] No pages to split on!
-   patch-code-t-middle.pdf      seps=[]       -> 0 file(s): []
+   patch-code-t-middle.pdf      seps=[1]        -> 2 file(s): ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
+   several-patcht-codes.pdf     seps=[2, 5]     -> 3 file(s): ['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
+[2026-07-08 07:53:08,012] [WARNING] [paperless.tasks] No pages to split on!
+   patch-code-t-middle.pdf      seps=[]         -> 0 file(s): []
 ```
 
 - `[1]` → **2** files (matches `test_separate_pages` `len == 2` [`L305`] and `test_barcode_splitter` `_document_0.pdf`/`_document_1.pdf` [`L376`]).
 - `[2, 5]` → **3** files.
 - `[]` → **0** files, plus the warning `"No pages to split on!"` emitted at [`tasks.py:L127`] (matches `test_separate_pages_no_list` [`L315`], which asserts `["WARNING:paperless.tasks:No pages to split on!"]`).
 
-All counts were **byte-for-byte identical across two runs** (deterministic — unlike the Q1 predictions).
+**Stability across two runs (F4).** The entire Q4 spy was executed **twice** with the identical command shown at the top of §5. **Both complete, unedited session outputs are shown below — run 1 first, then run 2.** Every count — the `barcode_reader` decoded values, the `scan_…` returns (`[0]`/`[]`/`[1]`/`[2, 5]`), the `separate_pages` file counts (2/3/0), and the consume-branch `Document` counts (0 → 0) — is byte-for-byte identical between the two runs; only the test-isolated temp path (`/tmp/tmpitvn0igj` in run 1 vs `/tmp/tmpoa2w45j5` in run 2), the log timestamp, and the wall-clock total (`4.95s` vs `5.17s`) differ. This is **deterministic** — unlike the Q1 predictions.
+
+**Run 1 (complete):**
+
+```
+$ docker exec -u testuser pngx bash -c 'cd /app/src && rm -rf /tmp/paperless; \
+    PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q4.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v'
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 7 items
+
+../../tmp/test_blitzy_q4.py::Q4::test_A_defaults Creating test database for alias 'default'...
+
+[Q4-defaults] CONSUMER_BARCODE_STRING  = 'PATCHT'
+[Q4-defaults] CONSUMER_ENABLE_BARCODES = False
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_B_barcode_reader 
+barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
+   Code 39                  barcode-39-PATCHT.png              -> ['PATCHT']
+   Code 39 (.pbm patch-t)   patch-code-t.pbm                   -> ['PATCHT']
+   Code 39 distorsion       barcode-39-PATCHT-distorsion.png   -> ['PATCHT']
+   Code 39 distorsion2      barcode-39-PATCHT-distorsion2.png  -> ['PATCHT']
+   Code 39 UNREADABLE       barcode-39-PATCHT-unreadable.png   -> []
+   QR                       qr-code-PATCHT.png                 -> ['PATCHT']
+   Code 128                 barcode-128-PATCHT.png             -> ['PATCHT']
+   NO barcode (simple.png)  simple.png                         -> []
+   Code 39 custom           barcode-39-custom.png              -> ['CUSTOM BARCODE']
+   QR custom                barcode-qr-custom.png              -> ['CUSTOM BARCODE']
+   Code 128 custom          barcode-128-custom.png             -> ['CUSTOM BARCODE']
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_C_scan_default 
+[Q4-scan default PATCHT] scan_file_for_separating_barcodes(...) ->
+   patch-code-t.pdf                   -> [0]
+   simple.pdf                         -> []
+   patch-code-t-middle.pdf            -> [1]
+   several-patcht-codes.pdf           -> [2, 5]
+   patch-code-t-middle_reverse.pdf    -> [1]
+   patch-code-t-qr.pdf                -> [0]
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_D_scan_custom 
+[Q4-scan CUSTOM BARCODE separator] ->
+   barcode-39-custom.pdf    -> [0]
+   barcode-qr-custom.pdf    -> [0]
+   barcode-128-custom.pdf   -> [0]
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_E_scan_negative 
+[Q4-scan NEGATIVE cross-product] barcode-39-custom.pdf under default 'PATCHT' -> []
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_F_separate_pages 
+[Q4-separate_pages] split-file counts ->
+   patch-code-t-middle.pdf      seps=[1]        -> 2 file(s): ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
+   several-patcht-codes.pdf     seps=[2, 5]     -> 3 file(s): ['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
+[2026-07-08 07:53:08,012] [WARNING] [paperless.tasks] No pages to split on!
+   patch-code-t-middle.pdf      seps=[]         -> 0 file(s): []
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_G_consume_zero_rows 
+[Q4-consume_file barcode branch, CONSUMER_ENABLE_BARCODES=True]
+   Document.objects.count() BEFORE = 0
+   Document.objects.count() AFTER  = 0
+   consume_file(...) returned      = 'File successfully split'
+   original input still on disk?   = False
+   save_to_dir called 2 time(s):
+      basename='patch-code-t-middle_document_0.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmpitvn0igj'
+      basename='patch-code-t-middle_document_1.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmpitvn0igj'
+   CONSUMPTION_DIR before          = []
+   CONSUMPTION_DIR after           = ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
+PASSEDDestroying test database for alias 'default'...
+
+
+============================== 7 passed in 4.95s ===============================
+```
+
+**Run 2 (complete):**
+
+```
+$ docker exec -u testuser pngx bash -c 'cd /app/src && rm -rf /tmp/paperless; \
+    PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q4.py \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v'
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 7 items
+
+../../tmp/test_blitzy_q4.py::Q4::test_A_defaults Creating test database for alias 'default'...
+
+[Q4-defaults] CONSUMER_BARCODE_STRING  = 'PATCHT'
+[Q4-defaults] CONSUMER_ENABLE_BARCODES = False
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_B_barcode_reader 
+barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
+   Code 39                  barcode-39-PATCHT.png              -> ['PATCHT']
+   Code 39 (.pbm patch-t)   patch-code-t.pbm                   -> ['PATCHT']
+   Code 39 distorsion       barcode-39-PATCHT-distorsion.png   -> ['PATCHT']
+   Code 39 distorsion2      barcode-39-PATCHT-distorsion2.png  -> ['PATCHT']
+   Code 39 UNREADABLE       barcode-39-PATCHT-unreadable.png   -> []
+   QR                       qr-code-PATCHT.png                 -> ['PATCHT']
+   Code 128                 barcode-128-PATCHT.png             -> ['PATCHT']
+   NO barcode (simple.png)  simple.png                         -> []
+   Code 39 custom           barcode-39-custom.png              -> ['CUSTOM BARCODE']
+   QR custom                barcode-qr-custom.png              -> ['CUSTOM BARCODE']
+   Code 128 custom          barcode-128-custom.png             -> ['CUSTOM BARCODE']
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_C_scan_default 
+[Q4-scan default PATCHT] scan_file_for_separating_barcodes(...) ->
+   patch-code-t.pdf                   -> [0]
+   simple.pdf                         -> []
+   patch-code-t-middle.pdf            -> [1]
+   several-patcht-codes.pdf           -> [2, 5]
+   patch-code-t-middle_reverse.pdf    -> [1]
+   patch-code-t-qr.pdf                -> [0]
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_D_scan_custom 
+[Q4-scan CUSTOM BARCODE separator] ->
+   barcode-39-custom.pdf    -> [0]
+   barcode-qr-custom.pdf    -> [0]
+   barcode-128-custom.pdf   -> [0]
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_E_scan_negative 
+[Q4-scan NEGATIVE cross-product] barcode-39-custom.pdf under default 'PATCHT' -> []
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_F_separate_pages 
+[Q4-separate_pages] split-file counts ->
+   patch-code-t-middle.pdf      seps=[1]        -> 2 file(s): ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
+   several-patcht-codes.pdf     seps=[2, 5]     -> 3 file(s): ['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
+[2026-07-08 07:53:31,056] [WARNING] [paperless.tasks] No pages to split on!
+   patch-code-t-middle.pdf      seps=[]         -> 0 file(s): []
+PASSED
+../../tmp/test_blitzy_q4.py::Q4::test_G_consume_zero_rows 
+[Q4-consume_file barcode branch, CONSUMER_ENABLE_BARCODES=True]
+   Document.objects.count() BEFORE = 0
+   Document.objects.count() AFTER  = 0
+   consume_file(...) returned      = 'File successfully split'
+   original input still on disk?   = False
+   save_to_dir called 2 time(s):
+      basename='patch-code-t-middle_document_0.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmpoa2w45j5'
+      basename='patch-code-t-middle_document_1.pdf' newname=None target_dir(CONSUMPTION_DIR)='/tmp/tmpoa2w45j5'
+   CONSUMPTION_DIR before          = []
+   CONSUMPTION_DIR after           = ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
+PASSEDDestroying test database for alias 'default'...
+
+
+============================== 7 passed in 5.17s ===============================
+```
 
 ### 5.4 Named barcode variants — every one covered
 
@@ -586,7 +1302,7 @@ barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
 
 ### 5.5 Training-data impact (link Q4 → Q1/Q2)
 
-**Observed:** the barcode branch creates **0** `Document` rows and instead re-queues the **N** split PDFs into the consumption directory (`CONSUMPTION_DIR before = []` → `after = [..._document_0.pdf, ..._document_1.pdf]`, original deleted, return `"File successfully split"`) — all shown in §5.1.
+**Observed:** the barcode branch creates **0** `Document` rows and instead re-queues the **N** split PDFs into the consumption directory (`CONSUMPTION_DIR before = []` → `after = ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']`, original deleted, return `"File successfully split"`) — all shown in §5.1.
 
 **INFERRED (downstream, not directly observed in the single call):** because those split files land back in the consumption directory, they are later **independently re-consumed** through the **non-barcode** branch of `consume_file` into **new `Document` rows**. Only then do they enter the corpus that `train()` reads via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`src/documents/classifier.py:L125-L127`]. Consequently, a single barcode input does **not immediately** change the effective training data (0 rows on the split call); it changes it **indirectly and later**, once the re-queued segments are consumed. This is labelled INFERRED because the split call itself was observed to create no rows and to return early; the subsequent re-consumption is the documented design of re-queuing to `CONSUMPTION_DIR` [`tasks.py:L164-L166`] rather than something exercised within the same call.
 
@@ -599,10 +1315,10 @@ Every named item across the four questions, with its concrete value, `file:line`
 | #   | Named item                                                               | Value / result (observed)                                                            | `file:line`                                         | Evidence (§)                                                |
 | --- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------- | ----------------------------------------------------------- |
 | 1   | `load_classifier()` / `MODEL_FILE`                                       | returns `None` if absent, else deserializes; default `…/classification_model.pickle` | `classifier.py:L30-L57`; `settings.py:L74`          | §2.1, §2.2                                                  |
-| 2   | `data_hash` reuse guard                                                  | `train()` returns `False` on unchanged data (no retrain, no save)                    | `classifier.py:L163-L164`                           | §2.2 (hash `230b98c1…` stable 1→2; `7a72f0b5…` on mutation) |
+| 2   | `data_hash` reuse guard                                                  | `train()` returns `False` on unchanged data (no retrain, no save)                    | `classifier.py:L163-L164`                           | §2.2 (hash `230b98c1…` stable 1→2; `faa493d0…` on mutation) |
 | 3   | `save()` / `load()` round-trip                                           | `testSaveClassifier` PASS                                                            | `classifier.py:L96`, `L76`                          | §2.2                                                        |
 | 4   | `MLPClassifier` missing `random_state` (3 sites)                         | tags, correspondent, doc-type — none seeded                                          | `classifier.py:L219`, `L227`, `L238`                | §2.4 (root cause)                                           |
-| 5   | `DirectoriesMixin` / tempdir isolation                                   | distinct `MODEL_FILE` per test                                                       | `utils.py:L14-L50`, `L45`, `L72-L83`                | §2.3 (`/tmp/tmplpy201ef` vs `/tmp/tmphh6ai7lj`)             |
+| 5   | `DirectoriesMixin` / tempdir isolation                                   | distinct `MODEL_FILE` per test                                                       | `utils.py:L14-L50`, `L45`, `L72-L83`                | §2.3 (`/tmp/tmpxiy5xzu3` vs `/tmp/tmpjdtrqnbt`)             |
 | 6   | committed `model.pickle` fixture                                         | 156,607 bytes; `test_load_and_classify` PASS                                         | `test_classifier.py:L183`                           | §2.2                                                        |
 | 7   | `pytest-xdist` parallelism                                               | default `--numprocesses auto` (128 CPUs)                                             | `setup.cfg:L10`                                     | §2.3                                                        |
 | 8   | `predict_correspondent` arg-max & `!= -1`                                | accept label only when `!= -1`, else `None`                                          | `classifier.py:L251-L260` (`L255-L256`)             | §3.1, §3.4                                                  |
@@ -635,25 +1351,30 @@ All 30 named items are addressed with observed evidence and grounded references.
 
 ## 7. Repository cleanliness
 
-All observation/instrumentation scripts were created **outside** the repository tree (host `/tmp/qna_scratch/` and container `/tmp/`) and have been **removed**. The repository is byte-for-byte unchanged except for this single new document.
+All observation/instrumentation scripts were created **outside** the repository tree — on the host under `/tmp/qna_scratch/` and, after `docker cp`, in the canonical container under `/tmp/`. Nothing temporary was ever written inside the repository working tree, so no temporary file could ever appear in `git status`. The repository is byte-for-byte unchanged except for this single new document.
 
-`git status --porcelain` from the repository root (the whole `blitzy/` directory is untracked, so git collapses it to the top-level prefix):
+**Net change versus the baseline.** The deliverable branch descends from the source baseline commit `542221a38` (the repository `HEAD` at the start of the investigation). The complete set of changes the branch introduces relative to that baseline is exactly **one added file** — this document — as `git diff --name-status` shows (this evidence is stable regardless of how many commits the branch has, because it compares end-states):
+
+```
+$ git diff --name-status 542221a38..HEAD
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+```
+
+The diff is entirely insertions of this one new file; **no pre-existing line anywhere in the repository is modified or deleted**.
+
+**Working tree after the document is committed.** The answer document is a **committed, tracked** file on the branch — not an untracked one. A clean working tree therefore reports nothing: `git status --porcelain` and its untracked-expanding form `-uall` both print no output:
 
 ```
 $ git status --porcelain
-?? blitzy/
-```
-
-Expanding untracked directories confirms the **only** added path is this document:
-
-```
 $ git status --porcelain -uall
-?? blitzy/documentation/paperless-ngx_542221a38dff.md
+$
 ```
 
-No tracked source, test, configuration, or fixture file appears as modified, added, or deleted. Temporary helpers removed on completion:
+(Both commands returned to the prompt with **zero lines** of output.) This is the corrected, current state. An **earlier pre-commit snapshot** — captured while the file was still untracked — instead showed the untracked markers `?? blitzy/` (collapsed to the top-level prefix) and, with `-uall`, `?? blitzy/documentation/paperless-ngx_542221a38dff.md`. Those untracked forms are **pre-commit only** and no longer apply once the file is committed to the branch.
 
-- Host scratch: `/tmp/qna_scratch/` (`test_blitzy_q1_spy.py`, `test_blitzy_q1_nondet.py`, `test_blitzy_q1_nondet2.py`, `test_blitzy_q1_proba.py`, `test_blitzy_q1_iso.py`, `test_blitzy_q2_spy.py`, `test_blitzy_q3_ocr.py`, `test_blitzy_q4_spy.py`, `test_blitzy_q4_reader.py`) — deleted.
-- Container `/tmp`: the same spy scripts plus the PATH shims `/tmp/binshim/{tesseract,gs}` and `/tmp/ocr_subprocess.log` — deleted.
+No tracked source, test, configuration, or fixture file appears as modified, added, or deleted — verified in **both** the deliverable working tree and the canonical container checkout at `/app`, where `git status --porcelain` is likewise empty after the investigation (confirming every fixture a spy touched was restored). Temporary helpers removed on completion:
 
-> **Constraint compliance:** source was treated as read-only; the classifier non-determinism was **explained and evidenced, not fixed** (no `random_state` added, no test ordering pinned, `pytest-xdist` toggled only to diagnose); and the sole repository artifact is `blitzy/documentation/paperless-ngx_542221a38dff.md`.
+- Host scratch `/tmp/qna_scratch/`: the spy scripts `test_blitzy_q1_reuse.py`, `test_blitzy_q1_nondet.py`, `test_blitzy_q1_proba.py`, `test_blitzy_q1_parallel.py`, `test_blitzy_q2.py`, `test_blitzy_q3_ocr.py`, `test_blitzy_q3_store.py`, `test_blitzy_q4.py`, plus their captured-output `.txt` files — deleted.
+- Container `/tmp`: the same spy scripts (copied in via `docker cp`) plus the OCR PATH shims `/tmp/binshim/{tesseract,gs}` and their argv log `/tmp/ocr_subprocess.log` — deleted.
+
+> **Constraint compliance:** source was treated as read-only; the classifier non-determinism was **explained and evidenced, not fixed** (no `random_state` added, no test ordering pinned, `pytest-xdist` toggled only to diagnose). One fixture that a spy rewrote **in place** — `no-text-alpha.png`, which the parser overwrites while stripping its alpha layer at [`src/paperless_tesseract/parsers.py:L201`] (`background.save(input_file, format=im.format)`) — was **restored with `git checkout`**, so the source tree is byte-for-byte unchanged. The sole repository artifact is `blitzy/documentation/paperless-ngx_542221a38dff.md`.
