@@ -1,39 +1,112 @@
-# How the paperless-ngx OCR subsystem behaves during ingestion — a runtime-observed Q&A
+# How the OCR Subsystem Behaves During Document Ingestion in paperless-ngx
 
-> **Branch:** `paperless-ngx_542221a38dff` · **HEAD commit:** `542221a38dff06361e07976452f9aea24d210542`
-> **Nature:** Read-only, **run-first** investigation. Every behavioral claim below is backed by a *triple*: the **exact command** that was run, its **complete, unedited output**, and a **`file:line`** reference into the source tree. Nothing here is asserted from reading source alone.
+> **Source branch:** `paperless-ngx_542221a38dff`
+> **HEAD commit:** `542221a38dff06361e07976452f9aea24d210542`
+> **Nature of this document:** A run-first, evidence-backed answer. Every behavioral claim below is paired with the exact command that produced it, the complete unedited output, and a `file:line` reference into the source tree. Nothing here is derived from reading source alone — the OCR ingestion pipeline was built and exercised through its real entry points (the upload API, the django-q worker, and the `RasterisedDocumentParser`), and the observations were captured live.
+> **When observed:** all runs below were captured on the container clock date `2026-07-08`.
+
+---
 
 ## Scope and method
 
-This document answers four questions about how OCR behaves while paperless-ngx ingests a document, with emphasis on the parts that are hard to observe from the outside:
+The question decomposes into four groups, restated with precision and then answered from runtime observation:
 
-- **Q1** — When I upload an image with **no embedded text**, how can I *see* that OCR has started, what does the processing state look like *while it is running*, how do the background workers behave, and what signal really indicates *active* OCR work?
-- **Q2** — When I upload a similar image that **already contains text**, does the system **skip OCR entirely** or still **touch the OCR pipeline**, and how can I tell the difference *after* processing finishes?
-- **Q3** — Compare the **final API responses** for both cases: which fields show OCR-generated text vs. pre-existing text?
-- **Q4** — When OCR produces **weak/incomplete results**, what happens to the document's **final state**? Does it still count as *fully processed*, and how is that reflected in the saved metadata?
+- **Q1 — Seeing OCR start and watching in-flight state.** How OCR initiation and in-flight processing state are observable, how the background (django-q `qcluster`) worker behaves during this phase, and which signal really indicates *active* OCR work.
+- **Q2 — Already-has-text: skip or still touch the pipeline?** Whether an image "that already contains text" skips OCR or still enters the OCR pipeline, versus the one genuine skip path (a text-layer PDF), and how to tell the difference after processing.
+- **Q3 — Comparing the final API responses.** Which `DocumentSerializer` fields carry text, and how OCR-generated text versus pre-existing text is (or is not) distinguished in the API response.
+- **Q4 — Weak/incomplete OCR: the terminal state.** What happens to the document's final state when OCR yields little or no text, whether it still counts as "fully processed," and how that is reflected in saved metadata — contrasted with the hard-failure path.
 
-**How the evidence was produced.** The project was built and run in its canonical Docker image (`ghcr.io/scaleapi/swe-atlas:...qna_1.01`, Python 3.9, all locked dependencies + the Tesseract/Ghostscript/unpaper/qpdf binaries). Documents were ingested exclusively through **real entry points** — the upload API `POST /api/documents/post_document/` handled by a real **django-q `qcluster`** worker — while a WebSocket client subscribed to the live status feed at `ws/status/`. The in-repo fixtures under `src/paperless_tesseract/tests/samples/` were used as canonical inputs. All observation used a throwaway data/media/DB directory outside the repository; the repository itself is left byte-for-byte unchanged (verified with `git status --porcelain`; see the final section). Temporary observation scripts are reproduced in the Appendix and were removed after the run.
-
-Where a claim requires a non-default configuration (for example `OCR_MODE=skip_noarchive` to force the true-skip branch in Q2), that run is **explicitly labeled non-canonical**. Where a direct in-process parser call is used to expose an internal value, it is **explicitly labeled supporting/non-canonical**; the canonical proof always comes from a real pipeline run.
+**Methodology.** OCR was triggered only through **real entry points**: `POST /api/documents/post_document/` (token-authenticated) with a session-authenticated WebSocket subscribed to `ws/status/` capturing every JSON status frame, executed by a live django-q `qcluster` worker. Supporting in-process probes (labelled **SUPPORTING / NON-CANONICAL**) expose internal values (OCRmyPDF arguments, sidecar bytes, checksums) that the canonical pipeline does not print; they never replace the canonical proof. The in-repo fixtures under `src/paperless_tesseract/tests/samples/` are used as canonical inputs. Timing/state observations were each repeated across **at least two runs** to confirm stability. The source repository was left byte-for-byte unchanged (see the read-only proof in the Appendix); all temporary scripts and the throwaway database/media were removed afterward.
 
 ---
 
 ## 1. Environment and reproducibility
 
-The exact toolchain versions and the canonical OCR settings **printed at runtime** (not merely read from source):
+All build/run/observation was performed **inside the canonical Docker image** the task pins. The host has Python 3.13 and no OCR tooling, so nothing was run natively.
 
+### 1.1 Canonical container identification
+
+```text
+########## CANONICAL CONTAINER (host) ##########
+$ docker images --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}'
+ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01  6e699f225ced  1.79GB
+
+$ docker ps --format '{{.Names}}  {{.Image}}  {{.Status}}'
+paperless_setup  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01  Up 2 hours
 ```
-$ python3 --version
-$ python3 -m pip show ocrmypdf django django-q channels channels-redis | grep -E "^Name:|^Version:"
-$ tesseract --version | head -2 ; gs --version ; unpaper --version | head -1 ; qpdf --version | head -1
-$ python3 manage.py shell -c "from django.conf import settings; print('OCR_MODE=',settings.OCR_MODE,'OCR_LANGUAGE=',settings.OCR_LANGUAGE,'OCR_OUTPUT_TYPE=',settings.OCR_OUTPUT_TYPE)"
+
+The container's repository is checked out at `/app` with `HEAD = 542221a38dff06361e07976452f9aea24d210542` (matching the source branch). Every command below prefixed with `docker exec paperless_setup ...` or shown after a `cd /app/src` runs inside this container.
+
+### 1.2 Canonical production dependencies installed inside the container
+
+The slim QnA image ships the Python stack and OCR binaries but not the runtime services that the canonical production `Dockerfile` provides. These were installed (they were already present at the pinned versions, so this is a no-op that documents the canonical set), and the canonical ImageMagick policy was applied:
+
+```text
+########## APT INSTALLS (canonical production deps not baked into the slim QnA image) ##########
+$ DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server libzbar0 curl
+Reading package lists...
+Building dependency tree...
+Reading state information...
+libzbar0 is already the newest version (0.23.90-1+deb11u1).
+curl is already the newest version (7.74.0-1.3+deb11u16).
+redis-server is already the newest version (5:6.0.16-1+deb11u8).
+0 upgraded, 0 newly installed, 0 to remove and 50 not upgraded.
+
+########## IMAGEMAGICK POLICY (canonical) ##########
+$ cp /app/docker/imagemagick-policy.xml /etc/ImageMagick-6/policy.xml
+policy copied; diff vs source:
+identical
+```
+
+### 1.3 Services started (the canonical run recipe)
+
+Redis backs **both** the django-q broker and the `channels_redis` status feed. The web/WebSocket tier is the ASGI app under gunicorn; the worker tier is `qcluster`.
+
+```text
+########## REDIS (broker for django-q AND channels_redis status feed) ##########
+$ redis-server --daemonize yes    # (already running in this container)
 $ redis-cli ping
+PONG
+
+########## DATABASE MIGRATE ##########
+$ python3 manage.py migrate --no-input
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
+Running migrations:
+  No migrations to apply.
+
+########## WHOOSH FULL-TEXT INDEX REINDEX ##########
+$ python3 manage.py document_index reindex
+
+0it [00:00, ?it/s]
+0it [00:00, ?it/s]
+
+########## SUPERUSER ##########
+$ python3 manage.py manage_superuser   # PAPERLESS_ADMIN_USER/PASSWORD/MAIL
 ```
 
+```text
+########## QCLUSTER WORKER (django-q) START ##########
+$ python3 manage.py qcluster    # backgrounded; log -> /tmp/inv/out/qcluster.log
+22:45:28 [Q] INFO Q Cluster september-thirteen-emma-grey starting.
+22:45:28 [Q] INFO Process-1:1 ready for work at 18014
+22:45:28 [Q] INFO Process-1:2 ready for work at 18015
+(one further "Process-1:N ready for work" line is emitted per pooled worker at startup)
+
+########## ASGI WEB + WEBSOCKET (gunicorn) START ##########
+$ gunicorn -c /app/gunicorn.conf.py paperless.asgi:application   # 0.0.0.0:8000
+[2026-07-08 22:45:40 +0000] [18033] [INFO] Listening at: http://0.0.0.0:8000 (18033)
+[2026-07-08 22:45:40 +0000] [18033] [INFO] Using worker: paperless.workers.ConfigurableWorker
+[2026-07-08 22:45:40 +0000] [18033] [INFO] Server is ready. Spawning workers
 ```
+
+### 1.4 Tool and library versions
+
+```text
 =========== VERSIONS ===========
+$ python3 --version
 Python 3.9.23
---- pip show (key deps) ---
+$ python3 -m pip show ocrmypdf django django-q channels channels-redis | grep -E "^Name:|^Version:"
 Name: ocrmypdf
 Version: 13.4.3
 Name: Django
@@ -44,6 +117,7 @@ Name: channels
 Version: 3.0.4
 Name: channels-redis
 Version: 3.4.0
+$ tesseract --version | head -2 ; gs --version ; unpaper --version | head -1 ; qpdf --version | head -1
 --- tesseract ---
 tesseract 4.1.1
  leptonica-1.79.0
@@ -52,357 +126,654 @@ tesseract 4.1.1
 --- unpaper / qpdf ---
 6.1
 qpdf version 10.1.0
+```
 
+### 1.5 Canonical OCR configuration (verified at runtime)
+
+The defaults in `src/paperless/settings.py` (`OCR_LANGUAGE` at L514, `OCR_OUTPUT_TYPE` at L518, `OCR_MODE` at L522) resolve at runtime to:
+
+```text
 =========== CANONICAL OCR SETTINGS (runtime) ===========
+$ python3 manage.py shell -c "from django.conf import settings; print('OCR_MODE=', settings.OCR_MODE, 'OCR_LANGUAGE=', settings.OCR_LANGUAGE, 'OCR_OUTPUT_TYPE=', settings.OCR_OUTPUT_TYPE)"
 OCR_MODE= skip OCR_LANGUAGE= eng OCR_OUTPUT_TYPE= pdfa
 
 =========== REDIS ===========
+$ redis-cli ping
 PONG
 ```
 
-These match the locked versions in `Pipfile.lock`/`Dockerfile`. The three canonical OCR defaults are defined at `src/paperless/settings.py:L514` (`OCR_LANGUAGE = "eng"`), `:L518` (`OCR_OUTPUT_TYPE = "pdfa"`), and `:L522` (`OCR_MODE = "skip"`) and are confirmed in effect above. Redis is required by **both** the django-q broker and the Channels layer, and is reachable (`PONG`).
+Unless a scenario states otherwise it runs under this canonical `OCR_MODE=skip`. Two Q2/Q3 sub-cases require `OCR_MODE=skip_noarchive` to demonstrate the *true skip*; those are explicitly labelled **non-canonical** and the worker is restarted with that mode transiently, then restored to `skip`.
 
-**Authentication model of the observation surface.** The upload API accepts a DRF token (`POST /api/token/`); the status WebSocket at `ws/status/` accepts **session** auth only. This smoke check confirms both, and confirms that an **unauthenticated** WebSocket connection is denied:
+### 1.6 Observation-surface auth model (real entry points; secrets redacted)
 
-```
-$ python3 /tmp/inv/scripts/smoke.py
+The upload API is token-authenticated; the `ws/status/` WebSocket is **session-authenticated only** and rejects unauthenticated clients with HTTP 403 at the `is_authenticated` gate in `StatusConsumer.connect` (`src/paperless/consumers.py:L11`). The DRF token and the session id are never printed — both are redacted to `<TOKEN>` and `<SESSIONID>` at the point of capture:
+
+```text
+########## AUTH SMOKE (real entry points; secrets redacted) ##########
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/smoke.py
 POST /api/token/ -> 200 {"token":"<TOKEN>"}
-GET /api/documents/ -> 200 count= 1
-Django Client.login -> True sessionid= 0drrwp4l...
+GET /api/documents/ -> 200 count= 0
+Django Client.login -> True sessionid= <SESSIONID>
 WS authed  -> CONNECTED
 WS no-auth -> REJECTED/InvalidStatusCode: server rejected WebSocket connection: HTTP 403
 ```
 
-The `HTTP 403` for an unauthenticated socket is the `is_authenticated` gate in `StatusConsumer.connect()` at `src/paperless/consumers.py:L11` (the real token value is redacted here as `<TOKEN>`).
+This is why the capture harness (`q1_capture.py`, Appendix 5.1) authenticates the WebSocket with a session cookie obtained via Django's test `Client.login`, while uploading through the token-authenticated REST endpoint.
 
 ---
 
-## 2. How ingestion and the status feed fit together
+## 2. Architecture of the ingestion path being observed
 
-The path that every uploaded image/PDF travels, with anchors:
-
-1. **Upload entry point** — `PostDocumentView.post` (`src/documents/views.py:L491` class, `:L497` method) writes the upload to a temp file in `SCRATCH_DIR`, generates `task_id = str(uuid.uuid4())` (`:L521`), and enqueues the work with `async_task("documents.tasks.consume_file", ...)` (`:L523`–`L533`), returning `Response("OK")` (`:L535`).
-2. **Worker task** — a django-q `qcluster` worker dequeues and runs `documents.tasks.consume_file` (`src/documents/tasks.py:L184`), which calls `Consumer().try_consume_file(...)` (`:L236`).
-3. **Pipeline + progress broadcaster** — `Consumer.try_consume_file` (`src/documents/consumer.py:L180`) emits progress frames through `_send_progress` (`:L56`), which builds a payload with keys `filename, task_id, current_progress, max_progress, status, message, document_id` (`:L64`–`L72`) and `group_send`s it to the `"status_updates"` channel group (`:L73`–`L74`).
-4. **WebSocket relay** — `StatusConsumer` (`src/paperless/consumers.py:L9`) joins the `"status_updates"` group on connect (`:L17`–`L18`, after the `is_authenticated` check at `:L11`) and forwards each event to the browser as `json.dumps(event["data"])` in `status_update()` (`:L29`–`L33`). The socket is routed at `ws/status/` (`src/paperless/urls.py:L137`) behind `AuthMiddlewareStack` (`src/paperless/asgi.py:L20`).
-
-The dispatch to the OCR engine happens inside step 3: for `image/*` and `application/pdf` the consumer selects `RasterisedDocumentParser` (registered in `src/paperless_tesseract/signals.py`), whose `parse()` (`src/paperless_tesseract/parsers.py:L230`) wraps OCRmyPDF/Tesseract. The status **constants** used throughout are defined at `src/documents/consumer.py:L43`–`L49` (`MESSAGE_NEW_FILE="new_file"`, `MESSAGE_PARSING_DOCUMENT="parsing_document"`, `MESSAGE_GENERATING_THUMBNAIL="generating_thumbnail"`, `MESSAGE_PARSE_DATE="parse_date"`, `MESSAGE_SAVE_DOCUMENT="save_document"`, `MESSAGE_FINISHED="finished"`).
+Uploads and directory-watched files converge on the django-q task `documents.tasks.consume_file` (`src/documents/tasks.py:L184`), which the `qcluster` worker executes by calling `Consumer().try_consume_file(...)` (`src/documents/tasks.py:L236`). The `Consumer` broadcasts progress frames via `_send_progress` (`src/documents/consumer.py:L56`) onto the `status_updates` channel group; `StatusConsumer` (`src/paperless/consumers.py:L9`) relays them to authenticated WebSocket clients. For images and PDFs the parser is `RasterisedDocumentParser.parse()` (`src/paperless_tesseract/parsers.py:L230`), which wraps OCRmyPDF over Tesseract.
 
 ```mermaid
 flowchart TD
-    A["POST /api/documents/post_document/"] --> B["PostDocumentView.post<br/>temp file + task_id=uuid4()<br/>views.py:L497,L521"]
-    B --> C["async_task(documents.tasks.consume_file)<br/>views.py:L523-533"]
-    C --> D["django-q qcluster worker<br/>consume_file  tasks.py:L184"]
-    D --> E["Consumer.try_consume_file<br/>consumer.py:L180"]
-    E --> F["_send_progress STARTING@0 -> WORKING@20 parsing_document<br/>consumer.py:L56,L202,L259"]
-    F --> G["RasterisedDocumentParser.parse()<br/>ocrmypdf.ocr  parsers.py:L230,L261"]
+    A["Upload image / PDF<br/>POST /api/documents/post_document/"] --> B["PostDocumentView.post<br/>writes temp file, task_id = uuid4()"]
+    B --> C["async_task(documents.tasks.consume_file, ...)"]
+    C --> D["django-q qcluster worker<br/>executes consume_file (tasks.py:L184)"]
+    D --> E["Consumer.try_consume_file<br/>(consumer.py:L180)"]
+    E --> F["_send_progress STARTING@0 (L202)<br/>then WORKING@20 PARSING (L259)"]
+    F --> G["RasterisedDocumentParser.parse()<br/>OCRmyPDF / Tesseract (parsers.py:L230)"]
     G --> H{"text found?"}
-    H -- "yes" --> I["content set; archive PDF written"]
-    H -- "empty" --> J["safe fallback (force_ocr) -> self.text=''<br/>parsers.py:L276-327"]
-    I --> K["_store + SUCCESS@100<br/>consumer.py:L300,L375"]
-    J --> K
-    F -. "frames" .-> L["channel group status_updates"]
-    L --> M["StatusConsumer -> ws/status/<br/>consumers.py:L9,L29-33"]
-    M --> N["client observes STARTING/WORKING/SUCCESS"]
+    H -- "yes" --> I["content populated<br/>archive PDF written"]
+    H -- "empty" --> J["safe_fallback retry -> self.text = ''<br/>(parsers.py:L318-L327)"]
+    H -- "hard failure" --> K["raise ParseError (parsers.py:L310)<br/>-> _fail -> FAILED@100 (consumer.py:L79)"]
+    I --> L["document.save() -> SUCCESS@100<br/>(consumer.py:L375)"]
+    J --> L
+    F -. "status frames" .-> M["channel group status_updates"]
+    M --> N["StatusConsumer WebSocket<br/>(paperless/consumers.py:L9)"]
+    N --> O["Client observes STARTING/WORKING/SUCCESS"]
+```
+
+**The `_send_progress` frame vocabulary**, verified against source (each is one `self._send_progress(...)` call in `try_consume_file`):
+
+| Frame | `current_progress` | `status` | `message` | Emitting line |
+|-------|--------------------|----------|-----------|---------------|
+| new file | 0 | `STARTING` | `new_file` | `consumer.py:L202` |
+| parsing document | 20 | `WORKING` | `parsing_document` | `consumer.py:L259` |
+| generating thumbnail | 70 | `WORKING` | `generating_thumbnail` | `consumer.py:L264` |
+| parse date | 90 | `WORKING` | `parse_date` | `consumer.py:L274` |
+| save document | 95 | `WORKING` | `save_document` | `consumer.py:L294` |
+| finished | 100 | `SUCCESS` | `finished` (carries `document.id`) | `consumer.py:L375` |
+| failed | 100 | `FAILED` | the exception message | `consumer.py:L79` (via `_fail`, L78-L81) |
+
+Verified source:
+
+```text
+$ sed -n '202p;259p;264p;274p;294p;375p' src/documents/consumer.py
+        self._send_progress(0, 100, "STARTING", MESSAGE_NEW_FILE)
+            self._send_progress(20, 100, "WORKING", MESSAGE_PARSING_DOCUMENT)
+            self._send_progress(70, 100, "WORKING", MESSAGE_GENERATING_THUMBNAIL)
+                self._send_progress(90, 100, "WORKING", MESSAGE_PARSE_DATE)
+        self._send_progress(95, 100, "WORKING", MESSAGE_SAVE_DOCUMENT)
+        self._send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)
+
+$ sed -n '78,81p' src/documents/consumer.py
+    def _fail(self, message, log_message=None, exc_info=None):
+        self._send_progress(100, 100, "FAILED", message)
+        self.log("error", log_message or message, exc_info=exc_info)
+        raise ConsumerError(f"{self.filename}: {log_message or message}")
 ```
 
 ---
 
-## Q1 — Seeing OCR start, the in-flight state, worker behavior, and the active-OCR signal
+## Q1 — Seeing OCR start, watching in-flight state, and the signal that means *active* OCR
 
-**Direct answer.** You see OCR has started when the status feed emits a **`WORKING` frame at `current_progress = 20` with `message = "parsing_document"`**. That single frame is the active-OCR signal: it is emitted at `src/documents/consumer.py:L259` immediately before `document_parser.parse()` is called at `:L261`, and it is *during* that frame that `RasterisedDocumentParser.parse()` (`src/paperless_tesseract/parsers.py:L230`) invokes `ocrmypdf.ocr(...)` (`:L261`), which runs Tesseract. While it runs, the document has **no persisted row yet** (`document_id` is `null` in every frame until the terminal one); the "state" you can observe is entirely the transient status feed, which progresses `STARTING@0 → WORKING@20(parsing_document) → WORKING@70(generating_thumbnail) → WORKING@90(parse_date) → WORKING@95(save_document) → SUCCESS@100(finished)`. The persisted `Document` row appears only at the end, carrying `document_id` in the final `SUCCESS` frame.
+**Direct answer.** You see OCR "start" the moment the worker emits the `WORKING @ 20%` frame carrying `message = "parsing_document"` (`src/documents/consumer.py:L259`). That frame is emitted immediately before the parser dispatch that calls `RasterisedDocumentParser.parse()` (`src/documents/consumer.py:L261` → `src/paperless_tesseract/parsers.py:L230`), inside which OCRmyPDF/Tesseract runs. While it runs, the document has **no database row yet** (the row is created later, at `consumer.py:L398-L402`), so the *only* live signal of in-flight OCR is the WebSocket status feed: the `STARTING @ 0` → `WORKING @ 20 (parsing_document)` → `WORKING @ 70 (generating_thumbnail)` progression. **The true "active OCR" signal is the time the run dwells at `WORKING @ 20 parsing_document` before advancing to `70`** — that span *is* the OCRmyPDF/Tesseract call. The worker itself is a django-q `qcluster` process that logs `processing [<file>]`, `Consuming <file>`, then `Document <title> consumption finished`, and finally recycles the worker process.
 
-### Q1.1 — The live frame sequence (before / during / after)
+### Q1.1 — Live status frames from a real upload (run 1, `simple.png`, a text-free image)
 
-Fixture: `src/paperless_tesseract/tests/samples/simple.png` — a raster image with **no embedded text layer** (images never have one) whose pixels OCR to `"This is a test document."`. Triggered through the **real upload API** while an authenticated WebSocket client recorded every frame with a timestamp:
+Command (the full harness source is Appendix 5.1); it authenticates a session WebSocket to `ws/status/`, uploads via the token-authenticated REST endpoint, and records every frame:
 
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+deleted 0 document(s); media cleared; count now = 0
+
+$ bash /tmp/inv/scripts/cap_scenario.sh q1run1 \
+      /app/src/paperless_tesseract/tests/samples/simple.png simple.png image/png
 ```
-$ python3 /tmp/inv/scripts/q1_capture.py q1run1 .../samples/simple.png simple.png image/png
+
+Complete, unedited output:
+
+```text
+############### Q1 RUN 1: simple.png (text-free image) ###############
 [BEFORE] document count = 0
 [WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.150s] {"filename": "simple.png", "task_id": "649b3816-d298-4350-9cb7-47ba61ce69f0", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.155s] {"filename": "simple.png", "task_id": "649b3816-d298-4350-9cb7-47ba61ce69f0", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 1.233s] {"filename": "simple.png", "task_id": "649b3816-d298-4350-9cb7-47ba61ce69f0", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 1.898s] {"filename": "simple.png", "task_id": "649b3816-d298-4350-9cb7-47ba61ce69f0", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 1.900s] {"filename": "simple.png", "task_id": "649b3816-d298-4350-9cb7-47ba61ce69f0", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 1.950s] {"filename": "simple.png", "task_id": "649b3816-d298-4350-9cb7-47ba61ce69f0", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 3}
 [UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
-[FRAME t+ 0.142s] {"filename": "simple.png", "task_id": "10155383-969f-477f-aa7d-c082edef268c", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
-[FRAME t+ 0.147s] {"filename": "simple.png", "task_id": "10155383-969f-477f-aa7d-c082edef268c", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
-[FRAME t+ 1.206s] {"filename": "simple.png", "task_id": "10155383-969f-477f-aa7d-c082edef268c", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
-[FRAME t+ 1.879s] {"filename": "simple.png", "task_id": "10155383-969f-477f-aa7d-c082edef268c", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
-[FRAME t+ 1.882s] {"filename": "simple.png", "task_id": "10155383-969f-477f-aa7d-c082edef268c", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
-[FRAME t+ 1.931s] {"filename": "simple.png", "task_id": "10155383-969f-477f-aa7d-c082edef268c", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 15}
 
 ===== FRAME SUMMARY (q1run1) =====
-('0.142', 0, 'STARTING', 'new_file')
-('0.147', 20, 'WORKING', 'parsing_document')
-('1.206', 70, 'WORKING', 'generating_thumbnail')
-('1.879', 90, 'WORKING', 'parse_date')
-('1.882', 95, 'WORKING', 'save_document')
-('1.931', 100, 'SUCCESS', 'finished')
-[DUR] parse/OCR phase (20->70) duration = 1.059s
-[DUR] total STARTING->terminal = 1.789s
+('0.150', 0, 'STARTING', 'new_file')
+('0.155', 20, 'WORKING', 'parsing_document')
+('1.233', 70, 'WORKING', 'generating_thumbnail')
+('1.898', 90, 'WORKING', 'parse_date')
+('1.900', 95, 'WORKING', 'save_document')
+('1.950', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 1.078s
+[DUR] total STARTING->terminal = 1.800s
 [PERPAGE] per-page WORKING frames (message=null) progress values: []
-[AFTER] finished document_id = 15
+[AFTER] finished document_id = 3
 [AFTER] doc content='This is a test document.' archived_file_name='2026-07-08 simple.pdf' original_file_name='2026-07-08 simple.png'
 ```
 
-Mapping each frame to its emission site (all in `src/documents/consumer.py`):
+**Reading the evidence.**
+- **OCR "started"** at `t+0.155s` — the `WORKING @ 20 parsing_document` frame (`consumer.py:L259`).
+- **Active OCR** is the `1.078s` the run dwelled between the `20` and `70` frames. That interval brackets `RasterisedDocumentParser.parse()`; within it OCRmyPDF invoked Tesseract (confirmed by the worker log and the direct probe below).
+- **`document_id` is `null` on every frame until the terminal `SUCCESS` frame**, which carries `document_id = 3`. This is the runtime proof that the DB row does not exist during OCR — the id only appears once the row is created and `_send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)` runs (`consumer.py:L375`).
+- After the run, the persisted document has `content='This is a test document.'` (Tesseract read the pixels) and an archive PDF (`2026-07-08 simple.pdf`).
 
-| Frame | progress | status | message | Anchor |
-|---|---|---|---|---|
-| new file | 0 | `STARTING` | `new_file` | `consumer.py:L202` (const `:L43`) |
-| **parsing — active OCR** | **20** | `WORKING` | `parsing_document` | `consumer.py:L259` (const `:L45`) — parse() called at `:L261` |
-| thumbnail | 70 | `WORKING` | `generating_thumbnail` | `consumer.py:L264` (const `:L46`) |
-| parse date | 90 | `WORKING` | `parse_date` | `consumer.py:L274` (const `:L47`) |
-| save | 95 | `WORKING` | `save_document` | `consumer.py:L294` (const `:L48`) |
-| finished | 100 | `SUCCESS` | `finished` (+ `document_id`) | `consumer.py:L375` (const `:L49`) |
+### Q1.2 — Frame-to-source mapping
 
-The `parse_date` frame at 90 is conditional — it is emitted only when a date must be parsed from content; see the encrypted-PDF run in Q4 where it does not appear.
+| Observed frame | Source line that emitted it |
+|----------------|------------------------------|
+| `STARTING 0 new_file` | `consumer.py:L202` |
+| `WORKING 20 parsing_document` | `consumer.py:L259` (immediately precedes the `parse()` dispatch at L261) |
+| `WORKING 70 generating_thumbnail` | `consumer.py:L264` |
+| `WORKING 90 parse_date` | `consumer.py:L274` |
+| `WORKING 95 save_document` | `consumer.py:L294` |
+| `SUCCESS 100 finished` (with `document_id`) | `consumer.py:L375` |
 
-### Q1.2 — The active-OCR signal, and an honest finding about per-page frames
+### Q1.3 — Per-page progress frames: honestly, none were observed at this scale
 
-The single **`WORKING@20 / parsing_document`** frame is the reliable "OCR is now running" signal. paperless *defines* a per-page `progress_callback` at `src/documents/consumer.py:L237`–`L240` intended to emit intermediate `WORKING` frames between 20 and 70 while OCRmyPDF processes pages. **Observed reality: no per-page frames are ever emitted for the OCR path** — `[PERPAGE] ... : []` above, and the progress jumps directly `20 → 70`. This reproduced for a 1-page image *and* for a 3-page image-PDF.
+The AAP notes a `progress_callback` can emit page-by-page `WORKING` frames spanning 20–70%. At the scale of these single-page fixtures **no intermediate per-page frames were emitted** — progress jumps directly from `20` to `70`. The harness explicitly checks for `WORKING` frames whose `message` is `null` (the per-page shape) and reports the collected list:
 
-Root cause (grounded in source, confirmed by the empty capture): the callback is wired into the base parser's `progress()` wrapper (`src/documents/parsers.py`), but `RasterisedDocumentParser` **never calls `self.progress()`** — it only sets `"progress_bar": False` when building OCRmyPDF args (`src/paperless_tesseract/parsers.py:L152`). So the per-page frames are effectively dead code for OCR. A secondary detail: the callback's own comment at `consumer.py:L238`–`L239` says progress is recalculated "within 20 and 80", but the formula `p = int((current_progress / max_progress) * 50 + 20)` mathematically spans **20 → 70**, not 20 → 80. This mismatch is moot in practice because the callback never fires for the OCR path. This is reported as observed, not as inferred.
-
-### Q1.3 — Worker behavior
-
-The task runs inside a **django-q `qcluster` worker process** (a `Process-1:N` daemon), captured live from the worker log:
-
-```
-$ sed -n '281,294p' /tmp/inv/out/qcluster.log
-21:30:27 [Q] INFO Process-1:8 processing [simple.png]
-[2026-07-08 21:30:27,376] [INFO] [paperless.consumer] Consuming simple.png
-[2026-07-08 21:30:27,795] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-[2026-07-08 21:30:29,160] [INFO] [paperless.consumer] Document 2026-07-08 simple consumption finished
-21:30:29 [Q] INFO Process-1:8 stopped doing work
-21:30:29 [Q] INFO Processed [simple.png]
-21:30:29 [Q] INFO recycled worker Process-1:8
-21:30:29 [Q] INFO Process-1:21 ready for work at 10129
-21:30:41 [Q] INFO Process-1:9 processing [simple.png]
-[2026-07-08 21:30:41,424] [INFO] [paperless.consumer] Consuming simple.png
-[2026-07-08 21:30:41,842] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-[2026-07-08 21:30:43,231] [INFO] [paperless.consumer] Document 2026-07-08 simple consumption finished
-21:30:43 [Q] INFO Process-1:9 stopped doing work
-21:30:43 [Q] INFO Processed [simple.png]
-```
-
-Notes:
-- `Consuming simple.png` is logged by the consumer as ingestion begins; `Document ... consumption finished` is logged at `src/documents/consumer.py:L373`, right before the `SUCCESS@100` frame at `:L375`.
-- The `[tesseract] Error during processing.` line (one per page) is **benign** — it is Tesseract's OSD stderr surfaced by OCRmyPDF at ERROR level; the run still succeeds (`Processed [simple.png]`).
-- Because django-q **daemonizes** its workers, OCRmyPDF is invoked with `use_threads=True` (`src/paperless_tesseract/parsers.py:L148`, whose comment explains daemonized processes cannot fork) — this is *why* OCR here is thread-based rather than multiprocess.
-- After success the consumer fires `document_consumption_finished` (`consumer.py:L306`–`L311`), whose handlers (`src/documents/signals/handlers.py`) apply post-processing: `add_inbox_tags` (`:L30`), `set_correspondent` (`:L35`), `set_document_type` (`:L101`), `set_tags` (`:L168`), and `add_to_index` (Whoosh full-text index, `:L428`).
-
-Supporting (non-canonical) — a direct in-process parse of the same image shows the exact OCRmyPDF arguments and that OCR ran on the primary attempt (no fallback), producing a real archive:
-
-```
-$ python3 /tmp/inv/scripts/direct_parse.py .../samples/simple.png image/png
-[CFG] OCR_MODE=skip fixture=.../simple.png mime=image/png
-[DEBUG][paperless.parsing.tesseract] Estimated DPI 62 based on image width 517
-[DEBUG][paperless.parsing.tesseract] Detected DPI for image .../simple.png: 72
-[DEBUG][paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '.../simple.png', 'output_file': '/tmp/inv/scratch/paperless-rsm8lo_i/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/inv/scratch/paperless-rsm8lo_i/sidecar.txt', 'image_dpi': 72}
-[2026-07-08 21:31:08,537] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-[DEBUG][paperless.parsing.tesseract] Using text from sidecar file
-[RESULT] archive_path='/tmp/inv/scratch/paperless-rsm8lo_i/archive.pdf'
-[RESULT] archive_path_is_file=True
-[RESULT] text='This is a test document.'
-[RESULT] text_len=24
-```
-
-The `'skip_text': True` argument is the mapping of the canonical `OCR_MODE="skip"` in `construct_ocrmypdf_parameters` (`src/paperless_tesseract/parsers.py:L157`–`L158`).
-
-### Q1.4 — Stability (≥2 runs)
-
-The same `simple.png` was uploaded again (docs deleted in between to bypass the duplicate guard `pre_check_duplicate`, `consumer.py:L102`–`L112`). The frame sequence, statuses, messages, and progress values are **identical**; timings are stable:
-
-```
-$ python3 /tmp/inv/scripts/q1_capture.py q1run2 .../samples/simple.png simple.png image/png
-('0.142', 0, 'STARTING', 'new_file')
-('0.147', 20, 'WORKING', 'parsing_document')
-('1.205', 70, 'WORKING', 'generating_thumbnail')
-('1.871', 90, 'WORKING', 'parse_date')
-('1.874', 95, 'WORKING', 'save_document')
-('1.954', 100, 'SUCCESS', 'finished')
-[DUR] parse/OCR phase (20->70) duration = 1.058s
-[DUR] total STARTING->terminal = 1.813s
+```text
 [PERPAGE] per-page WORKING frames (message=null) progress values: []
 ```
 
-| Run | parse/OCR phase (20→70) | total (STARTING→SUCCESS) | per-page frames |
-|---|---|---|---|
-| 1 | 1.059 s | 1.789 s | none (`[]`) |
-| 2 | 1.058 s | 1.813 s | none (`[]`) |
+This empty list held for **every** fixture in this investigation, including the multi-page ones. Reported exactly as observed: at these scales the only in-flight signal is the dwell time at `WORKING @ 20`, not a stream of per-page frames.
 
-The parse phase is ~1.06 s and stable across runs; only `document_id` and `task_id` differ.
+### Q1.4 — Worker (`qcluster`) behavior during the phase
+
+The complete worker-log block for run 1 (exact line range from the live `qcluster.log`, no elision):
+
+```text
+===== WORKER LOG for q1run1 (qcluster.log lines 56-63, complete) =====
+22:53:07 [Q] INFO Process-1:2 processing [simple.png]
+[2026-07-08 22:53:08,098] [INFO] [paperless.consumer] Consuming simple.png
+[2026-07-08 22:53:08,518] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:53:09,893] [INFO] [paperless.consumer] Document 2026-07-08 simple consumption finished
+22:53:09 [Q] INFO Process-1:2 stopped doing work
+22:53:09 [Q] INFO Processed [simple.png]
+22:53:10 [Q] INFO recycled worker Process-1:2
+22:53:10 [Q] INFO Process-1:15 ready for work at 20024
+```
+
+Worker behavior, step by step: a pooled worker process (`Process-1:2`) picks up the task and logs `processing [simple.png]`; `Consuming simple.png` marks the start of `try_consume_file`; the single `[tesseract] Error during processing.` line is **benign OCRmyPDF noise** emitted while Tesseract probes the low-resolution test image — it is not a failure (the run still succeeds and text is extracted); `consumption finished` marks success; then django-q **recycles** the worker (`stopped doing work` → `Processed` → `recycled worker` → a fresh `Process-1:15 ready for work`). Worker recycling after each task is normal django-q pool behavior.
+
+### Q1.5 — Stability: run 2 (identical input)
+
+```text
+$ bash /tmp/inv/scripts/cap_scenario.sh q1run2 \
+      /app/src/paperless_tesseract/tests/samples/simple.png simple.png image/png
+
+############### Q1 RUN 2: simple.png (stability) ###############
+[BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.143s] {"filename": "simple.png", "task_id": "d557b8a3-4b5a-4df3-a663-01104b784e29", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.149s] {"filename": "simple.png", "task_id": "d557b8a3-4b5a-4df3-a663-01104b784e29", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 1.205s] {"filename": "simple.png", "task_id": "d557b8a3-4b5a-4df3-a663-01104b784e29", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 1.880s] {"filename": "simple.png", "task_id": "d557b8a3-4b5a-4df3-a663-01104b784e29", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 1.883s] {"filename": "simple.png", "task_id": "d557b8a3-4b5a-4df3-a663-01104b784e29", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 1.932s] {"filename": "simple.png", "task_id": "d557b8a3-4b5a-4df3-a663-01104b784e29", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 4}
+[UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
+
+===== FRAME SUMMARY (q1run2) =====
+('0.143', 0, 'STARTING', 'new_file')
+('0.149', 20, 'WORKING', 'parsing_document')
+('1.205', 70, 'WORKING', 'generating_thumbnail')
+('1.880', 90, 'WORKING', 'parse_date')
+('1.883', 95, 'WORKING', 'save_document')
+('1.932', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 1.057s
+[DUR] total STARTING->terminal = 1.789s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 4
+[AFTER] doc content='This is a test document.' archived_file_name='2026-07-08 simple.pdf' original_file_name='2026-07-08 simple.png'
+
+===== WORKER LOG for q1run2 (qcluster.log lines 64-71, complete) =====
+22:53:26 [Q] INFO Process-1:3 processing [simple.png]
+[2026-07-08 22:53:26,518] [INFO] [paperless.consumer] Consuming simple.png
+[2026-07-08 22:53:26,932] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:53:28,303] [INFO] [paperless.consumer] Document 2026-07-08 simple consumption finished
+22:53:28 [Q] INFO Process-1:3 stopped doing work
+22:53:28 [Q] INFO Processed [simple.png]
+22:53:28 [Q] INFO recycled worker Process-1:3
+22:53:28 [Q] INFO Process-1:16 ready for work at 20086
+```
+
+**Stability verdict:** the frame sequence, progression, and per-page result are identical across runs. The active-OCR dwell (20→70) was `1.078s` (run 1) and `1.057s` (run 2) — stable to within ~20 ms. `document_id` was `null` throughout both runs until the terminal `SUCCESS` frame (ids `3` and `4`).
+
+### Q1.6 — Supporting probe: what OCRmyPDF actually received (NON-CANONICAL, in-process)
+
+To expose the arguments the canonical pipeline passes to OCRmyPDF (which the pipeline itself does not print), the supporting `direct_parse.py` probe (Appendix 5.1) instantiates `RasterisedDocumentParser` and calls `parse()` in-process on a scratch copy of `simple.png`:
+
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/direct_parse.py \
+      /app/src/paperless_tesseract/tests/samples/simple.png image/png
+[CFG] OCR_MODE=skip fixture=/app/src/paperless_tesseract/tests/samples/simple.png mime=image/png
+[DEBUG][paperless.parsing.tesseract] Estimated DPI 62 based on image width 517
+[DEBUG][paperless.parsing.tesseract] Detected DPI for image /tmp/paperless/dp-3e8164ad68e148d2bd6ceccac7450b3a.png: 72
+[DEBUG][paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/paperless/dp-3e8164ad68e148d2bd6ceccac7450b3a.png', 'output_file': '/tmp/paperless/paperless-puffiusb/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-puffiusb/sidecar.txt', 'image_dpi': 72}
+[2026-07-08 22:55:53,340] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[DEBUG][paperless.parsing.tesseract] Using text from sidecar file
+[RESULT] archive_path='/tmp/paperless/paperless-puffiusb/archive.pdf'
+[RESULT] archive_path_is_file=True
+[RESULT] text='This is a test document.'
+[RESULT] text_len=24
+[DEBUG][paperless.parsing.tesseract] Deleting directory /tmp/paperless/paperless-puffiusb
+```
+
+This confirms that for the canonical `OCR_MODE=skip`, `construct_ocrmypdf_parameters` (`parsers.py:L135`) builds the call with `skip_text: True` (`parsers.py:L158`), an explicit `sidecar` path, and image pre-processing (`clean`, `deskew`, `rotate_pages`). Because OCRmyPDF actually ran and produced text, the pipeline logged `Using text from sidecar file` and produced an archive PDF — the same behavior the canonical upload produced.
 
 
 ---
 
-## Q2 — Already-has-text: skip entirely, or still touch the OCR pipeline?
+## Q2 — Already-has-text: does the system skip OCR, or still touch the pipeline?
 
-**Direct answer.** An image that "already contains text" does **not** skip OCR. For a raster image the has-text flag `original_has_text` is **hard-coded `False`** (`src/paperless_tesseract/parsers.py:L237`–`L239`), so `RasterisedDocumentParser.parse()` always proceeds to `ocrmypdf.ocr(...)` (`:L261`) and produces an archive. The **only** true full skip is a **text-layer PDF under the non-canonical `OCR_MODE="skip_noarchive"`**, which hits the early return `"Document has text, skipping OCRmyPDF entirely."` (`:L241`–`L244`). After processing you tell them apart by the **archive artifact**: an OCR run produces an archive PDF so `has_archive_version` is `True`; a true skip produces none so `has_archive_version` is `False`.
+**Direct answer.** It depends on the input type, and the deciding logic is in `RasterisedDocumentParser.parse()` (`src/paperless_tesseract/parsers.py:L234-L244`):
 
-### Q2.1 — The decisive branch and the 50-character gate
+- **A raster image "that already contains text" does NOT skip OCR.** For any non-PDF, the parser hard-codes `original_has_text = False` (`parsers.py:L239`). The `skip_noarchive` early-return gate (`parsers.py:L241`) can therefore never fire for an image, so OCRmyPDF/Tesseract is always invoked (`parsers.py:L261`). Visible text in the image is read *by OCR*, not by-passed.
+- **The one genuine skip is a text-layer PDF under `OCR_MODE=skip_noarchive`.** When the PDF already has a text layer longer than 50 characters (`parsers.py:L236`) *and* the mode is `skip_noarchive`, the parser logs `"Document has text, skipping OCRmyPDF entirely."` and returns before OCRmyPDF is ever called (`parsers.py:L241-L244`).
+- Under the **canonical** `OCR_MODE=skip`, even a text-layer PDF still enters OCRmyPDF (with `skip_text=True`, so OCRmyPDF copies text pages through and OCRs only image-only pages) and an archive PDF is still produced.
 
-`parse()` computes has-text differently for PDFs vs images:
-- **PDF branch** (`parsers.py:L234`–`L236`): `text_original = self.extract_text(None, document_path)`, then `original_has_text = text_original and len(text_original) > 50`.
-- **Image branch** (`parsers.py:L237`–`L239`): `text_original = None; original_has_text = False` — **unconditional**.
+**How you tell the difference afterward:** a genuine skip produces **no archive artifact** (`has_archive_version == False`, `archived_file_name == null`); anything that touched OCRmyPDF produces an archive PDF (`has_archive_version == True`).
 
-Probing all four relevant fixtures through the real `parser.extract_text` (`parsers.py:L99`):
+Source of the deciding logic:
 
+```text
+$ sed -n '234,244p' src/paperless_tesseract/parsers.py
+        if mime_type == "application/pdf":
+            text_original = self.extract_text(None, document_path)
+            original_has_text = text_original and len(text_original) > 50
+        else:
+            text_original = None
+            original_has_text = False
+
+        if settings.OCR_MODE == "skip_noarchive" and original_has_text:
+            self.log("debug", "Document has text, skipping OCRmyPDF entirely.")
+            self.text = text_original
+            return
 ```
-$ python3 /tmp/inv/scripts/has_text_probe.py <fixture> <mime>   # for each fixture
+
+### Q2.1 — The has-text branch, exercised on four fixtures (SUPPORTING probe using the real `extract_text`)
+
+`has_text_probe.py` (Appendix 5.1) replicates the exact branch of `parse()` using the real `extract_text` (`parsers.py:L99`), reporting `original_has_text` and the length that drives the `len > 50` gate:
+
+```text
+$ for fx in "simple.png:image/png" "simple-digital.pdf:application/pdf" \
+            "multi-page-digital.pdf:application/pdf" "multi-page-images.pdf:application/pdf"; do
+    PYTHONPATH=/app/src python3 /tmp/inv/scripts/has_text_probe.py \
+        /app/src/paperless_tesseract/tests/samples/${fx%%:*} ${fx##*:}
+  done
+
 fixture=simple.png mime=image/png
-  text_original_len=0  original_has_text=False  (len>50 gate)
+  text_original_len=0  original_has_text=False  [image branch: original_has_text hard-coded False (parsers.py:L239)]
   snippet=None
 
 fixture=simple-digital.pdf mime=application/pdf
-  text_original_len=24  original_has_text=False  (len>50 gate)
+  text_original_len=24  original_has_text=False  [PDF branch: len>50 gate (parsers.py:L236)]
   snippet='This is a test document.'
 
 fixture=multi-page-digital.pdf mime=application/pdf
-  text_original_len=118  original_has_text=True  (len>50 gate)
-  snippet='This is a multi page document. Page 1.  This is a multi page document.'
+  text_original_len=118  original_has_text=True  [PDF branch: len>50 gate (parsers.py:L236)]
+  snippet='This is a multi page document. Page 1.\n\nThis is a multi page document.'
 
 fixture=multi-page-images.pdf mime=application/pdf
-  text_original_len=0  original_has_text=False  (len>50 gate)
+  text_original_len=0  original_has_text=False  [PDF branch: len>50 gate (parsers.py:L236)]
   snippet=None
 ```
 
-This directly demonstrates the `len > 50` threshold (`parsers.py:L236`): the born-digital `simple-digital.pdf` has only 24 characters and therefore evaluates `original_has_text=False` (it would still be OCR'd), whereas `multi-page-digital.pdf` (118 chars) evaluates `True`. The image `simple.png` is `False` because the image branch forces it. So the true-skip demonstration below uses `multi-page-digital.pdf`.
+This exercises every distinct sub-case of the gate:
+- **Image** (`simple.png`): `original_has_text=False` unconditionally — the image path can never skip.
+- **Text-layer PDF, short** (`simple-digital.pdf`, 24 chars): `False` because `24` is **not** `> 50`. Even a PDF with text can fall on the OCR side of the gate if its text is short.
+- **Text-layer PDF, long** (`multi-page-digital.pdf`, 118 chars): `True` — the only fixture that can trigger the true skip.
+- **Image-only PDF** (`multi-page-images.pdf`, 0 chars): `False` — a PDF with no text layer always needs OCR.
 
-### Q2.2 — Sub-case C1: an image "with text" STILL runs OCR (canonical `OCR_MODE=skip`)
+### Q2.2 — Case 1: an image "with visible text" STILL runs OCR (canonical `skip`, `simple.png`, doc 5)
 
-`simple.png` visibly contains the text "This is a test document." but is a raster image, so `original_has_text=False`. Consumed through the real pipeline it runs OCR and produces an archive:
+`simple.png` visibly contains "This is a test document." Uploaded through the real API under canonical `skip`:
 
-```
-$ python3 /tmp/inv/scripts/q1_capture.py q2c1 .../samples/simple.png simple.png image/png
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+$ bash /tmp/inv/scripts/cap_scenario.sh q2c1 \
+      /app/src/paperless_tesseract/tests/samples/simple.png simple.png image/png
+
+############### Q2 C1: simple.png (image WITH visible text) STILL runs OCR ###############
+[BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.147s] {"filename": "simple.png", "task_id": "dabd8d0e-bfef-4563-8558-10df9f8e3cc6", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.152s] {"filename": "simple.png", "task_id": "dabd8d0e-bfef-4563-8558-10df9f8e3cc6", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 1.218s] {"filename": "simple.png", "task_id": "dabd8d0e-bfef-4563-8558-10df9f8e3cc6", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 1.883s] {"filename": "simple.png", "task_id": "dabd8d0e-bfef-4563-8558-10df9f8e3cc6", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 1.886s] {"filename": "simple.png", "task_id": "dabd8d0e-bfef-4563-8558-10df9f8e3cc6", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 1.948s] {"filename": "simple.png", "task_id": "dabd8d0e-bfef-4563-8558-10df9f8e3cc6", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 5}
 [UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
-[FRAME t+ 0.223s] {..., "current_progress": 20, "status": "WORKING", "message": "parsing_document", "document_id": null}
-[FRAME t+ 2.022s] {..., "current_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 17}
 
-$ python3 /tmp/inv/scripts/doc_info.py            # ORM inspection of the produced row
-id=17 mime_type=image/png
-  has_archive_version=True  archive_filename='0000017.pdf'
-  checksum=249d1239dc39449c856dcdfbb75850c5 archive_checksum=58b809cca6c0ed1f9c47bbaca870d4e4
+===== FRAME SUMMARY (q2c1) =====
+('0.147', 0, 'STARTING', 'new_file')
+('0.152', 20, 'WORKING', 'parsing_document')
+('1.218', 70, 'WORKING', 'generating_thumbnail')
+('1.883', 90, 'WORKING', 'parse_date')
+('1.886', 95, 'WORKING', 'save_document')
+('1.948', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 1.065s
+[DUR] total STARTING->terminal = 1.801s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 5
+[AFTER] doc content='This is a test document.' archived_file_name='2026-07-08 simple.pdf' original_file_name='2026-07-08 simple.png'
+
+===== WORKER LOG for q2c1 (qcluster.log lines 72-79, complete) =====
+22:56:40 [Q] INFO Process-1:4 processing [simple.png]
+[2026-07-08 22:56:40,994] [INFO] [paperless.consumer] Consuming simple.png
+[2026-07-08 22:56:41,427] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:56:42,790] [INFO] [paperless.consumer] Document 2026-07-08 simple consumption finished
+22:56:42 [Q] INFO Process-1:4 stopped doing work
+22:56:42 [Q] INFO Processed [simple.png]
+22:56:43 [Q] INFO recycled worker Process-1:4
+22:56:43 [Q] INFO Process-1:17 ready for work at 20280
+
+===== ORM inspection of produced row =====
+id=5 mime_type=image/png
+  has_archive_version=True  archive_filename='0000005.pdf'
+  checksum=249d1239dc39449c856dcdfbb75850c5 archive_checksum=5d8050d6e942b63b4ca0967b9b374550
   content='This is a test document.' (len=24)
 ```
 
-The `parsing_document` frame fires and `has_archive_version=True` — OCR ran; nothing was skipped. (This is consistent with the test `test_image_simple`, `src/paperless_tesseract/tests/test_parser.py:L216`–`L223`, which asserts `os.path.isfile(parser.archive_path)`.)
+**Evidence of "OCR was touched":** a `1.065s` active-OCR dwell (20→70), a `[tesseract]` line in the worker log, and — decisively — `has_archive_version=True` with `archive_filename='0000005.pdf'` and an `archive_checksum`. The image path produced an archive PDF; OCR was not skipped.
 
-### Q2.3 — Sub-case C2: a text-layer PDF is the TRUE skip (non-canonical `skip_noarchive`)
+### Q2.3 — Case 2: the genuine skip — text-layer PDF under `skip_noarchive` (docs 6, 7)
 
-**Non-canonical run:** the worker was restarted transiently with `PAPERLESS_OCR_MODE=skip_noarchive`. Consuming the text-layer `multi-page-digital.pdf`:
+To demonstrate the true skip, the worker is transiently restarted with the **non-canonical** `OCR_MODE=skip_noarchive`, and the long-text PDF `multi-page-digital.pdf` (118 chars, `original_has_text=True`) is uploaded through the real API. Run 1:
 
-```
+```text
 $ bash /tmp/inv/scripts/restart_qcluster.sh skip_noarchive
+=== Restart qcluster: skip_noarchive (NON-CANONICAL) ===
 qcluster restarted (OCR_MODE=skip_noarchive)
-21:32:40 [Q] INFO Q Cluster romeo-sad-bravo-delaware running.
+22:57:01 [Q] INFO Q Cluster aspen-beer-king-rugby running.
 
-$ python3 /tmp/inv/scripts/q1_capture.py q2c2 .../samples/multi-page-digital.pdf multi-page-digital.pdf application/pdf
+$ bash /tmp/inv/scripts/cap_scenario.sh q2c2run1 \
+      /app/src/paperless_tesseract/tests/samples/multi-page-digital.pdf multi-page-digital.pdf application/pdf
+
+############### Q2 C2 RUN 1: multi-page-digital.pdf TRUE SKIP (skip_noarchive) ###############
+[BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.145s] {"filename": "multi-page-digital.pdf", "task_id": "0de8d808-2483-4fea-a430-8a330f3edd90", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.152s] {"filename": "multi-page-digital.pdf", "task_id": "0de8d808-2483-4fea-a430-8a330f3edd90", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 0.184s] {"filename": "multi-page-digital.pdf", "task_id": "0de8d808-2483-4fea-a430-8a330f3edd90", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 1.776s] {"filename": "multi-page-digital.pdf", "task_id": "0de8d808-2483-4fea-a430-8a330f3edd90", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 1.779s] {"filename": "multi-page-digital.pdf", "task_id": "0de8d808-2483-4fea-a430-8a330f3edd90", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 1.828s] {"filename": "multi-page-digital.pdf", "task_id": "0de8d808-2483-4fea-a430-8a330f3edd90", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 6}
 [UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
-[FRAME t+ 0.151s] {..., "current_progress": 20, "status": "WORKING", "message": "parsing_document", "document_id": null}
-[FRAME t+ 0.181s] {..., "current_progress": 70, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
-[FRAME t+ 1.825s] {..., "current_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 18}
-[DUR] parse/OCR phase (20->70) duration = 0.030s
 
-$ python3 /tmp/inv/scripts/doc_info.py
-id=18 mime_type=application/pdf
+===== FRAME SUMMARY (q2c2run1) =====
+('0.145', 0, 'STARTING', 'new_file')
+('0.152', 20, 'WORKING', 'parsing_document')
+('0.184', 70, 'WORKING', 'generating_thumbnail')
+('1.776', 90, 'WORKING', 'parse_date')
+('1.779', 95, 'WORKING', 'save_document')
+('1.828', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 0.032s
+[DUR] total STARTING->terminal = 1.683s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 6
+[AFTER] doc content='This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.' archived_file_name=None original_file_name='2026-07-08 multi-page-digital.pdf'
+
+===== WORKER LOG for q2c2run1 (qcluster.log lines 98-104, complete) =====
+22:57:11 [Q] INFO Process-1:1 processing [multi-page-digital.pdf]
+[2026-07-08 22:57:11,685] [INFO] [paperless.consumer] Consuming multi-page-digital.pdf
+[2026-07-08 22:57:13,364] [INFO] [paperless.consumer] Document 2026-07-08 multi-page-digital consumption finished
+22:57:13 [Q] INFO Process-1:1 stopped doing work
+22:57:13 [Q] INFO Processed [multi-page-digital.pdf]
+22:57:13 [Q] INFO recycled worker Process-1:1
+22:57:13 [Q] INFO Process-1:14 ready for work at 21011
+
+===== ORM inspection (run 1) =====
+id=6 mime_type=application/pdf
   has_archive_version=False  archive_filename=None
   checksum=9c9691e51741c1f4f41a20896af31770 archive_checksum=None
   content='This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.' (len=118)
 ```
 
-The parse phase collapses to **0.030 s** (vs ~1.06 s when OCR runs) and **no archive** is produced (`has_archive_version=False`, `archive_filename=None`). The content is the original text layer. Supporting (non-canonical) direct parse captures the explicit skip log line:
+Run 2 (stability, identical input):
 
+```text
+$ bash /tmp/inv/scripts/cap_scenario.sh q2c2run2 \
+      /app/src/paperless_tesseract/tests/samples/multi-page-digital.pdf multi-page-digital.pdf application/pdf
+
+############### Q2 C2 RUN 2: multi-page-digital.pdf TRUE SKIP (stability) ###############
+[BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.143s] {"filename": "multi-page-digital.pdf", "task_id": "6a95f82b-3b53-43b9-a534-8a83db498c7d", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.149s] {"filename": "multi-page-digital.pdf", "task_id": "6a95f82b-3b53-43b9-a534-8a83db498c7d", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 0.179s] {"filename": "multi-page-digital.pdf", "task_id": "6a95f82b-3b53-43b9-a534-8a83db498c7d", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 1.768s] {"filename": "multi-page-digital.pdf", "task_id": "6a95f82b-3b53-43b9-a534-8a83db498c7d", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 1.771s] {"filename": "multi-page-digital.pdf", "task_id": "6a95f82b-3b53-43b9-a534-8a83db498c7d", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 1.818s] {"filename": "multi-page-digital.pdf", "task_id": "6a95f82b-3b53-43b9-a534-8a83db498c7d", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 7}
+[UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
+
+===== FRAME SUMMARY (q2c2run2) =====
+('0.143', 0, 'STARTING', 'new_file')
+('0.149', 20, 'WORKING', 'parsing_document')
+('0.179', 70, 'WORKING', 'generating_thumbnail')
+('1.768', 90, 'WORKING', 'parse_date')
+('1.771', 95, 'WORKING', 'save_document')
+('1.818', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 0.030s
+[DUR] total STARTING->terminal = 1.675s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 7
+[AFTER] doc content='This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.' archived_file_name=None original_file_name='2026-07-08 multi-page-digital.pdf'
+
+===== WORKER LOG for q2c2run2 (qcluster.log lines 105-111, complete) =====
+22:57:28 [Q] INFO Process-1:2 processing [multi-page-digital.pdf]
+[2026-07-08 22:57:28,463] [INFO] [paperless.consumer] Consuming multi-page-digital.pdf
+[2026-07-08 22:57:30,133] [INFO] [paperless.consumer] Document 2026-07-08 multi-page-digital consumption finished
+22:57:30 [Q] INFO Process-1:2 stopped doing work
+22:57:30 [Q] INFO Processed [multi-page-digital.pdf]
+22:57:30 [Q] INFO recycled worker Process-1:2
+22:57:30 [Q] INFO Process-1:15 ready for work at 21056
+
+===== ORM inspection (run 2) =====
+id=7 mime_type=application/pdf
+  has_archive_version=False  archive_filename=None
+  checksum=9c9691e51741c1f4f41a20896af31770 archive_checksum=None
+  content='This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.' (len=118)
 ```
-$ PAPERLESS_OCR_MODE=skip_noarchive python3 /tmp/inv/scripts/direct_parse.py .../samples/multi-page-digital.pdf application/pdf
-[CFG] OCR_MODE=skip_noarchive fixture=.../multi-page-digital.pdf mime=application/pdf
-[DEBUG][paperless.parsing.tesseract] Extracted text from PDF file .../multi-page-digital.pdf
+
+**This is the genuine skip.** The tells, both stable across runs:
+- The active-OCR dwell (20→70) collapsed to **`0.032s` / `0.030s`** — two orders of magnitude below the ~1.06s OCR dwell in Q2.2 — because OCRmyPDF was never called.
+- **No archive PDF:** `has_archive_version=False`, `archive_filename=None`, `archive_checksum=None`.
+- **No `[tesseract]` line** in the worker log at all.
+- `content` is the PDF's own text layer (extracted by pdfminer.six), not OCR output.
+
+Supporting probe confirming the early-return branch fired (NON-CANONICAL, in-process):
+
+```text
+$ PYTHONPATH=/app/src PAPERLESS_OCR_MODE=skip_noarchive python3 /tmp/inv/scripts/direct_parse.py \
+      /app/src/paperless_tesseract/tests/samples/multi-page-digital.pdf application/pdf
+[CFG] OCR_MODE=skip_noarchive fixture=/app/src/paperless_tesseract/tests/samples/multi-page-digital.pdf mime=application/pdf
+[DEBUG][paperless.parsing.tesseract] Extracted text from PDF file /tmp/paperless/dp-de88327127dd4487ba5b08c8cee0c1f0.pdf
 [DEBUG][paperless.parsing.tesseract] Document has text, skipping OCRmyPDF entirely.
 [RESULT] archive_path=None
 [RESULT] archive_path_is_file=False
 [RESULT] text='This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.'
 [RESULT] text_len=118
+[DEBUG][paperless.parsing.tesseract] Deleting directory /tmp/paperless/paperless-8tqibvlg
 ```
 
-`"Document has text, skipping OCRmyPDF entirely."` is logged at `src/paperless_tesseract/parsers.py:L242`, followed by `self.text = text_original; return` (`:L243`–`:L244`) — the only genuine full skip. (Consistent with `test_skip_noarchive_withtext`, `test_parser.py:L357`, asserting `assertIsNone(parser.archive_path)`.)
+The line `Document has text, skipping OCRmyPDF entirely.` is exactly the `parsers.py:L242` log, and `archive_path=None` confirms the early return at `parsers.py:L244` before any OCRmyPDF call.
 
-### Q2.4 — Contrast: skip depends on the text layer, not the mode
+### Q2.4 — Contrast: an image-only PDF under the SAME `skip_noarchive` mode STILL runs OCR (docs 8, 9)
 
-Under the **same** `skip_noarchive` mode, an image-PDF with **no** text layer (`multi-page-images.pdf`) still runs OCR and still produces an archive:
+To prove the skip is gated on *having text*, not merely on the mode, `multi-page-images.pdf` (no text layer, `original_has_text=False`) was uploaded under the **same** `skip_noarchive` mode. Run 1 and run 2:
 
-```
-$ python3 /tmp/inv/scripts/q1_capture.py q2contrast .../samples/multi-page-images.pdf multi-page-images.pdf application/pdf
-[FRAME t+ 0.152s] {..., "current_progress": 20, "status": "WORKING", "message": "parsing_document", ...}
-[FRAME t+ 2.403s] {..., "current_progress": 70, "status": "WORKING", "message": "generating_thumbnail", ...}
-[FRAME t+ 4.031s] {..., "current_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 19}
-[DUR] parse/OCR phase (20->70) duration = 2.251s
+```text
+$ bash /tmp/inv/scripts/cap_scenario.sh q2contrast_run1 \
+      /app/src/paperless_tesseract/tests/samples/multi-page-images.pdf multi-page-images.pdf application/pdf
 
-$ python3 /tmp/inv/scripts/doc_info.py
-id=19 mime_type=application/pdf
-  has_archive_version=True  archive_filename='0000019.pdf'
-  checksum=62acb0bcbfbcaa62ca6ad3668e4e404b archive_checksum=8a9e7137da56657b2408103c7a83c0df
+############### Q2 CONTRAST RUN 1: multi-page-images.pdf (no text layer) under skip_noarchive -> OCR STILL RUNS ###############
+[BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.155s] {"filename": "multi-page-images.pdf", "task_id": "bffc637e-847c-4df8-a278-b7616c30d090", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.161s] {"filename": "multi-page-images.pdf", "task_id": "bffc637e-847c-4df8-a278-b7616c30d090", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 2.380s] {"filename": "multi-page-images.pdf", "task_id": "bffc637e-847c-4df8-a278-b7616c30d090", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 4.005s] {"filename": "multi-page-images.pdf", "task_id": "bffc637e-847c-4df8-a278-b7616c30d090", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 4.008s] {"filename": "multi-page-images.pdf", "task_id": "bffc637e-847c-4df8-a278-b7616c30d090", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 4.076s] {"filename": "multi-page-images.pdf", "task_id": "bffc637e-847c-4df8-a278-b7616c30d090", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 8}
+[UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
+
+===== FRAME SUMMARY (q2contrast_run1) =====
+('0.155', 0, 'STARTING', 'new_file')
+('0.161', 20, 'WORKING', 'parsing_document')
+('2.380', 70, 'WORKING', 'generating_thumbnail')
+('4.005', 90, 'WORKING', 'parse_date')
+('4.008', 95, 'WORKING', 'save_document')
+('4.076', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 2.219s
+[DUR] total STARTING->terminal = 3.921s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 8
+[AFTER] doc content='This is a multi page document. Page 1.\nThis is a multi page document. Page 2.\nThis is a multi page document. Page 3.' archived_file_name='2026-07-08 multi-page-images.pdf' original_file_name='2026-07-08 multi-page-images.pdf'
+
+===== WORKER LOG for q2contrast_run1 (qcluster.log lines 112-121, complete) =====
+22:57:45 [Q] INFO Process-1:3 processing [multi-page-images.pdf]
+[2026-07-08 22:57:45,990] [INFO] [paperless.consumer] Consuming multi-page-images.pdf
+[2026-07-08 22:57:46,563] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:57:46,567] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:57:46,571] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:57:49,906] [INFO] [paperless.consumer] Document 2026-07-08 multi-page-images consumption finished
+22:57:49 [Q] INFO Process-1:3 stopped doing work
+22:57:49 [Q] INFO Processed [multi-page-images.pdf]
+22:57:50 [Q] INFO recycled worker Process-1:3
+22:57:50 [Q] INFO Process-1:16 ready for work at 21143
+
+===== ORM inspection (contrast run 1) =====
+id=8 mime_type=application/pdf
+  has_archive_version=True  archive_filename='0000008.pdf'
+  checksum=62acb0bcbfbcaa62ca6ad3668e4e404b archive_checksum=f23fd7d1078e0dbd7eb6bb7f2a3278af
+  content='This is a multi page document. Page 1.\nThis is a multi page document. Page 2.\nThis is a multi page document. Page 3.' (len=116)
+
+############### Q2 CONTRAST RUN 2: multi-page-images.pdf (no text layer) under skip_noarchive -> OCR STILL RUNS ###############
+[BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.150s] {"filename": "multi-page-images.pdf", "task_id": "5f34aeaa-5c36-4da9-8a96-e691a736a3eb", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.156s] {"filename": "multi-page-images.pdf", "task_id": "5f34aeaa-5c36-4da9-8a96-e691a736a3eb", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 2.364s] {"filename": "multi-page-images.pdf", "task_id": "5f34aeaa-5c36-4da9-8a96-e691a736a3eb", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 3.936s] {"filename": "multi-page-images.pdf", "task_id": "5f34aeaa-5c36-4da9-8a96-e691a736a3eb", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 3.939s] {"filename": "multi-page-images.pdf", "task_id": "5f34aeaa-5c36-4da9-8a96-e691a736a3eb", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 3.989s] {"filename": "multi-page-images.pdf", "task_id": "5f34aeaa-5c36-4da9-8a96-e691a736a3eb", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 9}
+[UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
+
+===== FRAME SUMMARY (q2contrast_run2) =====
+('0.150', 0, 'STARTING', 'new_file')
+('0.156', 20, 'WORKING', 'parsing_document')
+('2.364', 70, 'WORKING', 'generating_thumbnail')
+('3.936', 90, 'WORKING', 'parse_date')
+('3.939', 95, 'WORKING', 'save_document')
+('3.989', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 2.207s
+[DUR] total STARTING->terminal = 3.839s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 9
+[AFTER] doc content='This is a multi page document. Page 1.\nThis is a multi page document. Page 2.\nThis is a multi page document. Page 3.' archived_file_name='2026-07-08 multi-page-images.pdf' original_file_name='2026-07-08 multi-page-images.pdf'
+
+===== WORKER LOG for q2contrast_run2 (qcluster.log lines 122-131, complete) =====
+22:57:55 [Q] INFO Process-1:4 processing [multi-page-images.pdf]
+[2026-07-08 22:57:55,492] [INFO] [paperless.consumer] Consuming multi-page-images.pdf
+[2026-07-08 22:57:56,060] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:57:56,065] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:57:56,066] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:57:59,325] [INFO] [paperless.consumer] Document 2026-07-08 multi-page-images consumption finished
+22:57:59 [Q] INFO Process-1:4 stopped doing work
+22:57:59 [Q] INFO Processed [multi-page-images.pdf]
+22:57:59 [Q] INFO recycled worker Process-1:4
+22:57:59 [Q] INFO Process-1:17 ready for work at 21222
+
+===== ORM inspection (contrast run 2) =====
+id=9 mime_type=application/pdf
+  has_archive_version=True  archive_filename='0000009.pdf'
+  checksum=62acb0bcbfbcaa62ca6ad3668e4e404b archive_checksum=426f9c037c8a09d0bf9246f6edd7dcf1
   content='This is a multi page document. Page 1.\nThis is a multi page document. Page 2.\nThis is a multi page document. Page 3.' (len=116)
 ```
 
-Parse phase 2.251 s (OCR ran), `has_archive_version=True`. So *within the same mode* the outcome flips purely on `original_has_text`. (Consistent with `test_skip_noarchive_notext`, `test_parser.py:L370`.) The worker was then restored to canonical `skip`.
+**Contrast verdict.** Same mode (`skip_noarchive`), opposite outcome: because the image-only PDF has no text layer, the skip gate does not fire, OCRmyPDF runs (three `[tesseract]` lines, one per page), the OCR dwell is a large **`2.219s` / `2.207s`** (stable), and an archive PDF is produced (`has_archive_version=True`). Note the **`checksum` is stable** (`62acb0bc…`, the fixture bytes are unchanged for a PDF) but the **`archive_checksum` differs run-to-run** (`f23fd7d1…` vs `426f9c03…`) — the generated PDF/A embeds a creation timestamp, so its bytes are not reproducible. This is expected and reported as observed; it does not affect `content` or `has_archive_version`.
 
-### Q2.5 — How to tell them apart after processing
+### Q2.5 — How OCR-generated vs pre-existing text is distinguished *internally*: the sidecar markers
 
-**External tell (via API/ORM):** whether an archive PDF was produced. An OCR run sets `Document.archive_filename`, so the `has_archive_version` property (`return self.archive_filename is not None`, `src/documents/models.py:L238`–`L239`) is `True`; a true skip leaves it `None` → `False`. Demonstrated above: doc 18 (true skip) `False` vs docs 17/19 (OCR) `True`.
+Internally, paperless tells OCR-generated text apart from pre-existing text via the OCRmyPDF sidecar. `extract_text` (`parsers.py:L99`) discards the sidecar and falls back to pdfminer.six when the sidecar contains the marker `[OCR skipped on page` (the check is at `parsers.py:L104`). `sidecar_demo.py` (Appendix 5.1) runs OCRmyPDF on `multi-page-mixed.pdf` (pages 1–3 have text, pages 4–6 are images) under canonical `skip` and prints the exact sidecar bytes:
 
-**Internal tell (the sidecar markers):** OCRmyPDF writes only the text of pages it actually OCR'd to the sidecar; pages that already had text appear as an `[OCR skipped on page(s) …]` marker instead. paperless reads the sidecar in `extract_text()` and, if it contains the substring `"[OCR skipped on page"` (checked at `parsers.py:L104`), **discards** the sidecar and falls back to pdfminer.six. The exact sidecar bytes from `multi-page-mixed.pdf` (a mixed text+image PDF, canonical `skip`):
+```text
+$ bash /tmp/inv/scripts/restart_qcluster.sh skip
+=== Restore canonical skip mode ===
+qcluster restarted (OCR_MODE=skip)
+22:58:31 [Q] INFO Q Cluster delta-beryllium-carpet-may running.
 
-```
-$ python3 /tmp/inv/scripts/sidecar_demo.py .../samples/multi-page-mixed.pdf
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/sidecar_demo.py \
+      /app/src/paperless_tesseract/tests/samples/multi-page-mixed.pdf
+
+############### Q2.5 sidecar_demo: multi-page-mixed.pdf (canonical skip) ###############
 OCR_MODE=skip  skip_text=True
+[2026-07-08 22:58:39,954] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:58:39,955] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 22:58:39,960] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
 === sidecar.txt (exact bytes) ===
 'This is a multi page document. Page 1.\n\x0cThis is a multi page document. Page 2.\n\x0cThis is a multi page document. Page 3.\n\x0c[OCR skipped on page(s) 4-6]'
 === contains substring "[OCR skipped on page" (parsers.py:L104 check) ? === True
 extract_text() result (first 160 chars) = 'This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.\n\nThis is a multi page document. Page 4.\n\n'
 ```
 
-The marker's exact form is `[OCR skipped on page(s) 4-6]` (matching `test_multi_page_mixed`, `test_parser.py:L398`), and the code's substring check `"[OCR skipped on page"` matches it. The `\x0c` bytes are form-feed page separators; because the marker is present, `extract_text()` discards the sidecar and returns the full pdfminer text (including pages 4–6).
+The sidecar's literal `[OCR skipped on page(s) 4-6]` marker is what OCRmyPDF writes for pages it did **not** OCR (i.e. pages that already had text). Because the marker is present, `extract_text` discards the sidecar and re-extracts the full text from the produced PDF via pdfminer.six — which is why the `extract_text()` result contains all pages (including page 4) rather than the sidecar's truncated content. This is the internal provenance tell; the external tell (for Q3) is `archived_file_name`/`has_archive_version`.
 
 
 ---
 
-## Q3 — Comparing the final API responses: which fields show OCR-generated vs. existing text?
+## Q3 — Comparing the final API responses: which fields show OCR-generated vs existing text
 
-**Direct answer.** The **`content`** field carries the extracted text in **every** case, regardless of whether it came from OCR or from a pre-existing text layer. **No `DocumentSerializer` field distinguishes "OCR-generated" from "existing" text.** The only provenance-adjacent field is `archived_file_name` (backed by `has_archive_version`), and even that only signals *"an archive PDF was produced"* — which, under the canonical `skip` mode, is `True` for **both** an OCR'd image and a text-layer PDF. It becomes `null` only in the true-skip (`skip_noarchive`) case.
+**Direct answer.** In the `GET /api/documents/{id}/` response (`DocumentSerializer`, `src/documents/serialisers.py:L201`), **the extracted text always lives in a single field, `content` (`serialisers.py:L227`), regardless of whether it came from OCR or from a pre-existing text layer.** There is **no field that separately labels "OCR text" versus "existing text."** The only field that indirectly reveals provenance is `archived_file_name` (`serialisers.py:L208`, computed by `get_archived_file_name`, `serialisers.py:L213-L217`): it is a filename when an archive PDF was produced (OCRmyPDF ran) and `null` when it was not (genuine skip). `original_file_name` (`serialisers.py:L207`, `get_original_file_name`, `serialisers.py:L210-L211`) is always present.
 
-### Q3.1 — Side-by-side responses (canonical `skip`)
+### Q3.1 — Side-by-side full JSON for both canonical cases (docs 10, 11)
 
-`GET /api/documents/{id}/` for the OCR'd image (doc 20, `simple.png`) and the text-layer PDF (doc 21, `multi-page-digital.pdf`):
+Under canonical `skip`, `q3_compare.py` (Appendix 5.1) uploads the OCR'd image (`simple.png`) and the text-layer PDF (`multi-page-digital.pdf`) through the real API, then GETs each and prints the complete JSON:
 
-```
-$ python3 /tmp/inv/scripts/q3_compare.py
-created ids: [20, 21]
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/q3_compare.py
 
-===== GET /api/documents/20/ (HTTP 200) — full JSON =====
+############### Q3.1 side-by-side API responses (canonical skip) ###############
+created ids: [10, 11]
+
+===== GET /api/documents/10/ (HTTP 200) - full JSON =====
 {
-  "id": 20,
+  "id": 10,
   "correspondent": null,
   "document_type": null,
   "title": "simple",
   "content": "This is a test document.",
   "tags": [],
-  "created": "2026-07-08T21:34:08Z",
-  "modified": "2026-07-08T21:34:10.694374Z",
-  "added": "2026-07-08T21:34:10.674933Z",
+  "created": "2026-07-08T22:59:15Z",
+  "modified": "2026-07-08T22:59:17.097406Z",
+  "added": "2026-07-08T22:59:17.079166Z",
   "archive_serial_number": null,
   "original_file_name": "2026-07-08 simple.png",
   "archived_file_name": "2026-07-08 simple.pdf"
 }
 
-===== GET /api/documents/21/ (HTTP 200) — full JSON =====
+===== GET /api/documents/11/ (HTTP 200) - full JSON =====
 {
-  "id": 21,
+  "id": 11,
   "correspondent": null,
   "document_type": null,
   "title": "multi-page-digital",
   "content": "This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.",
   "tags": [],
-  "created": "2026-07-08T21:34:10Z",
-  "modified": "2026-07-08T21:34:12.936234Z",
-  "added": "2026-07-08T21:34:12.875795Z",
+  "created": "2026-07-08T22:59:17Z",
+  "modified": "2026-07-08T22:59:19.365417Z",
+  "added": "2026-07-08T22:59:19.346168Z",
   "archive_serial_number": null,
   "original_file_name": "2026-07-08 multi-page-digital.pdf",
   "archived_file_name": "2026-07-08 multi-page-digital.pdf"
@@ -410,212 +781,354 @@ created ids: [20, 21]
 
 ===== FIELD DIFF (the three provenance-relevant fields) =====
   content:
-    doc 20: 'This is a test document.'
-    doc 21: 'This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.'
+    doc 10: 'This is a test document.'
+    doc 11: 'This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.'
   archived_file_name:
-    doc 20: '2026-07-08 simple.pdf'
-    doc 21: '2026-07-08 multi-page-digital.pdf'
+    doc 10: '2026-07-08 simple.pdf'
+    doc 11: '2026-07-08 multi-page-digital.pdf'
   original_file_name:
-    doc 20: '2026-07-08 simple.png'
-    doc 21: '2026-07-08 multi-page-digital.pdf'
+    doc 10: '2026-07-08 simple.png'
+    doc 11: '2026-07-08 multi-page-digital.pdf'
 ```
 
-### Q3.2 — The three provenance-relevant fields, by getter
+**Reading the comparison.**
+- **`content` carries the text in both cases, indistinguishably by provenance.** Doc 10's `content` is *OCR output* (Tesseract read `simple.png`'s pixels); doc 11's `content` is *pre-existing text* (the PDF's own text layer). Nothing in the field or its value announces which is which.
+- **Both have a non-null `archived_file_name`** under canonical `skip` — even the text-layer PDF, because `skip` (not `skip_noarchive`) still runs OCRmyPDF and produces an archive PDF. So under canonical settings, `archived_file_name` does **not** separate the two; it separates "OCRmyPDF ran" from "genuine skip," which requires the `skip_noarchive` variant (Q3.3) to observe.
 
-All in `src/documents/serialisers.py` (`DocumentSerializer`, `:L201`; `Meta.fields` at `:L222`–`L235`):
+### Q3.2 — Which serializer field is produced by which getter
 
-| Field | Source | Behavior | Anchor |
-|---|---|---|---|
-| `content` | model `TextField` | The extracted text, **regardless of origin** — OCR text and pre-existing text land in the same field. | field listed at `serialisers.py:L227`; model `content` at `models.py:L117` |
-| `original_file_name` | `SerializerMethodField` → `obj.get_public_filename()` | **Always present.** | decl `:L207`; getter `get_original_file_name` `:L210`–`L211` |
-| `archived_file_name` | `SerializerMethodField` → `obj.get_public_filename(archive=True)` | Only when `obj.has_archive_version` is `True`, else `None`. | decl `:L208`; getter `get_archived_file_name` `:L213`–`L217` |
+| API field | Serializer source | What it reflects |
+|-----------|-------------------|------------------|
+| `content` | model field, listed in `Meta.fields` at `serialisers.py:L227` | The extracted text — OCR **or** pre-existing, undifferentiated |
+| `original_file_name` | `get_original_file_name` → `obj.get_public_filename()` (`serialisers.py:L210-L211`) | Always the original upload's public filename |
+| `archived_file_name` | `get_archived_file_name` (`serialisers.py:L213-L217`); returns the archive filename iff `obj.has_archive_version`, else `null` | Presence ⇒ an archive PDF exists ⇒ OCRmyPDF ran; `null` ⇒ genuine skip |
 
-`get_public_filename` is defined at `src/documents/models.py:L252`; `has_archive_version` at `:L238`–`L239`.
+### Q3.3 — The variant that makes `archived_file_name` reveal a genuine skip (docs 12, 13)
 
-### Q3.3 — Why `archived_file_name` does not equal "was OCR'd"
+Re-running the text-layer PDF under **non-canonical** `skip_noarchive` (the true-skip mode) makes `archived_file_name` go `null`. Two runs for stability:
 
-Doc 20 (OCR'd image) and doc 21 (text-layer PDF) **both** have `archived_file_name` set — because under canonical `skip` paperless still runs OCRmyPDF over the text-layer PDF (`skip_text=True` copies text pages through and produces a normalized PDF/A archive). So the field cannot separate OCR-generated from pre-existing text. Only the true-skip variant drops the archive. Consuming the same `multi-page-digital.pdf` under the **non-canonical** `skip_noarchive`:
-
-```
+```text
 $ bash /tmp/inv/scripts/restart_qcluster.sh skip_noarchive
-$ python3 /tmp/inv/scripts/q1_capture.py q3variant .../samples/multi-page-digital.pdf multi-page-digital.pdf application/pdf
-[FRAME t+ 1.851s] {..., "current_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 22}
+=== Restart qcluster: skip_noarchive (NON-CANONICAL) for Q3 true-skip variant ===
+qcluster restarted (OCR_MODE=skip_noarchive)
+22:59:41 [Q] INFO Q Cluster artist-victor-twelve-cola running.
 
-$ # GET full JSON for the true-skip doc (authenticated)
-GET /api/documents/22/ (HTTP 200) — full JSON:
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/get_doc_json.py \
+      /app/src/paperless_tesseract/tests/samples/multi-page-digital.pdf multi-page-digital.pdf application/pdf
+
+############### Q3 TRUE-SKIP VARIANT RUN 1: multi-page-digital.pdf (skip_noarchive) ###############
+===== GET /api/documents/12/ (HTTP 200) - full JSON =====
 {
-  "id": 22,
+  "id": 12,
   "correspondent": null,
   "document_type": null,
   "title": "multi-page-digital",
   "content": "This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.",
   "tags": [],
-  "created": "2026-07-08T21:34:42Z",
-  "modified": "2026-07-08T21:34:44.812344Z",
-  "added": "2026-07-08T21:34:44.795122Z",
+  "created": "2026-07-08T22:59:50Z",
+  "modified": "2026-07-08T22:59:52.555672Z",
+  "added": "2026-07-08T22:59:52.536792Z",
+  "archive_serial_number": null,
+  "original_file_name": "2026-07-08 multi-page-digital.pdf",
+  "archived_file_name": null
+}
+
+############### Q3 TRUE-SKIP VARIANT RUN 2: multi-page-digital.pdf (skip_noarchive) ###############
+===== GET /api/documents/13/ (HTTP 200) - full JSON =====
+{
+  "id": 13,
+  "correspondent": null,
+  "document_type": null,
+  "title": "multi-page-digital",
+  "content": "This is a multi page document. Page 1.\n\nThis is a multi page document. Page 2.\n\nThis is a multi page document. Page 3.",
+  "tags": [],
+  "created": "2026-07-08T22:59:54Z",
+  "modified": "2026-07-08T22:59:56.405335Z",
+  "added": "2026-07-08T22:59:56.362002Z",
   "archive_serial_number": null,
   "original_file_name": "2026-07-08 multi-page-digital.pdf",
   "archived_file_name": null
 }
 ```
 
-Three-way summary:
+**Stable across both runs:** `content` is unchanged (the same text-layer text), but `archived_file_name` is now `null` — the API surface of the genuine skip. This is the field to compare when you want the response to reveal that OCR was truly skipped.
 
-| Doc | Input / mode | `content` | `archived_file_name` |
-|---|---|---|---|
-| 20 | `simple.png` / `skip` (OCR) | `'This is a test document.'` (OCR-generated) | `'2026-07-08 simple.pdf'` |
-| 21 | `multi-page-digital.pdf` / `skip` (text layer, still archived) | 3-page text (pre-existing) | `'2026-07-08 multi-page-digital.pdf'` |
-| 22 | `multi-page-digital.pdf` / `skip_noarchive` (true skip) | 3-page text (pre-existing) | `null` |
+### Q3.4 — Three-way summary of the provenance-relevant fields
 
-**Conclusion.** `content` is populated in all three; provenance (OCR vs. existing) is **not serialized** anywhere. It is only inferable *internally* from the sidecar `[OCR skipped on page …]` markers (`parsers.py:L104`), never from the API. (A minor incidental difference: pdfminer text-layer extraction yields `\n\n` page separators while the OCR sidecar path yields `\n` — visible between docs 21 and 19 — but this is a formatting artifact, not a reliable provenance signal.)
+| Case | `content` origin | `content` present? | `archived_file_name` | `has_archive_version` |
+|------|------------------|--------------------|-----------------------|-----------------------|
+| Image, OCR ran (doc 10, `skip`) | **OCR (Tesseract)** | yes | `2026-07-08 simple.pdf` | `True` |
+| Text-layer PDF, `skip` (doc 11) | pre-existing text layer | yes | `2026-07-08 multi-page-digital.pdf` | `True` |
+| Text-layer PDF, `skip_noarchive` (docs 12/13) | pre-existing text layer | yes | `null` | `False` |
+
+The dimension the question asks about — "which fields show OCR-generated text vs existing text" — resolves to: **`content` shows both, without distinction; only the archive-related fields (`archived_file_name`/`has_archive_version`) betray whether the OCR engine ran, and even then only when the mode is `skip_noarchive`.**
 
 
 ---
 
-## Q4 — Weak/incomplete OCR: final state, "fully processed" semantics, and saved metadata
+## Q4 — Weak/incomplete OCR: the terminal state and the saved metadata
 
-**Direct answer.** A weak/empty OCR result does **not** fail the document. The parser sets `self.text = ""` (with a warning), the `Document` **is** persisted, and the run still ends `SUCCESS @ 100%`. **"Fully processed" is not a stored flag** — the `Document` model has **no** `status`/`state`/`processed`/`progress` column; a persisted row *is* the processed state, and the per-run status exists only transiently on the WebSocket. This is the opposite of a genuine parser failure, which raises `ParseError`, ends `FAILED @ 100%`, and persists **no** row at all.
+**Direct answer.** When OCR produces weak or empty text, **the document is still fully persisted and the run still terminates with `SUCCESS @ 100%`** (`src/documents/consumer.py:L375`). The parser does not fail on empty text: when the sidecar/archive text is empty it raises `NoTextFoundException` (`parsers.py:L266-L267`), retries once with a safe `force_ocr` fallback (`parsers.py:L276-L306`), and — if still empty — falls through to the last-resort branch that sets `self.text = ""` after logging a warning (`parsers.py:L318-L327`). Crucially, **"fully processed" is not a stored attribute**: the `Document` model has **no status/state/processed column** (proven in Q4.3), so a persisted row *is* the processed state, and per-run status exists only transiently on the WebSocket. Only a **hard parser failure** raises `ParseError` (`parsers.py:L310`/`L314`) → `_fail` → the terminal `FAILED @ 100%` frame (`consumer.py:L79`) and **no row is persisted** (proven in Q4.4).
 
-### Q4.1 — The empty-OCR code path (with anchors)
+### Q4.1 — The empty-text code path
 
-Inside `RasterisedDocumentParser.parse()` (`src/paperless_tesseract/parsers.py`):
-1. Primary OCR: `ocrmypdf.ocr(**args)` (`:L261`), then `self.archive_path = archive_path` (`:L263`) is set **before** `self.text = self.extract_text(sidecar_file, archive_path)` (`:L264`); if the text is empty, `raise NoTextFoundException(...)` (`:L266`–`:L267`).
-2. Safe fallback: the `except (NoTextFoundException, InputFileError)` block (`:L276`) rebuilds args with `safe_fallback=True` (⇒ `force_ocr=True`, `:L155`–`:L156`) and re-runs `ocrmypdf.ocr` (`:L298`). It deliberately does **not** overwrite `self.archive_path` (comment at `:L300`–`:L301`: the force-OCR file is bigger/blurry) — so the **primary** `skip_text` archive is retained.
-3. Terminal empty case: `if not self.text:` (`:L318`) → for an image (no `original_has_text`) it logs `"No text was found in {document_path}, the content will be empty."` (`:L322`–`:L326`) and sets `self.text = ""` (`:L327`).
-4. Back in the consumer, `_store` (`consumer.py:L379`) persists the `Document` with `content=text` (`:L400`), then `SUCCESS @ 100` is emitted (`:L375`).
+The relevant source, verified:
 
-**Consequence of step 2**: a blank *image* keeps its primary archive, so `has_archive_version` is `True` even though `content` is empty (shown below). A blank/encrypted *PDF* that never produced an archive ends with `archive_path=None`.
+```text
+$ sed -n '266,267p;276,281p;296,310p;318,327p' src/paperless_tesseract/parsers.py
+            if not self.text:
+                raise NoTextFoundException("No text was found in the original document")
+        except (NoTextFoundException, InputFileError) as e:
+            self.log(
+                "warning",
+                f"Encountered an error while running OCR: {str(e)}. "
+                f"Attempting force OCR to get the text.",
+            )
+            try:
+                self.log("debug", f"Fallback: Calling OCRmyPDF with args: {args}")
+                ocrmypdf.ocr(**args)
 
-### Q4.2 — Empty OCR via the real pipeline (blank image `no-text-alpha.png`)
+                # Don't return the archived file here, since this file
+                # is bigger and blurry due to --force-ocr.
 
-Fixture: `src/paperless_tesseract/tests/samples/no-text-alpha.png` — the repo's canonical blank alpha-PNG (md5 `e8c17675174950020835add3f444f08c`, 32595 bytes). To honor the read-only rule, a **copy** was fed to the API (never the original, which `consume_file` unlinks on success). Complete unedited output of the real upload + authenticated WebSocket recorder:
+                self.text = self.extract_text(
+                    sidecar_file_fallback,
+                    archive_path_fallback,
+                )
 
+            except Exception as e:
+                # If this fails, we have a serious issue at hand.
+                raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+        if not self.text:
+            if original_has_text:
+                self.text = text_original
+            else:
+                self.log(
+                    "warning",
+                    f"No text was found in {document_path}, the content will "
+                    f"be empty.",
+                )
+                self.text = ""
 ```
-$ cp src/paperless_tesseract/tests/samples/no-text-alpha.png /tmp/inv/fixtures/no-text-alpha-canonical.png
-$ python3 /tmp/inv/scripts/q1_capture.py q4canonA /tmp/inv/fixtures/no-text-alpha-canonical.png no-text-alpha.png image/png
+
+So the empty-yield sequence is: primary OCR → empty → `NoTextFoundException` (L267) → caught (L276) → safe `force_ocr` fallback (L288-L306, `safe_fallback=True`) → still empty → last-resort branch sets `self.text = ""` (L327). No exception escapes `parse()`; the run proceeds to persist and succeed.
+
+### Q4.2 — Empty-OCR run through the real API (`no-text-alpha.png`, a blank image; docs 14, 15)
+
+`no-text-alpha.png` is a blank image with an alpha channel — OCR finds no text. Run 1 under canonical `skip`:
+
+```text
+$ bash /tmp/inv/scripts/restart_qcluster.sh skip
+=== Restore canonical skip mode for Q4 ===
+qcluster restarted (OCR_MODE=skip)
+23:00:11 [Q] INFO Q Cluster three-football-saturn-kansas running.
+
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+$ bash /tmp/inv/scripts/cap_scenario.sh q4run1 \
+      /app/src/paperless_tesseract/tests/samples/no-text-alpha.png no-text-alpha.png image/png
+
+############### Q4.2 RUN 1: no-text-alpha.png (blank image) EMPTY OCR ###############
 [BEFORE] document count = 0
 [WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.145s] {"filename": "no-text-alpha.png", "task_id": "05e15a22-8007-4619-81f9-7ebdaeb18531", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.152s] {"filename": "no-text-alpha.png", "task_id": "05e15a22-8007-4619-81f9-7ebdaeb18531", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 2.085s] {"filename": "no-text-alpha.png", "task_id": "05e15a22-8007-4619-81f9-7ebdaeb18531", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
+[FRAME t+ 9.648s] {"filename": "no-text-alpha.png", "task_id": "05e15a22-8007-4619-81f9-7ebdaeb18531", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
+[FRAME t+ 9.650s] {"filename": "no-text-alpha.png", "task_id": "05e15a22-8007-4619-81f9-7ebdaeb18531", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
+[FRAME t+ 9.697s] {"filename": "no-text-alpha.png", "task_id": "05e15a22-8007-4619-81f9-7ebdaeb18531", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 14}
 [UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
-[FRAME t+ 0.142s] {"filename": "no-text-alpha.png", "task_id": "fa552cba-66e8-43db-88cf-0c5c5f6db079", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
-[FRAME t+ 0.148s] {"filename": "no-text-alpha.png", "task_id": "fa552cba-66e8-43db-88cf-0c5c5f6db079", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
-[FRAME t+ 2.064s] {"filename": "no-text-alpha.png", "task_id": "fa552cba-66e8-43db-88cf-0c5c5f6db079", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
-[FRAME t+ 9.645s] {"filename": "no-text-alpha.png", "task_id": "fa552cba-66e8-43db-88cf-0c5c5f6db079", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}
-[FRAME t+ 9.647s] {"filename": "no-text-alpha.png", "task_id": "fa552cba-66e8-43db-88cf-0c5c5f6db079", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}
-[FRAME t+ 9.694s] {"filename": "no-text-alpha.png", "task_id": "fa552cba-66e8-43db-88cf-0c5c5f6db079", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 28}
 
-===== FRAME SUMMARY (q4canonA) =====
-('0.142', 0, 'STARTING', 'new_file')
-('0.148', 20, 'WORKING', 'parsing_document')
-('2.064', 70, 'WORKING', 'generating_thumbnail')
-('9.645', 90, 'WORKING', 'parse_date')
-('9.647', 95, 'WORKING', 'save_document')
-('9.694', 100, 'SUCCESS', 'finished')
-[DUR] STARTING@ t+0.14198684692382812
-[DUR] parsing_document(WORKING@20)@ t+0.1475837230682373
-[DUR] generating_thumbnail(WORKING@70)@ t+2.0639383792877197
-[DUR] terminal@ t+9.693799018859863
-[DUR] parse/OCR phase (20->70) duration = 1.916s
+===== FRAME SUMMARY (q4run1) =====
+('0.145', 0, 'STARTING', 'new_file')
+('0.152', 20, 'WORKING', 'parsing_document')
+('2.085', 70, 'WORKING', 'generating_thumbnail')
+('9.648', 90, 'WORKING', 'parse_date')
+('9.650', 95, 'WORKING', 'save_document')
+('9.697', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 1.933s
 [DUR] total STARTING->terminal = 9.552s
 [PERPAGE] per-page WORKING frames (message=null) progress values: []
-[AFTER] finished document_id = 28
+[AFTER] finished document_id = 14
 [AFTER] doc content='' archived_file_name='2026-07-08 no-text-alpha.pdf' original_file_name='2026-07-08 no-text-alpha.png'
 
-$ python3 /tmp/inv/scripts/doc_info.py 28          # AFTER (ORM)
-id=28 mime_type=image/png
-  has_archive_version=True  archive_filename='0000028.pdf'
-  checksum=a13999fabb65f07735dfcbbb001ddaa8 archive_checksum=718fabc5551649993faee8f267ff2836
+===== WORKER LOG for q4run1 (qcluster.log lines 215-234, complete) =====
+23:00:21 [Q] INFO Process-1:1 processing [no-text-alpha.png]
+[2026-07-08 23:00:21,145] [INFO] [paperless.consumer] Consuming no-text-alpha.png
+[2026-07-08 23:00:21,240] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/paperless/paperless-upload-9595sbkh: 'dpi'
+[2026-07-08 23:00:21,240] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /tmp/paperless/paperless-upload-9595sbkh for compatibility with img2pdf
+[2026-07-08 23:00:21,572] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 23:00:21,572] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning. Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 23:00:21,572] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 23:00:21,992] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 23:00:22,198] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+[2026-07-08 23:00:22,199] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/paperless/paperless-upload-9595sbkh: 'dpi'
+[2026-07-08 23:00:22,457] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 23:00:22,457] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning. Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 23:00:22,457] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
+[2026-07-08 23:00:22,876] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
+[2026-07-08 23:00:23,078] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/paperless/paperless-upload-9595sbkh, the content will be empty.
+[2026-07-08 23:00:30,693] [INFO] [paperless.consumer] Document 2026-07-08 no-text-alpha consumption finished
+23:00:30 [Q] INFO Process-1:1 stopped doing work
+23:00:30 [Q] INFO Processed [no-text-alpha.png]
+23:00:30 [Q] INFO recycled worker Process-1:1
+23:00:30 [Q] INFO Process-1:14 ready for work at 23822
+
+===== ORM inspection (run 1) =====
+id=14 mime_type=image/png
+  has_archive_version=True  archive_filename='0000014.pdf'
+  checksum=a13999fabb65f07735dfcbbb001ddaa8 archive_checksum=09ba7371ca56bbb3393b1ec2211e8fa0
   content='' (len=0)
 ```
 
-**Before/during/after:** *before* = no row (count 0); *during* = the `WORKING` frames (`document_id` is `null` throughout); *after* = a persisted row (id 28) with `content=''`, a `checksum`, and `has_archive_version=True`. The run terminates `SUCCESS @ 100`, **not** `FAILED`.
+The worker log walks the exact fallback path: primary OCR finds nothing → `Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.` (the `parsers.py:L277-L280` warning) → the force-OCR retry also finds nothing → the terminal empty-content warning `No text was found in <path>, the content will be empty.` (the `parsers.py:L322-L325` warning, shown verbatim with the real temp path in the worker-log block above) → **`consumption finished`** and the terminal **`SUCCESS`** frame. The persisted row exists (`id=14`) with `content=''` and, because the image path always produces an archive, `has_archive_version=True`.
 
-The parse phase (~1.92 s) is roughly **double** the ~1.06 s of `simple.png` because OCR runs **twice** (primary `skip_text`, then the force-OCR fallback). The worker log shows the alpha-layer normalization, both OCR passes, and the terminal empty-content warning:
+Run 2 (stability, identical input):
 
-```
-$ sed -n '316,334p' /tmp/inv/out/qcluster.log
-22:04:55 [Q] INFO Process-1:11 processing [no-text-alpha.png]
-[2026-07-08 22:04:55,801] [INFO] [paperless.consumer] Consuming no-text-alpha.png
-[2026-07-08 22:04:55,894] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/inv/scratch/paperless-upload-aenns2aj: 'dpi'
-[2026-07-08 22:04:55,895] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /tmp/inv/scratch/paperless-upload-aenns2aj for compatibility with img2pdf
-[2026-07-08 22:04:56,222] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
-[2026-07-08 22:04:56,222] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning. Invalid resolution 35 dpi. Using 70 instead.
-[2026-07-08 22:04:56,223] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-[2026-07-08 22:04:56,640] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
-[2026-07-08 22:04:56,841] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
-[2026-07-08 22:04:56,842] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/inv/scratch/paperless-upload-aenns2aj: 'dpi'
-[2026-07-08 22:04:57,095] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
-[2026-07-08 22:04:57,095] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning. Invalid resolution 35 dpi. Using 70 instead.
-[2026-07-08 22:04:57,095] [ERROR] [ocrmypdf._exec.tesseract] [tesseract] Error during processing.
-[2026-07-08 22:04:57,522] [WARNING] [ocrmypdf._exec.tesseract] [tesseract] Warning: Invalid resolution 35 dpi. Using 70 instead.
-[2026-07-08 22:04:57,716] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/inv/scratch/paperless-upload-aenns2aj, the content will be empty.
-[2026-07-08 22:05:05,349] [INFO] [paperless.consumer] Document 2026-07-08 no-text-alpha consumption finished
-22:05:05 [Q] INFO Process-1:11 stopped doing work
-22:05:05 [Q] INFO Processed [no-text-alpha.png]
-```
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+$ bash /tmp/inv/scripts/cap_scenario.sh q4run2 \
+      /app/src/paperless_tesseract/tests/samples/no-text-alpha.png no-text-alpha.png image/png
 
-The `"Encountered an error while running OCR: No text was found ... Attempting force OCR"` line is the `NoTextFoundException` → fallback (`parsers.py:L277`–`L281`); `"No text was found in ..., the content will be empty."` is the terminal empty case (`:L322`–`:L326`). (The warnings log the SCRATCH upload-copy path `paperless-upload-...` because the API copies the upload into `SCRATCH_DIR` before consuming.)
-
-The `"Removing alpha layer ... for compatibility with img2pdf"` line is `RasterisedDocumentParser`'s alpha-flattening step (`src/paperless_tesseract/parsers.py:L191`–`L199`, gated by `has_alpha()` at `:L73`). It is worth noting because it explains a subtlety in the saved metadata: `Document.checksum` is `hashlib.md5(...)` of the consumer's **working copy after** this normalization (`src/documents/consumer.py:L104` and `:L402`), **not** of the original upload bytes. Consequently two different PNG encodings of this fixture — the 32595-byte canonical file and a 31615-byte alpha-stripped variant — both persist the identical `checksum=a13999fabb65f07735dfcbbb001ddaa8` observed above; the byte-level difference is erased before the checksum is taken. (Observed: the ORM `checksum` field is stable across encodings; stated here because it directly affects the "saved metadata" that Q4 asks about.)
-
-### Q4.3 — "Fully processed" is not stored: no status column (runtime proof)
-
-```
-$ python3 manage.py shell -c "from documents.models import Document; import json; print(json.dumps([f.name for f in Document._meta.get_fields()]))"
-["id", "correspondent", "title", "document_type", "content", "mime_type", "checksum", "archive_checksum", "created", "modified", "storage_type", "added", "filename", "archive_filename", "archive_serial_number", "tags"]
-
-$ python3 manage.py shell -c "from documents.models import Document; names=[f.name for f in Document._meta.get_fields()]; print('matches:', [n for n in names if any(k in n.lower() for k in ('status','state','processed','progress'))])"
-matches: []
-```
-
-There is **no** `status`, `state`, `processed`, or `progress` field on `Document` (class body `src/documents/models.py:L88`–`L239`). This is the direct answer to "how is *fully processed* reflected in the saved metadata": it is reflected **only** by the existence of the row (optionally with an archive PDF and a Whoosh index entry) — never by a flag. The per-run status (`STARTING`/`WORKING`/`SUCCESS`/`FAILED`) lives only on the ephemeral status feed.
-
-### Q4.4 — Stability (empty-OCR ≥2 runs)
-
-Run 1 is shown in full above (id 28). The second run on the same unchanged canonical fixture copy (id 29):
-
-```
-$ python3 /tmp/inv/scripts/q1_capture.py q4canonB /tmp/inv/fixtures/no-text-alpha-canonical.png no-text-alpha.png image/png
-('0.145', 0, 'STARTING', 'new_file')
-('0.152', 20, 'WORKING', 'parsing_document')
-('2.138', 70, 'WORKING', 'generating_thumbnail')
-('9.706', 90, 'WORKING', 'parse_date')
-('9.708', 95, 'WORKING', 'save_document')
-('9.759', 100, 'SUCCESS', 'finished')
-[DUR] parse/OCR phase (20->70) duration = 1.986s
-[DUR] total STARTING->terminal = 9.614s
+############### Q4.4 RUN 2: no-text-alpha.png EMPTY OCR (stability) ###############
+===== FRAME SUMMARY (q4run2) =====
+('0.139', 0, 'STARTING', 'new_file')
+('0.145', 20, 'WORKING', 'parsing_document')
+('2.142', 70, 'WORKING', 'generating_thumbnail')
+('9.695', 90, 'WORKING', 'parse_date')
+('9.698', 95, 'WORKING', 'save_document')
+('9.749', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 1.998s
+[DUR] total STARTING->terminal = 9.610s
 [PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 15
+[AFTER] doc content='' archived_file_name='2026-07-08 no-text-alpha.pdf' original_file_name='2026-07-08 no-text-alpha.png'
+
+===== ORM inspection (run 2) =====
+id=15 mime_type=image/png
+  has_archive_version=True  archive_filename='0000015.pdf'
+  checksum=a13999fabb65f07735dfcbbb001ddaa8 archive_checksum=c27886d95c17288dedf65fa07bb8a533
+  content='' (len=0)
 ```
 
-| Run | parse/OCR phase | total | terminal | content | has_archive_version |
-|---|---|---|---|---|---|
-| 1 (id 28) | 1.916 s | 9.552 s | `SUCCESS@100` | `''` | `True` |
-| 2 (id 29) | 1.986 s | 9.614 s | `SUCCESS@100` | `''` | `True` |
+**Stability verdict:** both runs terminate `SUCCESS @ 100` with `content=''` and a persisted row. The active-OCR dwell (20→70) was `1.933s` / `1.998s` (stable). The total run (~9.55s / ~9.61s) is dominated by the ~7.5s gap between the `70` and `90` frames — that is Ghostscript thumbnail generation for the blank PDF/A, not OCR. Note the `checksum` is **identical across both runs** (`a13999fabb65f07735dfcbbb001ddaa8`) while the `archive_checksum` differs (`09ba7371…` vs `c27886d9…`, the PDF/A timestamp again).
 
-Identical terminal state and stable timings across both canonical-fixture runs. (The ~7.5 s gap between `WORKING@70` and `WORKING@90` is the post-OCR thumbnail generation of the PDF/A archive via Ghostscript; it is stable across runs.) Both runs persisted `checksum=a13999fabb65f07735dfcbbb001ddaa8` — encoding-independent for the reason given in Q4.2.
+#### The persisted checksum: `consumer.py:L104` vs `consumer.py:L402` (finding-corrected)
 
-### Q4.5 — Contrast: a genuine failure ends FAILED with NO persisted row
+The persisted `Document.checksum` is written at `src/documents/consumer.py:L402`, inside `Document.objects.create(...)`, hashing `self.path` **after** the parser has run. A **separate** md5 is computed earlier, at `consumer.py:L104`, inside `pre_check_duplicate`, hashing `self.path` **before** the parser runs. For an alpha-channel PNG these two hashes **differ**, because `RasterisedDocumentParser` rewrites its input file **in place** during alpha-layer removal (`src/paperless_tesseract/parsers.py:L201`, `background.save(input_file, format=im.format)`). Verified source:
 
-To produce a canonical `ParseError`, a genuinely un-parseable PDF (valid `%PDF` magic header, garbage body, no xref/trailer) was consumed. (This is the right trigger: a corrupt *image* raises a raw `OSError` in `has_alpha` *before* the OCR try-block, and the consumer catches only `ParseError`, so it would not emit a `FAILED` frame; a corrupt *PDF* fails inside the OCR try-block and surfaces as `ParseError`.)
+```text
+$ sed -n '102,104p' src/documents/consumer.py
+    def pre_check_duplicate(self):
+        with open(self.path, "rb") as f:
+            checksum = hashlib.md5(f.read()).hexdigest()
 
+$ sed -n '398,402p' src/documents/consumer.py
+            document = Document.objects.create(
+                title=(self.override_title or file_info.title)[:127],
+                content=text,
+                mime_type=mime_type,
+                checksum=hashlib.md5(f.read()).hexdigest(),
+
+$ sed -n '191p;200,201p' src/paperless_tesseract/parsers.py
+            if self.has_alpha(input_file):
+                    background = background.convert("RGB")
+                    background.save(input_file, format=im.format)
 ```
-$ python3 /tmp/inv/scripts/q1_capture.py q4fail /tmp/inv/fixtures/corrupt.pdf corrupt.pdf application/pdf
+
+`checksum_probe.py` (Appendix 5.1) demonstrates the difference empirically on a scratch copy of `no-text-alpha.png` (the in-repo fixture is never modified):
+
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/checksum_probe.py \
+      /app/src/paperless_tesseract/tests/samples/no-text-alpha.png image/png
+
+############### Q4 checksum L104-vs-L402 demonstration ###############
+$ md5sum <fixture>   (canonical file bytes on disk)
+e8c17675174950020835add3f444f08c  /app/src/paperless_tesseract/tests/samples/no-text-alpha.png
+
+fixture=no-text-alpha.png
+  md5 BEFORE parse (what pre_check_duplicate hashes, consumer.py:L104) = e8c17675174950020835add3f444f08c
+  md5 AFTER  parse (what _store persists, consumer.py:L402)        = a13999fabb65f07735dfcbbb001ddaa8
+  changed by in-place alpha normalization? True
+```
+
+**This corrects a claim in the previous version of this document.** The persisted checksum is **not** "encoding-independent," and it is set at **L402**, not L104. For this alpha-PNG the pre-check hash (`e8c176…`, the fixture's bytes) and the persisted hash (`a13999…`) **differ**, and the persisted value `a13999fabb65f07735dfcbbb001ddaa8` matches exactly the `checksum` on the persisted rows (docs 14 and 15 above) — confirming L402 is the source of the stored value. The encrypted-PDF case (Q4.5) is the clean contrast: PDFs are not rewritten in place, so there the persisted checksum equals the fixture's md5 exactly.
+
+
+### Q4.3 — "Fully processed" is not a stored attribute: the `Document` has no status column
+
+The `Document` model exposes no status/state/processed/progress/stage/phase field. Enumerated directly from the model's metadata:
+
+```text
+$ PYTHONPATH=/app/src DJANGO_SETTINGS_MODULE=paperless.settings python3 -c "
+import django; django.setup()
+from documents.models import Document
+names = [f.name for f in Document._meta.get_fields()]
+print('Document._meta.get_fields() -> concrete + relational field names:')
+for n in names:
+    print('   ', n)
+print()
+print('total fields:', len(names))
+suspects = [n for n in names if any(k in n.lower() for k in ('status','state','processed','progress','stage','phase'))]
+print('fields matching status/state/processed/progress/stage/phase:', suspects)
+"
+
+############### Q4: Document model field inventory (proving NO status column) ###############
+Document._meta.get_fields() -> concrete + relational field names:
+    id
+    correspondent
+    title
+    document_type
+    content
+    mime_type
+    checksum
+    archive_checksum
+    created
+    modified
+    storage_type
+    added
+    filename
+    archive_filename
+    archive_serial_number
+    tags
+
+total fields: 16
+fields matching status/state/processed/progress/stage/phase: []
+```
+
+The full field set is 16 fields, and the targeted search for any status-like name returns the empty list `[]`. **There is no "processed" flag to set.** The document's existence as a persisted row *is* the processed state; whatever happened during the run (including weak/empty OCR) is reflected only in the *values* of `content`, `archive_filename`/`archive_checksum`, and `checksum` — plus the transient WebSocket status that is gone once the run ends.
+
+### Q4.4 — The contrasting hard-failure path: `corrupt.pdf` → `FAILED`, and NO row persisted
+
+A deliberately malformed PDF (a temporary 74-byte fixture, md5 `275e5352ad888574113f18dfe5db4143`, containing a PDF header followed by garbage, no xref/trailer/root) drives the *hard-failure* path. Unlike weak OCR, this ends `FAILED` and persists nothing:
+
+```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+$ bash /tmp/inv/scripts/cap_scenario.sh q4fail /tmp/inv/fixtures/corrupt.pdf corrupt.pdf application/pdf
+
+############### Q4: corrupt.pdf -> FAILED path (ParseError -> _fail) ###############
 [BEFORE] document count = 0
+[WS] connected to ws/status/ ; subscribed to status_updates group
+[FRAME t+ 0.145s] {"filename": "corrupt.pdf", "task_id": "dfd62e4c-6275-453e-aa84-e47977c15ceb", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.150s] {"filename": "corrupt.pdf", "task_id": "dfd62e4c-6275-453e-aa84-e47977c15ceb", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 0.503s] {"filename": "corrupt.pdf", "task_id": "dfd62e4c-6275-453e-aa84-e47977c15ceb", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "InputFileError: ", "document_id": null}
 [UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
-[FRAME t+ 0.140s] {..., "current_progress": 0, "status": "STARTING", "message": "new_file", "document_id": null}
-[FRAME t+ 0.147s] {..., "current_progress": 20, "status": "WORKING", "message": "parsing_document", "document_id": null}
-[FRAME t+ 0.494s] {..., "current_progress": 100, "status": "FAILED", "message": "InputFileError: ", "document_id": null}
 
-===== AFTER: document count (expect 0 — NO row persisted on FAILED) =====
-document count = 0
+===== FRAME SUMMARY (q4fail) =====
+('0.145', 0, 'STARTING', 'new_file')
+('0.150', 20, 'WORKING', 'parsing_document')
+('0.503', 100, 'FAILED', 'InputFileError: ')
+[DUR] total STARTING->terminal = 0.358s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] terminal status=FAILED document_id=null ; document count = 0
 ```
 
-The run ends `FAILED @ 100` with `document_id: null` and **document count = 0** — no row was persisted. The message `"InputFileError: "` has a trailing space because `str(InputFileError())` is empty (formatted at `parsers.py:L310` as `f"{e.__class__.__name__}: {str(e)}"`). The complete, unedited worker traceback shows the exact `ParseError → FAILED` chain:
+The status feed goes straight from `WORKING @ 20` to **`FAILED @ 100`** with `message = "InputFileError: "` (there is no `70/90/95/SUCCESS` progression), the terminal `document_id` is `null`, and the document count remains **0** — no row was persisted. The complete worker-log block (exact line range, no elision) shows the full causal chain from pdfminer through OCRmyPDF's two attempts to the `ParseError`/`ConsumerError`:
 
-```
-$ sed -n '55,125p' /tmp/inv/out/qcluster.log
-21:36:25 [Q] INFO Process-1:3 processing [corrupt.pdf]
-[2026-07-08 21:36:25,889] [INFO] [paperless.consumer] Consuming corrupt.pdf
-[2026-07-08 21:36:25,913] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
+```text
+===== WORKER LOG for q4fail (qcluster.log lines 262-403, complete) =====
+23:03:03 [Q] INFO Process-1:4 processing [corrupt.pdf]
+[2026-07-08 23:03:03,206] [INFO] [paperless.consumer] Consuming corrupt.pdf
+[2026-07-08 23:03:03,231] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
 Traceback (most recent call last):
   File "/app/src/paperless_tesseract/parsers.py", line 120, in extract_text
     stripped = post_process_text(pdfminer_extract_text(pdf_file))
@@ -626,8 +1139,8 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 752, in __init__
     raise PDFSyntaxError("No /Root object! - Is this really a PDF?")
 pdfminer.pdfparser.PDFSyntaxError: No /Root object! - Is this really a PDF?
-[2026-07-08 21:36:26,143] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: . Attempting force OCR to get the text.
-[2026-07-08 21:36:26,240] [ERROR] [paperless.consumer] Error while consuming document corrupt.pdf: InputFileError: 
+[2026-07-08 23:03:03,465] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: . Attempting force OCR to get the text.
+[2026-07-08 23:03:03,562] [ERROR] [paperless.consumer] Error while consuming document corrupt.pdf: InputFileError: 
 Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
     return PdfInfo(
@@ -635,7 +1148,7 @@ Traceback (most recent call last):
     with Pdf.open(infile) as pdf:
   File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
     pdf = Pdf._open(
-pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.s_4kh5z7/origin.pdf: unable to find trailer dictionary while recovering damaged file
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.t6pcgz4n/origin.pdf: unable to find trailer dictionary while recovering damaged file
 
 The above exception was the direct cause of the following exception:
 
@@ -659,7 +1172,7 @@ Traceback (most recent call last):
     with Pdf.open(infile) as pdf:
   File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
     pdf = Pdf._open(
-pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.857fkvrd/origin.pdf: unable to find trailer dictionary while recovering damaged file
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.kd9i98j1/origin.pdf: unable to find trailer dictionary while recovering damaged file
 
 The above exception was the direct cause of the following exception:
 
@@ -682,148 +1195,1037 @@ Traceback (most recent call last):
   File "/app/src/paperless_tesseract/parsers.py", line 310, in parse
     raise ParseError(f"{e.__class__.__name__}: {str(e)}")
 documents.parsers.ParseError: InputFileError: 
-21:36:26 [Q] INFO Process-1:3 stopped doing work
-21:36:26 [Q] ERROR Failed [corrupt.pdf] - corrupt.pdf: Error while consuming document corrupt.pdf: InputFileError:  : Traceback (most recent call last):
+23:03:03 [Q] INFO Process-1:4 stopped doing work
+23:03:03 [Q] ERROR Failed [corrupt.pdf] - corrupt.pdf: Error while consuming document corrupt.pdf: InputFileError:  : Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
+    return PdfInfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/pdfinfo/info.py", line 901, in __init__
+    with Pdf.open(infile) as pdf:
+  File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
+    pdf = Pdf._open(
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.t6pcgz4n/origin.pdf: unable to find trailer dictionary while recovering damaged file
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 370, in run_pipeline
+    pdfinfo = get_pdfinfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 174, in get_pdfinfo
+    raise InputFileError() from e
+ocrmypdf.exceptions.InputFileError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
+    return PdfInfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/pdfinfo/info.py", line 901, in __init__
+    with Pdf.open(infile) as pdf:
+  File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
+    pdf = Pdf._open(
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.kd9i98j1/origin.pdf: unable to find trailer dictionary while recovering damaged file
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 298, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 370, in run_pipeline
+    pdfinfo = get_pdfinfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 174, in get_pdfinfo
+    raise InputFileError() from e
+ocrmypdf.exceptions.InputFileError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/asgiref/sync.py", line 266, in main_wrap
+    raise exc_info[1]
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 310, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: InputFileError: 
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker
+    res = f(*task["args"], **task["kwargs"])
+  File "/app/src/documents/tasks.py", line 236, in consume_file
+    document = Consumer().try_consume_file(
+  File "/app/src/documents/consumer.py", line 280, in try_consume_file
+    self._fail(
+  File "/app/src/documents/consumer.py", line 81, in _fail
+    raise ConsumerError(f"{self.filename}: {log_message or message}")
+documents.consumer.ConsumerError: corrupt.pdf: Error while consuming document corrupt.pdf: InputFileError: 
+
+23:03:03 [Q] INFO recycled worker Process-1:4
+23:03:03 [Q] INFO Process-1:17 ready for work at 23981
+
+===== ORM inspection (should be ZERO rows persisted) =====
+Traceback (most recent call last):
+  File "/tmp/inv/scripts/doc_info.py", line 19, in <module>
+    print(f"id={d.id} mime_type={d.mime_type}")
+AttributeError: 'NoneType' object has no attribute 'id'
 ```
 
-Both OCR passes raise `InputFileError` (primary at `parsers.py:L261`, fallback at `:L298`); the inner `except Exception` re-raises as `ParseError` at `:L310`; the consumer catches it and routes to `_fail` (`consumer.py:L78`), which emits `_send_progress(100, 100, "FAILED", message)` at `:L79` and then raises `ConsumerError`. No `Document` is stored on this path.
+The causal chain, grounded to source: pdfminer.six fails first (`parsers.py:L120`, `PDFSyntaxError: No /Root object!`); the primary `ocrmypdf.ocr` (`parsers.py:L261`) raises `InputFileError` (pikepdf: `unable to find trailer dictionary`); the fallback `ocrmypdf.ocr` (`parsers.py:L298`) raises the same; `parse()` converts it to `ParseError` (`parsers.py:L310`); `try_consume_file` (`consumer.py:L261`) catches it and calls `self._fail(...)` (`consumer.py:L280`), which emits the `FAILED @ 100` frame (`consumer.py:L79`) and raises `ConsumerError` (`consumer.py:L81`); django-q's `worker` (`cluster.py:L432`) records `Failed [corrupt.pdf]`. The trailing `AttributeError` from `doc_info.py` is **expected** — the ORM inspector assumes a row exists, and the exception is itself proof that **zero** rows were persisted (confirmed independently: `Document.objects.count()` returned `0`).
 
-### Q4.6 — Edge case: encrypted PDF → empty content but SUCCESS (no archive)
+### Q4.5 — Edge case: `encrypted.pdf` → content empty but document persisted `SUCCESS` (docs 16, 17)
 
-`encrypted.pdf` under canonical `skip` cannot be OCR'd; it ends `SUCCESS` with empty content and **no** archive:
+An encrypted PDF cannot be OCR'd, so this exercises the `EncryptedPdfError` branch (`parsers.py:L268-L275`). It is a *weak-result* case, not a failure — the document still persists with empty content and `SUCCESS`. Run 1:
 
-```
-$ python3 /tmp/inv/scripts/q1_capture.py q4enc .../samples/encrypted.pdf encrypted.pdf application/pdf
-[FRAME t+ 0.138s] {..., "current_progress": 0, "status": "STARTING", "message": "new_file", ...}
-[FRAME t+ 0.145s] {..., "current_progress": 20, "status": "WORKING", "message": "parsing_document", ...}
-[FRAME t+ 0.407s] {..., "current_progress": 70, "status": "WORKING", "message": "generating_thumbnail", ...}
-[FRAME t+ 1.193s] {..., "current_progress": 95, "status": "WORKING", "message": "save_document", ...}
-[FRAME t+ 1.240s] {..., "current_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 25}
+```text
+$ ls -l /app/src/paperless_tesseract/tests/samples/encrypted.pdf ; md5sum /app/src/paperless_tesseract/tests/samples/encrypted.pdf
+-rw-r--r-- 1 testuser testuser 46594 Feb 14 20:58 /app/src/paperless_tesseract/tests/samples/encrypted.pdf
+f4adf4460cbc7e05ac1890016a22d360  /app/src/paperless_tesseract/tests/samples/encrypted.pdf
 
-$ python3 /tmp/inv/scripts/doc_info.py
-id=25 mime_type=application/pdf
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+$ bash /tmp/inv/scripts/cap_scenario.sh q4enc1 \
+      /app/src/paperless_tesseract/tests/samples/encrypted.pdf encrypted.pdf application/pdf
+
+############### Q4 EDGE RUN 1: encrypted.pdf (EncryptedPdfError -> content retained/empty) ###############
+===== FRAME SUMMARY (q4enc1) =====
+('0.145', 0, 'STARTING', 'new_file')
+('0.151', 20, 'WORKING', 'parsing_document')
+('0.410', 70, 'WORKING', 'generating_thumbnail')
+('1.194', 90, 'WORKING', 'parse_date')
+('1.197', 95, 'WORKING', 'save_document')
+('1.244', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 0.259s
+[DUR] total STARTING->terminal = 1.099s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 16
+[AFTER] doc content='' archived_file_name=None original_file_name='2026-07-08 encrypted.pdf'
+
+===== WORKER LOG for q4enc1 (qcluster.log lines 404-454, complete) =====
+23:03:44 [Q] INFO Process-1:5 processing [encrypted.pdf]
+[2026-07-08 23:03:44,413] [INFO] [paperless.consumer] Consuming encrypted.pdf
+[2026-07-08 23:03:44,442] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 120, in extract_text
+    stripped = post_process_text(pdfminer_extract_text(pdf_file))
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/high_level.py", line 157, in extract_text
+    for page in PDFPage.get_pages(
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfpage.py", line 151, in get_pages
+    doc = PDFDocument(parser, password=password, caching=caching)
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 744, in __init__
+    self._initialize_password(password)
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 771, in _initialize_password
+    handler = factory(docid, param, password)
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 358, in __init__
+    self.init()
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 366, in init
+    self.init_key()
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 381, in init_key
+    raise PDFPasswordIncorrect
+pdfminer.pdfdocument.PDFPasswordIncorrect
+[2026-07-08 23:03:44,672] [WARNING] [paperless.parsing.tesseract] This file is encrypted, OCR is impossible. Using any text present in the original file.
+[2026-07-08 23:03:44,672] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/paperless/paperless-upload-j332sfpa, the content will be empty.
+   **** This file requires a password for access.
+Error: /invalidfileaccess in pdf_process_Encrypt
+Operand stack:
+
+Execution stack:
+   %interp_exit   .runexec2   --nostringval--   runpdf   --nostringval--   2   %stopped_push   --nostringval--   runpdf   runpdf   false   1   %stopped_push   1990   1   3   %oparray_pop   1989   1   3   %oparray_pop   1977   1   3   %oparray_pop   1978   1   3   %oparray_pop   runpdf   runpdf   runpdf   runpdf   false   1   %stopped_push
+Dictionary stack:
+   --dict:739/1123(ro)(G)--   --dict:1/20(G)--   --dict:80/200(L)--   --dict:80/200(L)--   --dict:133/256(ro)(G)--   --dict:320/325(ro)(G)--   --dict:29/32(L)--
+Current allocation mode is local
+Last OS error: No such file or directory
+GPL Ghostscript 9.53.3: Unrecoverable error, exit code 1
+convert-im6.q16: no images defined `/tmp/paperless/paperless-1pkjl0oe/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+[2026-07-08 23:03:44,755] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+   **** This file requires a password for access.
+Error: /invalidfileaccess in pdf_process_Encrypt
+Operand stack:
+
+Execution stack:
+   %interp_exit   .runexec2   --nostringval--   runpdf   --nostringval--   2   %stopped_push   --nostringval--   runpdf   runpdf   false   1   %stopped_push   1990   1   3   %oparray_pop   1989   1   3   %oparray_pop   1977   1   3   %oparray_pop   1978   1   3   %oparray_pop   runpdf   runpdf   runpdf   runpdf   false   1   %stopped_push
+Dictionary stack:
+   --dict:731/1123(ro)(G)--   --dict:1/20(G)--   --dict:80/200(L)--   --dict:80/200(L)--   --dict:133/256(ro)(G)--   --dict:320/325(ro)(G)--   --dict:27/32(L)--
+Current allocation mode is local
+GPL Ghostscript 9.53.3: Unrecoverable error, exit code 1
+[2026-07-08 23:03:45,507] [INFO] [paperless.consumer] Document 2026-07-08 encrypted consumption finished
+23:03:45 [Q] INFO Process-1:5 stopped doing work
+23:03:45 [Q] INFO Processed [encrypted.pdf]
+23:03:45 [Q] INFO recycled worker Process-1:5
+23:03:45 [Q] INFO Process-1:18 ready for work at 24049
+
+===== ORM inspection (run 1) =====
+id=16 mime_type=application/pdf
   has_archive_version=False  archive_filename=None
   checksum=f4adf4460cbc7e05ac1890016a22d360 archive_checksum=None
   content='' (len=0)
 ```
 
-Worker log (the benign Ghostscript thumbnail-fallback noise between the two key warnings is elided with `[...]`; it does not affect the outcome):
+Run 2 (stability):
 
+```text
+$ bash /tmp/inv/scripts/cap_scenario.sh q4enc2 \
+      /app/src/paperless_tesseract/tests/samples/encrypted.pdf encrypted.pdf application/pdf
+
+############### Q4 EDGE RUN 2: encrypted.pdf (stability) ###############
+===== FRAME SUMMARY (q4enc2) =====
+('0.140', 0, 'STARTING', 'new_file')
+('0.146', 20, 'WORKING', 'parsing_document')
+('0.406', 70, 'WORKING', 'generating_thumbnail')
+('1.186', 90, 'WORKING', 'parse_date')
+('1.189', 95, 'WORKING', 'save_document')
+('1.237', 100, 'SUCCESS', 'finished')
+[DUR] parse/OCR phase (20->70) duration = 0.260s
+[DUR] total STARTING->terminal = 1.097s
+[PERPAGE] per-page WORKING frames (message=null) progress values: []
+[AFTER] finished document_id = 17
+[AFTER] doc content='' archived_file_name=None original_file_name='2026-07-08 encrypted.pdf'
+
+===== ORM inspection (run 2) =====
+id=17 mime_type=application/pdf
+  has_archive_version=False  archive_filename=None
+  checksum=f4adf4460cbc7e05ac1890016a22d360 archive_checksum=None
+  content='' (len=0)
 ```
-$ sed -n '...' /tmp/inv/out/qcluster.log     # encrypted.pdf block
-21:36:54 [Q] INFO Process-1:4 processing [encrypted.pdf]
-[2026-07-08 21:36:54,979] [INFO] [paperless.consumer] Consuming encrypted.pdf
-[2026-07-08 21:36:55,007] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
-  ... pdfminer.pdfdocument.PDFPasswordIncorrect ...
-[2026-07-08 21:36:55,241] [WARNING] [paperless.parsing.tesseract] This file is encrypted, OCR is impossible. Using any text present in the original file.
-[2026-07-08 21:36:55,241] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/inv/scratch/paperless-upload-7fiiio40, the content will be empty.
-[...ghostscript thumbnail fallback noise...]
-[2026-07-08 21:36:56,076] [INFO] [paperless.consumer] Document 2026-07-08 encrypted consumption finished
-21:36:56 [Q] INFO Process-1:4 stopped doing work
-21:36:56 [Q] INFO Processed [encrypted.pdf]
-```
 
-pdfminer raises `PDFPasswordIncorrect`, then OCRmyPDF raises `EncryptedPdfError`, caught at `parsers.py:L268`; the warning `"This file is encrypted, OCR is impossible. Using any text present in the original file."` is at `:L269`–`:L273`; with no original text the terminal empty case applies and `self.text=""`. No archive was ever created, so `has_archive_version=False`. (Consistent with `test_encrypted`, `test_parser.py:L177`–`L187`, asserting `parser.archive_path is None` and `parser.get_text() == ""`.) Note this run went `70 → 95` with **no** `parse_date@90` frame — a minor per-run variation of the conditional date step; the core outcome (`content=''`, `SUCCESS`, no archive) is stable.
+**Reading the edge case.** pdfminer.six raises `PDFPasswordIncorrect` (`parsers.py:L120`); OCRmyPDF raises `EncryptedPdfError`, caught at `parsers.py:L268`, logging `This file is encrypted, OCR is impossible. Using any text present in the original file.` (`parsers.py:L269-L273`). Because `original_has_text` is `False` here, the last-resort branch sets `self.text = ""` (`parsers.py:L327`). The Ghostscript/ImageMagick noise is thumbnail generation failing on the encrypted PDF and falling back — it does **not** fail the run. The document persists (`id=16`/`17`) with `content=''`, `has_archive_version=False`, and terminates **`SUCCESS`**. This is the clean checksum contrast promised in Q4.2: the persisted `checksum` is `f4adf4460cbc7e05ac1890016a22d360`, **exactly equal to the fixture's md5** (PDFs are not rewritten in place), and it is stable across both runs.
 
-### Q4.7 — The three "empty content" outcomes, side by side
+### Q4.6 — The three terminal outcomes, contrasted
 
-| Input | Mode | Terminal status | Row persisted? | `content` | `has_archive_version` | Why |
-|---|---|---|---|---|---|---|
-| `no-text-alpha.png` (blank image) | `skip` | `SUCCESS@100` | **Yes** (id 28) | `''` | `True` | primary `skip_text` archive retained at `parsers.py:L263` |
-| `encrypted.pdf` | `skip` | `SUCCESS@100` | **Yes** (id 25) | `''` | `False` | `EncryptedPdfError`; archive never created (`:L268`) |
-| `corrupt.pdf` | `skip` | `FAILED@100` | **No** (count 0) | — | — | `ParseError` at `:L310` → `_fail` (`consumer.py:L79`) |
+| Input | OCR yield | Terminal frame | Row persisted? | `content` | `has_archive_version` |
+|-------|-----------|----------------|----------------|-----------|-----------------------|
+| `simple.png` (Q1) | text found | `SUCCESS @ 100` (`consumer.py:L375`) | yes (id 3/4) | `'This is a test document.'` | `True` |
+| `no-text-alpha.png` (Q4.2) | **empty** | `SUCCESS @ 100` | **yes** (id 14/15) | `''` | `True` |
+| `encrypted.pdf` (Q4.5) | **empty (encrypted)** | `SUCCESS @ 100` | **yes** (id 16/17) | `''` | `False` |
+| `corrupt.pdf` (Q4.4) | **hard failure** | **`FAILED @ 100`** (`consumer.py:L79`) | **no** (count 0) | — | — |
 
-**Empty content ≠ failure.** Persistence hinges solely on whether `parse()` raises `ParseError`. (A related non-OCR failure is a duplicate re-upload, which `pre_check_duplicate` at `consumer.py:L102`–`L112`/`L213` rejects with `FAILED` message `document_already_exists`, also persisting no new row.)
+**The answer to Q4:** weak/empty OCR still counts as fully processed — the document is saved and the run ends `SUCCESS`; the emptiness is reflected only as `content=''` (there is no status flag to indicate "incomplete"). It is categorically different from a hard parse failure, which ends `FAILED` and persists nothing.
 
 
 ---
 
-## 3. OCRmyPDF corroboration (supporting rationale only)
+## 3. Corroboration of the OCRmyPDF flag and sidecar semantics (official documentation)
 
-The authoritative answers above come from **runtime observation**. The following confirms, against the **official OCRmyPDF documentation**, that the flag/sidecar semantics the paperless code relies on are as understood. paperless pins `ocrmypdf ~=13.4` (resolved `13.4.3`); the cited pages are the closest published versions (`advanced.html` v11.7.2 / v12.0.2, `cookbook.html`), whose wording for these flags is identical.
+The runtime observations above are the authoritative evidence. This section cross-checks the *mechanism* — the OCRmyPDF mode flags and the sidecar behavior — against the official OCRmyPDF documentation, because paperless-ngx pins `ocrmypdf ~=13.4` (resolved to `13.4.3`, confirmed in §1.4) and drives it through the legacy boolean kwargs `force_ocr` / `skip_text` / `redo_ocr` set in `construct_ocrmypdf_parameters` (`src/paperless_tesseract/parsers.py:L135-L160`). The wording of these behaviors is stable across the OCRmyPDF versions surrounding 13.4; the version-pinned documentation pages cited below carry the same semantics.
 
-- **`--skip-text`** (paperless `skip_text`; `OCR_MODE` `skip`/`skip_noarchive` → `construct_ocrmypdf_parameters` `parsers.py:L157`–`L158`): the docs state that with `--skip-text` "no OCR will be performed on pages that already have text" and the page "will be copied to the output." This corroborates why a text-layer PDF's existing text is preserved and (under plain `skip`) still normalized into an archive.
-- **`--redo-ocr`** (paperless `redo_ocr`; `OCR_MODE` `redo` → `parsers.py:L159`–`L160`): the docs describe that a "detailed text analysis is performed," "Invisible text (OCR) is stripped out," and pages are re-OCR'd.
-- **`--force-ocr`** (paperless `force_ocr`; `OCR_MODE` `force` **and** the `safe_fallback=True` retry → `parsers.py:L155`–`L156`): the docs state that "all pages will be rasterized to images, discarding any hidden OCR text." This corroborates the fallback used in the empty-OCR path (`parsers.py:L276`–`L306`).
-- **Sidecar** (paperless discard-and-fallback heuristic, `parsers.py:L99`–`L123`): the docs state "The sidecar file contains the OCR text found by OCRmyPDF" and "If the document contains pages that already have text, that text will not appear in the sidecar." This directly corroborates why paperless sees an `[OCR skipped on page(s) N-M]` marker (not the real text) for pre-existing-text pages, and therefore discards the sidecar and falls back to pdfminer (`parsers.py:L104`).
-- **Default (no flag)**: the docs note that OCRmyPDF "will exit with an error if asked to modify a file with OCR." This corroborates why paperless always passes an explicit mode flag (`skip_text`/`redo_ocr`/`force_ocr`) in `construct_ocrmypdf_parameters`.
+**How paperless maps `OCR_MODE` to an OCRmyPDF flag** (verified source):
 
-Source: OCRmyPDF documentation, `ocrmypdf.readthedocs.io` (`advanced.html`, `cookbook.html`). These are supporting only; every behavioral claim in Q1–Q4 is backed by the runtime evidence shown.
+```text
+$ sed -n '155,162p' src/paperless_tesseract/parsers.py
+        if settings.OCR_MODE == "force" or safe_fallback:
+            ocrmypdf_args["force_ocr"] = True
+        elif settings.OCR_MODE in ["skip", "skip_noarchive"]:
+            ocrmypdf_args["skip_text"] = True
+        elif settings.OCR_MODE == "redo":
+            ocrmypdf_args["redo_ocr"] = True
+        else:
+            raise ParseError(f"Invalid ocr mode: {settings.OCR_MODE}")
+```
+
+| paperless kwarg | Set when | Line | OCRmyPDF behavior (per official docs) | Reference |
+|-----------------|----------|------|----------------------------------------|-----------|
+| `skip_text=True` | `OCR_MODE` is `skip` or `skip_noarchive` (the canonical default is `skip`) | `parsers.py:L158` | Pages that already contain text are not OCR'd and are copied through to the output; only image-only pages are OCR'd. This is why, under canonical `skip`, a text-layer PDF still produces an archive but its text pages are passed through untouched. | OCRmyPDF *Advanced features*, `--skip-text` section: https://ocrmypdf.readthedocs.io/en/v11.7.2/advanced.html |
+| `redo_ocr=True` | `OCR_MODE` is `redo` | `parsers.py:L160` | A text analysis is performed; previously-added *invisible* OCR text is stripped and re-OCR'd, while genuine visible text is preserved (no rasterization). | OCRmyPDF *Advanced features*, `--redo-ocr` section: https://ocrmypdf.readthedocs.io/en/v11.7.2/advanced.html |
+| `force_ocr=True` | `OCR_MODE` is `force`, **or** `safe_fallback=True` (the empty-text retry in Q4.1) | `parsers.py:L156` | All pages are rasterized to images, discarding any hidden text layer and re-OCR'ing everything. paperless uses this as the safe fallback precisely because it always yields a fresh OCR attempt (at the cost of a larger, blurrier archive — noted in the `parsers.py:L300-L301` comment). | OCRmyPDF *Advanced features*, `--force-ocr` section: https://ocrmypdf.readthedocs.io/en/v11.7.2/advanced.html |
+
+**Why paperless must always pass one of these flags.** Without a mode flag, OCRmyPDF treats a PDF that already contains text (or is a Tagged PDF) as not needing OCR and exits with an error rather than processing it. paperless therefore always supplies exactly one of `skip_text`/`redo_ocr`/`force_ocr`. The default-exit behavior and the override options are documented in the OCRmyPDF *Cookbook* (https://ocrmypdf.readthedocs.io/en/v11.7.3/cookbook.html) and reflected in the API's `TaggedPDFError` message, which explicitly names `--force-ocr`, `--skip-text`, and `--redo-ocr` as the overrides (OCRmyPDF *API reference*: https://ocrmypdf.readthedocs.io/en/latest/apiref.html).
+
+**Sidecar semantics (corroborating the Q2.5 `[OCR skipped on page]` heuristic).** The OCRmyPDF sidecar contains only the text that OCRmyPDF itself produced; text from pages that already had a text layer does **not** appear in the sidecar. This is exactly why paperless's `extract_text` (`parsers.py:L99`) treats a sidecar containing the `[OCR skipped on page` marker (`parsers.py:L104`) as unreliable and re-extracts the complete text from the produced PDF with pdfminer.six — as observed in Q2.5, where the sidecar's `[OCR skipped on page(s) 4-6]` marker caused the fallback and the full text (including page 4) was recovered. Sidecar behavior is documented in the OCRmyPDF *Cookbook*, "Text file of the OCR" section: https://ocrmypdf.readthedocs.io/en/v11.7.3/cookbook.html.
+
+**API-signature corroboration.** The `ocrmypdf.api.ocr(...)` function accepts the boolean keyword arguments `force_ocr`, `skip_text`, and `redo_ocr` (alongside `sidecar`, `language`, `output_type`, `image_dpi`, `deskew`, `rotate_pages`, `clean`, etc.), which is exactly the argument set observed in the Q1.6 `Calling OCRmyPDF with args:` dump (whose complete dictionary is shown verbatim in §Q1.6). This confirms paperless is exercising OCRmyPDF's public API, not a private path. Reference: OCRmyPDF *API reference*: https://ocrmypdf.readthedocs.io/en/latest/apiref.html.
+
+These documentation facts are supporting rationale only; every behavioral claim in Q1–Q4 is grounded in the runtime output captured above.
+
 
 ---
 
 ## 4. Coverage pass
 
-Every named mechanism, constant, value, flag, field, and fixture the questions imply, mapped to its evidence:
+Re-reading the four question groups and confirming each distinct item is answered with its value, `file:line`, and observed evidence.
 
-| Item | Value / behavior observed | `file:line` | Evidence |
-|---|---|---|---|
-| `PostDocumentView.post` | upload entry; temp file + `task_id`; enqueues task; returns `"OK"` | `views.py:L497,L521,L523-533,L535` | Q1/Q2/Q4 uploads → `200 "OK"` |
-| `async_task(...)` | enqueues `documents.tasks.consume_file` | `views.py:L523` | worker picks up task (Q1 log) |
-| `consume_file` | django-q task body | `tasks.py:L184` | `Process-1:N processing [...]` log |
-| `try_consume_file` | pipeline orchestration | `consumer.py:L180` | frame sequence emitted |
-| `_send_progress` | builds+`group_send`s status frame | `consumer.py:L56,L64-74` | every captured frame |
-| `_fail` | emits `FAILED@100`, raises `ConsumerError` | `consumer.py:L78-81` | Q4 corrupt.pdf `FAILED` |
-| status constants | `new_file`/`parsing_document`/`generating_thumbnail`/`parse_date`/`save_document`/`finished` | `consumer.py:L43-49` | Q1 frame messages |
-| progress values | 0 / 20 / 70 / 90 / 95 / 100 | `consumer.py:L202,L259,L264,L274,L294,L375` | Q1 frames |
-| `progress_callback` (per-page) | defined but never fires for OCR (20→70 jump); comment "20 and 80" vs formula 20→70 | `consumer.py:L237-240` | `[PERPAGE] ... []` (Q1) |
-| `StatusConsumer` | relays frames; `is_authenticated` gate | `paperless/consumers.py:L9,L11,L29-33` | WS auth vs no-auth 403 |
-| `status_updates` group / `ws/status/` | channel group + route | `consumer.py:L73`, `urls.py:L137`, `asgi.py:L20` | live capture |
-| `RasterisedDocumentParser.parse` | OCR engine wrapper | `parsers.py:L230,L261` | all consumes |
-| `original_has_text` (image) | **hard-coded `False`** | `parsers.py:L237-239` | probe: image→`False` |
-| `original_has_text` (PDF) | `text and len>50` | `parsers.py:L234-236` | probe: 24→`False`, 118→`True` |
-| `skip_noarchive` skip | `"Document has text, skipping OCRmyPDF entirely."` + `return` | `parsers.py:L241-244` | Q2 C2 log + `archive None` |
-| `construct_ocrmypdf_parameters` flags | `skip_text`/`redo_ocr`/`force_ocr` mapping | `parsers.py:L155-160` | direct-parse args (`skip_text:True`) |
-| `ocrmypdf.ocr` | primary + fallback OCR calls | `parsers.py:L261,L298` | Q1/Q4 args + tracebacks |
-| `extract_text` / sidecar | discards sidecar w/ `[OCR skipped on page` | `parsers.py:L99,L104` | sidecar_demo exact bytes |
-| `NoTextFoundException` | raised on empty primary text | `parsers.py:L266-267` | Q4 "Attempting force OCR" |
-| safe fallback (`force_ocr`) | `safe_fallback=True` re-run; keeps primary archive | `parsers.py:L276-306,L263` | Q4 double-OCR + `has_archive_version=True` |
-| empty terminal (`self.text=""`) | warning + empty content | `parsers.py:L316-327` | Q4 "content will be empty" |
-| `ParseError` → `FAILED` | inner raise → `_fail` | `parsers.py:L310`, `consumer.py:L79` | Q4 corrupt.pdf traceback |
-| `EncryptedPdfError` | keeps original text; no archive | `parsers.py:L268-275` | Q4 encrypted.pdf |
-| `DocumentSerializer.content` | text regardless of origin | `serialisers.py:L227` | Q3 both docs |
-| `archived_file_name` | set iff `has_archive_version` | `serialisers.py:L213-217` | Q3 (set for OCR + text-PDF; null for true-skip) |
-| `original_file_name` | always present | `serialisers.py:L210-211` | Q3 all docs |
-| `Document.has_archive_version` | `archive_filename is not None` | `models.py:L238-239` | Q2/Q4 ORM |
-| **no status column** | no `status`/`state`/`processed`/`progress` field | `models.py:L88-239` | Q4 field list + `matches: []` |
-| fixture `simple.png` | text-free image → OCR `"This is a test document."` | — | Q1, Q2 C1 |
-| fixture `simple-digital.pdf` | text-layer, 24 chars (< 50 gate) | — | Q2 probe |
-| fixture `multi-page-digital.pdf` | text-layer, 118 chars → true-skip | — | Q2 C2, Q3 |
-| fixture `multi-page-images.pdf` | image-PDF, no text → OCR under any mode | — | Q2 contrast |
-| fixture `multi-page-mixed.pdf` | mixed → sidecar `[OCR skipped on page(s) 4-6]` | — | Q2 sidecar |
-| fixture `no-text-alpha.png` | blank → empty OCR, SUCCESS | — | Q4 |
-| fixture `encrypted.pdf` | encrypted → empty content, no archive, SUCCESS | — | Q4 edge |
-| `corrupt.pdf` (temp) | unparseable PDF → `ParseError`/`FAILED` | — | Q4 contrast |
+### Q1 — "how can I see OCR has started / processing state while running / watch workers / signals of active OCR"
 
-**Image-vs-PDF × has-text cross-product:**
+| Item | Answer | Evidence |
+|------|--------|----------|
+| How to *see* OCR started | The `WORKING @ 20 parsing_document` WebSocket frame (`consumer.py:L259`), emitted just before the `parse()` dispatch (`consumer.py:L261`) | Q1.1 frame at `t+0.155s`; Q1.2 mapping table |
+| Processing state while running | Live WebSocket frames only; no DB row exists yet (`document_id: null` on all frames until terminal) | Q1.1 (`document_id` null until `SUCCESS` carries id 3) |
+| Watching background workers | django-q `qcluster` logs `processing` → `Consuming` → `consumption finished`, then recycles the worker | Q1.4 worker log (lines 56-63); Q1.5 (lines 64-71) |
+| The signal that means *active* OCR | The dwell time at `WORKING @ 20` before `70` — that span brackets the OCRmyPDF/Tesseract call | Q1.1 (`1.078s`), Q1.5 (`1.057s`); contrast with 0.03s true-skip in Q2.3 |
+| Per-page frames (`progress_callback`) | Not emitted at these fixture scales; progress jumps 20→70 | Q1.3 (per-page progress list observed empty: `[]`) |
+| Stability (≥2 runs) | Frame sequence and dwell stable across runs (docs 3, 4) | Q1.1 + Q1.5 |
+| OCRmyPDF arguments (supporting) | `skip_text: True`, sidecar path, `clean`/`deskew`/`rotate_pages`, `image_dpi: 72` | Q1.6 direct_parse dump |
 
-| | image | PDF |
-|---|---|---|
-| **has visible/embedded text** | `simple.png` → `original_has_text=False` → **OCR runs** (Q2 C1) | text-layer PDF → `True` → **true skip** under `skip_noarchive` (Q2 C2); still archived under `skip` (Q3 doc 21) |
-| **no text** | blank `no-text-alpha.png` → OCR runs, empty result, SUCCESS (Q4) | `multi-page-images.pdf` → `original_has_text=False` → **OCR runs** even under `skip_noarchive` (Q2 contrast) |
+### Q2 — "does an image with text skip OCR, or still touch the pipeline, and how to tell after"
 
-All four question groups (Q1–Q4) and each named item above appear with an observed value, a `file:line`, sibling variants, and a causal reason.
+| Item | Answer | Evidence |
+|------|--------|----------|
+| Image with text: skip or not? | **Never skips** — `original_has_text=False` for images (`parsers.py:L239`); OCR always runs (`parsers.py:L261`) | Q2.1 (probe), Q2.2 (doc 5: `has_archive_version=True`, `[tesseract]` line, 1.065s dwell) |
+| The genuine skip | Text-layer PDF (len>50, `parsers.py:L236`) under `skip_noarchive` → early return `"Document has text, skipping OCRmyPDF entirely."` (`parsers.py:L241-L244`) | Q2.3 (docs 6, 7: 0.03s dwell, no archive, no `[tesseract]`); direct_parse skip log |
+| Skip is gated on text, not mode | Same `skip_noarchive` mode + image-only PDF → OCR still runs | Q2.4 (docs 8, 9: 2.2s dwell, archive produced) |
+| How to tell after processing | Presence/absence of an archive: `has_archive_version` / `archived_file_name` | Q2.2 vs Q2.3 ORM inspection; Q3.4 table |
+| Internal provenance tell | Sidecar `[OCR skipped on page` marker (`parsers.py:L104`) | Q2.5 exact sidecar bytes: `[OCR skipped on page(s) 4-6]` |
+| Stability (≥2 runs) | True-skip (0.032/0.030s) and contrast (2.219/2.207s) both stable | Q2.3, Q2.4 |
+| `skip`/`redo`/`force` flag semantics | Corroborated against official OCRmyPDF docs | §3 table |
+
+### Q3 — "compare final API responses; which fields show OCR-generated vs existing text"
+
+| Item | Answer | Evidence |
+|------|--------|----------|
+| Which field holds the text | `content` (`serialisers.py:L227`) — for both OCR and pre-existing, undifferentiated | Q3.1 (doc 10 OCR text vs doc 11 text-layer), Q3.2 table |
+| Field that reveals OCR ran | `archived_file_name` (`serialisers.py:L213-L217`); non-null ⇒ archive exists | Q3.1, Q3.3 (null under skip_noarchive), Q3.4 |
+| `original_file_name` | Always present (`serialisers.py:L210-L211`) | Q3.1 both docs |
+| Is there an "OCR text" field? | No — no field labels provenance | Q3.1, Q3.4 |
+| Full API JSON, both cases | Complete bodies shown | Q3.1 (docs 10, 11) |
+| True-skip variant (≥2 runs) | `archived_file_name: null`, `content` unchanged | Q3.3 (docs 12, 13) |
+
+### Q4 — "weak/incomplete OCR: final state, is it fully processed, how reflected in metadata"
+
+| Item | Answer | Evidence |
+|------|--------|----------|
+| Terminal state on weak/empty OCR | `SUCCESS @ 100` (`consumer.py:L375`); document persisted | Q4.2 (docs 14, 15) |
+| Empty-text code path | `NoTextFoundException` (L267) → force-OCR fallback (L276-L306) → `self.text=""` (L327) | Q4.1 source; Q4.2 worker log walks it |
+| Does it count as fully processed? | Yes — persistence *is* the processed state | Q4.2, Q4.3 |
+| How reflected in metadata | Only as `content=''`; no status flag exists | Q4.2 (`content=''`), Q4.3 |
+| Is there a status/state column? | **No** — 16 fields, none status-like | Q4.3 field inventory (`[]`) |
+| Persisted checksum location | `consumer.py:L402` (after parse), **not** L104 (pre-check, before parse) | Q4.2 checksum sub-section + `checksum_probe.py` |
+| Checksum is NOT encoding-independent | Alpha-PNG: pre-check `e8c176…` ≠ persisted `a13999…` due to in-place rewrite (`parsers.py:L201`) | Q4.2 (corrected claim) |
+| Hard-failure contrast | `corrupt.pdf` → `FAILED @ 100` (`consumer.py:L79`), **no row** | Q4.4 full traceback, count 0 |
+| Encrypted-PDF edge | `EncryptedPdfError` (`parsers.py:L268`) → `content=''`, `SUCCESS`, persisted; checksum == fixture md5 | Q4.5 (docs 16, 17) |
+| Stability (≥2 runs) | Empty-OCR, corrupt (single terminal), encrypted all reproduced | Q4.2, Q4.5 |
+
+Every question part, every named mechanism (`consume_file`, `Consumer._send_progress`, `StatusConsumer`, `RasterisedDocumentParser.parse`, `DocumentSerializer`, `NoTextFoundException`, `ParseError`, the OCR mode flags), every named fixture, and every before/during/after transition has been exercised at runtime and answered with its value, `file:line`, and complete observed output.
+
 
 ---
 
-## 5. Appendix — temporary observation scripts (removed after the run)
+## 5. Appendix
 
-These scripts were created under `/tmp/inv/` (outside the repository) purely to capture the output above, and were **removed afterward** — they are reproduced here only for reproducibility. The DRF token in any output is redacted as `<TOKEN>`.
+### 5.1 Temporary observation scripts (complete sources)
 
-**`q1_capture.py`** — subscribes an authenticated WebSocket client to `ws/status/`, triggers the real upload API, and records every JSON frame with a timestamp (before/during/after), printing a frame summary, phase durations, and the persisted document's fields.
+These scripts were written under `/tmp/inv/scripts/` **inside the container** (outside any git tree), used to capture the evidence above, and **removed afterward** (see §5.2 for the read-only proof). They are reproduced here in full so every result is reproducible. None hard-code secrets: the throwaway admin password is redacted to `<PASSWORD>` (it was a throwaway value set via `PAPERLESS_ADMIN_PASSWORD` on the throwaway database, which was deleted afterward), and the DRF token / session id are always redacted at the point of printing.
 
-**`direct_parse.py`** *(supporting/non-canonical)* — instantiates `RasterisedDocumentParser` and calls `parse()` in-process to expose the exact OCRmyPDF args, whether a fallback occurred, the resulting `archive_path`, and the extracted text.
+#### `reset_docs.py` — clear the throwaway DB + media between stability runs
 
-**`has_text_probe.py`** *(supporting/non-canonical)* — replicates the `parse()` has-text logic using the real `extract_text` to print `original_has_text` and the length that drives the `>50` gate.
+```python
+#!/usr/bin/env python3
+"""reset_docs.py - delete all Document rows + their media files from the
+throwaway DB so the next stability run is not rejected by pre_check_duplicate
+(src/documents/consumer.py:L102-L112). Operates only on the throwaway
+data/media directories, never on the repository."""
+import os
+import shutil
+import django
 
-**`sidecar_demo.py`** *(supporting/non-canonical)* — builds the OCRmyPDF args via the real `construct_ocrmypdf_parameters`, runs `ocrmypdf.ocr`, and prints the exact sidecar bytes and the `[OCR skipped on page` substring check.
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
 
-**`q3_compare.py`** — uploads the OCR image and the text-layer PDF via the API, waits for their `SUCCESS` frames, then `GET`s `/api/documents/{id}/` for each and diffs `content`/`archived_file_name`/`original_file_name`.
+from django.conf import settings          # noqa: E402
+from documents.models import Document      # noqa: E402
 
-**`doc_info.py`** / **`reset_docs.py`** — ORM helpers to inspect a persisted `Document` (`has_archive_version`, `archive_filename`, `checksum`, `content`) and to clear documents between stability runs (to bypass `pre_check_duplicate`).
+n = Document.objects.count()
+Document.objects.all().delete()
+# Remove any stray media artifacts.
+for sub in ("originals", "archive", "thumbnails"):
+    d = os.path.join(settings.MEDIA_ROOT, "documents", sub)
+    if os.path.isdir(d):
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            try:
+                os.remove(p)
+            except IsADirectoryError:
+                shutil.rmtree(p, ignore_errors=True)
+print(f"deleted {n} document(s); media cleared; count now = {Document.objects.count()}")
+```
 
-**`smoke.py`** / **`restart_qcluster.sh`** — verify auth (token + session + no-auth WS rejection) and restart the single `qcluster` worker with a chosen `OCR_MODE` for the non-canonical `skip_noarchive` runs.
+#### `restart_qcluster.sh` — restart the single worker with a chosen `OCR_MODE`
 
-### Read-only verification
+```bash
+#!/usr/bin/env bash
+# restart_qcluster.sh <ocr_mode>
+# Restart the single django-q qcluster worker with a chosen PAPERLESS_OCR_MODE.
+# Runs INSIDE the container only; kills are matched via /proc cmdline and never
+# touch any host process. Used to switch to the non-canonical skip_noarchive mode
+# for the Q2/Q3 true-skip observations, then restore canonical skip.
+set -e
+MODE="${1:-skip}"
+for piddir in /proc/[0-9]*; do
+  pid=$(basename "$piddir")
+  if tr '\0' ' ' < "$piddir/cmdline" 2>/dev/null | grep -q "manage.py qcluster"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+done
+sleep 3
+cd /app/src
+PAPERLESS_OCR_MODE="$MODE" setsid bash -c \
+  "cd /app/src && exec python3 manage.py qcluster >> /tmp/inv/out/qcluster.log 2>&1" \
+  < /dev/null &
+disown
+sleep 8
+echo "qcluster restarted (OCR_MODE=$MODE)"
+tail -1 /tmp/inv/out/qcluster.log
+```
 
-The investigation ran against a throwaway data/media/DB directory outside the repository. The source tree was not modified; the only persisted new artifact is this document. This is confirmed in the deliverable's own repository with `git status --porcelain` showing only the new file under `blitzy/documentation/`.
+#### `smoke.py` — verify the observation-surface auth model (secrets redacted)
+
+```python
+#!/usr/bin/env python3
+"""smoke.py - verify the observation-surface auth model via REAL entry points.
+
+  1. POST /api/token/ returns a DRF token for the admin superuser.
+  2. GET /api/documents/ is reachable with that token.
+  3. ws/status/ accepts a SESSION-authenticated client and REJECTS an
+     unauthenticated one (HTTP 403 from the is_authenticated gate in
+     StatusConsumer.connect, src/paperless/consumers.py:L11).
+
+Secrets are redacted: the DRF token and session id are never printed.
+"""
+import os
+import asyncio
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+import requests            # noqa: E402
+import websockets          # noqa: E402
+from django.test import Client  # noqa: E402
+
+BASE = "http://localhost:8000"
+WS = "ws://localhost:8000/ws/status/"
+USER = "admin"
+PASSWORD = "<PASSWORD>"  # redacted throwaway admin password (PAPERLESS_ADMIN_PASSWORD on the throwaway DB)
+
+
+def get_token():
+    r = requests.post(f"{BASE}/api/token/",
+                      data={"username": USER, "password": PASSWORD})
+    print(f'POST /api/token/ -> {r.status_code} {{"token":"<TOKEN>"}}')
+    return r.json()["token"]
+
+
+def list_documents(token):
+    r = requests.get(f"{BASE}/api/documents/",
+                     headers={"Authorization": f"Token {token}"})
+    print(f"GET /api/documents/ -> {r.status_code} count= {r.json().get('count')}")
+
+
+def get_session_cookie():
+    c = Client()
+    ok = c.login(username=USER, password=PASSWORD)
+    sid = c.cookies["sessionid"].value
+    print(f"Django Client.login -> {ok} sessionid= <SESSIONID>")
+    return sid
+
+
+async def ws_probe(sid):
+    try:
+        async with websockets.connect(
+            WS, extra_headers={"Cookie": f"sessionid={sid}"}
+        ):
+            print("WS authed  -> CONNECTED")
+    except Exception as e:
+        print(f"WS authed  -> ERROR {e.__class__.__name__}: {e}")
+    try:
+        async with websockets.connect(WS):
+            print("WS no-auth -> UNEXPECTEDLY CONNECTED")
+    except Exception as e:
+        print(f"WS no-auth -> REJECTED/{e.__class__.__name__}: {e}")
+
+
+def main():
+    token = get_token()
+    list_documents(token)
+    sid = get_session_cookie()
+    asyncio.get_event_loop().run_until_complete(ws_probe(sid))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### `doc_info.py` — ORM inspection of a persisted `Document`
+
+```python
+#!/usr/bin/env python3
+"""doc_info.py [id] - ORM inspection of a persisted Document (throwaway DB).
+Defaults to the most recently added document. Prints the persistence-relevant
+metadata Q2/Q3/Q4 reason about."""
+import os
+import sys
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+from documents.models import Document  # noqa: E402
+
+if len(sys.argv) > 1:
+    d = Document.objects.get(id=int(sys.argv[1]))
+else:
+    d = Document.objects.order_by("-added").first()
+
+print(f"id={d.id} mime_type={d.mime_type}")
+print(f"  has_archive_version={d.has_archive_version}  archive_filename={d.archive_filename!r}")
+print(f"  checksum={d.checksum} archive_checksum={d.archive_checksum}")
+print(f"  content={d.content!r} (len={len(d.content)})")
+```
+
+#### `cap_scenario.sh` — run one capture and print its complete worker-log block
+
+```bash
+#!/usr/bin/env bash
+# cap_scenario.sh <label> <filepath> <upload_name> <mime>
+# Runs one real-pipeline capture and then prints the COMPLETE worker-log block
+# that the scenario produced (exact line range, no elision).
+set -e
+LABEL="$1"; FP="$2"; NAME="$3"; MIME="$4"
+LOG=/tmp/inv/out/qcluster.log
+START=$(wc -l < "$LOG")
+cd /app/src
+PYTHONPATH=/app/src python3 /tmp/inv/scripts/q1_capture.py "$LABEL" "$FP" "$NAME" "$MIME"
+sleep 2
+END=$(wc -l < "$LOG")
+echo ""
+echo "===== WORKER LOG for ${LABEL} (qcluster.log lines $((START+1))-${END}, complete) ====="
+sed -n "$((START+1)),${END}p" "$LOG"
+```
+
+#### `q1_capture.py` — the canonical WebSocket frame recorder (real API upload)
+
+```python
+#!/usr/bin/env python3
+"""q1_capture.py <label> <filepath> <upload_name> <mime_type>
+
+Triggers ingestion through the REAL upload API
+(POST /api/documents/post_document/, token auth) while an authenticated
+(session-auth) WebSocket client subscribed to ws/status/ records every JSON
+status frame emitted by Consumer._send_progress (src/documents/consumer.py:L56)
+and relayed by StatusConsumer (src/paperless/consumers.py:L9).
+
+Prints the before state, every frame with a t+ timestamp, a frame summary,
+phase durations, the per-page WORKING frames (if any), and the after state of
+the persisted Document. Secrets are never printed.
+"""
+import os
+import sys
+import json
+import time
+import asyncio
+import threading
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+import requests                     # noqa: E402
+import websockets                   # noqa: E402
+from django.test import Client      # noqa: E402
+from documents.models import Document  # noqa: E402
+
+BASE = "http://localhost:8000"
+WS = "ws://localhost:8000/ws/status/"
+USER = "admin"
+PASSWORD = "<PASSWORD>"   # redacted throwaway admin password (PAPERLESS_ADMIN_PASSWORD on the throwaway DB)
+
+LABEL, FILEPATH, UPLOAD_NAME, MIME = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+
+def token():
+    r = requests.post(f"{BASE}/api/token/", data={"username": USER, "password": PASSWORD})
+    return r.json()["token"]
+
+
+def session_cookie():
+    c = Client()
+    c.login(username=USER, password=PASSWORD)
+    return c.cookies["sessionid"].value
+
+
+async def ws_capture(tok, sid):
+    """Async ONLY: subscribe WS, trigger upload, collect frames. No ORM here."""
+    frames = []
+    upload = {}
+    async with websockets.connect(WS, extra_headers={"Cookie": f"sessionid={sid}"}) as ws:
+        print("[WS] connected to ws/status/ ; subscribed to status_updates group")
+        await asyncio.sleep(0.4)  # let group_add register before triggering work
+        t0 = time.time()
+
+        def do_upload():
+            with open(FILEPATH, "rb") as fh:
+                r = requests.post(
+                    f"{BASE}/api/documents/post_document/",
+                    headers={"Authorization": f"Token {tok}"},
+                    files={"document": (UPLOAD_NAME, fh, MIME)},
+                )
+            upload["status_code"] = r.status_code
+            upload["body"] = r.text
+
+        th = threading.Thread(target=do_upload)
+        th.start()
+
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=40)
+            except asyncio.TimeoutError:
+                print("[WS] timed out waiting for frames")
+                break
+            ts = time.time() - t0
+            data = json.loads(raw)
+            frames.append((ts, data))
+            print(f"[FRAME t+{ts:6.3f}s] {json.dumps(data)}")
+            if data.get("status") in ("SUCCESS", "FAILED"):
+                break
+        th.join()
+    print(f'[UPLOAD] POST /api/documents/post_document/ -> {upload.get("status_code")} {upload.get("body")}')
+    return frames
+
+
+def main():
+    tok = token()
+    sid = session_cookie()
+    print(f"[BEFORE] document count = {Document.objects.count()}")
+
+    frames = asyncio.get_event_loop().run_until_complete(ws_capture(tok, sid))
+
+    print(f"\n===== FRAME SUMMARY ({LABEL}) =====")
+    for ts, d in frames:
+        print((f"{ts:.3f}", d["current_progress"], d["status"], d["message"]))
+
+    by_prog = {}
+    for ts, d in frames:
+        by_prog.setdefault(d["current_progress"], ts)
+    if 20 in by_prog and 70 in by_prog:
+        print(f"[DUR] parse/OCR phase (20->70) duration = {by_prog[70] - by_prog[20]:.3f}s")
+    if frames:
+        print(f"[DUR] total STARTING->terminal = {frames[-1][0] - frames[0][0]:.3f}s")
+
+    perpage = [d["current_progress"] for _, d in frames
+               if d["status"] == "WORKING" and d["message"] is None]
+    print(f"[PERPAGE] per-page WORKING frames (message=null) progress values: {perpage}")
+
+    terminal = frames[-1][1] if frames else {}
+    doc_id = terminal.get("document_id")
+    if doc_id:
+        d = Document.objects.get(id=doc_id)
+        arch = d.get_public_filename(archive=True) if d.has_archive_version else None
+        print(f"[AFTER] finished document_id = {doc_id}")
+        print(f"[AFTER] doc content={d.content!r} archived_file_name={arch!r} "
+              f"original_file_name={d.get_public_filename()!r}")
+    else:
+        print(f"[AFTER] terminal status={terminal.get('status')} document_id=null ; "
+              f"document count = {Document.objects.count()}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+
+#### `direct_parse.py` — in-process parser probe (SUPPORTING / NON-CANONICAL)
+
+```python
+#!/usr/bin/env python3
+"""direct_parse.py <fixture> <mime>   (SUPPORTING / NON-CANONICAL)
+
+Instantiates RasterisedDocumentParser and calls parse() in-process to expose
+the exact OCRmyPDF arguments, whether a fallback occurred, the resulting
+archive_path, and the extracted text. This is a supporting probe, NOT the
+canonical pipeline; the canonical proof is the real upload+worker run.
+
+The fixture is COPIED to a scratch temp first because parse() may rewrite its
+input file in place (alpha-layer removal, src/paperless_tesseract/parsers.py:L201);
+the in-repo fixture is therefore never modified.
+
+Logging: a dedicated DEBUG handler is attached to ONLY the
+"paperless.parsing.tesseract" logger so the parser's own lines (OCRmyPDF args,
+DPI detection, sidecar decision) are shown cleanly and completely. Verbose PIL/
+ocrmypdf-internal DEBUG is left suppressed at its default level; the ocrmypdf
+ERROR/INFO summary still surfaces via paperless's own root handler.
+"""
+import os
+import sys
+import uuid
+import shutil
+import logging
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+_pt = logging.getLogger("paperless.parsing.tesseract")
+_pt.setLevel(logging.DEBUG)
+_pt.propagate = False
+_h = logging.StreamHandler(sys.stdout)
+_h.setLevel(logging.DEBUG)
+_h.setFormatter(logging.Formatter("[%(levelname)s][%(name)s] %(message)s"))
+_pt.addHandler(_h)
+
+from django.conf import settings                              # noqa: E402
+from paperless_tesseract.parsers import RasterisedDocumentParser  # noqa: E402
+
+FIXTURE, MIME = sys.argv[1], sys.argv[2]
+
+os.makedirs(settings.SCRATCH_DIR, exist_ok=True)
+ext = os.path.splitext(FIXTURE)[1]
+work = os.path.join(settings.SCRATCH_DIR, f"dp-{uuid.uuid4().hex}{ext}")
+shutil.copyfile(FIXTURE, work)
+
+print(f"[CFG] OCR_MODE={settings.OCR_MODE} fixture={FIXTURE} mime={MIME}")
+
+parser = RasterisedDocumentParser(logging_group=uuid.uuid4())
+try:
+    parser.parse(work, MIME)
+    print(f"[RESULT] archive_path={parser.archive_path!r}")
+    print(f"[RESULT] archive_path_is_file={bool(parser.archive_path) and os.path.isfile(parser.archive_path)}")
+    print(f"[RESULT] text={parser.get_text()!r}")
+    print(f"[RESULT] text_len={len(parser.get_text() or '')}")
+finally:
+    parser.cleanup()
+    if os.path.exists(work):
+        os.remove(work)
+```
+
+#### `has_text_probe.py` — replicate the has-text branch (SUPPORTING / NON-CANONICAL)
+
+```python
+#!/usr/bin/env python3
+"""has_text_probe.py <fixture> <mime>   (SUPPORTING / NON-CANONICAL)
+
+Replicates the exact has-text branch logic of RasterisedDocumentParser.parse()
+(src/paperless_tesseract/parsers.py:L234-L239) using the REAL extract_text
+(parsers.py:L99), and prints original_has_text plus the length that drives the
+PDF `len > 50` gate (parsers.py:L236).
+
+  PDF branch  (L234-236): text_original = extract_text(None, path);
+                          original_has_text = text_original and len(text_original) > 50
+  image branch(L237-239): text_original = None; original_has_text = False  (unconditional)
+"""
+import os
+import sys
+import uuid
+import logging
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+logging.disable(logging.CRITICAL)  # keep the probe output clean
+
+from paperless_tesseract.parsers import RasterisedDocumentParser  # noqa: E402
+
+FIXTURE, MIME = sys.argv[1], sys.argv[2]
+parser = RasterisedDocumentParser(logging_group=uuid.uuid4())
+try:
+    if MIME == "application/pdf":
+        text_original = parser.extract_text(None, FIXTURE)
+        original_has_text = bool(text_original and len(text_original) > 50)
+        branch = "PDF branch: len>50 gate (parsers.py:L236)"
+    else:
+        text_original = None
+        original_has_text = False
+        branch = "image branch: original_has_text hard-coded False (parsers.py:L239)"
+
+    tlen = len(text_original) if text_original else 0
+    snippet = (text_original[:70] if text_original else None)
+    print(f"fixture={os.path.basename(FIXTURE)} mime={MIME}")
+    print(f"  text_original_len={tlen}  original_has_text={original_has_text}  [{branch}]")
+    print(f"  snippet={snippet!r}")
+finally:
+    parser.cleanup()
+```
+
+#### `sidecar_demo.py` — expose the exact sidecar bytes (SUPPORTING / NON-CANONICAL)
+
+```python
+#!/usr/bin/env python3
+"""sidecar_demo.py <fixture>   (SUPPORTING / NON-CANONICAL)
+
+Builds the OCRmyPDF arguments via the REAL construct_ocrmypdf_parameters
+(src/paperless_tesseract/parsers.py:L135), runs ocrmypdf.ocr, and prints the
+EXACT sidecar bytes plus the `"[OCR skipped on page"` substring check that
+extract_text uses (parsers.py:L104) to decide whether to discard the sidecar
+and fall back to pdfminer.six. Also prints the extract_text() result.
+
+Runs under the process's current OCR_MODE (canonical skip here). The fixture is
+copied to scratch first; the in-repo fixture is never modified.
+"""
+import os
+import sys
+import uuid
+import shutil
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+from django.conf import settings                              # noqa: E402
+from paperless_tesseract.parsers import RasterisedDocumentParser  # noqa: E402
+import ocrmypdf                                               # noqa: E402
+
+FIXTURE = sys.argv[1]
+os.makedirs(settings.SCRATCH_DIR, exist_ok=True)
+work = os.path.join(settings.SCRATCH_DIR, f"sc-{uuid.uuid4().hex}.pdf")
+shutil.copyfile(FIXTURE, work)
+
+parser = RasterisedDocumentParser(logging_group=uuid.uuid4())
+try:
+    archive = os.path.join(parser.tempdir, "archive.pdf")
+    sidecar = os.path.join(parser.tempdir, "sidecar.txt")
+    args = parser.construct_ocrmypdf_parameters(work, "application/pdf", archive, sidecar)
+    print(f"OCR_MODE={settings.OCR_MODE}  skip_text={args.get('skip_text')}")
+    ocrmypdf.ocr(**args)
+    with open(sidecar, "r") as f:
+        sidecar_bytes = f.read()
+    print("=== sidecar.txt (exact bytes) ===")
+    print(repr(sidecar_bytes))
+    print('=== contains substring "[OCR skipped on page" (parsers.py:L104 check) ? ===',
+          "[OCR skipped on page" in sidecar_bytes)
+    result = parser.extract_text(sidecar, archive)
+    print("extract_text() result (first 160 chars) =", repr(result[:160]))
+finally:
+    parser.cleanup()
+    if os.path.exists(work):
+        os.remove(work)
+```
+
+#### `q3_compare.py` — upload both cases and diff the API responses (real entry points)
+
+```python
+#!/usr/bin/env python3
+"""q3_compare.py   (real entry points)
+
+Uploads the OCR'd image (simple.png) and the text-layer PDF
+(multi-page-digital.pdf) via POST /api/documents/post_document/, waits for each
+to finish, then GETs /api/documents/{id}/ (token auth) and prints the COMPLETE
+JSON body for each, followed by a diff of the three provenance-relevant fields
+(content, archived_file_name, original_file_name).
+"""
+import os
+import sys
+import json
+import time
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+import requests  # noqa: E402
+from documents.models import Document  # noqa: E402
+
+BASE = "http://localhost:8000"
+USER = "admin"
+PASSWORD = "<PASSWORD>"  # redacted throwaway admin password
+S = "/app/src/paperless_tesseract/tests/samples"
+
+
+def token():
+    r = requests.post(f"{BASE}/api/token/", data={"username": USER, "password": PASSWORD})
+    return r.json()["token"]
+
+
+def upload_and_wait(tok, path, name, mime, expected_count):
+    with open(path, "rb") as fh:
+        r = requests.post(
+            f"{BASE}/api/documents/post_document/",
+            headers={"Authorization": f"Token {tok}"},
+            files={"document": (name, fh, mime)},
+        )
+    assert r.status_code == 200, (r.status_code, r.text)
+    for _ in range(400):  # up to ~40s
+        if Document.objects.count() >= expected_count:
+            break
+        time.sleep(0.1)
+    return Document.objects.order_by("-added").first().id
+
+
+def main():
+    tok = token()
+    id1 = upload_and_wait(tok, f"{S}/simple.png", "simple.png", "image/png", 1)
+    id2 = upload_and_wait(tok, f"{S}/multi-page-digital.pdf", "multi-page-digital.pdf",
+                          "application/pdf", 2)
+    print(f"created ids: [{id1}, {id2}]")
+
+    bodies = {}
+    for i in (id1, id2):
+        r = requests.get(f"{BASE}/api/documents/{i}/",
+                         headers={"Authorization": f"Token {tok}"})
+        bodies[i] = r.json()
+        print(f"\n===== GET /api/documents/{i}/ (HTTP {r.status_code}) - full JSON =====")
+        print(json.dumps(bodies[i], indent=2))
+
+    print("\n===== FIELD DIFF (the three provenance-relevant fields) =====")
+    for field in ("content", "archived_file_name", "original_file_name"):
+        print(f"  {field}:")
+        print(f"    doc {id1}: {bodies[id1].get(field)!r}")
+        print(f"    doc {id2}: {bodies[id2].get(field)!r}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### `get_doc_json.py` — upload one file and print its full API JSON (real entry points)
+
+```python
+#!/usr/bin/env python3
+"""get_doc_json.py <fixture> <name> <mime>   (real entry points)
+
+Uploads one file via POST /api/documents/post_document/, waits for it to
+persist, then prints the COMPLETE JSON body from GET /api/documents/{id}/.
+"""
+import os
+import sys
+import json
+import time
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+import requests  # noqa: E402
+from documents.models import Document  # noqa: E402
+
+BASE = "http://localhost:8000"
+USER, PASSWORD = "admin", "<PASSWORD>"  # password redacted (throwaway)
+FIXTURE, NAME, MIME = sys.argv[1], sys.argv[2], sys.argv[3]
+
+tok = requests.post(f"{BASE}/api/token/",
+                    data={"username": USER, "password": PASSWORD}).json()["token"]
+before = Document.objects.count()
+with open(FIXTURE, "rb") as fh:
+    r = requests.post(f"{BASE}/api/documents/post_document/",
+                      headers={"Authorization": f"Token {tok}"},
+                      files={"document": (NAME, fh, MIME)})
+assert r.status_code == 200, (r.status_code, r.text)
+for _ in range(400):
+    if Document.objects.count() > before:
+        break
+    time.sleep(0.1)
+doc_id = Document.objects.order_by("-added").first().id
+r = requests.get(f"{BASE}/api/documents/{doc_id}/",
+                 headers={"Authorization": f"Token {tok}"})
+print(f"===== GET /api/documents/{doc_id}/ (HTTP {r.status_code}) - full JSON =====")
+print(json.dumps(r.json(), indent=2))
+```
+
+#### `checksum_probe.py` — demonstrate the L104-vs-L402 checksum difference (SUPPORTING / NON-CANONICAL)
+
+```python
+#!/usr/bin/env python3
+"""checksum_probe.py <fixture> <mime>   (SUPPORTING / NON-CANONICAL)
+
+Demonstrates why the persisted Document.checksum (set AFTER parse at
+src/documents/consumer.py:L402) can differ from the duplicate pre-check checksum
+(computed BEFORE parse at consumer.py:L104) for an image with an alpha layer:
+RasterisedDocumentParser rewrites its input file IN PLACE during alpha-layer
+removal (src/paperless_tesseract/parsers.py:L201, background.save(input_file)).
+
+Prints md5(input) before and after construct_ocrmypdf_parameters() runs on a
+COPY (the in-repo fixture is never modified).
+"""
+import os
+import sys
+import uuid
+import shutil
+import hashlib
+import logging
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+
+logging.disable(logging.CRITICAL)
+
+from django.conf import settings                              # noqa: E402
+from paperless_tesseract.parsers import RasterisedDocumentParser  # noqa: E402
+
+FIXTURE, MIME = sys.argv[1], sys.argv[2]
+
+
+def md5(path):
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+os.makedirs(settings.SCRATCH_DIR, exist_ok=True)
+work = os.path.join(settings.SCRATCH_DIR, f"ck-{uuid.uuid4().hex}.png")
+shutil.copyfile(FIXTURE, work)
+
+before = md5(work)
+print(f"fixture={os.path.basename(FIXTURE)}")
+print(f"  md5 BEFORE parse (what pre_check_duplicate hashes, consumer.py:L104) = {before}")
+
+parser = RasterisedDocumentParser(logging_group=uuid.uuid4())
+try:
+    archive = os.path.join(parser.tempdir, "archive.pdf")
+    sidecar = os.path.join(parser.tempdir, "sidecar.txt")
+    # This performs the in-place alpha-layer removal (parsers.py:L191-L201).
+    parser.construct_ocrmypdf_parameters(work, MIME, archive, sidecar)
+    after = md5(work)
+    print(f"  md5 AFTER  parse (what _store persists, consumer.py:L402)        = {after}")
+    print(f"  changed by in-place alpha normalization? {before != after}")
+finally:
+    parser.cleanup()
+    if os.path.exists(work):
+        os.remove(work)
+```
+
+
+### 5.2 Read-only proof: the source repository is unchanged
+
+The investigation modified **no** source file. All observation scripts lived under `/tmp/inv/` (outside any git tree) and were removed afterward; the temporary `Document` rows and media were deleted; the transient `skip_noarchive` mode was restored to canonical `skip`. Below is the actual, quoted git state.
+
+**Inside the container `/app` (the source checkout that was exercised):**
+
+```text
+$ git rev-parse HEAD
+542221a38dff06361e07976452f9aea24d210542
+
+$ git status --porcelain
+(exit: git status --porcelain produced the above; empty = clean)
+
+$ git diff --stat
+(empty = no tracked file modified)
+
+=== fixture md5s (unchanged vs canonical) ===
+249d1239dc39449c856dcdfbb75850c5  src/paperless_tesseract/tests/samples/simple.png
+e8c17675174950020835add3f444f08c  src/paperless_tesseract/tests/samples/no-text-alpha.png
+9c9691e51741c1f4f41a20896af31770  src/paperless_tesseract/tests/samples/multi-page-digital.pdf
+62acb0bcbfbcaa62ca6ad3668e4e404b  src/paperless_tesseract/tests/samples/multi-page-images.pdf
+beb6b3c0d5695ab0686d1a16e07faf5e  src/paperless_tesseract/tests/samples/multi-page-mixed.pdf
+f4adf4460cbc7e05ac1890016a22d360  src/paperless_tesseract/tests/samples/encrypted.pdf
+42995833e01aea9b3edee44bbfdd7ce1  src/paperless_tesseract/tests/samples/simple-digital.pdf
+```
+
+`git status --porcelain` and `git diff --stat` both produced **no output** — the tree is clean and no tracked file was modified. The fixture md5s are shown to prove the in-repo inputs were never altered (`RasterisedDocumentParser` rewrites only its own scratch copies, never the originals — see `direct_parse.py`/`checksum_probe.py`, which copy to `SCRATCH_DIR` first).
+
+**In the destination working tree (where this answer document is committed):** the only change over the source baseline is the addition of this single Markdown file.
+
+```text
+$ git rev-parse HEAD
+a8c2a1aa68462c8331ea591ff634c1f4005918d3
+
+$ git diff --name-status 542221a38dff06361e07976452f9aea24d210542..HEAD
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+
+$ git status --porcelain
+(empty above = clean)
+```
+
+`git diff --name-status` against the source baseline shows exactly one added path — `blitzy/documentation/paperless-ngx_542221a38dff.md` — and nothing modified or deleted. This satisfies the read-only constraint: the repository is left byte-for-byte unchanged apart from this answer document.
+
+---
+
+*End of document.*
+
