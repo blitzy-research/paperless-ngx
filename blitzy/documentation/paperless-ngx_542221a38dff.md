@@ -1,7 +1,7 @@
 # Paperless-ngx — Memory Usage During Document Import and Metadata Handling: A Runtime Investigation
 
 **Repository:** paperless-ngx
-**Commit investigated:** `542221a38dff06361e07976452f9aea24d210542` (HEAD of branch `blitzy-6a755538-5279-46bb-a229-50a82880251d`)
+**Commit investigated:** `542221a38dff06361e07976452f9aea24d210542` (the base/source commit of branch `blitzy-6a755538-5279-46bb-a229-50a82880251d`; the branch was created from this commit and the read-only `/app` checkout sits at it — it is **not** the branch tip, which advances as this document is revised)
 **Canonical runtime:** Python **3.9.23** inside the provided Docker image (`python:3.9-slim-bullseye` base per `Dockerfile:L18`), default configuration `DEBUG=NO` (`src/paperless/settings.py:L50`).
 **Nature of this document:** A read-only, run-first **diagnostic answer**. Every behavioural claim below is backed by the *actual, unedited* output of temporary observation scripts that drove the **real** paperless-ngx entry points under a tri-lens memory harness. No source file was modified; the harness scripts lived outside the repository and were deleted afterward. The read-only proof (`git status --porcelain`) is in the Appendix.
 
@@ -6063,28 +6063,25 @@ TIKA_PROBE_DONE
 
 All harness scripts lived under `/tmp/mem_harness/` (inside the canonical container, outside the repository) and were deleted after use; the only persistent write to the repository is this answer document.
 
-**Two distinct commits — do not conflate them:**
+**Source commit vs. destination branch — do not conflate them:**
 
 - **Source commit investigated** — `542221a38dff06361e07976452f9aea24d210542`. This is the paperless-ngx baseline that the read-only investigation targeted: the canonical container's `/app` checkout sits at this commit, and every `file:line` reference in this document is anchored to it.
-- **Destination-branch HEAD before this remediation** — `6103c10892bb46ce5d4c453c34801f11976fa948` on branch `blitzy-6a755538-5279-46bb-a229-50a82880251d`. This answer document is committed as a single follow-up commit whose **parent is `6103c108…`** (i.e. `HEAD~1`). Neither of these is the *source* commit; the document filename embeds the source short-SHA `542221a38dff` for traceability, which is the investigated commit — not any branch HEAD.
+- **Destination branch** — `blitzy-6a755538-5279-46bb-a229-50a82880251d`, created from the source commit above. This answer document is the **only** content the branch adds on top of that source commit: every commit on the branch touches this single file and nothing else. The branch tip (`HEAD`) advances each time the document is revised, so it is deliberately **not** quoted here as an absolute hash; the stable anchor for the read-only proof below is the fixed source commit `542221a38dff…`. The document filename embeds the source short-SHA `542221a38dff` for traceability — that is the investigated commit, **not** any branch HEAD.
 
-**What the deliverable commit changed (parent → this commit), verbatim — stable regardless of the commit's own hash:**
+**What the branch changed relative to the investigated source commit `542221a38dff…`, verbatim — stable regardless of how many times the document is revised:**
 
 ```
 $ git rev-parse --abbrev-ref HEAD
 blitzy-6a755538-5279-46bb-a229-50a82880251d
 
-$ git rev-parse HEAD~1
-6103c10892bb46ce5d4c453c34801f11976fa948
+$ git diff --name-status 542221a38dff06361e07976452f9aea24d210542 HEAD
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
 
-$ git diff --name-status HEAD~1 HEAD
-M	blitzy/documentation/paperless-ngx_542221a38dff.md
-
-$ git diff --name-only HEAD~1 HEAD -- src/ | wc -l
+$ git diff --name-only 542221a38dff06361e07976452f9aea24d210542 HEAD -- src/ | wc -l
 0
 ```
 
-The single follow-up commit modifies exactly **one** path across the whole tree — this answer document — and touches **zero** files under `src/`. (`git diff --name-status HEAD~1 HEAD` compares the pre-remediation HEAD `6103c108…` to the commit that carries this document, so it is unaffected by that commit's own absolute hash.)
+Relative to the investigated source commit `542221a38dff…`, the whole branch adds exactly **one** path across the entire tree — this answer document (status `A`) — and touches **zero** files under `src/`. Anchoring the diff to the absolute base SHA (rather than a relative `HEAD~N`) keeps this proof stable no matter how many revision commits are appended: the `src/` comparison always yields `0`.
 
 **Clean working tree after commit, and baseline-diff vs the investigated source, verbatim:**
 
