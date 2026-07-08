@@ -364,7 +364,7 @@ documents/tests/test_classifier.py::TestClassifier::test_load_classifier_cached 
 - `testDatasetHashing` [`test_classifier.py:L137`] — `assertTrue(train())` then `assertFalse(train())` (guard). **PASS.**
 - `testSaveClassifier` [`test_classifier.py:L168`] — train → `save()` → fresh `load()` → `assertFalse(train())`. **PASS.**
 - `test_load_and_classify` [`test_classifier.py:L183`] — loads the **committed** fixture `src/documents/tests/data/model.pickle` (**156,607 bytes**) under `override_settings(MODEL_FILE=…)`. **PASS.** (This is a _controlled_ reuse — not contamination.)
-- `test_load_classifier_cached` [`test_classifier.py:L402`] — **SKIPPED**, reason `"Disabled caching due to high memory usage - need to investigate"` (skip declared at `test_classifier.py:L391`).
+- `test_load_classifier_cached` [`test_classifier.py:L402`] — **SKIPPED**, reason `"Disabled caching due to high memory usage - need to investigate"` (the `@pytest.mark.skip` decorator is declared at `test_classifier.py:L399`; pytest's own summary reports the skip location as `test_classifier.py:391` — the first line of the test's stacked decorators, `@override_settings` at `L391`).
 
 ### 2.3 Cross-test contamination surface — evidence
 
@@ -959,6 +959,8 @@ Destroying test database for alias 'default'...
 
 (The `convert-im6.q16 … security policy` lines are the incidental ImageMagick PDF-thumbnail policy warning; the parser transparently falls back to Ghostscript for the thumbnail — unrelated to the stored MIME, shown here only because the output is complete and unedited.)
 
+(Fixture-naming note: the consume-time input filenames in the log above — `q3_pdf.pdf` and `q3_png.png` — are copies of the committed fixtures `simple.pdf` and `simple.png`, which the table below labels by their canonical fixture names. The consume-time copy does not change MIME detection: `magic.from_file(…, mime=True)` returns `application/pdf` for `simple.pdf` and `image/png` for `simple.png` — exactly the values in the table.)
+
 **All three MIME facets, side by side (input detection, OCR archive, and the value actually persisted to the DB):**
 
 | Input sample                     | input `magic.from_file` [`consumer.py:L219`] | OCR archive `magic.from_file` | **persisted `Document.mime_type`** [`consumer.py:L401`] |
@@ -1019,7 +1021,7 @@ The 5 selected tests are `test_skip_noarchive_notext`, `test_with_form`, `test_w
 
 ### 5.1 Direct answer (the key zero-rows result)
 
-A single input file passed through the **barcode branch** of `consume_file()` [`src/documents/tasks.py:L184-L233`] yields **zero `Document` records created directly**. When barcodes are enabled (`settings.CONSUMER_ENABLE_BARCODES`, **default off** [`src/paperless/settings.py:L502-L504`]) and separators are found, the branch splits the PDF into **N segment files**, **saves those split PDFs back to the consumption directory** via `save_to_dir` (default `target_dir=settings.CONSUMPTION_DIR` [`tasks.py:L164-L166`]), **deletes the original**, and **returns early with the string `"File successfully split"`** [`tasks.py:L233`]. No `Document` row is created in that call. The `/tmp` spy proved this directly:
+A single input file passed through the **barcode branch** of `consume_file()` [`src/documents/tasks.py:L184-L233`] yields **zero `Document` records created directly**. When barcodes are enabled (`settings.CONSUMER_ENABLE_BARCODES`, **default off** [`src/paperless/settings.py:L502-L504`]) and separators are found, the branch splits the PDF into **N segment files**, **saves those split PDFs back to the consumption directory** via `save_to_dir` (default `target_dir=settings.CONSUMPTION_DIR` [`tasks.py:L164-L168`]), **deletes the original**, and **returns early with the string `"File successfully split"`** [`tasks.py:L233`]. No `Document` row is created in that call. The `/tmp` spy proved this directly:
 
 ```
 [Q4-consume_file barcode branch, CONSUMER_ENABLE_BARCODES=True]
@@ -1304,7 +1306,7 @@ barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
 
 **Observed:** the barcode branch creates **0** `Document` rows and instead re-queues the **N** split PDFs into the consumption directory (`CONSUMPTION_DIR before = []` → `after = ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']`, original deleted, return `"File successfully split"`) — all shown in §5.1.
 
-**INFERRED (downstream, not directly observed in the single call):** because those split files land back in the consumption directory, they are later **independently re-consumed** through the **non-barcode** branch of `consume_file` into **new `Document` rows**. Only then do they enter the corpus that `train()` reads via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`src/documents/classifier.py:L125-L127`]. Consequently, a single barcode input does **not immediately** change the effective training data (0 rows on the split call); it changes it **indirectly and later**, once the re-queued segments are consumed. This is labelled INFERRED because the split call itself was observed to create no rows and to return early; the subsequent re-consumption is the documented design of re-queuing to `CONSUMPTION_DIR` [`tasks.py:L164-L166`] rather than something exercised within the same call.
+**INFERRED (downstream, not directly observed in the single call):** because those split files land back in the consumption directory, they are later **independently re-consumed** through the **non-barcode** branch of `consume_file` into **new `Document` rows**. Only then do they enter the corpus that `train()` reads via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`src/documents/classifier.py:L125-L127`]. Consequently, a single barcode input does **not immediately** change the effective training data (0 rows on the split call); it changes it **indirectly and later**, once the re-queued segments are consumed. This is labelled INFERRED because the split call itself was observed to create no rows and to return early; the subsequent re-consumption is the documented design of re-queuing to `CONSUMPTION_DIR` [`tasks.py:L164-L168`] rather than something exercised within the same call.
 
 ---
 
@@ -1343,7 +1345,7 @@ Every named item across the four questions, with its concrete value, `file:line`
 | 27  | zero `Document` rows + `"File successfully split"`                       | count 0 before **and** after; original deleted                                       | `tasks.py:L184-L233` (`L233`)                       | §5.1                                                        |
 | 28  | fixture counts `[0]` / `[1]` / `[2,5]`                                   | observed exactly                                                                     | `test_tasks.py:L207`,`L222`,`L232`                  | §5.3                                                        |
 | 29  | QR / Code 39 / Code 128 / custom / unreadable / multi-separator          | all decoded/scanned as tabled                                                        | `tasks.py:L75`, `L96`                               | §5.3, §5.4                                                  |
-| 30  | Q4 → Q1/Q2 training-data linkage                                         | 0 rows now; re-queue → later re-consumption (INFERRED)                               | `tasks.py:L164-L166`; `classifier.py:L125-L127`     | §5.5                                                        |
+| 30  | Q4 → Q1/Q2 training-data linkage                                         | 0 rows now; re-queue → later re-consumption (INFERRED)                               | `tasks.py:L164-L168`; `classifier.py:L125-L127`     | §5.5                                                        |
 
 All 30 named items are addressed with observed evidence and grounded references. Negative results (items 9, and the `[]`/unreadable cases) are stated plainly where they are the truth.
 
