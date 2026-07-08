@@ -16,7 +16,7 @@ Every claim below is grounded in one or more of three evidence types, which are 
 | **🔵 CODE** | A `file:line` reference into the pinned source tree (or the installed Django REST Framework 3.13.1 wheel) that explains the mechanism. |
 | **🟠 WEB** | Corroboration from authoritative external documentation (Django REST Framework guide, paperless-ngx docs). See the [Web Corroboration appendix](#appendix-a--web-corroboration). |
 
-**Token redaction.** The API token minted for this investigation is a throwaway credential that has already been destroyed (see [Cleanup](#cleanup--repository-integrity)). It is shown **redacted** everywhere as `745a…8bee` (first 4 + last 4 hex characters of the 40-character key). It is never printed in full.
+**Token redaction.** The API token minted for this investigation is a throwaway credential that has already been destroyed (see [Cleanup](#cleanup--repository-integrity)). It is shown **redacted** everywhere as `b91e…c7f7` (first 4 + last 4 hex characters of the 40-character key). It is never printed in full. For the same reason, no other 40-character token-like string appears anywhere in this document either: the illustrative Django REST Framework example key is shortened to `9944…ee4b`, and the deliberately-invalid key used in the Q9 edge case is shortened to `dead…beef`. The only full-length hex string kept in full is the 40-character **git commit hash** in the header, which is clearly labelled as such.
 
 ---
 
@@ -42,7 +42,7 @@ paperless-ngx contains two mechanisms that can **auto-authenticate** a request a
 
 **This investigation ran with the default, canonical configuration:** `DEBUG` was left at its default of `False` and `PAPERLESS_AUTO_LOGIN_USERNAME` was **not** set. `DEBUG` defaults to `False` because settings reads it as `__get_boolean("PAPERLESS_DEBUG", "NO")` (🔵 `src/paperless/settings.py:L50`). This was confirmed at runtime (see Q1).
 
-> **Environment disclosure (honest limitation note).** The live capture below was performed in the canonical **Python 3.9** runtime with the exact pinned dependency versions (`django==4.0.4`, `djangorestframework==3.13.1`), which is the same stack the project ships (`Dockerfile` = `FROM python:3.9-slim-bullseye`). The only deviation from a stock install is that the throwaway SQLite database and media/index directories were pointed at a temporary location **outside the repository** (via `PAPERLESS_DATA_DIR`) so that no repository file was touched and cleanup would be trivial. This relocation stores data elsewhere on disk; it does **not** alter any authentication code path. Three test documents were inserted through the Django ORM purely so the documents list would be non-empty; they are clearly identifiable ("Blitzy Test Document N") and were removed during cleanup.
+> **Environment disclosure (full reproducibility).** The live capture below was performed in the canonical **Python 3.9** runtime with the exact pinned dependency versions (`django==4.0.4`, `djangorestframework==3.13.1`), which is the same stack the project ships (`Dockerfile` = `FROM python:3.9-slim-bullseye`). **No configuration override of any kind was applied** — in particular `PAPERLESS_DATA_DIR` was **not** set, so all runtime artifacts landed in paperless's *default* locations: the SQLite database at `data/db.sqlite3` (from `DATA_DIR = os.getenv("PAPERLESS_DATA_DIR", os.path.join(BASE_DIR, "..", "data"))`, 🔵 `src/paperless/settings.py:L66`, with the DB name at 🔵 `L300`), the search index under `data/index/` (🔵 `L73`), logs under `data/log/` (🔵 `L76`), media under `media/` (🔵 `L61`), and collected statics under `static/` (🔵 `L59`). Every one of these default paths is already listed in the repository's `.gitignore` (`/data/`, `/media/`, `/static/`, `/consume/`), so running in the default configuration touches **no tracked file** and leaves `git status` clean. The only environment variables used were Django's standard **`DJANGO_SUPERUSER_*`** trio, which merely feed the non-interactive `createsuperuser` prompt (Q2) and are *not* configuration overrides. Three test documents were inserted through the Django ORM purely so the documents list would be non-empty; they are clearly identifiable ("Blitzy Test Document N") and — together with the throwaway database, index, user, and token — were removed during cleanup.
 
 ---
 
@@ -52,20 +52,27 @@ paperless-ngx contains two mechanisms that can **auto-authenticate** a request a
 
 ### Exact commands used
 
+These are the **exact, complete** commands used for the captured run. **No `PAPERLESS_*` environment variable was exported at any point**, so every setting takes its default — this is the true canonical configuration.
+
 ```bash
-# 1. Install pinned dependencies into a Python 3.9 virtualenv
+# 1. Create a Python 3.9 virtualenv and install the pinned dependencies
+python3.9 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 
 # 2. Ensure Redis is running (broker/cache for Django-Q and Channels)
-redis-server --daemonize yes        # already running here; verified with: redis-cli ping -> PONG
+redis-server --daemonize yes        # verified with: redis-cli ping -> PONG
 
-# 3. From the backend source root, build the schema, then run the server
+# 3. From the backend source root, build the schema, then run the server.
+#    NOTE: no PAPERLESS_* variables are set, so DATA_DIR/MEDIA_ROOT/etc. all
+#    default to the repo's (gitignored) data/, media/, static/ directories,
+#    the DB defaults to data/db.sqlite3, and DEBUG defaults to False.
 cd src
 python manage.py migrate            # creates all tables, INCLUDING authtoken_token
 python manage.py runserver 127.0.0.1:8000 --noreload   # DEBUG defaults to False (canonical)
 ```
 
-`src/manage.py` sets `DJANGO_SETTINGS_MODULE=paperless.settings` (🔵 `src/manage.py:L7`), so all commands run against the `paperless` project settings. The pinned versions come from `requirements.txt`: `channels==3.0.4` (🔵 `L23`), `django==4.0.4` (🔵 `L38`), `djangorestframework==3.13.1` (🔵 `L39`), `redis==3.5.3` (🔵 `L84`).
+`src/manage.py` sets `DJANGO_SETTINGS_MODULE=paperless.settings` (🔵 `src/manage.py:L7`), so all commands run against the `paperless` project settings. The pinned versions come from `requirements.txt`: `channels==3.0.4` (🔵 `L23`), `django==4.0.4` (🔵 `L38`), `djangorestframework==3.13.1` (🔵 `L39`), `redis==3.5.3` (🔵 `L84`). The only additional environment variables used in the whole investigation are Django's standard `DJANGO_SUPERUSER_USERNAME`/`_PASSWORD`/`_EMAIL`, shown in Q2, which non-interactively answer the `createsuperuser` prompt and are **not** configuration overrides.
 
 ### 🟢 OBSERVED — dependency versions and canonical DEBUG
 
@@ -79,13 +86,18 @@ redis(client) 3.5.3
 # redis-cli ping
 PONG
 
-# Settings loaded by manage.py (confirms canonical config):
+# Settings loaded by manage.py (confirms canonical / default config):
 DEBUG = False
-DATABASES.default.NAME = <throwaway>/db.sqlite3
+DATABASES.default.ENGINE = django.db.backends.sqlite3
+DATABASES.default.NAME = /tmp/blitzy/paperless-ngx/blitzy-1ad7bea6-aa97-43fb-8c92-b90d77d55110_90596c/src/../data/db.sqlite3
 authtoken in INSTALLED_APPS = True
+DEFAULT_AUTHENTICATION_CLASSES = ['rest_framework.authentication.BasicAuthentication', 'rest_framework.authentication.SessionAuthentication', 'rest_framework.authentication.TokenAuthentication']
+AngularApiAuthenticationOverride appended = False
 ```
 
-### 🟢 OBSERVED — `python manage.py migrate` (excerpt showing the token table being created)
+Two things in this literal output confirm the run is genuinely default/canonical. First, `DATABASES.default.NAME` ends in `.../src/../data/db.sqlite3` — i.e. `BASE_DIR/../data/db.sqlite3`, the *default* SQLite location built by 🔵 `src/paperless/settings.py:L66` and 🔵 `L300` with no `PAPERLESS_DATA_DIR` override (that directory is gitignored). Second, `AngularApiAuthenticationOverride appended = False` proves the DEBUG-only bypass is **not** active, so every authentication result reported below reflects the real token path (see the [Canonical run configuration](#canonical-run-configuration-why-this-matters) section above). The three always-on authenticators appear in the order `BasicAuthentication`, `SessionAuthentication`, `TokenAuthentication` (🔵 `src/paperless/settings.py:L118-L120`), which becomes important in Q9.
+
+### 🟢 OBSERVED — `python manage.py migrate` (complete, unedited output)
 
 ```text
 Operations to perform:
@@ -93,13 +105,95 @@ Operations to perform:
 Running migrations:
   Applying contenttypes.0001_initial... OK
   Applying auth.0001_initial... OK
-  ...
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying contenttypes.0002_remove_content_type_name... OK
+  Applying auth.0002_alter_permission_name_max_length... OK
+  Applying auth.0003_alter_user_email_max_length... OK
+  Applying auth.0004_alter_user_username_opts... OK
+  Applying auth.0005_alter_user_last_login_null... OK
+  Applying auth.0006_require_contenttypes_0002... OK
+  Applying auth.0007_alter_validators_add_error_messages... OK
+  Applying auth.0008_alter_user_username_max_length... OK
+  Applying auth.0009_alter_user_last_name_max_length... OK
+  Applying auth.0010_alter_group_name_max_length... OK
+  Applying auth.0011_update_proxy_permissions... OK
+  Applying auth.0012_alter_user_first_name_max_length... OK
   Applying authtoken.0001_initial... OK
   Applying authtoken.0002_auto_20160226_1747... OK
   Applying authtoken.0003_tokenproxy... OK
-  ...
+  Applying django_q.0001_initial... OK
+  Applying django_q.0002_auto_20150630_1624... OK
+  Applying django_q.0003_auto_20150708_1326... OK
+  Applying django_q.0004_auto_20150710_1043... OK
+  Applying django_q.0005_auto_20150718_1506... OK
+  Applying django_q.0006_auto_20150805_1817... OK
+  Applying django_q.0007_ormq... OK
+  Applying django_q.0008_auto_20160224_1026... OK
+  Applying django_q.0009_auto_20171009_0915... OK
+  Applying django_q.0010_auto_20200610_0856... OK
+  Applying django_q.0011_auto_20200628_1055... OK
+  Applying django_q.0012_auto_20200702_1608... OK
+  Applying django_q.0013_task_attempt_count... OK
+  Applying django_q.0014_schedule_cluster... OK
   Applying documents.0001_initial... OK
-  ...
+  Applying documents.0002_auto_20151226_1316... OK
+  Applying documents.0003_sender... OK
+  Applying documents.0004_auto_20160114_1844... OK
+  Applying documents.0005_auto_20160123_0313... OK
+  Applying documents.0006_auto_20160123_0430... OK
+  Applying documents.0007_auto_20160126_2114... OK
+  Applying documents.0008_document_file_type... OK
+  Applying documents.0009_auto_20160214_0040... OK
+  Applying documents.0010_log... OK
+  Applying documents.0011_auto_20160303_1929... OK
+  Applying documents.0012_auto_20160305_0040... OK
+  Applying documents.0013_auto_20160325_2111... OK
+  Applying documents.0014_document_checksum... OK
+  Applying documents.0015_add_insensitive_to_match... OK
+  Applying documents.0016_auto_20170325_1558... OK
+  Applying documents.0017_auto_20170512_0507... OK
+  Applying documents.0018_auto_20170715_1712... OK
+  Applying documents.0019_add_consumer_user... OK
+  Applying documents.0020_document_added... OK
+  Applying documents.0021_document_storage_type... OK
+  Applying documents.0022_auto_20181007_1420... OK
+  Applying documents.0023_document_current_filename... OK
+  Applying documents.1000_update_paperless_all... OK
+  Applying documents.1001_auto_20201109_1636... OK
+  Applying documents.1002_auto_20201111_1105... OK
+  Applying documents.1003_mime_types... OK
+  Applying documents.1004_sanity_check_schedule... OK
+  Applying documents.1005_checksums... OK
+  Applying documents.1006_auto_20201208_2209... OK
+  Applying documents.1007_savedview_savedviewfilterrule... OK
+  Applying documents.1008_auto_20201216_1736... OK
+  Applying documents.1009_auto_20201216_2005... OK
+  Applying documents.1010_auto_20210101_2159... OK
+  Applying documents.1011_auto_20210101_2340... OK
+  Applying documents.1012_fix_archive_files... OK
+  Applying documents.1013_migrate_tag_colour... OK
+  Applying documents.1014_auto_20210228_1614... OK
+  Applying documents.1015_remove_null_characters... OK
+  Applying documents.1016_auto_20210317_1351... OK
+  Applying documents.1017_alter_savedviewfilterrule_rule_type... OK
+  Applying documents.1018_alter_savedviewfilterrule_value... OK
+  Applying paperless_mail.0001_initial... OK
+  Applying paperless_mail.0002_auto_20201117_1334... OK
+  Applying paperless_mail.0003_auto_20201118_1940... OK
+  Applying paperless_mail.0004_mailrule_order... OK
+  Applying paperless_mail.0005_help_texts... OK
+  Applying paperless_mail.0006_auto_20210101_2340... OK
+  Applying paperless_mail.0007_auto_20210106_0138... OK
+  Applying paperless_mail.0008_auto_20210516_0940... OK
+  Applying paperless_mail.0009_mailrule_assign_tags... OK
+  Applying paperless_mail.0010_auto_20220311_1602... OK
+  Applying paperless_mail.0011_remove_mailrule_assign_tag... OK
+  Applying paperless_mail.0012_alter_mailrule_assign_tags... OK
+  Applying paperless_mail.0009_alter_mailrule_action_alter_mailrule_folder... OK
+  Applying paperless_mail.0013_merge_20220412_1051... OK
+  Applying paperless_mail.0014_alter_mailrule_action... OK
   Applying sessions.0001_initial... OK
 ```
 
@@ -111,11 +205,11 @@ Running migrations:
 Performing system checks...
 
 System check identified no issues (0 silenced).
-July 08, 2026 - 04:38:39
+July 08, 2026 - 05:09:22
 Django version 4.0.4, using settings 'paperless.settings'
 Starting development server at http://127.0.0.1:8000/
 Quit the server with CONTROL-C.
-[08/Jul/2026 04:38:39] "GET /api/ HTTP/1.1" 200 311
+[08/Jul/2026 05:21:00] "GET /api/ HTTP/1.1" 200 311
 ```
 
 The banner confirms the server bound to `http://127.0.0.1:8000/` using the `paperless.settings` module on Django 4.0.4 — the canonical runtime used for every capture below.
@@ -157,7 +251,7 @@ username= blitzy_apitest is_superuser= True is_staff= True is_active= True
 
 **Question.** Generate a DRF auth token for that user through a real path.
 
-Two real paths were exercised, and **both produced the same 40-character hex key** (redacted `745a…8bee`). They agree because DRF's token-acquisition view uses `get_or_create` — a user has at most one DRF token, so re-requesting returns the existing one.
+Two real paths were exercised, and **both produced the same 40-character hex key** (redacted `b91e…c7f7`). They agree because DRF's token-acquisition view uses `get_or_create` — a user has at most one DRF token, so re-requesting returns the existing one.
 
 ### Path A — management command `drf_create_token`
 
@@ -170,7 +264,7 @@ python manage.py drf_create_token blitzy_apitest
 #### 🟢 OBSERVED
 
 ```text
-Generated token 745a…8bee for user blitzy_apitest
+Generated token b91e…c7f7 for user blitzy_apitest
 ```
 
 Runtime inspection of the stored key (length, hex-ness, and the backing table):
@@ -193,7 +287,7 @@ curl -i -X POST -d "username=blitzy_apitest&password=<redacted>" http://127.0.0.
 
 ```text
 HTTP/1.1 200 OK
-Date: Wed, 08 Jul 2026 04:39:55 GMT
+Date: Wed, 08 Jul 2026 05:10:02 GMT
 Server: WSGIServer/0.2 CPython/3.9.25
 Content-Type: application/json
 Allow: POST, OPTIONS
@@ -205,7 +299,7 @@ X-Content-Type-Options: nosniff
 Referrer-Policy: same-origin
 Cross-Origin-Opener-Policy: same-origin
 
-{"token":"745a…8bee"}
+{"token":"b91e…c7f7"}
 ```
 
 **Cause → effect (why 40 hex chars).** The key is generated by `Token.generate_key()`, which is `binascii.hexlify(os.urandom(20)).decode()` (🔵 DRF 3.13.1 `rest_framework/authtoken/models.py:L36-L37`). Twenty random bytes hex-encode to exactly **40 hexadecimal characters**, which is the `max_length=40` primary-key column on the `Token` model (🔵 same file `L13`). The observed `LEN = 40` / `IS_HEX = True` confirm this.
@@ -219,14 +313,14 @@ Cross-Origin-Opener-Policy: same-origin
 ### Command
 
 ```bash
-curl -i -H "Authorization: Token 745a…8bee" http://127.0.0.1:8000/api/documents/
+curl -i -H "Authorization: Token b91e…c7f7" http://127.0.0.1:8000/api/documents/
 ```
 
-### 🟢 OBSERVED — full response (status line, all headers, JSON body)
+### 🟢 OBSERVED — full response, exactly as emitted by `curl -i` (status line, all headers, single-line JSON body)
 
 ```http
 HTTP/1.1 200 OK
-Date: Wed, 08 Jul 2026 04:39:16 GMT
+Date: Wed, 08 Jul 2026 05:10:42 GMT
 Server: WSGIServer/0.2 CPython/3.9.25
 Content-Type: application/json
 Vary: Accept, Accept-Language, Origin, Cookie
@@ -240,14 +334,20 @@ X-Content-Type-Options: nosniff
 Referrer-Policy: same-origin
 Cross-Origin-Opener-Policy: same-origin
 
-{"count":3,"next":null,"previous":null,"results":[
-  {"id":3,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 3","content":"This is the OCR content body of Blitzy test document number 3.","tags":[],"created":"2026-07-08T04:38:59.031257Z","modified":"2026-07-08T04:38:59.033344Z","added":"2026-07-08T04:38:59.031259Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 3.pdf","archived_file_name":null},
-  {"id":2,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 2","content":"This is the OCR content body of Blitzy test document number 2.","tags":[],"created":"2026-07-08T04:38:59.025076Z","modified":"2026-07-08T04:38:59.026681Z","added":"2026-07-08T04:38:59.025081Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 2.pdf","archived_file_name":null},
-  {"id":1,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 1","content":"This is the OCR content body of Blitzy test document number 1.","tags":[],"created":"2026-07-08T04:38:59.006500Z","modified":"2026-07-08T04:38:59.010374Z","added":"2026-07-08T04:38:59.006505Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 1.pdf","archived_file_name":null}
-]}
+{"count":3,"next":null,"previous":null,"results":[{"id":3,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 3","content":"This is the OCR content body of Blitzy test document number 3.","tags":[],"created":"2026-07-08T05:10:35.480312Z","modified":"2026-07-08T05:10:35.480427Z","added":"2026-07-08T05:10:35.480316Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 3.pdf","archived_file_name":null},{"id":2,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 2","content":"This is the OCR content body of Blitzy test document number 2.","tags":[],"created":"2026-07-08T05:10:35.474928Z","modified":"2026-07-08T05:10:35.475064Z","added":"2026-07-08T05:10:35.474932Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 2.pdf","archived_file_name":null},{"id":1,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 1","content":"This is the OCR content body of Blitzy test document number 1.","tags":[],"created":"2026-07-08T05:10:35.465334Z","modified":"2026-07-08T05:10:35.466931Z","added":"2026-07-08T05:10:35.465344Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 1.pdf","archived_file_name":null}]}
 ```
 
-> The body above is the exact bytes returned (`Content-Length: 1263`); it has only been pretty-printed with line breaks between the three `results` items for readability. The three items are the disclosed "Blitzy Test Document" fixtures. `X-Version: 1.7.0` is the paperless version and `X-Api-Version: 2` is the negotiated API version (from `AcceptHeaderVersioning`, 🔵 `src/paperless/settings.py:L122`).
+> This is the **verbatim, unedited** `curl -i` output: the status line, every response header in the exact order sent, a blank line, then the JSON body **on a single line exactly as returned** — it has **not** been reflowed or pretty-printed. The body is `Content-Length: 1263` bytes; on the wire each header line is terminated by CRLF (`\r\n`) per the HTTP spec (shown here as ordinary line breaks). The three `results` items are the disclosed "Blitzy Test Document" fixtures. `X-Version: 1.7.0` is the paperless version and `X-Api-Version: 2` is the negotiated API version (from `AcceptHeaderVersioning`, 🔵 `src/paperless/settings.py:L122`).
+
+> **Reading aid only (not the wire bytes).** The same body re-indented for legibility — one `results` item per line — is shown below purely to make the field set easy to read; the authoritative output is the single-line body above.
+
+```jsonc
+{"count":3,"next":null,"previous":null,"results":[
+  {"id":3,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 3","content":"This is the OCR content body of Blitzy test document number 3.","tags":[],"created":"2026-07-08T05:10:35.480312Z","modified":"2026-07-08T05:10:35.480427Z","added":"2026-07-08T05:10:35.480316Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 3.pdf","archived_file_name":null},
+  {"id":2,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 2","content":"This is the OCR content body of Blitzy test document number 2.","tags":[],"created":"2026-07-08T05:10:35.474928Z","modified":"2026-07-08T05:10:35.475064Z","added":"2026-07-08T05:10:35.474932Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 2.pdf","archived_file_name":null},
+  {"id":1,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 1","content":"This is the OCR content body of Blitzy test document number 1.","tags":[],"created":"2026-07-08T05:10:35.465334Z","modified":"2026-07-08T05:10:35.466931Z","added":"2026-07-08T05:10:35.465344Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 1.pdf","archived_file_name":null}
+]}
+```
 
 **Cause → effect.** The token in the `Authorization` header is validated by `TokenAuthentication` (Q5/Q10), which sets `request.user` to `blitzy_apitest`. The viewset's `permission_classes = (IsAuthenticated,)` (🔵 `src/documents/views.py:L183`) then passes because the request is now authenticated, so the viewset returns the serialized, paginated document list with **HTTP 200**.
 
@@ -258,7 +358,7 @@ Cross-Origin-Opener-Policy: same-origin
 **Question.** State the precise header name and value format.
 
 - **Header name:** `Authorization`
-- **Header value:** `Token ` + the 40-character key — i.e. `Authorization: Token 745a…8bee`
+- **Header value:** `Token ` + the 40-character key — i.e. `Authorization: Token b91e…c7f7`
 
 This is the exact header used in the Q4 request that produced HTTP 200.
 
@@ -276,7 +376,7 @@ So the literal word **`Token`**, followed by whitespace, followed by the key, is
 TokenAuthentication.keyword = 'Token'
 ```
 
-**🟠 WEB.** The DRF authentication guide states the key must be prefixed by the string literal "Token" with whitespace separating the two, giving the example `Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b` (🟠 [WEB-1](#appendix-a--web-corroboration)). paperless's own docs show the same `Authorization: Token <token>` header (🔵 `docs/api.rst:L143`).
+**🟠 WEB.** The DRF authentication guide states the key must be prefixed by the string literal "Token" with whitespace separating the two, giving the example `Authorization: Token 9944…ee4b` (🟠 [WEB-1](#appendix-a--web-corroboration)). paperless's own docs show the same `Authorization: Token <token>` header (🔵 `docs/api.rst:L143`).
 
 ---
 
@@ -346,20 +446,31 @@ Pagination is wired **per-viewset** via `pagination_class = StandardPagination` 
 ### 🟢 OBSERVED — controlling the page with `?page_size=1`
 
 ```bash
-curl -i -H "Authorization: Token 745a…8bee" "http://127.0.0.1:8000/api/documents/?page_size=1"
+curl -i -H "Authorization: Token b91e…c7f7" "http://127.0.0.1:8000/api/documents/?page_size=1"
 ```
+
+### 🟢 OBSERVED — complete, unedited `curl -i` response (all headers + single-line JSON body)
 
 ```http
 HTTP/1.1 200 OK
+Date: Wed, 08 Jul 2026 05:10:50 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
 Content-Type: application/json
-Content-Length: 508
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
 X-Api-Version: 2
 X-Version: 1.7.0
-...
-{"count":3,"next":"http://127.0.0.1:8000/api/documents/?page=2&page_size=1","previous":null,"results":[
-  {"id":3, ... ,"title":"Blitzy Test Document 3", ... }
-]}
+Content-Length: 508
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
+{"count":3,"next":"http://127.0.0.1:8000/api/documents/?page=2&page_size=1","previous":null,"results":[{"id":3,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 3","content":"This is the OCR content body of Blitzy test document number 3.","tags":[],"created":"2026-07-08T05:10:35.480312Z","modified":"2026-07-08T05:10:35.480427Z","added":"2026-07-08T05:10:35.480316Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 3.pdf","archived_file_name":null}]}
 ```
+
+> This is the **full** response with **no** lines omitted (contrast the abbreviated earlier draft): every header in the order sent, a blank line, then the JSON body on a single line (`Content-Length: 508` bytes). The single `results` item is the disclosed "Blitzy Test Document 3" fixture; only one item is returned because `page_size=1`.
 
 **Cause → effect.** With `page_size=1`, `PageNumberPagination` slices the queryset to a single item per page. `count` still reports the full total (`3`), and because more pages exist, `next` is now a **populated URL** (`…?page=2&page_size=1`) rather than `null`. This proves the endpoint hands out **bounded pages** and exposes navigation links — it never dumps all records in one unbounded response. (Contrast with the default Q4 call where all 3 fit on one page of size 25, so `next` was `null`.)
 
@@ -379,7 +490,7 @@ curl -i http://127.0.0.1:8000/api/documents/
 
 ```http
 HTTP/1.1 401 Unauthorized
-Date: Wed, 08 Jul 2026 04:39:37 GMT
+Date: Wed, 08 Jul 2026 05:11:02 GMT
 Server: WSGIServer/0.2 CPython/3.9.25
 Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
@@ -422,13 +533,24 @@ BasicAuthentication.authenticate_header(None)  = 'Basic realm="api"'
 To show the behavior is not limited to the "no header at all" case, two malformed/invalid credential requests were also run — both correctly denied with 401:
 
 ```bash
-# (a) Well-formed header, but the key matches no row in authtoken_token
-curl -i -H "Authorization: Token deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" http://127.0.0.1:8000/api/documents/
+# (a) Well-formed header whose key is a deliberately-invalid 40-hex placeholder
+#     ('deadbeef' repeated to 40 hex chars, shown here redacted) matching no row in authtoken_token
+curl -i -H "Authorization: Token dead…beef" http://127.0.0.1:8000/api/documents/
 ```
 ```http
 HTTP/1.1 401 Unauthorized
+Date: Wed, 08 Jul 2026 05:11:03 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
+Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
 Content-Length: 27
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
 
 {"detail":"Invalid token."}
 ```
@@ -439,8 +561,18 @@ curl -i -H "Authorization: Token" http://127.0.0.1:8000/api/documents/
 ```
 ```http
 HTTP/1.1 401 Unauthorized
+Date: Wed, 08 Jul 2026 05:11:03 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
+Content-Type: application/json
 WWW-Authenticate: Basic realm="api"
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
 Content-Length: 59
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
 
 {"detail":"Invalid token header. No credentials provided."}
 ```
@@ -542,20 +674,22 @@ flowchart TD
 
 ## Cleanup & repository integrity
 
-All runtime artifacts were **temporary and created outside the repository**, then removed:
+All runtime artifacts were **temporary** — created only in paperless's default **gitignored** locations (never in any tracked file) — and then removed:
 
-- The throwaway SQLite database, media/index directories, test superuser `blitzy_apitest`, its token row in `authtoken_token`, and the 3 seeded "Blitzy Test Document" fixtures all lived under a temporary `PAPERLESS_DATA_DIR` in `/tmp` — deleted after capture.
+- The throwaway SQLite database (`data/db.sqlite3`), the search index (`data/index/`), and logs (`data/log/`) all lived in paperless's **default, gitignored** locations under the repository (no `PAPERLESS_DATA_DIR` override was ever set — see the Environment disclosure above). The test superuser `blitzy_apitest`, its token row in `authtoken_token`, and the 3 seeded "Blitzy Test Document" fixtures were all removed, and the pre-existing `data/` contents were restored, after capture.
 - The running dev server was stopped and all temporary observation scripts/logs removed.
-- The minted token was a throwaway credential and is shown only redacted (`745a…8bee`); it no longer exists.
+- The minted token was a throwaway credential and is shown only redacted (`b91e…c7f7`); it no longer exists.
 
-**No file in the source repository was modified.** `git diff --name-only` is empty (no tracked file changed), and `git status --porcelain` reports only the single new deliverable under `blitzy/` (the default output collapses the new untracked directory; `-uall` expands it to the exact file):
+**No file in the source repository was modified.** The only change on this branch versus the base source commit `542221a38dff` is this single deliverable; no tracked source file changed, and after committing, the working tree is clean (no stray runtime artifacts — the throwaway database was restored to its pre-run state and all observation scripts/logs were removed):
 
 ```text
-# git status --porcelain
-?? blitzy/
+# The only change vs the base source commit is the deliverable itself:
+$ git diff --name-only 542221a38dff..HEAD
+blitzy/documentation/paperless-ngx_542221a38dff.md
 
-# git status --porcelain -uall
-?? blitzy/documentation/paperless-ngx_542221a38dff.md
+# The working tree is clean — no tracked source file modified, no leftover temp artifacts:
+$ git status --porcelain
+(empty — clean working tree)
 ```
 
 ---
@@ -564,7 +698,7 @@ All runtime artifacts were **temporary and created outside the repository**, the
 
 The following authoritative sources corroborate the observed behavior. Quotations are kept short; prefer the live 🟢 OBSERVED output and in-repo 🔵 `file:line` evidence above as primary.
 
-- **WEB-1 — DRF token header format.** Django REST Framework, *Authentication* guide — `https://www.django-rest-framework.org/api-guide/authentication/`. The token key is sent in the `Authorization` header prefixed by the literal string "Token" with whitespace, e.g. `Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b`. To enable it you configure `TokenAuthentication`, add `rest_framework.authtoken` to `INSTALLED_APPS`, and run `manage.py migrate`.
+- **WEB-1 — DRF token header format.** Django REST Framework, *Authentication* guide — `https://www.django-rest-framework.org/api-guide/authentication/`. The token key is sent in the `Authorization` header prefixed by the literal string "Token" with whitespace, e.g. `Authorization: Token 9944…ee4b`. To enable it you configure `TokenAuthentication`, add `rest_framework.authtoken` to `INSTALLED_APPS`, and run `manage.py migrate`.
 - **WEB-2 — DRF `Token` model.** Same guide + DRF source `https://github.com/encode/django-rest-framework/blob/main/rest_framework/authentication.py`. Tokens are the `rest_framework.authtoken.models.Token` model; `migrate` creates the `authtoken_token` table.
 - **WEB-3 — DRF 401-vs-403 rule.** Same guide. HTTP 401 responses must include a `WWW-Authenticate` header while 403 responses do not; "The first authentication class set on the view is used when determining the type of response." A request that authenticates but is denied permission always yields 403.
 - **WEB-4 — paperless-ngx API conventions.** paperless-ngx docs `https://docs.paperless-ngx.com/api/` + in-repo `docs/api.rst`. "POST a username and password … to /api/token/ and paperless will respond with a token"; the token is then supplied via an HTTP header; list endpoints use the `{count, next, previous, results}` envelope and full-text search is available on `/api/documents/`. Community discussion `https://github.com/paperless-ngx/paperless-ngx/discussions/3865` confirms the superuser nuance: a limited user receives `{"detail":"You do not have permission to perform this action."}` on `/api/documents/`, resolved by upgrading the account to superuser.
