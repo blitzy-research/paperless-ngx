@@ -361,6 +361,16 @@ $ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=tr
 [12, 11, 10, 9, 7, 13, 8, 6, 16, 17, 15, 14]
 ```
 
+**Reproducibility note — this scrambled order is one representative single‑snapshot capture, not a fixed constant of the bug.** The 12‑element permutation above is the hash‑bucket order that PostgreSQL's `HashAggregate` happened to emit for *this* seed under *this* plan. `HashAggregate` de‑duplicates by hashing the **full row tuple**, which includes per‑row‑unique bytes this analysis never pins (`checksum`, `title`, `content`, `filename`); an independent re‑seed with the *same* tie structure but *different* row bytes therefore drops the rows into *different* hash buckets and returns a *different* order — and which of the two near‑cost‑tied plans the planner picks is itself the cost decision noted above (it shifts with table statistics, row counts, PostgreSQL version, and config). An independent re‑seed of the identical structure (12 rows sharing one `created`, same IDs 6–17, fresh row bytes) shows a *different* order with `count` still 12:
+
+```text
+$ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=true&page_size=100&fields=id" | python3 -c "import sys,json;d=json.load(sys.stdin);print('count',d['count']);print('order',[r['id'] for r in d['results']])"
+count 12
+order [11, 15, 16, 17, 8, 7, 13, 10, 12, 9, 14, 6]
+```
+
+What *is* exactly reproducible — and what actually answers H3 — is independent of the particular sequence: the verdict (root cause), the **mechanism** (the `HashAggregate` plan drops the `id` tiebreaker, leaving a non‑total order that per‑page `LIMIT/OFFSET` then slices inconsistently), and the constant `count`. Only the *specific* scrambled order is snapshot‑specific.
+
 ### 6.3 The haunting itself: different pages of one list, different plans (the smoking gun)
 
 Because every page is an **independent** `LIMIT 3 OFFSET N` query (§6, `src/paperless/views.py:8-11`), and because the two plans of §6.2 are near‑cost‑tied, the planner can pick a **different plan for different offsets of the same list**. Paging the real endpoint through `?is_in_inbox=true` at `page_size=3` — repeated 3× to show it is not a fluke — produces this, stably:
@@ -407,6 +417,15 @@ page 4 (OFFSET 9 LIMIT 3) -> ids [17, 15, 14] | DISTINCT via HashAggregate
 ```
 
 Cause → effect: pages 1–3 (`OFFSET 0/3/6`) are planned as `Sort+Unique`, whose `Sort Key` includes the unique `id`, so they slice the `id`‑ordered total order `[6,7,8 | 9,10,11 | 12,13,14 | …]`. Page 4 (`OFFSET 9`) is planned as `HashAggregate`, whose top `Sort Key` is `created DESC` **only**, so it slices the *hash* order `[12,11,10,9,7,13,8,6,16,17,15,14]` — its tail (positions 9–11) is `[17,15,14]`. The two plans encode **two different orderings**, and the paginator stitches slices from both into one browse. The result is that doc `14` — which the `id`‑ordered total order placed at the tail of page 3 (`[12,13,14]`) — reappears in the tail of the hash order on the *immediately following* page 4, so the user meets the same document twice on two neighbouring pages; meanwhile doc `16` (which the total order would place on page 4 as part of `[15,16,17]`) is emitted by neither plan and simply vanishes from the browse. No row was edited; the sort the user sees ("newest first") never changed; only the invisible tie order differed between two of the page queries — the definition of a "haunted" list.
+
+**Reproducibility note — the *specific* duplicated/skipped IDs and the "neighbouring pages 3 & 4" adjacency are snapshot‑specific; the duplicate‑and‑skip *phenomenon* is the invariant.** Which document duplicates, which is skipped, and whether the duplicate lands on adjacent or non‑adjacent pages all follow from the hash‑bucket order of §6.2, which (as shown there) varies per seed and per plan choice. On the independent re‑seed of §6.2, the identical forward browse instead duplicates rows on **non‑adjacent** pages and drops three different rows — while `count` stays 12 and no `?ordering=` is sent:
+
+```text
+$ for p in 1 2 3 4; do curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=true&page=$p&page_size=3&fields=id" | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; done; echo
+p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [9, 14, 6]
+```
+
+Here the union duplicates doc 6 on pages **1 and 4** and doc 9 on pages **2 and 4** — **non‑adjacent** pages, not only neighbouring ones — plus doc 14 on pages 3 and 4, while docs 15, 16, 17 are skipped. So the headline walk above (doc 14 on neighbouring pages 3 & 4, doc 16 skipped) is one representative capture; a duplicate can equally surface on non‑adjacent pages, and the count of duplicated/skipped rows varies with the hash order. What is invariant — and what matches the user's report — is that whenever the forward browse crosses a tied boundary served by two different plans, at least one tied row is duplicated across a page boundary and at least one is skipped, with `count` constant and the visible sort unchanged.
 
 ### 6.4 Summary of H3
 
@@ -528,6 +547,19 @@ Cause → effect, grounded in the code:
 - The **only** per‑user‑scoped queryset anywhere in the viewset module is `SavedViewViewSet.get_queryset → SavedView.objects.filter(user=user)` (`src/documents/views.py:461-463`) — that scopes *saved filter presets*, not documents.
 
 So the "non‑admin" angle is a **negative result**: no sharing model exists to shape visibility. The reproducible haunting is the same for everyone and is fully explained by H3. **(inferred, then confirmed):** reading the model and requirements suggested no ownership/ACL; the identical‑hash observation above confirms it at runtime.
+
+**Reproducibility note — the literal SHA‑256 digest is a single‑snapshot value; the *equality* is the reproducible, load‑bearing fact.** The digest `591e5eee…437a12` is taken over the entire JSON body, which embeds seed‑specific bytes (titles, checksums, `created`/`added`/`modified` timestamps, ids), so it necessarily changes on any re‑seed. What is invariant — and what actually settles the non‑admin question — is that the admin body and the viewer body hash to the **same** value as each other. An independent re‑seed confirms both halves at once — a *different* digest, still **identical** between the two identities:
+
+```text
+$ A=$(curl -s -u admin:admin123  "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
+$ B=$(curl -s -u viewer:viewer123 "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
+$ echo "admin  $A"; echo "viewer $B"; [ "$A" = "$B" ] && echo "IDENTICAL" || echo "DIFFERENT"
+admin  b3e2a7f73ee2d282a54401a21035e48e223037b5b044eb8865639b2a84a13b5e
+viewer b3e2a7f73ee2d282a54401a21035e48e223037b5b044eb8865639b2a84a13b5e
+IDENTICAL
+```
+
+The digest differs from the one above (`b3e2a7f7…` vs `591e5eee…`) because the body bytes differ per seed; the admin==viewer equality — the fact that proves viewer‑independence — holds on every re‑seed.
 
 ---
 
@@ -736,6 +768,8 @@ Per the read‑only scope, **no source file was modified**; the following is doc
 | **Control** — `ordering=id` | **Stable** (confirms tie‑specificity) | pages `[6,7,8][9,10,11][12,13,14][15,16,17]` identical over 3 runs, even with M2M filter; every page's Sort Key leads with `id` | `src/documents/views.py:187-196` | §7: 3 identical runs + per‑page `EXPLAIN` Sort Key `id` | with/without M2M filter; OFFSET 0 & 9 | `id` is unique → total order → deterministic boundaries regardless of plan |
 | **Non‑admin / sharing** | **No permission scoping; viewer‑independent** | admin vs viewer identical ids; full‑body SHA‑256 identical `591e5eee…437a12` | `src/documents/views.py:183,198-199,461-463`; `src/documents/models.py:88-205`; `requirements.txt` (no guardian) | §8: paired full‑list + per‑page walks + `sha256sum` → IDENTICAL | DB & Whoosh paths; full‑list ids, per‑page walk & full‑body hash | only `IsAuthenticated`; no `owner` field; no guardian; only `SavedView` is user‑scoped |
 | **Whoosh path** (`?query=`) | **Same instability class; no rescue** | all scores `1.0`; quiescent walk 0 dup/0 skip (×3); one re‑index → doc 14 dup on neighbouring pages 3 & 4 + doc 15 skip; doc 12 disappears then returns; `count`=12 | `src/documents/index.py:165-190,203-221,87`; `src/documents/views.py:388-411` | §9: quiescent walk ×3 (0/0) + neighbouring dup + disappears/comeback + `ordering=id` ignored | relevance tie; quiescent vs post‑re‑index; neighbouring dup; disappears/comeback; `ordering=id` ignored | no `id` in `sort_fields_map`; per‑page `search_page`; `update_document`=delete+append churns docnum |
+
+**Note on the illustrative DB‑path values in this table.** The specific DB‑path figures quoted in the **H3** row (`p4[17,15,14]`; doc 14 duplicated on neighbouring pages 3 & 4; doc 16 skipped) and the **Non‑admin** row (the literal SHA‑256 `591e5eee…437a12`) are one representative single‑snapshot capture — they vary per re‑seed and per query plan, as demonstrated in §6.2, §6.3, and §8. Everything else is exactly reproducible: the verdicts, the underlying mechanism (a `HashAggregate` plan drops the `id` tiebreaker → non‑total order under per‑page `LIMIT/OFFSET`), the constant `count`, the `ordering=id` control, the admin==viewer *equality*, and the **Whoosh** row (whose neighbouring‑page duplicate is *deterministic* — an ordinary re‑index moves the touched doc to the tie‑block end, so it reproduces byte‑for‑byte).
 
 Every named item (H1, H2, H3, non‑admin) is answered by name with a concrete observed value, a `file:line`, captured evidence, sibling variants, and a cause→effect reason.
 
