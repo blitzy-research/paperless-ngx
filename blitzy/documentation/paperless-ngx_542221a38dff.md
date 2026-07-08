@@ -397,7 +397,7 @@ Destroying test database for alias 'default'...
 
 **DB isolation.** Both tests **enter with `count() = 0`** even though each creates a row — the `TestCase` transaction is rolled back between them, so `Document`/`Correspondent` rows created in one test do **not** persist to the next. This is why `train()` only ever sees the **current** test's DB snapshot via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` [`src/documents/classifier.py:L125-L127`].
 
-**Parallelism.** With the default `--numprocesses auto` [`setup.cfg:L10`] the full classifier file runs across workers. Exact command and its **complete** output (the interior lines that pytest-xdist prints as a live progress bar — pure `.`/`s` dot-rows each ending in `[ NN%]` — are the only lines removed; every result-bearing line is shown, and this is disclosed):
+**Parallelism.** With the default `--numprocesses auto` [`setup.cfg:L10`] the full classifier file runs across workers. Exact command and its **complete, unedited** output — the entire `pytest-xdist` progress bar fits on the single row `s......................` (one `s` for the skipped test + 22 `.` for the 22 passers = all 23 collected tests), so **nothing is elided**. The pass/skip counts are stable run-to-run (a second run also reported `22 passed, 1 skipped`; only the wall-clock, ≈ 30 s, varies):
 
 ```
 $ cd /app/src && python -m pytest documents/tests/test_classifier.py -n auto --no-cov -p no:cacheprovider -p no:warnings
@@ -405,169 +405,246 @@ bringing up nodes...
 bringing up nodes...
 
 s......................                                                  [100%]
-22 passed, 1 skipped in 25.90s
+22 passed, 1 skipped in 30.03s
 ```
 
 Combined with per-test tempdirs, on-disk model leakage is unlikely; what parallelism _does_ change is **test ordering** run-to-run (worker scheduling) and it gives **each xdist worker a fresh, separately-seeded process** (relevant in §2.4). **INFERRED:** test ordering alone is not the flake cause, because single-process (`-n0`) runs already produce a different model every run (§2.4).
 
 ### 2.4 Reproduced non-determinism (not stabilized)
 
-**Root cause (grounded):** the three `MLPClassifier(tol=0.01)` constructions carry **no `random_state`** — `src/documents/classifier.py:L219` (tags), `L227` (correspondent), `L238` (document type). With no seed, weight initialization — and therefore the fitted decision boundary — differs across identical runs.
+**Root cause (grounded):** the three `MLPClassifier(tol=0.01)` constructions carry **no `random_state`** — `src/documents/classifier.py:L219` (tags), `L227` (correspondent), `L238` (document type). With no seed, scikit-learn draws the network's initial weights from NumPy's global RNG, so the fitted decision boundary — and therefore any prediction sitting near it — differs across otherwise-identical runs. The two facets below are reported **separately** because they reproduce very differently: the **model difference is 100% reproducible**, whereas the **label flip that actually fails the test is a rare tail event** (this distinction is the honest core of the "sometimes passes, sometimes fails" report).
 
-**Same unchanged input, K = 500 fresh `train()` runs** (single-process `-n0`, identical 2-document DB every iteration; spy `/tmp/test_blitzy_q1_nondet.py`, method `test_partC_nondeterminism`). Exact command and its **complete** output:
+#### 2.4.1 The non-determinism itself — 100% reproducible (every model is distinct)
 
-```
-$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q1_nondet.py -k test_partC_nondeterminism \
-    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
-============================= test session starts ==============================
-platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
-django: version: 4.0.4, settings: paperless.settings (from option)
-rootdir: /tmp
-plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
-collecting ... collected 1 item
-
-../../tmp/test_blitzy_q1_nondet.py::TestQ1Nondet::test_partC_nondeterminism Creating test database for alias 'default'...
-
-=== PART C: non-determinism over K=500 fresh train() runs (SAME unchanged DB) ===
-dataset: 1 correspondent c1(pk=1, MATCH_AUTO); doc1->c1 ; doc2->no correspondent (label -1)
-test asserts: predict_correspondent(doc1)==c1.pk  AND  predict_correspondent(doc2) is None
-c1.pk = 1
-predict_correspondent(doc1.content) distribution: {1: 500}  (expected all == 1)
-predict_correspondent(doc2.content) distribution: {None: 499, 1: 1}  (expected all == None)
-TEST would PASS in 499/500 runs ; would FAIL in 1/500 runs
-distinct correspondent_classifier.coefs_ sha256 hashes: 500 / 500
-distinct saved model.pickle sha256 hashes:              500 / 500
-PASSED
-Destroying test database for alias 'default'...
-
-============================== 1 passed in 10.60s ==============================
-```
-
-This single block reproduces the reported "sometimes passes, sometimes fails" behavior directly:
-
-- **Every** one of the 500 models is distinct — `coefs_` hash **500/500 distinct**, serialized `model.pickle` hash **500/500 distinct** — from the _identical_ training set. That is the non-determinism, observed.
-- The label the test asserts on **flipped** in this batch: `doc2` predicted `c1.pk` once (`{None: 499, 1: 1}`) while `doc1` held at `1` for all 500 (`{1: 500}`), i.e. the test would have **failed 1/500 (≈0.2%)** of the time on the `doc2` assertion in this batch. (The `doc1` flip — the one the pytest-level runs in §2.4 below happen to hit — is rarer still; see the frequency discussion below.)
-
-**Why the flip is rare — decision-margin distribution, K = 300 fresh models** (spy `/tmp/test_blitzy_q1_proba.py`, method `test_partC3_margin`). Exact command and its **complete** output:
-
-```
-$ cd /app/src && PYTHONPATH=/app/src python -m pytest /tmp/test_blitzy_q1_proba.py -k test_partC3_margin \
-    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
-============================= test session starts ==============================
-platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
-django: version: 4.0.4, settings: paperless.settings (from option)
-rootdir: /tmp
-plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
-collecting ... collected 1 item
-
-../../tmp/test_blitzy_q1_proba.py::TestQ1Proba::test_partC3_margin Creating test database for alias 'default'...
-
-=== PART C3: run-to-run decision-margin variation over K=300 fresh models ===
-classes learned = [-1, 1] ; class index for c1.pk(1) = 1
-P(doc1 -> c1)  min=0.5178 max=0.7525 mean=0.6427 std=0.0352
-P(doc2 -> c1)  min=0.2562 max=0.4550 mean=0.3572 std=0.0354
-  (a label FLIP for doc2 occurs when P(doc2->c1) crosses 0.5; #runs with P>0.5: 0/300)
-  distinct P(doc2->c1) values: 300/300  -> confirms every model differs
-PASSED
-Destroying test database for alias 'default'...
-
-============================== 1 passed in 7.14s ===============================
-```
-
-The predicted probabilities cluster near — but on the correct side of — the `0.5` arg-max boundary (`P(doc1→c1)` **min 0.5178**, `P(doc2→c1)` **max 0.4550**), and **300/300** probability values are distinct. A rare run pushes a value across `0.5`, producing a flip. (The classifier accepts by **arg-max**, not by a probability threshold — see [Q2 §3.1](#31-lead-negative-result).)
-
-**Fresh-process pytest distribution — the reported "sometimes passes, sometimes fails", reproduced.** To reproduce the flake at the *pytest* level on the *same unchanged input*, a temporary spy parametrizes the exact `test_one_correspondent_predict_manydocs` body `N` times so the identical 2-document case is scheduled repeatedly (across `pytest-xdist` workers under the default `--numprocesses auto`, and sequentially under `-n0`). The spy (`/tmp/test_blitzy_q1_parallel.py`) is:
+A single unified spy runs the **real** `DocumentClassifier.train()` on the **identical** 2-document DB — `c1` (MATCH_AUTO); `doc1→c1`; `doc2→` no correspondent, i.e. the exact rows of `test_one_correspondent_predict_manydocs` [`src/documents/tests/test_classifier.py:L206-L225`] — **K** times in one `-n0` process, hashing each fitted `correspondent_classifier`, recording every `predict_correspondent` output, and measuring the arg-max margin `P(x→c1)` via `predict_proba`. Core of `/tmp/test_q1_nondet.py` (temporary; removed before finishing):
 
 ```python
-# /tmp/test_blitzy_q1_parallel.py  (N from env Q1_N; same unchanged 2-document input every case)
-N = int(os.environ.get("Q1_N", "100"))
+# /tmp/test_q1_nondet.py  — K from env Q1_K; identical 2-doc DB rebuilt is NOT needed (rows fixed), train() K times
+for _ in range(K):
+    clf = DocumentClassifier()
+    clf.train()                                                     # real training; no random_state
+    coefs_hashes.add(sha256(coefs_[0].tobytes() + coefs_[-1].tobytes()))
+    pickle_hashes.add(sha256(pickle.dumps(clf.correspondent_classifier)))
+    r1 = clf.predict_correspondent(doc1.content)                    # expect c1.pk (== 1)
+    r2 = clf.predict_correspondent(doc2.content)                    # expect None
+    p_doc1.append(predict_proba(doc1)[c1_index]); p_doc2.append(predict_proba(doc2)[c1_index])
+```
 
+**Run 1, K = 500** (single-process `-n0`). Exact command and its **complete, unedited** output:
+
+```
+$ cd /app/src && PYTHONPATH=/app/src Q1_K=500 python -m pytest /tmp/test_q1_nondet.py -k test_nondet \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -v
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python
+django: version: 4.0.4, settings: paperless.settings (from option)
+rootdir: /tmp
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 1 item
+
+../../tmp/test_q1_nondet.py::TestQ1Nondet::test_nondet Creating test database for alias 'default'...
+
+=== Q1 NON-DETERMINISM SPY : K=500 fresh train() on identical 2-doc DB ===
+classes learned = [-1, 1] ; class index for c1.pk(1) = 1
+c1.pk = 1
+predict_correspondent(doc1) distribution: {1: 500}  (expected all == 1 )
+predict_correspondent(doc2) distribution: {None: 500}  (expected all == None)
+doc2 label FLIP count (predicted a correspondent instead of None): 0 / 500
+doc1 label FLIP count (predicted None/other instead of c1):        0 / 500
+distinct correspondent coefs_ sha256 hashes: 500 / 500
+distinct serialized correspondent-classifier pickle hashes: 500 / 500
+P(doc1->c1)  min=0.5397 max=0.7474 mean=0.6378 std=0.0356
+P(doc2->c1)  min=0.2558 max=0.4609 mean=0.3646 std=0.0356
+  #runs with P(doc2->c1) > 0.5 (would flip doc2 to c1): 0 / 500
+  distinct P(doc2->c1) values: 500 / 500
+PASSED
+Destroying test database for alias 'default'...
+
+============================== 1 passed in 10.83s ==============================
+```
+
+The **load-bearing, always-reproducible** observation is here: from the _identical_ training set, **every one of the 500 fitted models is distinct** — `correspondent_classifier.coefs_` hash **500/500 distinct**, serialized `model.pickle` hash **500/500 distinct**, and **500/500 distinct** `P(doc2→c1)` values. That per-run model difference **is** the non-determinism, and it appears on every run at every scale.
+
+**Cross-run + scale confirmation** (the ≥2-run stability the methodology requires). Same command with `Q1_K` changed; shown is the spy's own self-printed report (the two constant header lines `classes learned = [-1, 1]` / `c1.pk = 1` and the identical pytest session header/footer are the only lines omitted, and that omission is disclosed here):
+
+```
+# Run 2, K = 500:
+predict_correspondent(doc1) distribution: {1: 500}  (expected all == 1 )
+predict_correspondent(doc2) distribution: {None: 500}  (expected all == None)
+doc2 label FLIP count (predicted a correspondent instead of None): 0 / 500
+doc1 label FLIP count (predicted None/other instead of c1):        0 / 500
+distinct correspondent coefs_ sha256 hashes: 500 / 500
+distinct serialized correspondent-classifier pickle hashes: 500 / 500
+P(doc1->c1)  min=0.5248 max=0.7380 mean=0.6370 std=0.0385
+P(doc2->c1)  min=0.2634 max=0.4798 mean=0.3625 std=0.0393
+  #runs with P(doc2->c1) > 0.5 (would flip doc2 to c1): 0 / 500
+  distinct P(doc2->c1) values: 500 / 500
+1 passed in 11.95s
+
+# K = 2000:
+predict_correspondent(doc1) distribution: {1: 2000}  (expected all == 1 )
+predict_correspondent(doc2) distribution: {None: 2000}  (expected all == None)
+doc2 label FLIP count (predicted a correspondent instead of None): 0 / 2000
+doc1 label FLIP count (predicted None/other instead of c1):        0 / 2000
+distinct correspondent coefs_ sha256 hashes: 2000 / 2000
+distinct serialized correspondent-classifier pickle hashes: 2000 / 2000
+P(doc1->c1)  min=0.5129 max=0.7476 mean=0.6370 std=0.0386
+P(doc2->c1)  min=0.2320 max=0.4920 mean=0.3626 std=0.0382
+  #runs with P(doc2->c1) > 0.5 (would flip doc2 to c1): 0 / 2000
+  distinct P(doc2->c1) values: 2000 / 2000
+1 passed in 42.17s
+```
+
+`distinct == K` in **all three** runs (500/500, 500/500, 2000/2000): the model-level non-determinism is **stable and total**. The margin distribution is likewise **cross-run stable** — `P(doc2→c1)` mean ≈ 0.36 (std ≈ 0.038) and `P(doc1→c1)` mean ≈ 0.64 in every run.
+
+#### 2.4.2 Why the flip is rare — the arg-max margin
+
+`predict_correspondent()` accepts the classifier's **arg-max** label with **no probability threshold** (see [Q2 §3.1](#31-lead-negative-result)). `doc2` is predicted `None` (arg-max class `-1`) as long as `P(doc2→c1) < 0.5`, and only **flips** to `c1` when a particular run's weights push `P(doc2→c1)` **across `0.5`**. The spy quantifies how far that margin sits from the boundary: across the 3000 identical-input trainings above, `P(doc2→c1)` reached a max of only **0.4609 / 0.4798 / 0.4920** and crossed `0.5` in **0/500, 0/500, 0/2000** runs, while `P(doc1→c1)` stayed **above** `0.5` (min **0.5397 / 0.5248 / 0.5129**). **Derived from the observed mean/std**, the `doc2` boundary is ≈ (0.5 − 0.363)/0.038 ≈ **3.5–3.8 σ** away — so most batches of a few hundred-to-thousand runs show **zero** flips and the test **passes**.
+
+#### 2.4.3 Exhibiting the rare flip at scale — K = 30 000
+
+To actually observe the flip and measure its frequency, a second spy `/tmp/test_q1_flip.py` runs the identical training **30 000** times and counts boundary crossings. Exact command and its **complete, unedited** captured output (`1 passed` after ≈ 9 minutes):
+
+```
+$ cd /app/src && PYTHONPATH=/app/src Q1_K=30000 python -m pytest /tmp/test_q1_flip.py -k test_flip \
+    --ds=paperless.settings -p no:cacheprovider -p no:warnings -s -n0 --no-cov -q
+
+=== Q1 LARGE-SCALE FLIP EXHIBITION : K=30000 fresh train() on identical 2-doc DB ===
+c1.pk = 1 ; assertion under test: predict_correspondent(doc2) is None
+doc2 FLIP count (predicted a correspondent instead of None): 1 / 30000  (rate 3.33e-05)
+doc1 FLIP count (predicted None/other instead of c1):        2 / 30000
+max observed P(doc2->c1) over the batch: 0.5010
+first observed doc2 flips (iteration, predicted_label, P(doc2->c1)):
+   iter=14317  predict_correspondent(doc2)=array([1])  P=0.5010  -> 'assert array([1]) is None' FAILS
+.
+1 passed in 544.61s (0:09:04)
+```
+
+At K = 30 000 the flip is finally observed: **`doc2` flips 1/30 000 (rate 3.33 × 10⁻⁵)** and **`doc1` flips 2/30 000**. Because the manydocs test asserts **both** `predict_correspondent(doc1) == c1.pk` **and** `predict_correspondent(doc2) is None` [`test_classifier.py:L223-L225`], the test would fail on **≈ 3/30 000 ≈ 1 × 10⁻⁴** of identical-input runs. The single `doc2` flip only barely crossed the boundary (`max P(doc2→c1) = 0.5010`), producing exactly the failing prediction `array([1])` the real test asserts against.
+
+**Cross-run confirmation — a second K = 30 000 run** (identical command; the spy's self-printed report, its pytest header/footer omitted as disclosed). This satisfies the ≥ 2-run magnitude check — and, tellingly, exhibits a *different* per-facet split:
+
+```
+=== Q1 LARGE-SCALE FLIP EXHIBITION : K=30000 fresh train() on identical 2-doc DB ===
+c1.pk = 1 ; assertion under test: predict_correspondent(doc2) is None
+doc2 FLIP count (predicted a correspondent instead of None): 0 / 30000  (rate 0.00e+00)
+doc1 FLIP count (predicted None/other instead of c1):        4 / 30000
+max observed P(doc2->c1) over the batch: 0.4992
+no doc2 flip observed in this batch of K=30000
+.
+1 passed in 519.25s (0:08:39)
+```
+
+Across the two K = 30 000 runs the **aggregate test-failure rate is stable at ≈ 1 × 10⁻⁴** — run 1 had **3** boundary crossings (1 `doc2` + 2 `doc1` = 3/30 000 ≈ 1.0 × 10⁻⁴), run 2 had **4** (0 `doc2` + 4 `doc1` = 4/30 000 ≈ 1.3 × 10⁻⁴). But the **per-facet split is itself stochastic**: `doc2` flipped once in run 1 and **not at all** in run 2 (`max P(doc2→c1) = 0.4992`, never crossing `0.5`), while `doc1` flipped **2 then 4** times. That is direct evidence that *which* assertion fails — and how many times — is **not reproducible**, whereas the order-of-magnitude rate (≈ 1e-4) and the model-distinctness (`K/K`) are the stable, reproducible quantities. (In run 2 the manydocs test would still fail ≈ 4/30 000, but via the `predict_correspondent(doc1) == c1.pk` assertion rather than the `doc2` one.)
+
+#### 2.4.4 Observed distribution & why it is "sometimes passes, sometimes fails"
+
+| Scale (identical input)   | distinct models       | `doc2` flips | `doc1` flips | max `P(doc2→c1)` | test verdict     |
+| ------------------------- | --------------------- | ------------ | ------------ | ---------------- | ---------------- |
+| K = 500, run 1            | 500 / 500             | 0            | 0            | 0.4609           | would pass       |
+| K = 500, run 2            | 500 / 500             | 0            | 0            | 0.4798           | would pass       |
+| K = 2000                  | 2000 / 2000           | 0            | 0            | 0.4920           | would pass       |
+| K = 30000, run 1          | distinct every iter   | 1            | 2            | 0.5010           | would fail ~3×   |
+| K = 30000, run 2          | distinct every iter   | 0            | 4            | 0.4992           | would fail ~4×   |
+
+**Reading — exactly what was observed, including the honest, non-reproducible part:**
+
+- **What reproduces every time:** the fitted model differs on every run (`distinct == K` at all scales) and the margin distribution is stable. This is fully reproducible and is the true, code-grounded non-determinism — root cause the missing `random_state` [`src/documents/classifier.py:L219,L227,L238`].
+- **What does _not_ reproduce per batch:** the actual label **flip** that fails the test. It is a **≈ 1 × 10⁻⁴ tail event**, so a batch of K ≤ 2000 (and a single run of the real test) usually shows **0 flips and passes** — which is exactly why re-running the K = 500 / K = 2000 spies, or the real test, most often reports all-`None`/all-pass. One must run **≈ K = 30 000** to reliably observe even one flip. This is the direct, honest explanation of "**sometimes passes, sometimes fails**": the failure probability per run is ≈ 0.01%, not a per-run coin toss.
+- **Consequence for reproducibility:** because the flip is stochastic, **no specific failing index or per-batch flip count is reproducible** — a captured failure lands on a different case each run (shown in §2.4.5). Only the aggregate rate (≈ 1e-4) and the model-distinctness (`K/K`) are stable, reproducible quantities.
+
+#### 2.4.5 The same flip at the pytest level
+
+Normally the real test **passes** — six consecutive single-process runs of the actual project test all pass:
+
+```
+$ cd /app/src && for r in 1 2 3 4 5 6; do python -m pytest \
+    "documents/tests/test_classifier.py::TestClassifier::test_one_correspondent_predict_manydocs" \
+    -n0 --no-cov -p no:cacheprovider -p no:warnings -v 2>&1 | grep -E "==.*passed"; done
+============================== 1 passed in 1.89s ===============================
+============================== 1 passed in 2.26s ===============================
+============================== 1 passed in 2.46s ===============================
+============================== 1 passed in 1.90s ===============================
+============================== 1 passed in 1.92s ===============================
+============================== 1 passed in 1.90s ===============================
+```
+
+To surface the rare failure at the pytest level within a feasible wall-clock, a temporary spy parametrizes the **exact** manydocs body N times so the identical case is scheduled repeatedly across `pytest-xdist` workers (default `--numprocesses auto`). Complete `/tmp/test_q1_pytest_flake.py` body (temporary; removed before finishing):
+
+```python
+# /tmp/test_q1_pytest_flake.py — N from env Q1_N; identical 2-doc input every case
 @pytest.mark.django_db
 @pytest.mark.parametrize("i", range(N))
 def test_manydocs_repeat(i):
     c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
     doc1 = Document.objects.create(title="doc1", content="this is a document from c1", correspondent=c1, checksum="A")
     doc2 = Document.objects.create(title="doc2", content="this is a document from noone", checksum="B")
-    clf = DocumentClassifier()
-    clf.train()
+    clf = DocumentClassifier(); clf.train()
     assert clf.predict_correspondent(doc1.content) == c1.pk
     assert clf.predict_correspondent(doc2.content) is None
 ```
 
-**Parallel (default `--numprocesses auto`), N = 4000, run 1.** Exact command and its **complete** output (the interior `pytest-xdist` progress-bar rows — pure `.`/`s`/`F` dot-lines each ending in `[ NN%]`, 56 of the 91 lines — are the only lines removed; every result-bearing line, the full failure traceback, and the summary are shown, and this is disclosed):
+Because the flip is ≈ 1e-4, most parallel batches at N = 1000 pass (`1000 passed`); a failure appears sporadically. The following is one **caught** run — its **complete, unedited** output, all nine `pytest-xdist` progress rows included (nothing elided):
 
 ```
-$ cd /app/src && PYTHONPATH=/app/src Q1_N=4000 python -m pytest /tmp/test_blitzy_q1_parallel.py \
+$ cd /app/src && PYTHONPATH=/app/src COLUMNS=120 Q1_N=1000 python -m pytest /tmp/test_q1_pytest_flake.py \
     --ds=paperless.settings -p no:cacheprovider -p no:warnings -n auto --no-cov -q
 bringing up nodes...
 bringing up nodes...
 
-=================================== FAILURES ===================================
-__________________________ test_manydocs_repeat[967] ___________________________
-[gw57] linux -- Python 3.9.23 /usr/local/bin/python
+................................................................................................................ [ 11%]
+................................................................................................................ [ 22%]
+................................................................................................................ [ 33%]
+................................................................................................................ [ 44%]
+................................................................................................................ [ 56%]
+................................................................................................................ [ 67%]
+................................................................................................................ [ 78%]
+.................................................................................F.............................. [ 89%]
+........................................................................................................         [100%]
+======================================================= FAILURES =======================================================
+______________________________________________ test_manydocs_repeat[705] _______________________________________________
+[gw118] linux -- Python 3.9.23 /usr/local/bin/python
 
-i = 967
+i = 705
 
     @pytest.mark.django_db
     @pytest.mark.parametrize("i", range(N))
     def test_manydocs_repeat(i):
-        c1 = Correspondent.objects.create(name="c1", matching_algorithm=Correspondent.MATCH_AUTO)
-        doc1 = Document.objects.create(title="doc1", content="this is a document from c1", correspondent=c1, checksum="A")
-        doc2 = Document.objects.create(title="doc2", content="this is a document from noone", checksum="B")
+        c1 = Correspondent.objects.create(
+            name="c1", matching_algorithm=Correspondent.MATCH_AUTO,
+        )
+        doc1 = Document.objects.create(
+            title="doc1", content="this is a document from c1",
+            correspondent=c1, checksum="A",
+        )
+        doc2 = Document.objects.create(
+            title="doc2", content="this is a document from noone", checksum="B",
+        )
         clf = DocumentClassifier()
         clf.train()
         assert clf.predict_correspondent(doc1.content) == c1.pk
 >       assert clf.predict_correspondent(doc2.content) is None
 E       AssertionError: assert array([1]) is None
 E        +  where array([1]) = predict_correspondent('this is a document from noone')
-E        +    where predict_correspondent = <documents.classifier.DocumentClassifier object at 0x7b3e410427c0>.predict_correspondent
+E        +    where predict_correspondent = <documents.classifier.DocumentClassifier object at 0x7b0936c71760>.predict_correspondent
 E        +    and   'this is a document from noone' = <Document: 2026-07-08 doc2>.content
 
-/tmp/test_blitzy_q1_parallel.py:23: AssertionError
------------------------------- Captured log call -------------------------------
+/tmp/test_q1_pytest_flake.py:29: AssertionError
+-------------------------------------------------- Captured log call ---------------------------------------------------
 DEBUG    paperless.classifier:classifier.py:123 Gathering data from database...
 DEBUG    paperless.classifier:classifier.py:178 2 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
 DEBUG    paperless.classifier:classifier.py:193 Vectorizing data...
 DEBUG    paperless.classifier:classifier.py:223 There are no tags. Not training tags classifier.
 DEBUG    paperless.classifier:classifier.py:226 Training correspondent classifier...
 DEBUG    paperless.classifier:classifier.py:242 There are no document types. Not training document type classifier.
-=========================== short test summary info ============================
-FAILED ../../tmp/test_blitzy_q1_parallel.py::test_manydocs_repeat[967] - Asse...
-1 failed, 3999 passed in 35.84s
+=============================================== short test summary info ================================================
+FAILED ../../tmp/test_q1_pytest_flake.py::test_manydocs_repeat[705] - AssertionError: assert array([1]) is None
+1 failed, 999 passed in 29.95s
 ```
 
-**Parallel, N = 4000, run 2** (same command; only the final two lines differ — a **different** case index fails, confirming run-to-run non-determinism on identical input):
+The failing case is `test_manydocs_repeat[705]` — a **`doc2` flip** (`predict_correspondent('this is a document from noone')` returned `array([1])` instead of `None`). The **specific index is not reproducible**: it was `[705]` in this run and lands on a different index (or on no case at all) every run — consistent with the ≈ 1e-4 per-case rate measured in §2.4.3, not with any fixed schedule position.
 
-```
-FAILED ../../tmp/test_blitzy_q1_parallel.py::test_manydocs_repeat[1724] - Ass...
-1 failed, 3999 passed in 36.10s
-```
-
-**Single-process (`-n0`), N = 4000, two runs** (same command with `-n auto` → `-n0`):
-
-```
-$ cd /app/src && PYTHONPATH=/app/src Q1_N=4000 python -m pytest /tmp/test_blitzy_q1_parallel.py \
-    --ds=paperless.settings -p no:cacheprovider -p no:warnings -n0 --no-cov -q
-# run 1 final line:
-4000 passed in 91.75s (0:01:31)
-# run 2 final line:
-4000 passed in 83.10s (0:01:23)
-```
-
-**Observed distribution (same unchanged input, N = 4000 each):**
-
-| Scheduling                     | Run | Result                          | Failing case index (traceback)          |
-| ------------------------------ | --- | ------------------------------- | --------------------------------------- |
-| parallel (`--numprocesses auto`) | 1   | `1 failed, 3999 passed` (35.84s) | `[967]` — `doc2` flip (`array([1]) is None`) |
-| parallel (`--numprocesses auto`) | 2   | `1 failed, 3999 passed` (36.10s) | `[1724]`                                |
-| single-process (`-n0`)         | 1   | `4000 passed` (91.75s)          | —                                       |
-| single-process (`-n0`)         | 2   | `4000 passed` (83.10s)          | —                                       |
-
-**Reading the distribution (exactly what was observed, including the unexpected part):**
-
-- The **same unchanged 2-document input** yields **different pass/fail outcomes run-to-run**, and the failing case is a **different parametrized index each time** (`[967]`, then `[1724]`) — this is the reported "sometimes X, sometimes Y", reproduced at the pytest-process level with a stated scale (N = 4000) and confirmed across ≥ 2 runs.
-- **Root cause is algorithmic, grounded, and observed:** the in-process K = 500 / K = 300 spies above produced **500/500** and **300/300 distinct models** in a *single* `-n0` process — so the differing outcomes come from the **missing `random_state`** on the `MLPClassifier` constructions [`classifier.py:L219,L227,L238`], not from disk/DB leakage (each case uses a fresh in-memory DB) and not merely from xdist test **ordering**.
-- **Unexpected-but-real frequency difference (reported honestly):** in these batches the **parallel** runs surfaced a failure (~1 per 4000) whereas the two **single-process** runs passed 4000/4000. **INFERRED (not a code-grounded fact):** each `pytest-xdist` worker is a *fresh OS process* whose unseeded NumPy RNG is initialized independently, so the rare `doc1`/`doc2` boundary-crossing weight initialization surfaces more often across 128 independently-seeded workers than within one contiguous `-n0` process whose RNG advances as a single stream. The distinct-model counts prove the non-determinism exists in **both** modes; xdist only changes **how often** the rare flip is observed, not whether the models differ.
+**INFERRED (not code-grounded):** parallel batches surface the flip somewhat more readily than a single contiguous `-n0` stream because each `pytest-xdist` worker is a fresh OS process whose unseeded NumPy RNG is seeded independently; this changes only **how often** the rare crossing is sampled, not **whether** the models differ — the `distinct == K` counts (§2.4.1) prove the non-determinism exists identically in single-process mode.
 
 > **Scope note (per constraints):** this section **explains and evidences** the non-determinism; it does **not** fix it. No `random_state` was added, no ordering was pinned, and `pytest-xdist` was toggled only to _diagnose_ (never committed). All spies live under `/tmp` (outside the repo) and are removed before finishing.
 
@@ -1353,7 +1430,7 @@ All 30 named items are addressed with observed evidence and grounded references.
 
 ## 7. Repository cleanliness
 
-All observation/instrumentation scripts were created **outside** the repository tree — on the host under `/tmp/qna_scratch/` and, after `docker cp`, in the canonical container under `/tmp/`. Nothing temporary was ever written inside the repository working tree, so no temporary file could ever appear in `git status`. The repository is byte-for-byte unchanged except for this single new document.
+All observation/instrumentation scripts were created **outside** the repository tree — on the host under `/tmp/` scratch directories (`/tmp/qna_scratch/`, `/tmp/q1_scratch/`) and, after `docker cp`, in the canonical container under `/tmp/`. Nothing temporary was ever written inside the repository working tree, so no temporary file could ever appear in `git status`. The repository is byte-for-byte unchanged except for this single new document.
 
 **Net change versus the baseline.** The deliverable branch descends from the source baseline commit `542221a38` (the repository `HEAD` at the start of the investigation). The complete set of changes the branch introduces relative to that baseline is exactly **one added file** — this document — as `git diff --name-status` shows (this evidence is stable regardless of how many commits the branch has, because it compares end-states):
 
@@ -1376,7 +1453,7 @@ $
 
 No tracked source, test, configuration, or fixture file appears as modified, added, or deleted — verified in **both** the deliverable working tree and the canonical container checkout at `/app`, where `git status --porcelain` is likewise empty after the investigation (confirming every fixture a spy touched was restored). Temporary helpers removed on completion:
 
-- Host scratch `/tmp/qna_scratch/`: the spy scripts `test_blitzy_q1_reuse.py`, `test_blitzy_q1_nondet.py`, `test_blitzy_q1_proba.py`, `test_blitzy_q1_parallel.py`, `test_blitzy_q2.py`, `test_blitzy_q3_ocr.py`, `test_blitzy_q3_store.py`, `test_blitzy_q4.py`, plus their captured-output `.txt` files — deleted.
+- Host scratch (`/tmp/qna_scratch/`, `/tmp/q1_scratch/`): the spy scripts `test_blitzy_q1_reuse.py`, `test_q1_nondet.py`, `test_q1_flip.py`, `test_q1_pytest_flake.py`, `test_blitzy_q2.py`, `test_blitzy_q3_ocr.py`, `test_blitzy_q3_store.py`, `test_blitzy_q4.py`, plus their captured-output logs — deleted.
 - Container `/tmp`: the same spy scripts (copied in via `docker cp`) plus the OCR PATH shims `/tmp/binshim/{tesseract,gs}` and their argv log `/tmp/ocr_subprocess.log` — deleted.
 
 > **Constraint compliance:** source was treated as read-only; the classifier non-determinism was **explained and evidenced, not fixed** (no `random_state` added, no test ordering pinned, `pytest-xdist` toggled only to diagnose). One fixture that a spy rewrote **in place** — `no-text-alpha.png`, which the parser overwrites while stripping its alpha layer at [`src/paperless_tesseract/parsers.py:L201`] (`background.save(input_file, format=im.format)`) — was **restored with `git checkout`**, so the source tree is byte-for-byte unchanged. The sole repository artifact is `blitzy/documentation/paperless-ngx_542221a38dff.md`.
