@@ -11,7 +11,7 @@ All values below were produced by **building and running Paperless‑NGX in its 
 | Property | Value | Evidence |
 |----------|-------|----------|
 | Application | **Paperless‑NGX v1.7.0** | `[src/paperless/version.py:1]` → `__version__ = (1, 7, 0)` |
-| Runtime | **Python 3.9** (container base `python:3.9-slim-bullseye`; observed interpreter `Python 3.9.25`) | matches the project `Dockerfile` base |
+| Runtime | **Python 3.9** (container base `python:3.9-slim-bullseye`; observed interpreter `Python 3.9.25`) | `[Dockerfile:18]` → `FROM python:3.9-slim-bullseye as main-app`; observed interpreter `Python 3.9.25` matches this base |
 | Database | **SQLite** at `DATA_DIR/db.sqlite3` (default) | `[src/paperless/settings.py:299-300]`; PostgreSQL only if `PAPERLESS_DBHOST` is set `[src/paperless/settings.py:304-311]` |
 | Message broker + channel layer | **Redis** | Q_CLUSTER broker `[src/paperless/settings.py:449-456]`; Channels layer `[src/paperless/settings.py:178-182]` |
 | Queuing framework | **Django‑Q `1.3.9`** — cluster name `paperless`, worker timeout `1800`s | `[requirements.txt:37]`, `[src/paperless/settings.py:449-454]`; registered in `INSTALLED_APPS` as `"django_q"` `[src/paperless/settings.py:110]` |
@@ -87,6 +87,110 @@ python manage.py qcluster                                         # Django-Q    
 
 ### Observed results
 
+The **complete, unedited** output of the canonical `manage.py migrate` command (producing command shown, then its full stdout; the command returned exit code `0`):
+
+```bash
+$ cd "$REPO/src" && python manage.py migrate
+```
+
+```
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
+Running migrations:
+  Applying contenttypes.0001_initial... OK
+  Applying auth.0001_initial... OK
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying contenttypes.0002_remove_content_type_name... OK
+  Applying auth.0002_alter_permission_name_max_length... OK
+  Applying auth.0003_alter_user_email_max_length... OK
+  Applying auth.0004_alter_user_username_opts... OK
+  Applying auth.0005_alter_user_last_login_null... OK
+  Applying auth.0006_require_contenttypes_0002... OK
+  Applying auth.0007_alter_validators_add_error_messages... OK
+  Applying auth.0008_alter_user_username_max_length... OK
+  Applying auth.0009_alter_user_last_name_max_length... OK
+  Applying auth.0010_alter_group_name_max_length... OK
+  Applying auth.0011_update_proxy_permissions... OK
+  Applying auth.0012_alter_user_first_name_max_length... OK
+  Applying authtoken.0001_initial... OK
+  Applying authtoken.0002_auto_20160226_1747... OK
+  Applying authtoken.0003_tokenproxy... OK
+  Applying django_q.0001_initial... OK
+  Applying django_q.0002_auto_20150630_1624... OK
+  Applying django_q.0003_auto_20150708_1326... OK
+  Applying django_q.0004_auto_20150710_1043... OK
+  Applying django_q.0005_auto_20150718_1506... OK
+  Applying django_q.0006_auto_20150805_1817... OK
+  Applying django_q.0007_ormq... OK
+  Applying django_q.0008_auto_20160224_1026... OK
+  Applying django_q.0009_auto_20171009_0915... OK
+  Applying django_q.0010_auto_20200610_0856... OK
+  Applying django_q.0011_auto_20200628_1055... OK
+  Applying django_q.0012_auto_20200702_1608... OK
+  Applying django_q.0013_task_attempt_count... OK
+  Applying django_q.0014_schedule_cluster... OK
+  Applying documents.0001_initial... OK
+  Applying documents.0002_auto_20151226_1316... OK
+  Applying documents.0003_sender... OK
+  Applying documents.0004_auto_20160114_1844... OK
+  Applying documents.0005_auto_20160123_0313... OK
+  Applying documents.0006_auto_20160123_0430... OK
+  Applying documents.0007_auto_20160126_2114... OK
+  Applying documents.0008_document_file_type... OK
+  Applying documents.0009_auto_20160214_0040... OK
+  Applying documents.0010_log... OK
+  Applying documents.0011_auto_20160303_1929... OK
+  Applying documents.0012_auto_20160305_0040... OK
+  Applying documents.0013_auto_20160325_2111... OK
+  Applying documents.0014_document_checksum... OK
+  Applying documents.0015_add_insensitive_to_match... OK
+  Applying documents.0016_auto_20170325_1558... OK
+  Applying documents.0017_auto_20170512_0507... OK
+  Applying documents.0018_auto_20170715_1712... OK
+  Applying documents.0019_add_consumer_user... OK
+  Applying documents.0020_document_added... OK
+  Applying documents.0021_document_storage_type... OK
+  Applying documents.0022_auto_20181007_1420... OK
+  Applying documents.0023_document_current_filename... OK
+  Applying documents.1000_update_paperless_all... OK
+  Applying documents.1001_auto_20201109_1636... OK
+  Applying documents.1002_auto_20201111_1105... OK
+  Applying documents.1003_mime_types... OK
+  Applying documents.1004_sanity_check_schedule... OK
+  Applying documents.1005_checksums... OK
+  Applying documents.1006_auto_20201208_2209... OK
+  Applying documents.1007_savedview_savedviewfilterrule... OK
+  Applying documents.1008_auto_20201216_1736... OK
+  Applying documents.1009_auto_20201216_2005... OK
+  Applying documents.1010_auto_20210101_2159... OK
+  Applying documents.1011_auto_20210101_2340... OK
+  Applying documents.1012_fix_archive_files... OK
+  Applying documents.1013_migrate_tag_colour... OK
+  Applying documents.1014_auto_20210228_1614... OK
+  Applying documents.1015_remove_null_characters... OK
+  Applying documents.1016_auto_20210317_1351... OK
+  Applying documents.1017_alter_savedviewfilterrule_rule_type... OK
+  Applying documents.1018_alter_savedviewfilterrule_value... OK
+  Applying paperless_mail.0001_initial... OK
+  Applying paperless_mail.0002_auto_20201117_1334... OK
+  Applying paperless_mail.0003_auto_20201118_1940... OK
+  Applying paperless_mail.0004_mailrule_order... OK
+  Applying paperless_mail.0005_help_texts... OK
+  Applying paperless_mail.0006_auto_20210101_2340... OK
+  Applying paperless_mail.0007_auto_20210106_0138... OK
+  Applying paperless_mail.0008_auto_20210516_0940... OK
+  Applying paperless_mail.0009_mailrule_assign_tags... OK
+  Applying paperless_mail.0010_auto_20220311_1602... OK
+  Applying paperless_mail.0011_remove_mailrule_assign_tag... OK
+  Applying paperless_mail.0012_alter_mailrule_assign_tags... OK
+  Applying paperless_mail.0009_alter_mailrule_action_alter_mailrule_folder... OK
+  Applying paperless_mail.0013_merge_20220412_1051... OK
+  Applying paperless_mail.0014_alter_mailrule_action... OK
+  Applying sessions.0001_initial... OK
+```
+
 - `redis-cli ping` → `PONG`.
 - `manage.py migrate` → **exit 0**; applied migrations for `admin / auth / authtoken / contenttypes / django_q / documents[0001..1018] / paperless_mail / sessions`. In this run **no system‑check warnings appeared**, because all three binaries that `binaries_check` inspects — `settings.CONVERT_BINARY`, `settings.OPTIPNG_BINARY`, and `"tesseract"` `[src/paperless/checks.py:75]` — were present on `PATH`. (When one is missing, `binaries_check` `[src/paperless/checks.py:66-82]` appends a non‑fatal `Warning(...)` `[src/paperless/checks.py:80]` such as `Paperless can't find convert`.)
 - `migrate` created the backing tables **`documents_document`**, **`documents_log`**, **`django_q_task`**, **`django_q_schedule`**, **`django_admin_log`**, and **`auth_user`** (verified present in `/tmp/pngx-work/data/db.sqlite3`).
@@ -106,13 +210,13 @@ python manage.py qcluster                                         # Django-Q    
 
 ```
 $ gunicorn -c /tmp/blitzy/paperless-ngx/blitzy-02766774-d432-4287-a066-d2b57627175a_b181c9/gunicorn.conf.py paperless.asgi:application
-[2026-07-08 05:51:53 +0000] [55175] [INFO] Starting gunicorn 20.1.0
-[2026-07-08 05:51:53 +0000] [55175] [INFO] Listening at: http://0.0.0.0:8000 (55175)
-[2026-07-08 05:51:53 +0000] [55175] [INFO] Using worker: paperless.workers.ConfigurableWorker
-[2026-07-08 05:51:53 +0000] [55175] [INFO] Server is ready. Spawning workers
+[2026-07-08 07:51:38 +0000] [121151] [INFO] Starting gunicorn 20.1.0
+[2026-07-08 07:51:38 +0000] [121151] [INFO] Listening at: http://0.0.0.0:8000 (121151)
+[2026-07-08 07:51:38 +0000] [121151] [INFO] Using worker: paperless.workers.ConfigurableWorker
+[2026-07-08 07:51:38 +0000] [121151] [INFO] Server is ready. Spawning workers
 ```
 
-  Health checks against the live server (master PID `55175` + 2 workers):
+  Health checks against the live server (master PID `121151` + 2 workers):
 
 ```
 $ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/admin/login/
@@ -157,25 +261,25 @@ $ sed -n '2,14p' /tmp/pngx-work/log/paperless.log
 ```
 
 ```
-[2026-07-08 05:52:27,624] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/report_2022.txt to the task queue.
-[2026-07-08 05:53:32,327] [INFO] [paperless.consumer] Consuming report_2022.txt
-[2026-07-08 05:53:32,332] [DEBUG] [paperless.consumer] Detected mime type: text/plain
-[2026-07-08 05:53:32,335] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
-[2026-07-08 05:53:32,337] [DEBUG] [paperless.consumer] Parsing report_2022.txt...
-[2026-07-08 05:53:32,337] [DEBUG] [paperless.consumer] Generating thumbnail for report_2022.txt...
-[2026-07-08 05:53:32,399] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/pngx-work/scratch/paperless-4dz5gxi7/thumb.png -out /tmp/pngx-work/scratch/paperless-4dz5gxi7/thumb_optipng.png
-[2026-07-08 05:53:33,142] [DEBUG] [paperless.management.consumer] Not consuming file /tmp/pngx-work/consume/__paperless_write_test_56667__: File has moved.
-[2026-07-08 05:53:34,449] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-[2026-07-08 05:53:34,452] [DEBUG] [paperless.consumer] Saving record to database
-[2026-07-08 05:53:34,468] [DEBUG] [paperless.consumer] Deleting file /tmp/pngx-work/consume/report_2022.txt
-[2026-07-08 05:53:34,603] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/pngx-work/scratch/paperless-4dz5gxi7
-[2026-07-08 05:53:34,603] [INFO] [paperless.consumer] Document 2026-07-08 report_2022 consumption finished
+[2026-07-08 07:51:44,399] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/report_2022.txt to the task queue.
+[2026-07-08 07:52:03,656] [INFO] [paperless.consumer] Consuming report_2022.txt
+[2026-07-08 07:52:03,660] [DEBUG] [paperless.consumer] Detected mime type: text/plain
+[2026-07-08 07:52:03,663] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
+[2026-07-08 07:52:03,665] [DEBUG] [paperless.consumer] Parsing report_2022.txt...
+[2026-07-08 07:52:03,666] [DEBUG] [paperless.consumer] Generating thumbnail for report_2022.txt...
+[2026-07-08 07:52:03,688] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/pngx-work/scratch/paperless-q_s8b4s2/thumb.png -out /tmp/pngx-work/scratch/paperless-q_s8b4s2/thumb_optipng.png
+[2026-07-08 07:52:04,479] [DEBUG] [paperless.management.consumer] Not consuming file /tmp/pngx-work/consume/__paperless_write_test_121205__: File has moved.
+[2026-07-08 07:52:05,639] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[2026-07-08 07:52:05,642] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-08 07:52:05,659] [DEBUG] [paperless.consumer] Deleting file /tmp/pngx-work/consume/report_2022.txt
+[2026-07-08 07:52:05,705] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/pngx-work/scratch/paperless-q_s8b4s2
+[2026-07-08 07:52:05,705] [INFO] [paperless.consumer] Document 2026-07-08 report_2022 consumption finished
 ```
 
 Two **real** artifacts appear in this verbatim slice and are explained rather than edited out:
 
-- The **≈65 s gap** between `Adding …` (`05:52:27`) and `Consuming …` (`05:53:32`) is deliberate: `qcluster` (the worker) was started only *after* the broker was snapshotted for R4, so the task sat enqueued on the Redis list in the interim (see the `LLEN 0 → 1 → 0` transition in R4). With `qcluster` already running, the `Consuming` line follows within ≈130 ms — see run 2 (`report_2023`) in Secondary Conditions.
-- The line `Not consuming file …/__paperless_write_test_56667__: File has moved.` is **not** part of `report_2022`'s consumption. It is the watcher briefly seeing the transient write‑probe file that `path_check` `[src/paperless/checks.py:19]` creates as `__paperless_write_test_{os.getpid()}__` `[src/paperless/checks.py:27-30]` (via `open(test_file, "w")` `[src/paperless/checks.py:32]`) and then removes `[src/paperless/checks.py:45-46]` to verify the consumption directory is writable; `56667` is the `qcluster` PID. It exits early through the same `_consume` guard that logs `Not consuming file {}: File has moved.` `[src/documents/management/commands/document_consumer.py:51]`.
+- The **≈19 s gap** between `Adding …` (`07:51:44`) and `Consuming …` (`07:52:03`) is deliberate: `qcluster` (the worker) was started only *after* the broker was snapshotted for R4, so the task sat enqueued on the Redis list in the interim (see the `LLEN 0 → 1 → 0` transition in R4). With `qcluster` already running, the `Consuming` line follows within ≈127 ms — see run 2 (`report_2023`) in Secondary Conditions.
+- The line `Not consuming file …/__paperless_write_test_121205__: File has moved.` is **not** part of `report_2022`'s consumption. It is the watcher briefly seeing the transient write‑probe file that `path_check` `[src/paperless/checks.py:19]` creates as `__paperless_write_test_{os.getpid()}__` `[src/paperless/checks.py:27-30]` (via `open(test_file, "w")` `[src/paperless/checks.py:32]`) and then removes `[src/paperless/checks.py:45-46]` to verify the consumption directory is writable; `121205` is the `qcluster` PID. It exits early through the same `_consume` guard that logs `Not consuming file {}: File has moved.` `[src/documents/management/commands/document_consumer.py:51]`.
 
 ### Per‑line `file:line` mapping
 
@@ -233,9 +337,6 @@ documents.tasks.train_classifier              success=True result=None
 documents.tasks.index_optimize                success=True result=None
 documents.tasks.sanity_check                  success=True result='No issues detected.'
 paperless_mail.tasks.process_mail_accounts    success=True result='No new documents were added.'
-paperless_mail.tasks.process_mail_accounts    success=True result='No new documents were added.'
-paperless_mail.tasks.process_mail_accounts    success=True result='No new documents were added.'
-paperless_mail.tasks.process_mail_accounts    success=True result='No new documents were added.'
 ```
 
 `train_classifier`/`index_optimize` return `None` (nothing to train/optimise on a fresh index); `sanity_check` returns `'No issues detected.'`; the interval‑scheduled `process_mail_accounts` (mail app) returns `'No new documents were added.'` each tick. All are **separate scheduled tasks**, **not** part of the inline consumption pipeline that runs inside `consume_file`.
@@ -283,10 +384,10 @@ The broker list therefore transitions **empty → one signed package → drained
 
 ### Raw queued payload (observed, complete — not truncated)
 
-The queued entry is a **447‑byte ASCII string** in the form `<urlsafe‑base64(pickle)>:<base62‑timestamp>:<HMAC‑signature>` produced by Django‑Q's signing framework (a `TimestampSigner`; note the `_` in the body confirms the URL‑safe base64 alphabet). The **complete** raw value, via `redis-cli --no-raw LINDEX django_q:paperless:q 0`:
+The queued entry is a **447‑byte ASCII string** in the form `<urlsafe‑base64(pickle)>:<base62‑timestamp>:<HMAC‑signature>` produced by Django‑Q's signing framework (a `TimestampSigner`; note the `-` in the body confirms the URL‑safe base64 alphabet). The **complete** raw value, via `redis-cli --no-raw LINDEX django_q:paperless:q 0`:
 
 ```
-"gAWVHgEAAAAAAAB9lCiMAmlklIwgOTM4YTIxNGU5NmViNGU4NmJiNTY2ZjM4ZDJjYjgyMjWUjARuYW1llIwPcmVwb3J0XzIwMjIudHh0lIwEZnVuY5SMHGRvY3VtZW50cy50YXNrcy5jb25zdW1lX2ZpbGWUjARhcmdzlIwmL3RtcC9wbmd4LXdvcmsvY29uc3VtZS9yZXBvcnRfMjAyMi50eHSUhZSMBmt3YXJnc5R9lIwQb3ZlcnJpZGVfdGFnX2lkc5ROc4wHc3RhcnRlZJSMCGRhdGV0aW1llIwIZGF0ZXRpbWWUk5RDCgfqBwgFNBsJi_qUaA6MCHRpbWV6b25llJOUaA6MCXRpbWVkZWx0YZSTlEsASwBLAIeUUpSFlFKUhpRSlHUu:1whLCt:tfgy6uVvHvnR5mDOd3Ulj4CqkbiLAT3cQBmtml8TLXA"
+"gAWVHgEAAAAAAAB9lCiMAmlklIwgZjEwODM4NGM1YjVhNGU5MTk4MDJjYTViM2UyYjJhZDmUjARuYW1llIwPcmVwb3J0XzIwMjIudHh0lIwEZnVuY5SMHGRvY3VtZW50cy50YXNrcy5jb25zdW1lX2ZpbGWUjARhcmdzlIwmL3RtcC9wbmd4LXdvcmsvY29uc3VtZS9yZXBvcnRfMjAyMi50eHSUhZSMBmt3YXJnc5R9lIwQb3ZlcnJpZGVfdGFnX2lkc5ROc4wHc3RhcnRlZJSMCGRhdGV0aW1llIwIZGF0ZXRpbWWUk5RDCgfqBwgHMywGHX-UaA6MCHRpbWV6b25llJOUaA6MCXRpbWVkZWx0YZSTlEsASwBLAIeUUpSFlFKUhpRSlHUu:1whN4K:GrnTy65RGfk8xJaN2PoHchuVjlg48Yzgu0er8bnvGQk"
 ```
 
 **Pickle protocol — measured, not assumed.** The `gAWV` prefix decodes to the pickle **PROTO** opcode `\x80` followed by protocol byte `\x05` (and the start of a `FRAME` opcode `\x95`), i.e. **pickle protocol 5** — which is `pickle.HIGHEST_PROTOCOL` on Python 3.9. Verified directly against the interpreter **and** the actual payload body:
@@ -317,11 +418,11 @@ decoded['func']           : 'documents.tasks.consume_file'
 decoded['args']           : ('/tmp/pngx-work/consume/report_2022.txt',)
 decoded['kwargs']         : {'override_tag_ids': None}
 decoded['name']           : 'report_2022.txt'
-decoded['id']             : '938a214e96eb4e86bb566f38d2cb8225'
-decoded['started']        : datetime.datetime(2026, 7, 8, 5, 52, 27, 625658, tzinfo=datetime.timezone.utc)
+decoded['id']             : 'f108384c5b5a4e919802ca5b3e2b2ad9'
+decoded['started']        : datetime.datetime(2026, 7, 8, 7, 51, 44, 400767, tzinfo=datetime.timezone.utc)
 ```
 
-> **End‑to‑end traceability (observed).** This broker snapshot used the **same** `report_2022.txt` as the R2/R5 database trace. The decoded task **`id` = `938a214e96eb4e86bb566f38d2cb8225`** reappears verbatim as the **`django_q_task.id`** in R5(b), and `decoded['args']` points at the same consumption‑dir path — so the queued package and the persisted task‑history row are demonstrably the **same task**. The **structure** — a signed `dict` with keys `args/func/id/kwargs/name/started` and `func == documents.tasks.consume_file` — is identical regardless of which file is dropped.
+> **End‑to‑end traceability (observed).** This broker snapshot used the **same** `report_2022.txt` as the R2/R5 database trace. The decoded task **`id` = `f108384c5b5a4e919802ca5b3e2b2ad9`** reappears verbatim as the **`django_q_task.id`** in R5(b), and `decoded['args']` points at the same consumption‑dir path — so the queued package and the persisted task‑history row are demonstrably the **same task**. The **structure** — a signed `dict` with keys `args/func/id/kwargs/name/started` and `func == documents.tasks.consume_file` — is identical regardless of which file is dropped.
 
 ### Commands used
 
@@ -364,9 +465,9 @@ content = 'Paperless NGX runtime trace test.\nAcme Corporation invoice.\nDated 2
 mime_type = 'text/plain'
 checksum = '0da8a96bf7f3a377f2acba04d2800b51'
 archive_checksum = None
-created = datetime.datetime(2026, 7, 8, 5, 52, 26, 618350, tzinfo=datetime.timezone.utc)
-modified = datetime.datetime(2026, 7, 8, 5, 53, 34, 467972, tzinfo=datetime.timezone.utc)
-added = datetime.datetime(2026, 7, 8, 5, 53, 34, 452876, tzinfo=datetime.timezone.utc)
+created = datetime.datetime(2026, 7, 8, 7, 51, 43, 393898, tzinfo=datetime.timezone.utc)
+modified = datetime.datetime(2026, 7, 8, 7, 52, 5, 659008, tzinfo=datetime.timezone.utc)
+added = datetime.datetime(2026, 7, 8, 7, 52, 5, 642889, tzinfo=datetime.timezone.utc)
 storage_type = 'unencrypted'
 filename = '0000001.txt'
 ```
@@ -383,17 +484,17 @@ from django_q.models import Task
 t = Task.objects.get(name='report_2022.txt')
 for f in ['id','name','func','args','success','result','started','stopped']:
     print(f + ' = ' + repr(getattr(t, f)))"
-id = '938a214e96eb4e86bb566f38d2cb8225'
+id = 'f108384c5b5a4e919802ca5b3e2b2ad9'
 name = 'report_2022.txt'
 func = 'documents.tasks.consume_file'
 args = ('/tmp/pngx-work/consume/report_2022.txt',)
 success = True
 result = 'Success. New document id 1 created'
-started = datetime.datetime(2026, 7, 8, 5, 52, 27, 625658, tzinfo=datetime.timezone.utc)
-stopped = datetime.datetime(2026, 7, 8, 5, 53, 34, 606998, tzinfo=datetime.timezone.utc)
+started = datetime.datetime(2026, 7, 8, 7, 51, 44, 400767, tzinfo=datetime.timezone.utc)
+stopped = datetime.datetime(2026, 7, 8, 7, 52, 5, 708215, tzinfo=datetime.timezone.utc)
 ```
 
-**End‑to‑end traceability:** this task `id` **`938a214e96eb4e86bb566f38d2cb8225`** is byte‑for‑byte the same `id` decoded from the Redis broker package in R4, and its `result` names the `documents_document` row (`id 1`) from (a) — the queued package, the executed task, and the stored document are one and the same unit of work. Django‑Q's result monitor persists **both** successes and failures here. The `result` string `Success. New document id {} created` is produced by `consume_file` `[src/documents/tasks.py:247]`. Failed runs (the duplicate/unsupported cases) are stored with `success = False` and the traceback/error text as `result` — demonstrated with real rows in the Secondary Conditions section.
+**End‑to‑end traceability:** this task `id` **`f108384c5b5a4e919802ca5b3e2b2ad9`** is byte‑for‑byte the same `id` decoded from the Redis broker package in R4, and its `result` names the `documents_document` row (`id 1`) from (a) — the queued package, the executed task, and the stored document are one and the same unit of work. Django‑Q's result monitor persists **both** successes and failures here. The `result` string `Success. New document id {} created` is produced by `consume_file` `[src/documents/tasks.py:247]`. Failed runs (the duplicate/unsupported cases) are stored with `success = False` and the traceback/error text as `result` — demonstrated with real rows in the Secondary Conditions section.
 
 ### (c) Admin audit entry — table `django_admin_log`, written by `set_log_entry` `[src/documents/signals/handlers.py:413]`
 
@@ -418,16 +519,17 @@ The `documents_log` table / `Log` model `[src/documents/models.py:285]` is **def
 
 ### (e) Full‑text index (ties R5 to indexing)
 
-After consumption, `add_to_index` `[src/documents/signals/handlers.py:428]` → `index.add_or_update_document` `[src/documents/index.py:118]` (schema `[src/documents/index.py:31]`) maintains the Whoosh index under `/tmp/pngx-work/data/index/`. Producing command + complete output (after all three documents were consumed — one `.seg` segment per document):
+After consumption, `add_to_index` `[src/documents/signals/handlers.py:428]` → `index.add_or_update_document` `[src/documents/index.py:118]` (schema `[src/documents/index.py:31]`) maintains the Whoosh index under `/tmp/pngx-work/data/index/`. Producing command + complete output (listing taken in **this run** after all three documents were consumed). The exact set of `.seg` segment files and the `.toc` filename are internal Whoosh details that vary run‑to‑run with buffered writes, flushes, and segment merges — so the number of `.seg` files does **not** necessarily equal the document count (here, three consumed documents left **two** `.seg` segments):
 
 ```bash
 $ ls -la /tmp/pngx-work/data/index/
-total 52
--rwxr-xr-x 1 root root     0 Jul  8 05:53 MAIN_WRITELOCK
--rw-r--r-- 1 root root 11716 Jul  8 05:56 MAIN_epkh41216nc58y4z.seg
--rw-r--r-- 1 root root 11714 Jul  8 05:54 MAIN_omfrk45y0xutv88b.seg
--rw-r--r-- 1 root root 11713 Jul  8 05:54 MAIN_r9gr5mudg7mtxnh1.seg
--rw-r--r-- 1 root root  4594 Jul  8 05:56 _MAIN_4.toc
+total 44
+drwxr-xr-x 2 root root  4096 Jul  8 07:52 .
+drwxr-xr-x 3 root root  4096 Jul  8 07:52 ..
+-rwxr-xr-x 1 root root     0 Jul  8 07:52 MAIN_WRITELOCK
+-rw-r--r-- 1 root root 11715 Jul  8 07:52 MAIN_hkqcavnvt7n33d57.seg
+-rw-r--r-- 1 root root 14480 Jul  8 07:52 MAIN_l50ljmbjyz6r6jbh.seg
+-rw-r--r-- 1 root root  4486 Jul  8 07:52 _MAIN_4.toc
 ```
 
 
@@ -496,37 +598,82 @@ Beyond the primary happy path, the following secondary/error/edge/alternate‑fl
 
 ### 1. Stable log ordering across ≥2 runs
 
-A second happy file `report_2023.txt` (md5 `74b4099aecf6f9943d9bb5204fd98962`, which became `documents_document` id `2`) produced a log sequence whose ordering is **identical** to the first run — only the filename, timestamps, and the scratch‑dir hash differ. Note this run's `Adding → Consuming` gap is ≈128 ms (`05:54:48.949 → 05:54:49.077`) because `qcluster` was already running — confirming the ≈65 s gap in R3 was purely the deliberate broker‑snapshot delay.
+A second happy file `report_2023.txt` (md5 `41a6465cc9c6ae26bf82fef3e87aadce`, which became `documents_document` id `2`) produced a log sequence whose ordering is **identical** to the first run — only the filename, timestamps, and the scratch‑dir hash differ. This run's `Adding → Consuming` gap is ≈127 ms (`07:52:08.999 → 07:52:09.126`) because `qcluster` was already running — confirming the ≈19 s gap in R3 was purely the deliberate broker‑snapshot delay.
 
-```
-[2026-07-08 05:54:48,949] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/report_2023.txt to the task queue.
-[2026-07-08 05:54:49,077] [INFO] [paperless.consumer] Consuming report_2023.txt
-[2026-07-08 05:54:49,081] [DEBUG] [paperless.consumer] Detected mime type: text/plain
-[2026-07-08 05:54:49,083] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
-[2026-07-08 05:54:49,085] [DEBUG] [paperless.consumer] Parsing report_2023.txt...
-[2026-07-08 05:54:49,086] [DEBUG] [paperless.consumer] Generating thumbnail for report_2023.txt...
-[2026-07-08 05:54:49,107] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/pngx-work/scratch/paperless-ivyfe2mo/thumb.png -out /tmp/pngx-work/scratch/paperless-ivyfe2mo/thumb_optipng.png
-[2026-07-08 05:54:51,050] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-[2026-07-08 05:54:51,053] [DEBUG] [paperless.consumer] Saving record to database
-[2026-07-08 05:54:51,073] [DEBUG] [paperless.consumer] Deleting file /tmp/pngx-work/consume/report_2023.txt
-[2026-07-08 05:54:51,079] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/pngx-work/scratch/paperless-ivyfe2mo
-[2026-07-08 05:54:51,080] [INFO] [paperless.consumer] Document 2026-07-08 report_2023 consumption finished
-```
-
-Normalising both runs (masking timestamps, the file stem, and the scratch‑dir hash) shows the 12‑line consumption sequence is **byte‑for‑byte identical** — `diff` reports no differences:
+**Input file — producing command + md5/size:**
 
 ```bash
+$ printf 'Paperless NGX runtime trace test.\nBeta Corporation invoice.\nDated 2023-04-01. Amount due 84.00 USD.\n' \
+    > /tmp/pngx-work/consume/report_2023.txt
+$ md5sum /tmp/pngx-work/consume/report_2023.txt
+41a6465cc9c6ae26bf82fef3e87aadce  /tmp/pngx-work/consume/report_2023.txt
+$ wc -c   /tmp/pngx-work/consume/report_2023.txt
+100 /tmp/pngx-work/consume/report_2023.txt
+```
+
+**Log‑extraction command + complete, unedited output** — the contiguous `Adding … → … consumption finished` window for `report_2023.txt`:
+
+```bash
+$ awk '/Adding .*report_2023\.txt to the task queue/{f=1} f{print} /report_2023 consumption finished/{exit}' \
+    /tmp/pngx-work/log/paperless.log
+```
+
+```
+[2026-07-08 07:52:08,999] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/report_2023.txt to the task queue.
+[2026-07-08 07:52:09,126] [INFO] [paperless.consumer] Consuming report_2023.txt
+[2026-07-08 07:52:09,130] [DEBUG] [paperless.consumer] Detected mime type: text/plain
+[2026-07-08 07:52:09,132] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
+[2026-07-08 07:52:09,135] [DEBUG] [paperless.consumer] Parsing report_2023.txt...
+[2026-07-08 07:52:09,135] [DEBUG] [paperless.consumer] Generating thumbnail for report_2023.txt...
+[2026-07-08 07:52:09,156] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/pngx-work/scratch/paperless-fj3zwo9f/thumb.png -out /tmp/pngx-work/scratch/paperless-fj3zwo9f/thumb_optipng.png
+[2026-07-08 07:52:11,049] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[2026-07-08 07:52:11,052] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-08 07:52:11,068] [DEBUG] [paperless.consumer] Deleting file /tmp/pngx-work/consume/report_2023.txt
+[2026-07-08 07:52:11,113] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/pngx-work/scratch/paperless-fj3zwo9f
+[2026-07-08 07:52:11,114] [INFO] [paperless.consumer] Document 2026-07-08 report_2023 consumption finished
+```
+
+**Normalisation + diff — producing commands + complete output.** To prove the ordering is identical (not merely similar), each run's `Adding … → … consumption finished` window is normalised — the transient write‑probe line is dropped and the three volatile tokens (timestamp, file stem, scratch‑dir hash) are masked — then compared with `diff`:
+
+```bash
+$ normalize() {
+    grep -v '__paperless_write_test_' "$1" \
+    | sed -E \
+        -e 's/^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,]+\]/[TS]/' \
+        -e 's/report_202[0-9]/DOC/g' \
+        -e 's#paperless-[a-z0-9_]+#paperless-HASH#g'
+  }
+$ normalize run1_report_2022.window > run1.norm   # the R3 Adding→finished window (write-probe line dropped)
+$ normalize run2_report_2023.window > run2.norm   # the window shown just above
 $ diff run1.norm run2.norm && echo "IDENTICAL"
 IDENTICAL
 ```
 
+Both normalised windows are **12 lines** and compare **byte‑for‑byte equal**, confirming stable log ordering across the two runs.
+
 ### 2. Duplicate file (pre‑existing checksum)
 
-Re‑creating the exact content of an already‑consumed document — `duplicate_of_2023.txt` carries the **same** content (hence same md5 `74b4099aecf6f9943d9bb5204fd98962`) as `report_2023.txt` from condition 1 — triggers `pre_check_duplicate` `[src/documents/consumer.py:213]` (definition `[:102]`, checksum compare `[:104-107]`), which runs **before** the `Consuming` log `[:215]`:
+Re‑creating the exact content of an already‑consumed document — `duplicate_of_2023.txt` carries the **same** content (hence same md5 `41a6465cc9c6ae26bf82fef3e87aadce`) as `report_2023.txt` from condition 1 — triggers `pre_check_duplicate` `[src/documents/consumer.py:213]` (definition `[:102]`, checksum compare `[:104-107]`), which runs **before** the `Consuming` log `[:215]`.
+
+**Input file — producing command + md5** (identical bytes to `report_2023.txt`, hence the identical checksum that trips the duplicate check):
+
+```bash
+$ printf 'Paperless NGX runtime trace test.\nBeta Corporation invoice.\nDated 2023-04-01. Amount due 84.00 USD.\n' \
+    > /tmp/pngx-work/consume/duplicate_of_2023.txt
+$ md5sum /tmp/pngx-work/consume/duplicate_of_2023.txt
+41a6465cc9c6ae26bf82fef3e87aadce  /tmp/pngx-work/consume/duplicate_of_2023.txt
+```
+
+**Log‑extraction command + complete, unedited output:**
+
+```bash
+$ awk '/Adding .*duplicate_of_2023\.txt to the task queue/{f=1} f{print} /It is a duplicate/{exit}' \
+    /tmp/pngx-work/log/paperless.log
+```
 
 ```
-[2026-07-08 05:55:22,327] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/duplicate_of_2023.txt to the task queue.
-[2026-07-08 05:55:22,461] [ERROR] [paperless.consumer] Not consuming duplicate_of_2023.txt: It is a duplicate.
+[2026-07-08 07:52:15,025] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/duplicate_of_2023.txt to the task queue.
+[2026-07-08 07:52:15,156] [ERROR] [paperless.consumer] Not consuming duplicate_of_2023.txt: It is a duplicate.
 ```
 
 The worker records the task as **`success = False`** in `django_q_task`, with the full traceback as the `result` (producing command + complete output):
@@ -540,7 +687,7 @@ print('name    =', t.name)
 print('func    =', t.func)
 print('success =', t.success)
 print('result  ='); print(t.result)"
-id      = cc626c7996254b45ba55f46537e9de1c
+id      = 9452db958bd54e3480196210bfdbd051
 name    = duplicate_of_2023.txt
 func    = documents.tasks.consume_file
 success = False
@@ -563,21 +710,64 @@ The traceback confirms the exact codepath: `consume_file` `[src/documents/tasks.
 
 ### 3. Unsupported MIME — two distinct rejection paths
 
-**(a) Watcher‑level (unknown extension).** Dropping `archive.zip` is rejected **before queuing** — no task is created:
+**(a) Watcher‑level (unknown extension).** Dropping `archive.zip` is rejected **before queuing** — no task is created.
+
+**Input file — producing command** (`archive.zip` is never parsed; the watcher rejects the unknown extension before any content is read, so the bytes are immaterial):
+
+```bash
+$ printf 'zip payload\n' > /tmp/pngx-work/consume/archive.zip
+```
+
+**Log‑extraction command + complete, unedited output** (the watcher logged the rejection **twice** — once when the file was dropped, and again when the consumer was later restarted into polling mode for §4 and re‑scanned the still‑present file):
+
+```bash
+$ grep -F 'archive.zip' /tmp/pngx-work/log/paperless.log
+```
 
 ```
-[2026-07-08 05:55:44,194] [WARNING] [paperless.management.consumer] Not consuming file /tmp/pngx-work/consume/archive.zip: Unknown file extension.
+[2026-07-08 07:52:19,449] [WARNING] [paperless.management.consumer] Not consuming file /tmp/pngx-work/consume/archive.zip: Unknown file extension.
+[2026-07-08 07:52:32,825] [WARNING] [paperless.management.consumer] Not consuming file /tmp/pngx-work/consume/archive.zip: Unknown file extension.
 ```
 
 This is the `is_file_ext_supported` gate `[src/documents/management/commands/document_consumer.py:54-55]` (predicate defined `[src/documents/parsers.py:62]`). Because the rejection happens in `_consume` **before** `async_task`, **no `django_q_task` row is created** for `archive.zip`.
 
-**(b) Consumer‑level (supported extension, unsupported content).** A file with a `.txt` extension but binary content (512 zero bytes → `magic` detects `application/octet-stream`, which has no parser) passes the extension filter, is queued, and fails at the MIME check:
+**Verification query — no task row, task count unchanged** (producing commands + complete output, run immediately before and after the drop):
+
+```bash
+$ python manage.py shell -c "from django_q.models import Task; print('TASKS_BEFORE=%d' % Task.objects.count())"
+TASKS_BEFORE=3
+$ printf 'zip payload\n' > /tmp/pngx-work/consume/archive.zip     # (the drop shown above)
+$ python manage.py shell -c "from django_q.models import Task; print('exists', Task.objects.filter(name='archive.zip').exists()); print('TASKS_AFTER=%d' % Task.objects.count())"
+exists False
+TASKS_AFTER=3
+```
+
+At the moment this condition ran, exactly three task rows existed — the two successful consumptions (`report_2022`, `report_2023`) plus the one failed `duplicate_of_2023`. Dropping `archive.zip` left that total **unchanged at 3** and produced **no** row named `archive.zip`, confirming the watcher‑level rejection never reaches the queue.
+
+**(b) Consumer‑level (supported extension, unsupported content).** A file with a `.txt` extension but binary content (512 zero bytes → `magic` detects `application/octet-stream`, which has no parser) passes the extension filter, is queued, and fails at the MIME check.
+
+**Input file — producing command + md5/size** (512 zero bytes; `magic` reports `application/octet-stream`, for which no parser is declared):
+
+```bash
+$ head -c 512 /dev/zero > /tmp/pngx-work/consume/unsupported.txt
+$ md5sum /tmp/pngx-work/consume/unsupported.txt
+bf619eac0cdf3f68d496ea9344137e8b  /tmp/pngx-work/consume/unsupported.txt
+$ wc -c   /tmp/pngx-work/consume/unsupported.txt
+512 /tmp/pngx-work/consume/unsupported.txt
+```
+
+**Log‑extraction command + complete, unedited output:**
+
+```bash
+$ awk '/Adding .*unsupported\.txt to the task queue/{f=1} f{print} /Unsupported mime type/{exit}' \
+    /tmp/pngx-work/log/paperless.log
+```
 
 ```
-[2026-07-08 05:55:47,201] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/unsupported.txt to the task queue.
-[2026-07-08 05:55:47,330] [INFO] [paperless.consumer] Consuming unsupported.txt
-[2026-07-08 05:55:47,332] [DEBUG] [paperless.consumer] Detected mime type: application/octet-stream
-[2026-07-08 05:55:47,334] [ERROR] [paperless.consumer] Unsupported mime type application/octet-stream
+[2026-07-08 07:52:26,284] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/unsupported.txt to the task queue.
+[2026-07-08 07:52:26,418] [INFO] [paperless.consumer] Consuming unsupported.txt
+[2026-07-08 07:52:26,420] [DEBUG] [paperless.consumer] Detected mime type: application/octet-stream
+[2026-07-08 07:52:26,422] [ERROR] [paperless.consumer] Unsupported mime type application/octet-stream
 ```
 
 Here `get_parser_class_for_mime_type` returns `None` `[src/documents/consumer.py:223]` → `_fail(MESSAGE_UNSUPPORTED_TYPE, ...)` `[:225]`, with constant `MESSAGE_UNSUPPORTED_TYPE = "unsupported_type"` `[:44]`. Because the file **was** queued (its `.txt` extension passed the watcher gate), the worker records a `success = False` row (producing command + complete output):
@@ -591,7 +781,7 @@ print('name    =', t.name)
 print('func    =', t.func)
 print('success =', t.success)
 print('result  ='); print(t.result)"
-id      = 7a4e4d6f44bc46efb98bd2011d8229a0
+id      = 529932eb97be4ddf8b030fd95f4462fb
 name    = unsupported.txt
 func    = documents.tasks.consume_file
 success = False
@@ -612,34 +802,62 @@ The traceback confirms the codepath differs from the duplicate case: it fails at
 
 ### 4. Polling vs. inotify watcher modes
 
-The default is **inotify** (`CONSUMER_POLLING == 0` `[src/documents/management/commands/document_consumer.py:178]`). Restarting the consumer with `PAPERLESS_CONSUMER_POLLING=2` switches to **polling**. The distinguishing startup lines:
+The default is **inotify** (`CONSUMER_POLLING == 0` `[src/documents/management/commands/document_consumer.py:178]`). To switch to **polling**, the consumer is stopped and relaunched with `PAPERLESS_CONSUMER_POLLING=2` — the exact restart commands (run from `$REPO/src`):
+
+```bash
+# stop the inotify consumer started earlier for R2/R3
+$ kill "$CONSUMER_PID"
+# relaunch the same management command with polling enabled (2-second interval)
+$ export PAPERLESS_CONSUMER_POLLING=2
+$ python manage.py document_consumer >> /tmp/pngx-work/log/consumer.stdout 2>&1 &
+```
+
+The two modes emit distinguishing startup lines:
 
 ```
 # inotify (default) startup line:
-[2026-07-08 05:52:15,399] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /tmp/pngx-work/consume    # :200
+[2026-07-08 07:51:42,910] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /tmp/pngx-work/consume    # :200
 # polling (PAPERLESS_CONSUMER_POLLING=2) startup line:
-[2026-07-08 05:56:21,446] [INFO] [paperless.management.consumer] Polling directory for changes: /tmp/pngx-work/consume                   # :186
+[2026-07-08 07:52:32,825] [INFO] [paperless.management.consumer] Polling directory for changes: /tmp/pngx-work/consume                   # :186
 ```
 
-Under polling, a distinct debounce line (`Waiting for file … to remain unmodified`) appears **before** queuing. Here is the **complete, unedited** polling stream for `report_poll.txt` (no ellipsis) — the `Waiting` line at `05:56:25` precedes the `Adding` line at `05:56:30`, ≈5 s later, reflecting the `PAPERLESS_CONSUMER_POLLING=2` debounce:
+Under polling, a distinct debounce line (`Waiting for file … to remain unmodified`) appears **before** queuing.
 
-```
-[2026-07-08 05:56:25,448] [DEBUG] [paperless.management.consumer] Waiting for file /tmp/pngx-work/consume/report_poll.txt to remain unmodified
-[2026-07-08 05:56:30,454] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/report_poll.txt to the task queue.
-[2026-07-08 05:56:30,580] [INFO] [paperless.consumer] Consuming report_poll.txt
-[2026-07-08 05:56:30,584] [DEBUG] [paperless.consumer] Detected mime type: text/plain
-[2026-07-08 05:56:30,587] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
-[2026-07-08 05:56:30,589] [DEBUG] [paperless.consumer] Parsing report_poll.txt...
-[2026-07-08 05:56:30,589] [DEBUG] [paperless.consumer] Generating thumbnail for report_poll.txt...
-[2026-07-08 05:56:30,610] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/pngx-work/scratch/paperless-hsn464vp/thumb.png -out /tmp/pngx-work/scratch/paperless-hsn464vp/thumb_optipng.png
-[2026-07-08 05:56:32,544] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-[2026-07-08 05:56:32,546] [DEBUG] [paperless.consumer] Saving record to database
-[2026-07-08 05:56:32,564] [DEBUG] [paperless.consumer] Deleting file /tmp/pngx-work/consume/report_poll.txt
-[2026-07-08 05:56:32,609] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/pngx-work/scratch/paperless-hsn464vp
-[2026-07-08 05:56:32,610] [INFO] [paperless.consumer] Document 2026-07-08 report_poll consumption finished
+**Input file — producing command + md5/size** (a 99‑byte plaintext memo, distinct from the earlier files):
+
+```bash
+$ printf 'Paperless NGX polling trace test.\nDelta Corporation memo.\nDated 2025-07-04. Amount due 168.00 USD.\n' \
+    > /tmp/pngx-work/consume/report_poll.txt
+$ md5sum /tmp/pngx-work/consume/report_poll.txt
+f40860d7e08bc811354e40fbeb719c38  /tmp/pngx-work/consume/report_poll.txt
+$ wc -c   /tmp/pngx-work/consume/report_poll.txt
+99 /tmp/pngx-work/consume/report_poll.txt
 ```
 
-The `Waiting` line is emitted by `_consume_wait_unmodified` `[src/documents/management/commands/document_consumer.py:99]` (`Waiting for file … to remain unmodified` `[:103]`), which loops `settings.CONSUMER_POLLING_RETRY_COUNT` `[:107]` times sleeping `settings.CONSUMER_POLLING_DELAY` `[:122]` between tries, and logs a timeout error `[:125]` if the file never settles. The processing order **after detection** is identical to inotify; only the detection mechanism and the debounce differ. (`report_poll.txt` md5 `e2ae5c1a5c3dd6610e933af10bb0e8a2` became `documents_document` id `3`.) Also observed: on restart into polling mode the watcher **re‑scans pre‑existing files** via the `handle()` initial scan `[:167-173]`, so `duplicate_of_2023.txt` and `unsupported.txt` (left behind because failed files are **not** deleted) are re‑detected — which is why the `django_q_task` failure counts above show each name twice.
+**Log‑extraction command + complete, unedited output** (no ellipsis) — the `Waiting` line at `07:52:36` precedes the `Adding` line at `07:52:41`, ≈5 s later, reflecting the `PAPERLESS_CONSUMER_POLLING=2` debounce:
+
+```bash
+$ awk '/Waiting for file .*report_poll\.txt to remain unmodified/{f=1} f{print} /report_poll consumption finished/{exit}' \
+    /tmp/pngx-work/log/paperless.log
+```
+
+```
+[2026-07-08 07:52:36,827] [DEBUG] [paperless.management.consumer] Waiting for file /tmp/pngx-work/consume/report_poll.txt to remain unmodified
+[2026-07-08 07:52:41,833] [INFO] [paperless.management.consumer] Adding /tmp/pngx-work/consume/report_poll.txt to the task queue.
+[2026-07-08 07:52:41,963] [INFO] [paperless.consumer] Consuming report_poll.txt
+[2026-07-08 07:52:41,967] [DEBUG] [paperless.consumer] Detected mime type: text/plain
+[2026-07-08 07:52:41,970] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
+[2026-07-08 07:52:41,971] [DEBUG] [paperless.consumer] Parsing report_poll.txt...
+[2026-07-08 07:52:41,972] [DEBUG] [paperless.consumer] Generating thumbnail for report_poll.txt...
+[2026-07-08 07:52:41,993] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/pngx-work/scratch/paperless-r5wssogt/thumb.png -out /tmp/pngx-work/scratch/paperless-r5wssogt/thumb_optipng.png
+[2026-07-08 07:52:43,909] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[2026-07-08 07:52:43,911] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-08 07:52:43,928] [DEBUG] [paperless.consumer] Deleting file /tmp/pngx-work/consume/report_poll.txt
+[2026-07-08 07:52:43,972] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/pngx-work/scratch/paperless-r5wssogt
+[2026-07-08 07:52:43,973] [INFO] [paperless.consumer] Document 2026-07-08 report_poll consumption finished
+```
+
+The `Waiting` line is emitted by `_consume_wait_unmodified` `[src/documents/management/commands/document_consumer.py:99]` (`Waiting for file … to remain unmodified` `[:103]`), which loops `settings.CONSUMER_POLLING_RETRY_COUNT` `[:107]` times sleeping `settings.CONSUMER_POLLING_DELAY` `[:122]` between tries, and logs a timeout error `[:125]` if the file never settles. The processing order **after detection** is identical to inotify; only the detection mechanism and the debounce differ. (`report_poll.txt` md5 `f40860d7e08bc811354e40fbeb719c38` became `documents_document` id `3`.) Also observed: on restart into polling mode the watcher **re‑scans pre‑existing files** via the `handle()` initial scan `[:167-173]`, so `duplicate_of_2023.txt` and `unsupported.txt` (left behind because failed files are **not** deleted) are re‑detected — which is why the `django_q_task` failure counts above show each name twice.
 
 ### 5. Barcode‑split branch (code‑level; off by default)
 
