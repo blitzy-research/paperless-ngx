@@ -9,19 +9,24 @@
 
 ## The questions being answered
 
-This document answers, verbatim, the following questions:
+The user's original prompt is reproduced **verbatim** below, exactly as it was posed:
 
-> **Q1.** "How does a new document usually enter paperless-ngx. Once a document is received, what are the main stages it goes through before it's fully processed and available, are there any background jobs and what is used for background execution."
+> I'm trying to get a big-picture understanding of how documents flow through the system. How does a new document usually enter paperless-ngx. Once a document is received, what are the main stages it goes through before it's fully processed and available, are there any background jobs and what is used for background execution.
 >
-> **Q2 (metadata).** "What metadata fields are saved, and which ones are absolutely required versus optional or derived later during runtime-processing. Can you show with a runtime example?"
+> I'm also curious about the kind of information paperless stores for each document. What metadata fields are saved, and which ones are absolutely required versus optional or derived later during runtime-processing. Can you show with a runtime example?
 >
-> **Q3 (organisation).** "how ... tags, correspondents, and document types are used together to organize documents in a practical way."
+> Also I wonder how things like tags, correspondents, and document types are used together to organize documents in a practical way.
 >
-> **Q4 (constraint).** "Please don't make any changes to the repository itself. You can create temporary scripts for testing if needed but do clean them up once you're done."
+> Please don't make any changes to the repository itself. You can create temporary scripts for testing if needed but do clean them up once you're done.
 
-(Q1's compound question — stages + background jobs + execution engine — is answered in full under the heading **Q2 — Processing stages, background jobs, and the execution engine** further below. The metadata question is answered under **Q3 — Metadata model**, and the organisation question under **Q4 — Organising with tags, correspondents, and document types**, to keep each self-contained.)
+For structured answering, that prompt is **decomposed** into the parts below, each mapped to the section that answers it. The labels, numbering, and groupings here are this document's own organisation — they are *not* a re-quote of the user's wording:
 
-The read-only constraint (Q4 above) **was honoured**: no existing repository file was modified, created, or deleted. The only artefact added is this Markdown document (and the `blitzy/`, `blitzy/documentation/` directories that hold it). All temporary observation scripts were created outside the tracked tree (under `/tmp`) and removed. The real `git` proof is embedded verbatim in **Coverage and cleanup** at the end.
+- **How a document *usually* enters, the main processing stages it goes through before it is fully processed and available, whether there are background jobs, and what is used for background execution** → answered under **Q1 — How a document *usually* enters** (the three ingestion entry points and their convergence point) and **Q2 — Processing stages, background jobs, and the execution engine**.
+- **What metadata is stored per document, and which fields are absolutely required versus optional versus derived later at runtime, shown with a runtime example** → answered under **Q3 — Metadata model**.
+- **How tags, correspondents, and document types are used together to organise documents in a practical way** → answered under **Q4 — Organising with tags, correspondents, and document types**.
+- **The read-only request** (the prompt's fourth paragraph) → honoured throughout, and proven with real `git` output in **Coverage and cleanup**.
+
+The read-only request (the prompt's fourth paragraph above) **was honoured**: no existing repository file was modified, created, or deleted. The only artefact added is this Markdown document (and the `blitzy/`, `blitzy/documentation/` directories that hold it). All temporary observation scripts were created outside the tracked tree (under `/tmp`) and removed. The real `git` proof is embedded verbatim in **Coverage and cleanup** at the end.
 
 ---
 
@@ -1203,7 +1208,7 @@ $ git ls-files --others --exclude-standard
 (no output — zero untracked files; no temporary script leaked into the tree)
 
 $ git status --porcelain
- M blitzy/documentation/paperless-ngx_542221a38dff.md
+(no output — the working tree is clean; the deliverable is committed)
 ```
 
-`git diff --name-status` against the pinned baseline `542221a38dff06361e07976452f9aea24d210542` shows the **only** added path is this deliverable; `git ls-files --others --exclude-standard` is empty (no leftover temporary files); and `git status --porcelain` shows the deliverable as the single pending change (this document itself, immediately before it was committed). The working tree is therefore identical to HEAD apart from this one file.
+`git diff --name-status` against the pinned baseline `542221a38dff06361e07976452f9aea24d210542` shows the **only** added path is this deliverable; `git ls-files --others --exclude-standard` is empty (no leftover temporary files); and `git status --porcelain` is empty because the deliverable has been committed, leaving the working tree clean. The repository therefore differs from the pinned paperless-ngx baseline `542221a38dff06361e07976452f9aea24d210542` by exactly one added file — this document — and by nothing else.
