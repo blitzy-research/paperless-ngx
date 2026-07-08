@@ -345,13 +345,13 @@ $ ../venv/bin/python manage.py shell -c "from documents.models import Document; 
 DOC_COUNT = 1
 ```
 
-Second, a timestamped grep of this session's OCR-invocation and duplicate lines shows the duplicate (`05:30:48`) produced **no** `Calling OCRmyPDF` line — it sits between the run-1 OCR call (`05:29:11`) and the run-2 OCR call (`05:31:45`), with no OCR invocation of its own (the args dicts are abbreviated with `{…}` here only to keep the chronology readable; the full dicts appear above and in Repeatability below):
+Second, a timestamped grep of this session's OCR-invocation and duplicate lines shows the duplicate (`05:30:48`) produced **no** `Calling OCRmyPDF` line — it sits between the run-1 OCR call (`05:29:11`, pk=3) and the run-2 OCR call (`05:31:45`, pk=4), with no OCR invocation of its own. The complete, unedited `grep` output follows; each `Calling OCRmyPDF with args` line carries its full argument dict (the run-1 dict is identical to the one shown under *The OCRmyPDF invocation parameters* above, and the run-2 dict is identical to the one shown under *Repeatability* below — only the per-run `mkdtemp` temp paths in `input_file`/`output_file`/`sidecar` differ):
 
 ```bash
 $ grep -E "Calling OCRmyPDF with args|It is a duplicate" data/log/paperless.log | grep -E "2026-07-08 05:(29|30|31)"
-[2026-07-08 05:29:11,903] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {…}   # run 1 (pk=3)
-[2026-07-08 05:30:48,079] [ERROR] [paperless.consumer] Not consuming multi-page-images.pdf: It is a duplicate.   # duplicate -> NO OCR
-[2026-07-08 05:31:45,271] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {…}   # run 2 (pk=4)
+[2026-07-08 05:29:11,903] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/paperless/paperless-upload-guh5v_d6', 'output_file': '/tmp/paperless/paperless-xd151v1g/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-xd151v1g/sidecar.txt'}
+[2026-07-08 05:30:48,079] [ERROR] [paperless.consumer] Not consuming multi-page-images.pdf: It is a duplicate.
+[2026-07-08 05:31:45,271] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/paperless/paperless-upload-l7irefmw', 'output_file': '/tmp/paperless/paperless-tgju0h4j/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-tgju0h4j/sidecar.txt'}
 
 $ grep "Calling OCRmyPDF with args" data/log/paperless.log | grep -cE "2026-07-08 05:(29|30|31)"
 2
@@ -660,11 +660,12 @@ $ kill "$(cat /tmp/blitzy_evidence/qcluster.pid)" "$(cat /tmp/blitzy_evidence/gu
 $ rm -rf /tmp/blitzy_evidence
 ```
 
-Finally, `git status` confirms the working tree is pristine — the only change is this answer document (runtime data under `media/`, `data/`, and `*.log` is gitignored, so it never dirties tracked files):
+Finally, the repository is verified pristine at delivery. The deliverable is committed, so `git status --porcelain` produces **no output** (a clean working tree — no modified, staged, or untracked files), and the only difference from the upstream paperless-ngx HEAD (commit `542221a38`, i.e. the tree before this document existed) is the single **added** answer document — no tracked source file is modified. Runtime data under `media/`, `data/`, and `*.log` is gitignored, so it never dirties tracked files:
 
 ```bash
 $ git status --porcelain
- M blitzy/documentation/paperless-ngx_542221a38dff.md
+$ git diff --name-status 542221a38..HEAD
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
 ```
 
-No tracked source file was modified and no file other than `blitzy/documentation/paperless-ngx_542221a38dff.md` was added, satisfying the read-only mandate.
+The first command prints nothing (clean working tree); the second shows the only change relative to upstream is this added answer document (status `A`). No existing source file was modified (no ` M`/`D` entries) and no other file was added, satisfying the read-only mandate.
