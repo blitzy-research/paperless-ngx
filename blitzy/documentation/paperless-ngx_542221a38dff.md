@@ -949,7 +949,7 @@ Even at complete idle — no documents in flight, no mail accounts configured, n
 2. **`gunicorn` + its two Uvicorn ASGI workers** — the `[program:gunicorn]` program (`docker/supervisord.conf:10-11`) runs the gunicorn master, which forks `workers = 2` (`gunicorn.conf.py:4`) Uvicorn workers (`paperless.workers.ConfigurableWorker`, `src/paperless/workers.py:4,9`). This is the always-on HTTP **and** WebSocket server (`paperless.asgi:application`).
 3. **`document_consumer`** — the `[program:consumer]` program (`docker/supervisord.conf:19-20`) runs `manage.py document_consumer`, the always-running directory watcher (idle behaviour covered in [Q1](#the-document-consumer-at-idle-clean-baseline)).
 4. **The Django-Q cluster** — the `[program:scheduler]` program (`docker/supervisord.conf:28-29`) runs `manage.py qcluster`, which stays up as a tree of role processes: the **sentinel/guard loop**, the **monitor**, the **pusher**, and the **worker pool** (`Q_CLUSTER`, `src/paperless/settings.py:449-457`). Two of these are *continuously active even with zero tasks*: the **guard loop** (heartbeats the cluster Stat) and the **pusher** (blocks on the broker waiting for work).
-5. **The Redis server** — a single Redis process that serves **two** always-connected roles simultaneously: the Django-Q **broker** (`src/paperless/settings.py:456`) and the Channels **channel layer** (`CHANNEL_LAYERS`, `src/paperless/settings.py:178-186`).
+5. **The Redis server** — a single Redis process that serves **two** always-connected roles simultaneously: the Django-Q **broker** (`src/paperless/settings.py:456`) and the Channels **channel layer** (`CHANNEL_LAYERS`, `src/paperless/settings.py:178-187`).
 6. **The ASGI `StatusConsumer` WebSocket endpoint** at `ws/status/` — routed by the ASGI `ProtocolTypeRouter` (`src/paperless/asgi.py:17-21`) and mounted for the entire lifetime of the gunicorn workers; it is continuously reachable (proven below with a live handshake) even when no status is being pushed.
 
 Two more Docker-level always-on facts frame the above: **Docker's liveness healthcheck** fires every 30 s for the container's whole life (evidenced in [Q2 §Cadence 1](#cadence-1--the-docker-healthcheck-every-30-s-silent-in-app-logs)), and the container's process table never drops below this fixed set.
@@ -962,7 +962,7 @@ Two more Docker-level always-on facts frame the above: **Docker's liveness healt
 | **Django-Q guard loop** | Heartbeats cluster Stat; reincarnates dead role processes | `qcluster` sentinel | Stat-key TTL held at 3 s across a 2 s gap | `django-q 1.3.9 · site-packages/django_q/cluster.py` (guard); `src/paperless/settings.py:449-457` |
 | **Django-Q pusher** | Blocks on broker (`BLPOP`) waiting for task packages | `qcluster` pusher | Redis `id=6 flags=b cmd=blpop age=1272` | `django-q 1.3.9 · site-packages/django_q/cluster.py` (pusher) |
 | **Django-Q worker pool + monitor** | Idle processes ready to run tasks | `qcluster` | PIDs 382–392 etc. under sentinel 379 | `Q_CLUSTER` `src/paperless/settings.py:449-457` |
-| **Redis server** | Broker **and** channel layer | `redis-server` | `uptime_in_seconds:1274`; keys `django_q:*` + `asgi:group:*` | `src/paperless/settings.py:456,178-186` |
+| **Redis server** | Broker **and** channel layer | `redis-server` | `uptime_in_seconds:1274`; keys `django_q:*` + `asgi:group:*` | `src/paperless/settings.py:456,178-187` |
 | **ASGI `StatusConsumer`** WS endpoint | Always-mounted `ws/status/`; real-time status channel | `ProtocolTypeRouter` → `StatusConsumer` | live handshake → HTTP 101 | `src/paperless/asgi.py:17-21`; `src/paperless/urls.py:136-138`; `src/paperless/consumers.py:9-33` |
 
 Everything below grounds each row with the exact command and its complete, unedited output.
@@ -1046,7 +1046,7 @@ id=13 addr=127.0.0.1:55102 fd=13 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 mu
 The channel layer is `channels_redis.core.RedisChannelLayer` pointed at the same Redis (`hosts` = `PAPERLESS_REDIS`, `expiry: 15`), so no separate service is needed:
 
 ```console
-$ docker exec paperless-app-canon sed -n '178,186p' /app/src/paperless/settings.py
+$ docker exec paperless-app-canon sed -n '178,187p' /app/src/paperless/settings.py
 CHANNEL_LAYERS = {
     "default": {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
@@ -1800,7 +1800,7 @@ $ docker exec -w /app/src paperless-app-canon python3 /tmp/ws_trigger.py        
 # source citations captured for Q4
 $ docker exec paperless-app-canon cat -n /app/src/paperless/asgi.py                        # q4_83
 $ docker exec paperless-app-canon sed -n '136,138p' /app/src/paperless/urls.py             # q4_81
-$ docker exec paperless-app-canon sed -n '178,186p' /app/src/paperless/settings.py         # q4_80
+$ docker exec paperless-app-canon sed -n '178,187p' /app/src/paperless/settings.py         # q4_80
 $ docker exec paperless-app-canon grep -nE "nodaemon|^\[program|command=" /app/docker/supervisord.conf   # q4_82
 ```
 
