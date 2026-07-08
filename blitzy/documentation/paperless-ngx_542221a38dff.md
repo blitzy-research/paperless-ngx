@@ -554,7 +554,7 @@ newest Failure: simple.pdf success=False
 
 Cause → effect: `Success (6) + Failure (1) == Task (7)` because `Success`/`Failure` are proxies partitioning the one `django_q_task` table by the `success` boolean (Q5). The 7 rows are: 4 startup-schedule tasks (Q2) + JobA success (`simple.pdf`, doc 1) + JobB success (`test_with_bom.pdf`, doc 2) + JobC failure (`simple.pdf` duplicate) — of which exactly one (`JobC`) is a `Failure`.
 
-**(e) Django admin inspection.** The admin registers the Django-Q proxy models. Authenticated GETs (the session for `admin` is minted in-process with `Client.force_login` — no password typed, and the session key is never printed):
+**(e) Django admin inspection.** The admin registers Django-Q's task changelists — `Success` and `Failure` (proxies over `django_q_task`) and `Schedule` (a concrete model with its own `django_q_schedule` table); `Task` and `OrmQ` are **not** registered (both → 404). Authenticated GETs (the session for `admin` is minted in-process with `Client.force_login` — no password typed, and the session key is never printed):
 
 ```text
 $ python3 /tmp/blitzy_obs/admin_get.py     # django.test.Client + force_login(admin); prints each status code and page title
@@ -573,7 +573,7 @@ from django_q import models as qm
 reg = admin.site._registry
 print({n: getattr(qm, n)._meta.proxy for n in ['Task','Success','Failure','Schedule','OrmQ'] if getattr(qm, n) in reg})
 "
-{'Task': False, 'Success': True, 'Failure': True, 'Schedule': True, 'OrmQ': False}
+{'Success': True, 'Failure': True, 'Schedule': False}
 ```
 
 Cause → effect: `Success`, `Failure`, and `Schedule` are registered and browsable (hence 200); their changelist titles ("Successful/Failed/Scheduled task") are exactly what a user sees. `Task` itself and `OrmQ` are **not** registered in this build, so `/admin/django_q/ormq/` returns **404** — after-the-fact inspection of *waiting* work is not available via the admin (it is in Redis, Q4).
