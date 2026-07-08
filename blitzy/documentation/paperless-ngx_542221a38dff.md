@@ -302,7 +302,7 @@ MODEL_FILE = /tmp/tmpwe_a7hxw/classification_model.pickle
 [after  3rd train_classifier (MUTATED data)  ] exists=True size=12422B mtime=1783494901.954924
   -> mtime changed after 3rd call? True
 PASSED
-../../tmp/test_blitzy_q1_reuse.py::TestQ1PartAB::test_partB_datahash 
+../../tmp/test_blitzy_q1_reuse.py::TestQ1PartAB::test_partB_datahash
 === PART B: DocumentClassifier.train() data_hash reuse guard [classifier.py:L163-164] ===
 initial clf.data_hash = None
 [DEBUG] [paperless.classifier] Gathering data from database...
@@ -364,7 +364,7 @@ documents/tests/test_classifier.py::TestClassifier::test_load_classifier_cached 
 - `testDatasetHashing` [`test_classifier.py:L137`] — `assertTrue(train())` then `assertFalse(train())` (guard). **PASS.**
 - `testSaveClassifier` [`test_classifier.py:L168`] — train → `save()` → fresh `load()` → `assertFalse(train())`. **PASS.**
 - `test_load_and_classify` [`test_classifier.py:L183`] — loads the **committed** fixture `src/documents/tests/data/model.pickle` (**156,607 bytes**) under `override_settings(MODEL_FILE=…)`. **PASS.** (This is a _controlled_ reuse — not contamination.)
-- `test_load_classifier_cached` [`test_classifier.py:L402`] — **SKIPPED**, reason `"Disabled caching due to high memory usage - need to investigate"` (the `@pytest.mark.skip` decorator is declared at `test_classifier.py:L399`; pytest's own summary reports the skip location as `test_classifier.py:391` — the first line of the test's stacked decorators, `@override_settings` at `L391`).
+- `test_load_classifier_cached` [`test_classifier.py:L402`] — **SKIPPED**, reason `"Disabled caching due to high memory usage - need to investigate."` (the `@pytest.mark.skip` decorator is declared at `test_classifier.py:L399`; pytest's own summary reports the skip location as `test_classifier.py:391` — the first line of the test's stacked decorators, `@override_settings` at `L391`). Verified with `-rs`: `SKIPPED [1] documents/tests/test_classifier.py:391: Disabled caching due to high memory usage - need to investigate.`
 
 ### 2.3 Cross-test contamination surface — evidence
 
@@ -1206,7 +1206,7 @@ collecting ... collected 7 items
 [Q4-defaults] CONSUMER_BARCODE_STRING  = 'PATCHT'
 [Q4-defaults] CONSUMER_ENABLE_BARCODES = False
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_B_barcode_reader 
+../../tmp/test_blitzy_q4.py::Q4::test_B_barcode_reader
 barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
    Code 39                  barcode-39-PATCHT.png              -> ['PATCHT']
    Code 39 (.pbm patch-t)   patch-code-t.pbm                   -> ['PATCHT']
@@ -1220,7 +1220,7 @@ barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
    QR custom                barcode-qr-custom.png              -> ['CUSTOM BARCODE']
    Code 128 custom          barcode-128-custom.png             -> ['CUSTOM BARCODE']
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_C_scan_default 
+../../tmp/test_blitzy_q4.py::Q4::test_C_scan_default
 [Q4-scan default PATCHT] scan_file_for_separating_barcodes(...) ->
    patch-code-t.pdf                   -> [0]
    simple.pdf                         -> []
@@ -1229,23 +1229,23 @@ PASSED
    patch-code-t-middle_reverse.pdf    -> [1]
    patch-code-t-qr.pdf                -> [0]
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_D_scan_custom 
+../../tmp/test_blitzy_q4.py::Q4::test_D_scan_custom
 [Q4-scan CUSTOM BARCODE separator] ->
    barcode-39-custom.pdf    -> [0]
    barcode-qr-custom.pdf    -> [0]
    barcode-128-custom.pdf   -> [0]
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_E_scan_negative 
+../../tmp/test_blitzy_q4.py::Q4::test_E_scan_negative
 [Q4-scan NEGATIVE cross-product] barcode-39-custom.pdf under default 'PATCHT' -> []
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_F_separate_pages 
+../../tmp/test_blitzy_q4.py::Q4::test_F_separate_pages
 [Q4-separate_pages] split-file counts ->
    patch-code-t-middle.pdf      seps=[1]        -> 2 file(s): ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
    several-patcht-codes.pdf     seps=[2, 5]     -> 3 file(s): ['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
 [2026-07-08 07:53:08,012] [WARNING] [paperless.tasks] No pages to split on!
    patch-code-t-middle.pdf      seps=[]         -> 0 file(s): []
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_G_consume_zero_rows 
+../../tmp/test_blitzy_q4.py::Q4::test_G_consume_zero_rows
 [Q4-consume_file barcode branch, CONSUMER_ENABLE_BARCODES=True]
    Document.objects.count() BEFORE = 0
    Document.objects.count() AFTER  = 0
@@ -1280,7 +1280,7 @@ collecting ... collected 7 items
 [Q4-defaults] CONSUMER_BARCODE_STRING  = 'PATCHT'
 [Q4-defaults] CONSUMER_ENABLE_BARCODES = False
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_B_barcode_reader 
+../../tmp/test_blitzy_q4.py::Q4::test_B_barcode_reader
 barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
    Code 39                  barcode-39-PATCHT.png              -> ['PATCHT']
    Code 39 (.pbm patch-t)   patch-code-t.pbm                   -> ['PATCHT']
@@ -1294,7 +1294,7 @@ barcode_reader(image) decoded values [tasks.py:L75, pyzbar.decode L82]:
    QR custom                barcode-qr-custom.png              -> ['CUSTOM BARCODE']
    Code 128 custom          barcode-128-custom.png             -> ['CUSTOM BARCODE']
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_C_scan_default 
+../../tmp/test_blitzy_q4.py::Q4::test_C_scan_default
 [Q4-scan default PATCHT] scan_file_for_separating_barcodes(...) ->
    patch-code-t.pdf                   -> [0]
    simple.pdf                         -> []
@@ -1303,23 +1303,23 @@ PASSED
    patch-code-t-middle_reverse.pdf    -> [1]
    patch-code-t-qr.pdf                -> [0]
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_D_scan_custom 
+../../tmp/test_blitzy_q4.py::Q4::test_D_scan_custom
 [Q4-scan CUSTOM BARCODE separator] ->
    barcode-39-custom.pdf    -> [0]
    barcode-qr-custom.pdf    -> [0]
    barcode-128-custom.pdf   -> [0]
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_E_scan_negative 
+../../tmp/test_blitzy_q4.py::Q4::test_E_scan_negative
 [Q4-scan NEGATIVE cross-product] barcode-39-custom.pdf under default 'PATCHT' -> []
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_F_separate_pages 
+../../tmp/test_blitzy_q4.py::Q4::test_F_separate_pages
 [Q4-separate_pages] split-file counts ->
    patch-code-t-middle.pdf      seps=[1]        -> 2 file(s): ['patch-code-t-middle_document_0.pdf', 'patch-code-t-middle_document_1.pdf']
    several-patcht-codes.pdf     seps=[2, 5]     -> 3 file(s): ['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
 [2026-07-08 07:53:31,056] [WARNING] [paperless.tasks] No pages to split on!
    patch-code-t-middle.pdf      seps=[]         -> 0 file(s): []
 PASSED
-../../tmp/test_blitzy_q4.py::Q4::test_G_consume_zero_rows 
+../../tmp/test_blitzy_q4.py::Q4::test_G_consume_zero_rows
 [Q4-consume_file barcode branch, CONSUMER_ENABLE_BARCODES=True]
    Document.objects.count() BEFORE = 0
    Document.objects.count() AFTER  = 0
