@@ -71,7 +71,7 @@ A rise in RSS that never returns to the OS is frequently an artifact of the allo
 9. Python docs — *gc*: https://docs.python.org/3/library/gc.html
 10. Python docs — *resource*: https://docs.python.org/3/library/resource.html
 
-References [1]–[5] frame CPython `pymalloc` arena retention (small objects ≤ 512 bytes; arena returned to the OS only when all its pools are empty — "rarely happens" in long-running processes); [6]–[7] frame glibc `ptmalloc2` per-thread arenas (up to ~8 × CPU cores, tunable via `MALLOC_ARENA_MAX`); [8]–[10] document the tri-lens measurement APIs — `tracemalloc.get_traced_memory()` current/peak plus `reset_peak()` (new in Python 3.9, matching the canonical runtime), `gc.get_objects()` / `gc.get_referrers()` for live-object and referrer inspection, and `resource.getrusage(RUSAGE_SELF).ru_maxrss` — used by `probe.py` (§3.3, App. A-1). The doc's "arena (256 KB)" matches the canonical Python 3.9.23 runtime, where `sys._debugmallocstats()` reports `262144 bytes/arena` (the current C-API doc lists 1 MiB for 64-bit builds of newer CPython versions).
+References [1]–[5] frame CPython `pymalloc` arena retention (small objects ≤ 512 bytes; arena returned to the OS only when all its pools are empty — "rarely happens" in long-running processes); [6]–[7] frame glibc `ptmalloc2` per-thread arenas (up to ~8 × CPU cores, tunable via `MALLOC_ARENA_MAX`); [8]–[10] document the tri-lens measurement APIs — `tracemalloc.get_traced_memory()` current/peak plus `reset_peak()` (new in Python 3.9, matching the canonical runtime), `gc.get_objects()` / `gc.get_referrers()` for live-object and referrer inspection, and `resource.getrusage(RUSAGE_SELF).ru_maxrss` — used by `probe.py` (§3.3, App. A-1). The doc's "arena (256 KB)" matches the canonical Python 3.9.23 runtime, where `sys._debugmallocstats()` reports `262144 bytes/arena` (the current C-API doc lists 1 MiB for 64-bit builds of newer CPython versions). Analogously, the bullet's "64 size classes" is the universally-published canonical description of `pymalloc` (8-byte alignment); the same `sys._debugmallocstats()` call on this 64-bit 3.9.23 build actually reports `Small block threshold = 512, in 32 size classes` — the build uses 16-byte `ALIGNMENT` (512 / 16 = 32 classes), and its per-class `size` column steps by 16 bytes (16, 32, 48, 64, ...). Command: `python3 -c "import sys; sys._debugmallocstats()"` (canonical container). This size-class count is immaterial to every measurement, hotspot attribution, and the normal-vs-leak verdict here, because all investigated allocations (OCR image buffers, the full-text `content` string, pickled classifier arrays) are transients far larger than the 512-byte threshold and therefore bypass `pymalloc` entirely.
 
 ### 3.3 The tri-lens harness (exact source)
 
@@ -329,7 +329,7 @@ STAGE handler:set_tags                0.00        0.00     53.54         5
 
 - **`parse` (`consumer.py:L261`) is the ONLY stage that grows RSS** — digital **+25.28 MiB**, image **+92.87 MiB** current RSS. This is where the parser reads the file and (for images) invokes OCR. For the digital PDF `tracemalloc.current` rises +10.71 MiB (pdfminer text extraction is in-Python); for the image PDF `tracemalloc.current` rises only +0.76 MiB despite +92.87 MiB RSS — proving the OCR memory is **native**, not Python heap. `parse` is also where live objects jump (+13 235 digital).
 - **`get_optimised_thumbnail` (`consumer.py:L265`)** — image +0.70 MiB RSS (renders a thumbnail via the parent), digital ~0; negligible.
-- **`get_text` (`consumer.py:L271`)** — **0.00 MiB**: the text was already extracted *during* `parse` and cached in the parser's `self.text` (`parsers.py:L296`); `get_text()` just returns it (`parsers.py:L342`). No allocation here.
+- **`get_text` (`consumer.py:L271`)** — **0.00 MiB**: the text was already extracted *during* `parse` and cached in the parser's `self.text` (`src/documents/parsers.py:L296`); `get_text()` just returns it (`src/documents/parsers.py:L342`). No allocation here.
 - **`get_date` (`consumer.py:L272`)** — 0.00 MiB for these small documents (it scans `self.text`; the cost is proportional to text length — see §5.4 for a large-text case).
 - **`get_archive_path`, `load_classifier` (`consumer.py:L292`)** — 0.00 MiB. `load_classifier()` returns `None` here because the fresh temp `DATA_DIR` has no `MODEL_FILE` (`classifier.py:L36`); its "during" probe shows exactly **+2 live objects** and 0 MiB (the `None` return path — see §6.1 for the model-present path).
 - **`_store` (`consumer.py:L379`)** — +0.03 MiB `tracemalloc`, +89 live objects: it builds the `Document` row and computes the MD5 checksum; small for these samples (see §5.3 for the content-string analysis).
@@ -432,7 +432,7 @@ The leaked directories are verified **empty** (the harness lists their contents)
 
 ### 5.2 The un-closed `pikepdf` handle is reclaimed promptly (NOT a leak)
 
-`RasterisedDocumentParser.extract_metadata` opens `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`) with **no** context manager and **no** `pdf.close()` before `return result` (`L55`). Despite the code smell, the QPDF C handle does **not** linger. Calling the real `extract_metadata` directly and counting live `pikepdf.Pdf` before/during/after (no `gc.collect()`) shows the handle exists only for the duration of the call (`q2_pikepdf_content.py`, Q2(a); full output App. B-3):
+`RasterisedDocumentParser.extract_metadata` opens `pdf = pikepdf.open(document_path)` (`src/paperless_tesseract/parsers.py:L34`) with **no** context manager and **no** `pdf.close()` before `return result` (`src/paperless_tesseract/parsers.py:L55`). Despite the code smell, the QPDF C handle does **not** linger. Calling the real `extract_metadata` directly and counting live `pikepdf.Pdf` before/during/after (no `gc.collect()`) shows the handle exists only for the duration of the call (`q2_pikepdf_content.py`, Q2(a); full output App. B-3):
 
 ```
   live pikepdf.Pdf BEFORE construct parser: 0
@@ -445,7 +445,7 @@ The count is **1** while `extract_metadata` runs (the open handle) and **0** the
 
 ### 5.3 The full-text `content` string is held exactly once (necessary, not redundant)
 
-The extracted text flows: parser `self.text` (`src/documents/parsers.py:L296`) → `get_text()` returns `self.text` (`L342`) → the consumer's `text` local (`src/documents/consumer.py:L271`) → `Document(content=text)` (`_store`, `L398–L406` → `Document.content` `TextField`, `src/documents/models.py:L117`). Instrumenting `_store` while consuming `simple-digital.pdf` showed the consumer passes the **same object**, not a copy (`q2_pikepdf_content.py`, Q2(b); full output App. B-3):
+The extracted text flows: parser `self.text` (`src/documents/parsers.py:L296`) → `get_text()` returns `self.text` (`src/documents/parsers.py:L342`) → the consumer's `text` local (`src/documents/consumer.py:L271`) → `Document(content=text)` (`_store`, `L398–L406` → `Document.content` `TextField`, `src/documents/models.py:L117`). Instrumenting `_store` while consuming `simple-digital.pdf` showed the consumer passes the **same object**, not a copy (`q2_pikepdf_content.py`, Q2(b); full output App. B-3):
 
 ```
   text IS document.content (same object, single copy): True
@@ -543,7 +543,7 @@ whoosh AFTER-GC (gc.collect)  {0, 0, 0}    VmRSS 106.0 MiB  tm.current 38.74 MiB
 
 ### 6.4 ORM query log — only under the labeled non-default `DEBUG=YES` (§9)
 
-`connection.queries` grows one dict per SQL statement **only when `settings.DEBUG` is True**. The default is `DEBUG=NO` (`src/paperless/settings.py:L50`; the file's own comment at `L48` is "NEVER RUN WITH DEBUG IN PRODUCTION"). Under the default, `connection.queries` stayed at length **0** after ~10 000 statements. The full DEBUG=YES vs DEBUG=NO comparison is in §9. **Verdict Q3:** no accumulation in the canonical configuration.
+`connection.queries` grows one dict per SQL statement **only when `settings.DEBUG` is True**. The default is `DEBUG=NO` (`src/paperless/settings.py:L50`; the file's own comment at `src/paperless/settings.py:L49` is "NEVER RUN WITH DEBUG IN PRODUCTION"). Under the default, `connection.queries` stayed at length **0** after ~10 000 statements. The full DEBUG=YES vs DEBUG=NO comparison is in §9. **Verdict Q3:** no accumulation in the canonical configuration.
 
 
 ---
@@ -675,7 +675,7 @@ This whole-command delta (~+14 MiB) is **larger than the manifest copies themsel
 
 ## 9. Labeled non-canonical variant — `PAPERLESS_DEBUG=YES`
 
-**This section is explicitly non-canonical.** The default is `DEBUG=NO` (`src/paperless/settings.py:L50`: `DEBUG = __get_boolean("PAPERLESS_DEBUG", "NO")`; the env var was unset in the container), and `settings.py:L48` warns "NEVER RUN WITH DEBUG IN PRODUCTION." It is exercised only to characterise the ORM-query-log accumulation the user asked about; it is **not** recommended and **not** applied as a change.
+**This section is explicitly non-canonical.** The default is `DEBUG=NO` (`src/paperless/settings.py:L50`: `DEBUG = __get_boolean("PAPERLESS_DEBUG", "NO")`; the env var was unset in the container), and `src/paperless/settings.py:L49` warns "NEVER RUN WITH DEBUG IN PRODUCTION." It is exercised only to characterise the ORM-query-log accumulation the user asked about; it is **not** recommended and **not** applied as a change.
 
 The same ORM workload was run under both configurations in one process (`debug_harness.py`, Appendix A; full tri-lens output — including the before/after `PROBE` blocks — in Appendix B-6). Under `DEBUG=NO` the workload is 200 creates + 200 reads (~400 statements); under `DEBUG=YES` it is 5000 creates + 5000 reads (~10 000 statements). The decisive result lines (each **verbatim** from `debug_harness.txt`):
 
@@ -719,10 +719,10 @@ Verdicts: **EXPECTED** = large but released/proportional to real work; **BENIGN 
 | # | Hotspot / method | file:line | Observed peak | Live objects across `gc.collect()` | Verdict |
 |---|---|---|---|---|---|
 | 1 | OCR rasterization (`ocrmypdf`/ghostscript/tesseract) via `RasterisedDocumentParser.parse` | `paperless_tesseract/parsers.py`; `consumer.py:L261` | image PDF RSS hi **241.8 MiB** vs `tm.peak` 54.9 MiB (parse stage `dRSS`=+92.87 MiB, `dTM`=+0.76 MiB); RSS plateau ~220–258 MiB across a batch | `gc.live` flat ~96–108 k; RSS drops 187.0→159.6 after `gc` | EXPECTED transient + BENIGN retention |
-| 2 | Full-text `content` string | `parsers.py:L296` → `get_text L342` → `consumer.py:L271` → `models.py:L117` | one copy = doc size; 5 MiB doc → transient `tm.peak` 79.8 MiB (+100 MiB RSS); 20 MiB → 187.3 MiB (+331 MiB RSS) | held once (`text is doc.content`); heap returns to baseline (43.41 MiB) after `gc`; RSS stays elevated | EXPECTED single copy + BENIGN retention |
+| 2 | Full-text `content` string | `src/documents/parsers.py:L296` → `get_text src/documents/parsers.py:L342` → `consumer.py:L271` → `models.py:L117` | one copy = doc size; 5 MiB doc → transient `tm.peak` 79.8 MiB (+100 MiB RSS); 20 MiB → 187.3 MiB (+331 MiB RSS) | held once (`text is doc.content`); heap returns to baseline (43.41 MiB) after `gc`; RSS stays elevated | EXPECTED single copy + BENIGN retention |
 | 3 | Classifier 7× `pickle.load` (`MLPClassifier` dominant) | `classifier.py:L76–L92` (L91 dominant) | +0.28 MiB/load (`MLPClassifier` 268.7 KiB; `CountVectorizer` only 12.3 KiB) | 12 consumes flat; live `DocumentClassifier` = 1 constant | EXPECTED (loaded once, freed) |
 | 4 | Metadata-endpoint parser temp-dirs | `views.py:L266`, `L269` (no `cleanup()`) | 400 empty dirs after 200 calls; RAM +0.4 MiB (170.1→170.5) | dirs survive gc (filesystem); RSS/heap flat | RESOURCE LEAK (~0 RAM) |
-| 5 | `pikepdf.open` un-closed handle | `paperless_tesseract/parsers.py:L34`, `L55` | live `Pdf` = 0 at all probes | reclaimed by refcount before gc | NOT a leak (code smell) |
+| 5 | `pikepdf.open` un-closed handle | `src/paperless_tesseract/parsers.py:L34`, `src/paperless_tesseract/parsers.py:L55` | live `Pdf` = 0 at all probes | reclaimed by refcount before gc | NOT a leak (code smell) |
 | 6 | Importer `json.load` (copy #1) | `document_importer.py:L73` | ≈ manifest bytes (0.981 MiB @ 0.972 MiB manifest; 4.894 MiB @ 4.857 MiB manifest) | released; `tm.current` → ~42–70 MiB after gc | EXPECTED (scales `batch×content`) |
 | 7 | Importer `loaddata` re-parse | `document_importer.py:L87` | transient +manifest, coexists with copy #1 (peak 73.97→83.88 @ 4.857 MiB manifest, +9.91 ≈ 2× manifest) | streams to DB, released | EXPECTED transient |
 | 8 | Importer `list(filter)` (copy #2) | `document_importer.py:L137-138` | shallow ref list 0.6–2.0 KiB | released | EXPECTED (shallow, negligible) |
@@ -749,7 +749,7 @@ Each named item the question asks for, with where it is answered and the evidenc
 | — error path (corrupt vs. encrypted PDF) | §4.6, §6 | corrupt→`ConsumerError`(ocrmypdf `InputFileError`), `cleanup()` runs (tempdirs 0→0); encrypted→succeeds (`content_len=0`) | App. B-14 |
 | **Q2** Unnecessary copies / reference retention | §5 | metadata endpoint leaks empty tempdirs; `pikepdf` handle reclaimed; `content` held once | §5.1–§5.4 |
 | — metadata-endpoint tempdirs | §5.1 | **2 per call**, never cleaned (`views.py:L266/L269`); 400 empty dirs / 200 calls; ~0 RAM | App. B-2 |
-| — `pikepdf.open` handle | §5.2 | live `Pdf`=0 before & after gc (`parsers.py:L34/L55`) — reclaimed by refcount | App. B-3 |
+| — `pikepdf.open` handle | §5.2 | live `Pdf`=0 before & after gc (`src/paperless_tesseract/parsers.py:L34/L55`) — reclaimed by refcount | App. B-3 |
 | — full-text `content` string | §5.3 | held **once** (`text is doc.content` → True), `models.py:L117` | §5.3 |
 | **Q3** Caching accumulation | §6 | none in default config | §6.1–§6.4 |
 | — classifier model | §6.1, §6.2 | 7×`pickle.load` (`classifier.py:L76-92`), `MLPClassifier` 268.7 KiB dominant, loaded once/consume then freed; 12-doc batch flat (live=1) | App. B-4, B-4b |
@@ -5884,7 +5884,7 @@ NO_MODEL_HARNESS_DONE
 
 ### B-14. Error / encrypted path — `error_path.py` (Q1/Q4, F4)
 
-Drives two real failure inputs through `consume_file` → `try_consume_file`. **CASE A** — an **encrypted** PDF (`encrypted.pdf`, 46 594 B): `pdfminer` raises `PDFPasswordIncorrect`, the parser logs "This file is encrypted, OCR is impossible" and consumption **SUCCEEDS** with empty content (`Document pk=1`, `content_len=0`). **CASE B** — a genuinely **corrupt** PDF (`corrupt.pdf`, 1 450 B): `pdfminer` raises `PSEOF: Unexpected EOF`, `ocrmypdf` then raises `InputFileError` (pikepdf `PdfError: unable to find trailer dictionary`), wrapped as `ParseError` at `parsers.py:L310` and surfaced from `consumer.py:L261` as `ConsumerError`. In **both** cases the `finally: document_parser.cleanup()` (`consumer.py:L369`) runs, so `paperless-*` tempdirs are `before=0 after=0` (no leak); `peakTM` during = 55.04 MiB (A) and 53.24 MiB (B). Command:
+Drives two real failure inputs through `consume_file` → `try_consume_file`. **CASE A** — an **encrypted** PDF (`encrypted.pdf`, 46 594 B): `pdfminer` raises `PDFPasswordIncorrect`, the parser logs "This file is encrypted, OCR is impossible" and consumption **SUCCEEDS** with empty content (`Document pk=1`, `content_len=0`). **CASE B** — a genuinely **corrupt** PDF (`corrupt.pdf`, 1 450 B): `pdfminer` raises `PSEOF: Unexpected EOF`, `ocrmypdf` then raises `InputFileError` (pikepdf `PdfError: unable to find trailer dictionary`), wrapped as `ParseError` at `src/paperless_tesseract/parsers.py:L310` and surfaced from `consumer.py:L261` as `ConsumerError`. In **both** cases the `finally: document_parser.cleanup()` (`consumer.py:L369`) runs, so `paperless-*` tempdirs are `before=0 after=0` (no leak); `peakTM` during = 55.04 MiB (A) and 53.24 MiB (B). Command:
 ```
 cd /app/src && PYTHONPATH=/app/src:/tmp/mem_harness DJANGO_SETTINGS_MODULE=paperless.settings PAPERLESS_DISABLE_DBHANDLER=true python /tmp/mem_harness/error_path.py
 ```
