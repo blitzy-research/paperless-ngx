@@ -106,11 +106,21 @@ Plus helper installs (`setuptools<81`, `python-dotenv`, `python-gnupg`) needed f
 
 **The reported values are version-agnostic.** The captured filesystem paths, MD5/SHA-1 digests,
 and log strings depend only on Paperless-NGX's own source code and the input bytes — not on the
-numeric library versions. This is proven directly by the evidence: the classifier SHA-1
-`data_hash` (`b41ce39793cd61f391afe34e6e4de9b361c74447`, Q3) and the MD5 fixtures
-(`42995833e01aea9b3edee44bbfdd7ce1` original and `62acb0bcbfbcaa62ca6ad3668e4e404b` archive, Q4/Q5)
-match the source code constants and the project's own test fixtures exactly (e.g.,
-`src/documents/tests/test_sanity_check.py:105-106`), across the version deviation.
+numeric library versions. Two distinct grounds support this, and they are *not* the same kind of
+thing:
+
+- The **MD5 fixtures** (`42995833e01aea9b3edee44bbfdd7ce1` original and
+  `62acb0bcbfbcaa62ca6ad3668e4e404b` archive, Q4/Q5) are the project's own **test-fixture
+  constants**, defined literally in the source at `src/documents/tests/test_sanity_check.py:105-106`
+  and reproduced byte-for-byte at runtime.
+- The **classifier SHA-1 `data_hash`** (`b41ce39793cd61f391afe34e6e4de9b361c74447`, Q3) is **not** a
+  literal source constant; it is **derived at runtime** by the application's own `hashlib.sha1`
+  (`src/documents/classifier.py:124`, `:161`) over the deterministic canonical fixture data
+  (`generate_test_data`) — content plus auto-classification labels — and was reproduced
+  **identically across ≥2 runs** and across the version deviation.
+
+Because none of these digests is produced by a version-pinned library artifact, the Python/
+scikit-learn deviation does not change them.
 
 ---
 
@@ -237,12 +247,15 @@ succeed too; if the forward move failed, "nothing has changed anyway."
 ### Answer to both parts
 
 - **Does it truly recover, or just promise to?** In the mid-move failure case it **truly
-  recovers** — the observed evidence below shows both files back at their origin and the instance
-  attributes restored, with no log line emitted.
+  recovers at the file level** — the observed evidence below shows both files back at their origin
+  and the instance attributes restored, with no log line emitted.
 - **What actually happens to files when a move fails partway?** The completed portion of the move
   is physically undone by a reverse `os.rename`; the files end up back where they started. But
   because the recovery is best-effort / non-transactional (inner `except Exception: pass`), this
-  is documented as a **finding**, not something remediated here.
+  is documented as a **finding**, not something remediated here. A second **finding** is that the
+  recovery is *file-level only*: the empty destination directory created by
+  `create_source_path_directory` (`src/documents/signals/handlers.py:353`, `:358`) before the
+  failed rename is never removed and lingers on disk (demonstrated per-scenario below).
 
 The reproduction mirrors `test_move_file_error`
 (`src/documents/tests/test_file_handling.py:759`), which patches
@@ -256,21 +269,42 @@ under `PAPERLESS_FILENAME_FORMAT="{correspondent}/{title}"`.
 
 ```text
 os.rename called: True call count: 1
-rename attempts (dir/base of src): ['originals/0000002.pdf']
+rename attempts: ['documents/originals/0000002.pdf -> documents/originals/ACME/other_doc.pdf']
 AFTER failed move + rollback:
   original file back at ORIGINALS_DIR/0000002.pdf : True
   archive  file back at ARCHIVE_DIR/0000002.pdf   : True
   doc.filename (restored) = '0000002.pdf'
   doc.archive_filename    = '0000002.pdf'
   CAPTURED LOG LINES = []
+  originals/ACME/ exists: True | empty: True
+  archive/ACME/   exists: False | empty: False
+
+FULL MEDIA TREE (documents/, [DIR]=directory, [FILE]=file):
+    documents/archive/  [DIR]
+    documents/archive/0000002.pdf  [FILE]
+    documents/originals/  [DIR]
+    documents/originals/0000002.pdf  [FILE]
+    documents/originals/ACME/  [DIR]
+    documents/thumbnails/  [DIR]
 ```
 
 **Explanation:** the **first** `os.rename` (the original, `src/documents/signals/handlers.py:354`)
-raises before its destination is created, so nothing actually moved. The reverse branch is a
+raises, so the file itself never moves — no destination *file* is created. The reverse branch is a
 no-op (its `os.path.isfile(instance.source_path)` guard at
 `src/documents/signals/handlers.py:375` is false because the file never left origin), and both
 files remain at origin — the "nothing has changed anyway" case. Attributes are restored; no log
 line is emitted.
+
+Note the same directory side-effect documented for Q2b: `create_source_path_directory`
+(`os.makedirs(os.path.dirname(source_path), exist_ok=True)`,
+`src/documents/file_handling.py:19-20`) runs at `src/documents/signals/handlers.py:353` — *before*
+the raising rename at `:354` — so the empty destination directory `documents/originals/ACME/` is
+physically created and lingers (`exists: True | empty: True` above). Because the original move
+raised first, control jumps straight to the `except` block before the archive move
+(`src/documents/signals/handlers.py:356-359`) is ever reached, so `documents/archive/ACME/` is
+never created (`exists: False`). The empty-directory cleanup (`src/documents/signals/handlers.py:396-410`)
+again targets only the *old* directories and is skipped because the old file is present. So even in
+this "nothing moved" case, one empty destination directory is left behind.
 
 ### Q2b — mid-move sibling (original moves for real, archive raises → reverse-rename fires)
 
@@ -279,7 +313,7 @@ when `"archive" in src`.
 
 ```text
 os.rename called: True call count: 3
-rename attempts: ['originals/0000002.pdf -> ACME/other_doc.pdf', 'archive/0000002.pdf -> ACME/other_doc.pdf', 'ACME/other_doc.pdf -> originals/0000002.pdf']
+rename attempts: ['documents/originals/0000002.pdf -> documents/originals/ACME/other_doc.pdf', 'documents/archive/0000002.pdf -> documents/archive/ACME/other_doc.pdf', 'documents/originals/ACME/other_doc.pdf -> documents/originals/0000002.pdf']
 AFTER partial move + rollback:
   original file back at ORIGINALS_DIR/0000002.pdf : True
   archive  file back at ARCHIVE_DIR/0000002.pdf   : True
@@ -287,17 +321,47 @@ AFTER partial move + rollback:
   doc.archive_filename    = '0000002.pdf'
   CAPTURED LOG LINES = []
 
-MEDIA TREE originals/: ['0000002.pdf']
-MEDIA TREE archive/: ['0000002.pdf']
+  originals/ACME/ exists: True | empty: True
+  archive/ACME/   exists: True | empty: True
+
+FULL MEDIA TREE (documents/, [DIR]=directory, [FILE]=file):
+    documents/archive/  [DIR]
+    documents/archive/0000002.pdf  [FILE]
+    documents/archive/ACME/  [DIR]
+    documents/originals/  [DIR]
+    documents/originals/0000002.pdf  [FILE]
+    documents/originals/ACME/  [DIR]
+    documents/thumbnails/  [DIR]
 ```
+
+The listing above is the complete, unedited output of the re-run (stable across two runs);
+the walk enumerates directories as well as files so lingering empty subdirectories are visible.
 
 **Explanation:** here the original move (`src/documents/signals/handlers.py:354`) genuinely
 completed (rename attempt #1), then the archive move (`src/documents/signals/handlers.py:359`)
 raised (attempt #2). The **third** rename, `ACME/other_doc.pdf -> originals/0000002.pdf`, is the
 reverse `os.rename` at `src/documents/signals/handlers.py:376` physically undoing the completed
-original move. Both files end back at origin, **no `ACME/` directory lingers**, the instance
-attributes are restored (`src/documents/signals/handlers.py:393-394`), and **no log line** is
-emitted. This is the case that actually exercises the safety net — and it recovers.
+original move. Both **files** end back at origin and the instance attributes are restored
+(`src/documents/signals/handlers.py:393-394`), and **no log line** is emitted. This is the case
+that actually exercises the safety net — and the files recover.
+
+**Finding — the recovery is file-level only; the empty destination directories linger.** As the
+FULL MEDIA TREE above shows, after rollback the two empty subdirectories
+`documents/originals/ACME/` and `documents/archive/ACME/` remain on disk
+(`exists: True | empty: True` for both, observed identically on both runs). The forward path
+created them *before* renaming:
+`create_source_path_directory` calls `os.makedirs(os.path.dirname(source_path), exist_ok=True)`
+(`src/documents/file_handling.py:19-20`), invoked at `src/documents/signals/handlers.py:353`
+(originals) and `:358` (archive) — and the mocked `os.rename` does not intercept `os.makedirs`,
+so the directories are physically created regardless of whether the subsequent rename succeeds.
+The rollback block (`src/documents/signals/handlers.py:367-390`) only reverse-renames the *files*
+(`:376`, `:379`); it never removes the directories it created. The empty-directory cleanup
+(`src/documents/signals/handlers.py:396-410`) calls `delete_empty_directories` only on the *old*
+directories `os.path.dirname(old_source_path)` / `os.path.dirname(old_archive_path)` — never on
+the new `ACME/` destinations — and only when the old file is absent (`:398`, `:404-406`); because
+rollback restored the old files, that guard is false and cleanup is skipped entirely. Net result:
+the safety net recovers the **files** but leaves two empty `ACME/` directories behind — the
+recovery is not directory-complete.
 
 ---
 
@@ -308,9 +372,18 @@ emitted. This is the case that actually exercises the safety net — and it reco
 ### Mechanism (inferred from source)
 
 `DocumentClassifier.train()` (`src/documents/classifier.py:115`) computes a **SHA-1** digest over
-the training data. It initializes `m = hashlib.sha1()` (`src/documents/classifier.py:124`),
-updates it with each document's preprocessed content, and takes `new_data_hash = m.digest()`
-(`src/documents/classifier.py:161`). The **skip** decision is:
+the training data. It initializes `m = hashlib.sha1()` (`src/documents/classifier.py:124`) and,
+for each non-inbox document (ordered by `pk`), updates it with **four** inputs: (1) the document's
+preprocessed **content** bytes — `m.update(preprocessed_content.encode("utf-8"))`
+(`src/documents/classifier.py:129`); (2) the auto-matched **document-type** label —
+`m.update(y.to_bytes(4, "little", signed=True))` (`src/documents/classifier.py:136`), where
+`y = document_type.pk` when the type's matching algorithm is `MATCH_AUTO`, else `-1`; (3) the
+auto-matched **correspondent** label — same 4-byte signed little-endian encoding
+(`src/documents/classifier.py:143`, same `pk`-or-`-1` rule); and (4) each auto-matched **tag** pk —
+`m.update(tag.to_bytes(4, "little", signed=True))` (`src/documents/classifier.py:154-155`). It then
+takes `new_data_hash = m.digest()` (`src/documents/classifier.py:161`). The digest therefore covers
+**both the document content and the auto-classification labels/metadata**, not content alone. The
+**skip** decision is:
 
 ```python
 if self.data_hash and new_data_hash == self.data_hash:
@@ -337,8 +410,13 @@ management entry point is `document_create_classifier`
 ### Byte-exact hash + stability (observed)
 
 The SHA-1 `data_hash` observed is `b41ce39793cd61f391afe34e6e4de9b361c74447` (20 bytes), and it
-was **stable across ≥2 runs**. Because the digest is a pure SHA-1 over preprocessed content bytes,
-its exact match across the environment/version deviation confirms the value is **version-agnostic**.
+was **stable across ≥2 runs**. Because the digest is computed by the application's own
+`hashlib.sha1` over deterministic inputs — the preprocessed document content **plus** the
+auto-classification labels (document-type, correspondent, and tag pks;
+`src/documents/classifier.py:129,136,143,154-155`) — and never over any library-versioned
+artifact, its exact match across the environment/version deviation confirms the value is
+**version-agnostic**: it depends only on the fixture data and the hashing algorithm, not on the
+scikit-learn build.
 The reproduction pattern mirrors the project's own test
 (`assertTrue(self.classifier.train())` / `assertFalse(self.classifier.train())` at
 `src/documents/tests/test_classifier.py:141-142`).
@@ -389,6 +467,33 @@ TASK train_classifier() SECOND call captured lines:
   [DEBUG] [paperless.tasks] Training data unchanged.
 ```
 
+### Observed output — what the hash covers (label sensitivity, content held byte-identical)
+
+To confirm directly that the digest covers **labels** and not only content, exactly one
+document-type **label** was changed (`doc1.document_type` from `dt` to `dt2`) while the document
+**content was held byte-identical**; a fresh `DocumentClassifier().train()` was then run. The
+`data_hash` changed, and restoring the label reproduced the original digest exactly:
+
+```text
+FIRST train() -> True ; data_hash (SHA-1) = b41ce39793cd61f391afe34e6e4de9b361c74447
+  content(doc1) = 'this is a document from c1'
+SECOND train() on unchanged data -> False (expect False = instant skip)
+
+AFTER label-only change (document_type dt -> dt2), content unchanged:
+  content(doc1) still = 'this is a document from c1'
+  content byte-identical to before: True
+  train() -> True ; data_hash (SHA-1) = 2495f526b4a3b05ce19067ec826407941885ed51
+  H2 == H1 ? False  -> label change DID change the hash: True
+
+AFTER restoring label (document_type -> dt):
+  data_hash (SHA-1) = b41ce39793cd61f391afe34e6e4de9b361c74447 ; H3 == H1 ? True
+```
+
+This is direct evidence that a metadata/label change alone — with content unchanged — yields a
+different digest (`2495f526b4a3b05ce19067ec826407941885ed51` ≠
+`b41ce39793cd61f391afe34e6e4de9b361c74447`) and therefore forces a FULL retrain; the change is
+driven by the `document_type` label update hashed at `src/documents/classifier.py:136`.
+
 ### Cause → effect
 
 - **"Instant" (SKIPPED):** on the second call, the recomputed SHA-1 `data_hash` equals the stored
@@ -401,11 +506,17 @@ TASK train_classifier() SECOND call captured lines:
   `True`; the task then logs the INFO `Saving updated classifier model to
   /tmp/pngx-data/classification_model.pickle...` and persists the model. The extra
   `Document classification model does not exist (yet), …` DEBUG on the first task call comes from
-  `load_classifier()` (`src/documents/classifier.py:30`) because no model file existed yet.
+  `load_classifier()` (`src/documents/classifier.py:30`) because no model file existed yet. A full
+  retrain also fires on any *later* call whenever the recomputed digest differs — which happens not
+  only when document **content** changes but also when the auto-classification **labels/metadata**
+  change (document-type, correspondent, or auto-tag assignments), as demonstrated above where a
+  label-only change flipped the digest.
 
 The hash that "detects changes" is therefore the **SHA-1 `data_hash`**
-(`src/documents/classifier.py:124`, `:161-164`): identical training data → identical digest →
-skip; changed data → different digest → full retrain.
+(`src/documents/classifier.py:124`, `:161-164`), computed over the preprocessed content **and** the
+auto-classification labels/metadata (`:129,136,143,154-155`): identical content *and* identical
+labels → identical digest → skip; any change to content **or** to those labels/metadata → different
+digest → full retrain.
 
 ---
 
@@ -440,12 +551,13 @@ at `src/documents/consumer.py:105-107`. This check runs **before any parsing**:
 (`src/documents/consumer.py:81`) with the message `Not consuming {filename}: It is a duplicate.`
 (`src/documents/consumer.py:112`); if `CONSUMER_DELETE_DUPLICATES` (`src/paperless/settings.py:486`)
 is set, `os.unlink(self.path)` (`src/documents/consumer.py:109`) runs first. The ERROR is logged
-via `LoggingMixin.log` (`src/documents/loggers.py`) under `logging_name = "paperless.consumer"`
+via `LoggingMixin.log` (`src/documents/loggers.py:14-21`) under `logging_name = "paperless.consumer"`
 (`src/documents/consumer.py:54`). Detection is therefore **content-based** — the incoming
 filename is irrelevant.
 
 **Methodology honesty.** The WebSocket progress side-channel `Consumer._send_progress` was patched
-to a no-op exactly as the canonical `test_consumer.py` harness does; `pre_check_duplicate`,
+to a no-op exactly as the canonical `test_consumer.py` harness does
+(`src/documents/tests/test_consumer.py:289-291`); `pre_check_duplicate`,
 `try_consume_file`, and `_fail` all ran through their real code path. `channels-redis==3.4.0`
 (the canonical pin) was installed so `Consumer.__init__` (`src/documents/consumer.py:83`) can call
 `get_channel_layer()` (`src/documents/consumer.py:93`) and import the production `CHANNEL_LAYERS`
@@ -602,8 +714,10 @@ but deterministic) corrupt bytes written to the original; the stored checksum
 
 ### Mechanism (inferred from source)
 
-`check_sanity()` (`src/documents/sanity_checker.py:49`) walks `MEDIA_ROOT` into a set of present
-files, then for each document removes its thumbnail, original, and archive paths from that set.
+`check_sanity()` (`src/documents/sanity_checker.py:49`) walks `MEDIA_ROOT` into a **list** of
+present files — `present_files = []` populated by `os.walk` + `.append(...)`
+(`src/documents/sanity_checker.py:52-55`) — then for each document removes its thumbnail, original,
+and archive paths from that list (`present_files.remove(...)`, `:67`, `:80`, `:109`).
 Any file **left over** (present on disk but referenced by no document) is reported as a WARNING:
 
 ```python
@@ -640,7 +754,7 @@ orphan file STILL exists AFTER sanity check: True (True => reported, never delet
 
 ### Cause → effect
 
-Yes — orphaned files **linger**. The unreferenced file remained in the present-files set after all
+Yes — orphaned files **linger**. The unreferenced file remained in the present-files list after all
 document paths were removed, so `check_sanity()` emitted the WARNING
 `Orphaned file in media dir: /tmp/pngx-media/documents/originals/orphaned_extra_file.pdf`
 (`src/documents/sanity_checker.py:131`) naming the exact path, and `sanity_check()` returned
@@ -684,10 +798,11 @@ Every question and every named sub-item is addressed:
   (silent move; `src/documents/signals/handlers.py:312-395`). ✅ *Before/after paths shown:*
   `.../originals/Invoice2023.pdf` → `.../originals/Bank/Invoice2023.pdf`; old path no longer
   exists.
-- **Q2 — Rollback on move failure.** ✅ *Does it truly recover?* Yes — best-effort but effective in
-  the mid-move case. ✅ *What happens to files?* Files are restored to origin (Q2a no-op case; Q2b
-  reverse-rename fires), attributes restored, no log line. Non-transactional nature documented as
-  a finding.
+- **Q2 — Rollback on move failure.** ✅ *Does it truly recover?* Yes at the **file level** —
+  best-effort but effective in the mid-move case. ✅ *What happens to files?* Files are restored to
+  origin (Q2a original-raises case; Q2b reverse-rename fires), attributes restored, no log line.
+  Two findings documented: the recovery is **non-transactional**, and it is **file-level only** —
+  empty destination directories (`ACME/`) created before the failed rename linger.
 - **Q3 — Classifier instant vs. long.** ✅ *Both scenarios triggered:* full retrain (`train()` →
   `True`) and instant skip (`train()` → `False`). ✅ *SKIP vs. FULL log messages captured.*
   ✅ *Hash that detects changes shown:* SHA-1 `data_hash = b41ce39793cd61f391afe34e6e4de9b361c74447`,
