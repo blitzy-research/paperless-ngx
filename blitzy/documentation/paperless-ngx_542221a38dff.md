@@ -1,0 +1,574 @@
+# Token-Based Authentication in the paperless-ngx REST API
+
+> **Audience & goal.** This document is for developers who want to integrate external tools with the paperless-ngx REST API and need to understand how **token-based authentication** works. It answers ten specific questions (Q1–Q10), each backed by **evidence captured from actually running paperless-ngx locally** — not from reading the code alone.
+>
+> **Source commit.** All code references are pinned to git branch `paperless-ngx_542221a38dff` (HEAD `542221a38dff06361e07976452f9aea24d210542`).
+
+---
+
+## How to read this document
+
+Every claim below is grounded in one or more of three evidence types, which are always labelled:
+
+| Label | Meaning |
+|-------|---------|
+| **🟢 OBSERVED** | Literal, unedited output captured from a live run of paperless-ngx on this machine (e.g. `curl -i` responses, management-command output). |
+| **🔵 CODE** | A `file:line` reference into the pinned source tree (or the installed Django REST Framework 3.13.1 wheel) that explains the mechanism. |
+| **🟠 WEB** | Corroboration from authoritative external documentation (Django REST Framework guide, paperless-ngx docs). See the [Web Corroboration appendix](#appendix-a--web-corroboration). |
+
+**Token redaction.** The API token minted for this investigation is a throwaway credential that has already been destroyed (see [Cleanup](#cleanup--repository-integrity)). It is shown **redacted** everywhere as `745a…8bee` (first 4 + last 4 hex characters of the 40-character key). It is never printed in full.
+
+---
+
+## Executive summary
+
+paperless-ngx exposes a standard **Django REST Framework (DRF)** API. For programmatic ("external tool") integration, the relevant scheme is **token authentication**:
+
+1. Obtain a 40-character hex token for a user — either with the `python manage.py drf_create_token <user>` management command, or by `POST`-ing credentials to the `/api/token/` HTTP endpoint.
+2. Send that token on every request in the HTTP header **`Authorization: Token <key>`**.
+3. Hit the resource endpoints, e.g. the documents list at **`/api/documents/`**, which returns a **paginated JSON envelope** `{count, next, previous, results}`.
+4. A request **without** valid credentials is rejected with **HTTP 401 Unauthorized**, header `WWW-Authenticate: Basic realm="api"`, and body `{"detail":"Authentication credentials were not provided."}`.
+
+The authentication class that handles the token is `rest_framework.authentication.TokenAuthentication`, and tokens are persisted by the `rest_framework.authtoken.models.Token` model in the database table **`authtoken_token`**.
+
+---
+
+## Canonical run configuration (why this matters)
+
+paperless-ngx contains two mechanisms that can **auto-authenticate** a request and therefore **mask** the real token path. Both were kept **disabled** so that the behavior reported here reflects genuine token authentication:
+
+- **DEBUG-only Angular override.** When `DEBUG` is true, settings appends `paperless.auth.AngularApiAuthenticationOverride` to the authentication classes (🔵 `src/paperless/settings.py:L129-L132`). That authenticator logs in the first `is_staff` user whenever the request `Referer` starts with `http://localhost:4200/` (🔵 `src/paperless/auth.py:L18-L33`, specifically the DEBUG + Referer check at `L24-L28` and `User.objects.filter(is_staff=True).first()` at `L29`).
+- **Auto-login middleware.** Setting `PAPERLESS_AUTO_LOGIN_USERNAME` activates `AutoLoginMiddleware`, which sets `request.user` to a fixed user with no credential check (🔵 `src/paperless/auth.py:L9-L15`).
+
+**This investigation ran with the default, canonical configuration:** `DEBUG` was left at its default of `False` and `PAPERLESS_AUTO_LOGIN_USERNAME` was **not** set. `DEBUG` defaults to `False` because settings reads it as `__get_boolean("PAPERLESS_DEBUG", "NO")` (🔵 `src/paperless/settings.py:L50`). This was confirmed at runtime (see Q1).
+
+> **Environment disclosure (honest limitation note).** The live capture below was performed in the canonical **Python 3.9** runtime with the exact pinned dependency versions (`django==4.0.4`, `djangorestframework==3.13.1`), which is the same stack the project ships (`Dockerfile` = `FROM python:3.9-slim-bullseye`). The only deviation from a stock install is that the throwaway SQLite database and media/index directories were pointed at a temporary location **outside the repository** (via `PAPERLESS_DATA_DIR`) so that no repository file was touched and cleanup would be trivial. This relocation stores data elsewhere on disk; it does **not** alter any authentication code path. Three test documents were inserted through the Django ORM purely so the documents list would be non-empty; they are clearly identifiable ("Blitzy Test Document N") and were removed during cleanup.
+
+---
+
+## Q1 — Running paperless-ngx locally (canonical config)
+
+**Question.** Build and run a paperless-ngx instance in its default configuration; state the exact commands.
+
+### Exact commands used
+
+```bash
+# 1. Install pinned dependencies into a Python 3.9 virtualenv
+pip install -r requirements.txt
+
+# 2. Ensure Redis is running (broker/cache for Django-Q and Channels)
+redis-server --daemonize yes        # already running here; verified with: redis-cli ping -> PONG
+
+# 3. From the backend source root, build the schema, then run the server
+cd src
+python manage.py migrate            # creates all tables, INCLUDING authtoken_token
+python manage.py runserver 127.0.0.1:8000 --noreload   # DEBUG defaults to False (canonical)
+```
+
+`src/manage.py` sets `DJANGO_SETTINGS_MODULE=paperless.settings` (🔵 `src/manage.py:L7`), so all commands run against the `paperless` project settings. The pinned versions come from `requirements.txt`: `channels==3.0.4` (🔵 `L23`), `django==4.0.4` (🔵 `L38`), `djangorestframework==3.13.1` (🔵 `L39`), `redis==3.5.3` (🔵 `L84`).
+
+### 🟢 OBSERVED — dependency versions and canonical DEBUG
+
+```text
+Python 3.9.25
+Django 4.0.4
+DRF 3.13.1
+channels 3.0.4
+redis(client) 3.5.3
+
+# redis-cli ping
+PONG
+
+# Settings loaded by manage.py (confirms canonical config):
+DEBUG = False
+DATABASES.default.NAME = <throwaway>/db.sqlite3
+authtoken in INSTALLED_APPS = True
+```
+
+### 🟢 OBSERVED — `python manage.py migrate` (excerpt showing the token table being created)
+
+```text
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
+Running migrations:
+  Applying contenttypes.0001_initial... OK
+  Applying auth.0001_initial... OK
+  ...
+  Applying authtoken.0001_initial... OK
+  Applying authtoken.0002_auto_20160226_1747... OK
+  Applying authtoken.0003_tokenproxy... OK
+  ...
+  Applying documents.0001_initial... OK
+  ...
+  Applying sessions.0001_initial... OK
+```
+
+**Cause → effect.** Because `rest_framework.authtoken` is listed in `INSTALLED_APPS` (🔵 `src/paperless/settings.py:L108`), `migrate` runs that app's migration `authtoken.0001_initial`, which creates the `authtoken_token` table that later stores minted tokens (this ties directly to Q3 and Q10).
+
+### 🟢 OBSERVED — `python manage.py runserver` (startup banner)
+
+```text
+Performing system checks...
+
+System check identified no issues (0 silenced).
+July 08, 2026 - 04:38:39
+Django version 4.0.4, using settings 'paperless.settings'
+Starting development server at http://127.0.0.1:8000/
+Quit the server with CONTROL-C.
+[08/Jul/2026 04:38:39] "GET /api/ HTTP/1.1" 200 311
+```
+
+The banner confirms the server bound to `http://127.0.0.1:8000/` using the `paperless.settings` module on Django 4.0.4 — the canonical runtime used for every capture below.
+
+---
+
+## Q2 — Creating a test user
+
+**Question.** Create a test user through a real management entry point.
+
+A **superuser** was created deliberately. The reason is a subtle DRF distinction that matters for Q4 vs Q9: a request that **authenticates successfully but lacks object/model permission** returns **HTTP 403** (`{"detail":"You do not have permission to perform this action."}`), which is a *different* case from the unauthenticated **401** we report in Q9. Using a superuser guarantees the authenticated path in Q4 is a clean **200**, keeping the only 4xx we report the genuine unauthenticated 401. (This exact real-world gotcha — a non-superuser getting a 403 on `/api/documents/` and fixing it by upgrading to superuser — is documented in the paperless-ngx community; see 🟠 [WEB-4](#appendix-a--web-corroboration).)
+
+### Exact command used
+
+The password prompt of `createsuperuser` is interactive, so the non-interactive form was used (Django's built-in `--noinput` plus `DJANGO_SUPERUSER_*` environment variables). `createsuperuser` is a standard Django management command reached through `src/manage.py`.
+
+```bash
+export DJANGO_SUPERUSER_USERNAME=blitzy_apitest
+export DJANGO_SUPERUSER_PASSWORD='<redacted-throwaway-password>'
+export DJANGO_SUPERUSER_EMAIL='blitzy_apitest@example.invalid'
+python manage.py createsuperuser --noinput
+```
+
+### 🟢 OBSERVED
+
+```text
+Superuser created successfully.
+```
+
+Verification that the principal exists with the expected flags:
+
+```text
+username= blitzy_apitest is_superuser= True is_staff= True is_active= True
+```
+
+---
+
+## Q3 — Generating an API token
+
+**Question.** Generate a DRF auth token for that user through a real path.
+
+Two real paths were exercised, and **both produced the same 40-character hex key** (redacted `745a…8bee`). They agree because DRF's token-acquisition view uses `get_or_create` — a user has at most one DRF token, so re-requesting returns the existing one.
+
+### Path A — management command `drf_create_token`
+
+This command is contributed by the `rest_framework.authtoken` app (registered at 🔵 `src/paperless/settings.py:L108`).
+
+```bash
+python manage.py drf_create_token blitzy_apitest
+```
+
+#### 🟢 OBSERVED
+
+```text
+Generated token 745a…8bee for user blitzy_apitest
+```
+
+Runtime inspection of the stored key (length, hex-ness, and the backing table):
+
+```text
+LEN = 40
+IS_HEX = True
+DB_TABLE = authtoken_token
+```
+
+### Path B — HTTP endpoint `POST /api/token/`
+
+The endpoint is wired at 🔵 `src/paperless/urls.py:L81` (`path("token/", views.obtain_auth_token)`) inside the `^api/` block, using DRF's `authtoken` views imported at 🔵 `src/paperless/urls.py:L26` (`from rest_framework.authtoken import views`). paperless documents this endpoint in-repo at 🔵 `docs/api.rst:L132-L136` and 🟠 [WEB-4](#appendix-a--web-corroboration).
+
+```bash
+curl -i -X POST -d "username=blitzy_apitest&password=<redacted>" http://127.0.0.1:8000/api/token/
+```
+
+#### 🟢 OBSERVED
+
+```text
+HTTP/1.1 200 OK
+Date: Wed, 08 Jul 2026 04:39:55 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
+Content-Type: application/json
+Allow: POST, OPTIONS
+X-Frame-Options: SAMEORIGIN
+Content-Length: 52
+Vary: Accept-Language, Origin, Cookie
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
+{"token":"745a…8bee"}
+```
+
+**Cause → effect (why 40 hex chars).** The key is generated by `Token.generate_key()`, which is `binascii.hexlify(os.urandom(20)).decode()` (🔵 DRF 3.13.1 `rest_framework/authtoken/models.py:L36-L37`). Twenty random bytes hex-encode to exactly **40 hexadecimal characters**, which is the `max_length=40` primary-key column on the `Token` model (🔵 same file `L13`). The observed `LEN = 40` / `IS_HEX = True` confirm this.
+
+---
+
+## Q4 — Authenticated request to list documents (full HTTP response)
+
+**Question.** Make an authenticated GET to the documents list endpoint and capture the full HTTP response.
+
+### Command
+
+```bash
+curl -i -H "Authorization: Token 745a…8bee" http://127.0.0.1:8000/api/documents/
+```
+
+### 🟢 OBSERVED — full response (status line, all headers, JSON body)
+
+```http
+HTTP/1.1 200 OK
+Date: Wed, 08 Jul 2026 04:39:16 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
+Content-Type: application/json
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
+X-Api-Version: 2
+X-Version: 1.7.0
+Content-Length: 1263
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
+{"count":3,"next":null,"previous":null,"results":[
+  {"id":3,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 3","content":"This is the OCR content body of Blitzy test document number 3.","tags":[],"created":"2026-07-08T04:38:59.031257Z","modified":"2026-07-08T04:38:59.033344Z","added":"2026-07-08T04:38:59.031259Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 3.pdf","archived_file_name":null},
+  {"id":2,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 2","content":"This is the OCR content body of Blitzy test document number 2.","tags":[],"created":"2026-07-08T04:38:59.025076Z","modified":"2026-07-08T04:38:59.026681Z","added":"2026-07-08T04:38:59.025081Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 2.pdf","archived_file_name":null},
+  {"id":1,"correspondent":null,"document_type":null,"title":"Blitzy Test Document 1","content":"This is the OCR content body of Blitzy test document number 1.","tags":[],"created":"2026-07-08T04:38:59.006500Z","modified":"2026-07-08T04:38:59.010374Z","added":"2026-07-08T04:38:59.006505Z","archive_serial_number":null,"original_file_name":"2026-07-08 Blitzy Test Document 1.pdf","archived_file_name":null}
+]}
+```
+
+> The body above is the exact bytes returned (`Content-Length: 1263`); it has only been pretty-printed with line breaks between the three `results` items for readability. The three items are the disclosed "Blitzy Test Document" fixtures. `X-Version: 1.7.0` is the paperless version and `X-Api-Version: 2` is the negotiated API version (from `AcceptHeaderVersioning`, 🔵 `src/paperless/settings.py:L122`).
+
+**Cause → effect.** The token in the `Authorization` header is validated by `TokenAuthentication` (Q5/Q10), which sets `request.user` to `blitzy_apitest`. The viewset's `permission_classes = (IsAuthenticated,)` (🔵 `src/documents/views.py:L183`) then passes because the request is now authenticated, so the viewset returns the serialized, paginated document list with **HTTP 200**.
+
+---
+
+## Q5 — Exact token header name and format
+
+**Question.** State the precise header name and value format.
+
+- **Header name:** `Authorization`
+- **Header value:** `Token ` + the 40-character key — i.e. `Authorization: Token 745a…8bee`
+
+This is the exact header used in the Q4 request that produced HTTP 200.
+
+**🔵 CODE — cause → effect.** `TokenAuthentication` is registered as an authentication class at 🔵 `src/paperless/settings.py:L120`. In the DRF 3.13.1 wheel (`rest_framework/authentication.py`):
+
+- `TokenAuthentication.keyword = 'Token'` (🔵 `L161`).
+- `TokenAuthentication.authenticate()` (🔵 `L177`) reads the `Authorization` header, splits it on whitespace, and requires the first part, lowercased, to equal the keyword: `if not auth or auth[0].lower() != self.keyword.lower().encode(): return None` (🔵 `L180`). The second part is treated as the key.
+- The key is then looked up by `authenticate_credentials(key)` (🔵 `L198`) via `model.objects.select_related('user').get(key=key)` (🔵 `L201`).
+
+So the literal word **`Token`**, followed by whitespace, followed by the key, is mandatory — anything else fails the keyword comparison. Runtime introspection confirms the keyword:
+
+### 🟢 OBSERVED
+
+```text
+TokenAuthentication.keyword = 'Token'
+```
+
+**🟠 WEB.** The DRF authentication guide states the key must be prefixed by the string literal "Token" with whitespace separating the two, giving the example `Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b` (🟠 [WEB-1](#appendix-a--web-corroboration)). paperless's own docs show the same `Authorization: Token <token>` header (🔵 `docs/api.rst:L143`).
+
+---
+
+## Q6 — Complete documents list endpoint path
+
+**Question.** State the full path of the documents list endpoint.
+
+- **Complete path:** `/api/documents/`
+
+**🔵 CODE — cause → effect.** The path is assembled from three pieces in `src/paperless/urls.py`:
+
+1. A DRF `DefaultRouter` is instantiated: `api_router = DefaultRouter()` (🔵 `src/paperless/urls.py:L27,L29`).
+2. The documents route is registered on it: `api_router.register(r"documents", UnifiedSearchViewSet)` (🔵 `src/paperless/urls.py:L32`). This produces a list route named `documents`.
+3. The whole router is mounted under the `^api/` URL prefix (🔵 `src/paperless/urls.py:L40`).
+
+Combining the `^api/` mount + the `documents` registration gives `/api/documents`; the **trailing slash** is added automatically by `DefaultRouter` (its default `trailing_slash=True`), yielding **`/api/documents/`**. The class actually bound to the route is `UnifiedSearchViewSet` (🔵 `src/documents/views.py:L377`), which subclasses `DocumentViewSet` (🔵 `src/documents/views.py:L172`). The Q4 capture confirms the path serves an HTTP 200. paperless docs also reference full-text search on this exact endpoint (🔵 `docs/api.rst:L150`; 🟠 [WEB-4](#appendix-a--web-corroboration)).
+
+---
+
+## Q7 — Top-level JSON response fields
+
+**Question.** Describe the top-level fields of the response body.
+
+There are **two distinct levels**, and it is important not to confuse them:
+
+### Level 1 — the top-level pagination *envelope* (4 fields)
+
+| Field | Meaning | Observed value (Q4) |
+|-------|---------|---------------------|
+| `count` | Total number of matching documents across all pages | `3` |
+| `next` | Absolute URL of the next page, or `null` if none | `null` |
+| `previous` | Absolute URL of the previous page, or `null` if none | `null` |
+| `results` | Array of document objects for the current page | 3 items |
+
+**🔵 CODE.** These four keys are the standard output of DRF's `PageNumberPagination`, which paperless subclasses as `StandardPagination` (🔵 `src/paperless/views.py:L8-L11`). The in-repo API docs show the same envelope shape `{count, next, previous, results}` (🔵 `docs/api.rst:L171-L175`).
+
+### Level 2 — the per-item objects *inside* `results` (the `DocumentSerializer` fields)
+
+Each element of `results` is a serialized `Document`. `DocumentSerializer` (🔵 `src/documents/serialisers.py:L201`) declares `depth = 1` (🔵 `L221`) and exposes exactly **12 fields** (🔵 `src/documents/serialisers.py:L222-L234`), which is precisely the key set observed in every `results` item above:
+
+```text
+id, correspondent, document_type, title, content, tags,
+created, modified, added, archive_serial_number,
+original_file_name, archived_file_name
+```
+
+These fields originate from the `Document` model (🔵 `src/documents/models.py:L88`). (`original_file_name` and `archived_file_name` are serializer method fields; `correspondent`, `document_type`, and `tags` are related objects expanded because of `depth = 1`.)
+
+**Cause → effect.** A `GET` on a list route returns the paginator's envelope at the top level; the viewset serializes each page item with `serializer_class = DocumentSerializer` (🔵 `src/documents/views.py:L181`), so the per-item shape is the 12 serializer fields — never the raw model, and never a bare array at the top level.
+
+---
+
+## Q8 — Pagination behavior
+
+**Question.** Is pagination used (versus dumping all records at once)? What is the page size and which query parameters control it?
+
+**Yes — the list is paginated, not dumped all at once.**
+
+**🔵 CODE.** `StandardPagination` subclasses `PageNumberPagination` with (🔵 `src/paperless/views.py:L8-L11`):
+
+- `page_size = 25` — default items per page,
+- `page_size_query_param = "page_size"` — client override parameter,
+- `max_page_size = 100000` — upper bound on `page_size`.
+
+Pagination is wired **per-viewset** via `pagination_class = StandardPagination` (🔵 `src/documents/views.py:L182`); there is **no** global `DEFAULT_PAGINATION_CLASS` in the `REST_FRAMEWORK` settings block (🔵 `src/paperless/settings.py:L116-L127`). The `page` and `page_size` query parameters drive navigation.
+
+### 🟢 OBSERVED — controlling the page with `?page_size=1`
+
+```bash
+curl -i -H "Authorization: Token 745a…8bee" "http://127.0.0.1:8000/api/documents/?page_size=1"
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 508
+X-Api-Version: 2
+X-Version: 1.7.0
+...
+{"count":3,"next":"http://127.0.0.1:8000/api/documents/?page=2&page_size=1","previous":null,"results":[
+  {"id":3, ... ,"title":"Blitzy Test Document 3", ... }
+]}
+```
+
+**Cause → effect.** With `page_size=1`, `PageNumberPagination` slices the queryset to a single item per page. `count` still reports the full total (`3`), and because more pages exist, `next` is now a **populated URL** (`…?page=2&page_size=1`) rather than `null`. This proves the endpoint hands out **bounded pages** and exposes navigation links — it never dumps all records in one unbounded response. (Contrast with the default Q4 call where all 3 fit on one page of size 25, so `next` was `null`.)
+
+---
+
+## Q9 — Unauthenticated response (exact status code and error body)
+
+**Question.** Repeat the same request without credentials; capture the exact HTTP status code and error message body.
+
+### Command
+
+```bash
+curl -i http://127.0.0.1:8000/api/documents/
+```
+
+### 🟢 OBSERVED — full response
+
+```http
+HTTP/1.1 401 Unauthorized
+Date: Wed, 08 Jul 2026 04:39:37 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
+Content-Type: application/json
+WWW-Authenticate: Basic realm="api"
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
+Content-Length: 58
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
+{"detail":"Authentication credentials were not provided."}
+```
+
+- **Status code:** `401 Unauthorized`
+- **Challenge header:** `WWW-Authenticate: Basic realm="api"`
+- **Body:** `{"detail":"Authentication credentials were not provided."}`
+
+### Why 401 (and not 403)? — cause → effect
+
+This is the most subtle part of the whole flow, so it is spelled out precisely.
+
+1. **Permission is what rejects the request.** The viewset declares `permission_classes = (IsAuthenticated,)` (🔵 `src/documents/views.py:L183`). With no credentials, `request.user` is anonymous, so `IsAuthenticated` denies access.
+2. **The authentication *ordering* decides whether that denial is 401 or 403.** DRF's rule: *the first authentication class listed on the view determines the response type* — if that first class's `authenticate_header()` returns a non-`None` value, DRF emits **401 with that value as the `WWW-Authenticate` header**; otherwise it emits **403** (🟠 [WEB-3](#appendix-a--web-corroboration)).
+3. **paperless lists `BasicAuthentication` first.** The `DEFAULT_AUTHENTICATION_CLASSES` order is `BasicAuthentication` (🔵 `src/paperless/settings.py:L118`), then `SessionAuthentication` (🔵 `L119`), then `TokenAuthentication` (🔵 `L120`).
+4. **`BasicAuthentication` supplies a challenge.** In the DRF 3.13.1 wheel, `BasicAuthentication.www_authenticate_realm = 'api'` (🔵 `rest_framework/authentication.py:L57`) and `authenticate_header()` returns `'Basic realm="%s"' % self.www_authenticate_realm` (🔵 `L108-L109`) → `'Basic realm="api"'`, which is non-`None`.
+
+Therefore the unauthenticated denial is **401** with `WWW-Authenticate: Basic realm="api"` — exactly as observed. Runtime introspection confirms the challenge string:
+
+### 🟢 OBSERVED — the challenge string comes from BasicAuthentication
+
+```text
+BasicAuthentication.www_authenticate_realm    = 'api'
+BasicAuthentication.authenticate_header(None)  = 'Basic realm="api"'
+```
+
+### Edge cases also exercised (every condition the question implies)
+
+To show the behavior is not limited to the "no header at all" case, two malformed/invalid credential requests were also run — both correctly denied with 401:
+
+```bash
+# (a) Well-formed header, but the key matches no row in authtoken_token
+curl -i -H "Authorization: Token deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" http://127.0.0.1:8000/api/documents/
+```
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="api"
+Content-Length: 27
+
+{"detail":"Invalid token."}
+```
+
+```bash
+# (b) Keyword present but no key supplied
+curl -i -H "Authorization: Token" http://127.0.0.1:8000/api/documents/
+```
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="api"
+Content-Length: 59
+
+{"detail":"Invalid token header. No credentials provided."}
+```
+
+**Cause → effect for the edge cases.** In case (a), `TokenAuthentication.authenticate_credentials()` fails the DB lookup `model.objects.select_related('user').get(key=key)` (🔵 `rest_framework/authentication.py:L201`) and raises `AuthenticationFailed('Invalid token.')` (🔵 `L203`). In case (b), `authenticate()` finds the header has only one part (`if len(auth) == 1:`) and raises the "Invalid token header. No credentials provided." error (🔵 `L183`-`L185`). Note that in **both** cases the `WWW-Authenticate` header is still `Basic realm="api"` — **not** `Token` — because, per the rule in step 2, the *first* authenticator (`BasicAuthentication`) always sets the challenge, regardless of which authenticator raised the failure.
+
+> **Distinction from 403.** Had we used a *non-superuser* with a valid token, the request would have **authenticated** but could be **denied permission**, yielding **403** `{"detail":"You do not have permission to perform this action."}` — a genuinely different case (🟠 [WEB-3](#appendix-a--web-corroboration), [WEB-4](#appendix-a--web-corroboration)). Using a superuser (Q2) kept Q4 a clean 200 and this Q9 the only 4xx, avoiding that confusion.
+
+---
+
+## Q10 — Code trace: the authentication class and the token model
+
+**Question.** Name (a) the authentication class that handles token auth, and (b) the model that stores tokens, with `file:line` references.
+
+### (a) Authentication class → `rest_framework.authentication.TokenAuthentication`
+
+- **Registered at:** 🔵 `src/paperless/settings.py:L120` (third entry in `DEFAULT_AUTHENTICATION_CLASSES`).
+- **Mechanism (🔵 DRF 3.13.1 `rest_framework/authentication.py`):**
+  - `class TokenAuthentication(BaseAuthentication)` at `L151`, `keyword = 'Token'` at `L161`.
+  - `authenticate()` (`L177`) extracts the header and enforces the `Token` keyword (`L180`).
+  - `authenticate_credentials(key)` (`L198`) resolves the user with `model.objects.select_related('user').get(key=key)` (`L201`); a miss raises `AuthenticationFailed('Invalid token.')` (`L203`).
+  - On success it returns `(user, token)`, so DRF sets `request.user`; `IsAuthenticated` (🔵 `src/documents/views.py:L183`) then passes.
+
+**Cause → effect.** `TokenAuthentication` is the specific class that turns the `Authorization: Token <key>` header into an authenticated `request.user`; every other step (permission check, serialization, pagination) happens *after* it succeeds.
+
+### (b) Token model → `rest_framework.authtoken.models.Token` (table `authtoken_token`)
+
+- **App registered at:** 🔵 `src/paperless/settings.py:L108` (`"rest_framework.authtoken"` in `INSTALLED_APPS`).
+- **Model definition (🔵 DRF 3.13.1 `rest_framework/authtoken/models.py`):**
+  - `class Token(models.Model)` at `L9`.
+  - `key = models.CharField(max_length=40, primary_key=True)` at `L13` — the token string is itself the primary key.
+  - `user = models.OneToOneField(...)` at `L14` — one token per user.
+  - `created = models.DateTimeField(auto_now_add=True)` at `L18`.
+  - `generate_key()` at `L36-L37` = `binascii.hexlify(os.urandom(20)).decode()` → 40 hex chars.
+- **Table name:** the model sets no explicit `db_table`, and migration `authtoken.0001_initial` creates it, so Django uses the default table name **`authtoken_token`** (`<app_label>_<model>`).
+
+### 🟢 OBSERVED — runtime confirmation of both (a) and (b)
+
+```text
+TokenAuthentication module   = rest_framework.authentication
+TokenAuthentication.keyword  = 'Token'
+Token model module           = rest_framework.authtoken.models
+Token._meta.db_table         = authtoken_token
+Token key field max_length   = 40   primary_key = True
+authtoken_token in DB tables = True
+```
+
+**Cause → effect (end-to-end tie-back).** Because `rest_framework.authtoken` is installed (settings `L108`), `migrate` created the `authtoken_token` table (Q1 output). `drf_create_token` / `POST /api/token/` inserted a row there keyed by the 40-hex string (Q3). On each request, `TokenAuthentication` (settings `L120`) reads the `Authorization: Token <key>` header (Q5) and looks that key up in `authtoken_token`; a hit authenticates the request (Q4 → 200), a miss or absence is denied (Q9 → 401).
+
+---
+
+## The three authentication forms paperless documents
+
+For completeness, the in-repo API docs (🔵 `docs/api.rst`) describe **three** authentication schemes, which line up with the always-on `DEFAULT_AUTHENTICATION_CLASSES` (🔵 `src/paperless/settings.py:L116-L121`). Your external-tool integration question centers on **Token** (form 3):
+
+| # | Scheme | How the client authenticates | Source |
+|---|--------|------------------------------|--------|
+| 1 | **Basic** | `Authorization: Basic <base64(user:password)>` | 🔵 `docs/api.rst:L116`; `BasicAuthentication` settings `L118` |
+| 2 | **Session** | Browser session cookie (you're logged into the web UI) | 🔵 `docs/api.rst:L126`; `SessionAuthentication` settings `L119` |
+| 3 | **Token** ✅ | `POST /api/token/` → token, then `Authorization: Token <token>` on each request | 🔵 `docs/api.rst:L132-L143`; `TokenAuthentication` settings `L120` |
+
+Token auth is the recommended choice for external tools: it avoids sending the password on every call (unlike Basic) and does not depend on a browser cookie (unlike Session).
+
+---
+
+## End-to-end authentication flow
+
+```mermaid
+flowchart TD
+    A["Client: GET /api/documents/"] --> B{Authorization header present?}
+    B -->|No| C["First authenticator = BasicAuthentication<br/>authenticate_header() -> 'Basic realm=api'"]
+    C --> D["HTTP 401 + WWW-Authenticate: Basic realm=api<br/>{'detail':'Authentication credentials were not provided.'}"]
+    B -->|"Yes: 'Token key'"| E["TokenAuthentication.authenticate()<br/>keyword must equal 'Token'"]
+    E --> F{key found in authtoken_token?}
+    F -->|No| G["HTTP 401 {'detail':'Invalid token.'}"]
+    F -->|Yes| H["request.user set -> IsAuthenticated passes"]
+    H --> I["UnifiedSearchViewSet -> HTTP 200"]
+    I --> J["StandardPagination envelope:<br/>count, next, previous, results"]
+```
+
+---
+
+## Coverage checklist (Q1–Q10)
+
+| # | Question | Answer (short) | Where |
+|---|----------|----------------|-------|
+| Q1 | Run paperless locally (canonical) | `pip install -r requirements.txt` → `migrate` → `runserver` on Python 3.9, `DEBUG=False` | [Q1](#q1--running-paperless-ngx-locally-canonical-config) |
+| Q2 | Create a test user | `createsuperuser` → `blitzy_apitest` (superuser) | [Q2](#q2--creating-a-test-user) |
+| Q3 | Generate an API token | 40-hex key via `drf_create_token` **and** `POST /api/token/` | [Q3](#q3--generating-an-api-token) |
+| Q4 | Authenticated list request | `curl -i -H "Authorization: Token …" /api/documents/` → **HTTP 200** | [Q4](#q4--authenticated-request-to-list-documents-full-http-response) |
+| Q5 | Header name & format | `Authorization: Token <40-hex-key>` (keyword `Token`) | [Q5](#q5--exact-token-header-name-and-format) |
+| Q6 | Complete endpoint path | `/api/documents/` (`^api/` + router + trailing slash) | [Q6](#q6--complete-documents-list-endpoint-path) |
+| Q7 | Top-level JSON fields | Envelope `count, next, previous, results`; items carry 12 `DocumentSerializer` fields | [Q7](#q7--top-level-json-response-fields) |
+| Q8 | Pagination behavior | Paginated; `page_size=25`, `page_size` param, `max_page_size=100000`; per-viewset | [Q8](#q8--pagination-behavior) |
+| Q9 | Unauthenticated response | **HTTP 401**, `WWW-Authenticate: Basic realm="api"`, `{"detail":"Authentication credentials were not provided."}` | [Q9](#q9--unauthenticated-response-exact-status-code-and-error-body) |
+| Q10 | Code trace | `TokenAuthentication` (settings `L120`); `Token` model / `authtoken_token` (settings `L108`) | [Q10](#q10--code-trace-the-authentication-class-and-the-token-model) |
+
+---
+
+## Cleanup & repository integrity
+
+All runtime artifacts were **temporary and created outside the repository**, then removed:
+
+- The throwaway SQLite database, media/index directories, test superuser `blitzy_apitest`, its token row in `authtoken_token`, and the 3 seeded "Blitzy Test Document" fixtures all lived under a temporary `PAPERLESS_DATA_DIR` in `/tmp` — deleted after capture.
+- The running dev server was stopped and all temporary observation scripts/logs removed.
+- The minted token was a throwaway credential and is shown only redacted (`745a…8bee`); it no longer exists.
+
+**No file in the source repository was modified.** `git diff --name-only` is empty (no tracked file changed), and `git status --porcelain` reports only the single new deliverable under `blitzy/` (the default output collapses the new untracked directory; `-uall` expands it to the exact file):
+
+```text
+# git status --porcelain
+?? blitzy/
+
+# git status --porcelain -uall
+?? blitzy/documentation/paperless-ngx_542221a38dff.md
+```
+
+---
+
+## Appendix A — Web corroboration
+
+The following authoritative sources corroborate the observed behavior. Quotations are kept short; prefer the live 🟢 OBSERVED output and in-repo 🔵 `file:line` evidence above as primary.
+
+- **WEB-1 — DRF token header format.** Django REST Framework, *Authentication* guide — `https://www.django-rest-framework.org/api-guide/authentication/`. The token key is sent in the `Authorization` header prefixed by the literal string "Token" with whitespace, e.g. `Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b`. To enable it you configure `TokenAuthentication`, add `rest_framework.authtoken` to `INSTALLED_APPS`, and run `manage.py migrate`.
+- **WEB-2 — DRF `Token` model.** Same guide + DRF source `https://github.com/encode/django-rest-framework/blob/main/rest_framework/authentication.py`. Tokens are the `rest_framework.authtoken.models.Token` model; `migrate` creates the `authtoken_token` table.
+- **WEB-3 — DRF 401-vs-403 rule.** Same guide. HTTP 401 responses must include a `WWW-Authenticate` header while 403 responses do not; "The first authentication class set on the view is used when determining the type of response." A request that authenticates but is denied permission always yields 403.
+- **WEB-4 — paperless-ngx API conventions.** paperless-ngx docs `https://docs.paperless-ngx.com/api/` + in-repo `docs/api.rst`. "POST a username and password … to /api/token/ and paperless will respond with a token"; the token is then supplied via an HTTP header; list endpoints use the `{count, next, previous, results}` envelope and full-text search is available on `/api/documents/`. Community discussion `https://github.com/paperless-ngx/paperless-ngx/discussions/3865` confirms the superuser nuance: a limited user receives `{"detail":"You do not have permission to perform this action."}` on `/api/documents/`, resolved by upgrading the account to superuser.
+
+---
+
+*End of document.*
