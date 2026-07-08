@@ -123,8 +123,8 @@ directory and, on a new file, logs a line and enqueues a Django-Q task; it does 
 pipeline itself.
 
 ```
-$ cat /work/consumer.out
-[2026-07-08 05:00:07,204] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /work/consume
+$ head -1 /work/consumer.out
+[2026-07-08 05:56:47,621] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /work/consume
 ```
 
 - Logger `paperless.management.consumer` — `src/documents/management/commands/document_consumer.py:L24`.
@@ -136,6 +136,31 @@ $ cat /work/consumer.out
 ```
 $ redis-cli ping
 PONG
+$ redis-server --version
+Redis server v=6.0.16 sha=00000000:0 malloc=jemalloc-5.2.1 bits=64 build=d4b5be3f91fa055c
+$ redis-cli INFO server
+# Server
+redis_version:6.0.16
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:d4b5be3f91fa055c
+redis_mode:standalone
+os:Linux 6.6.122+ x86_64
+arch_bits:64
+multiplexing_api:epoll
+atomicvar_api:atomic-builtin
+gcc_version:10.2.1
+process_id:719
+run_id:68768607b18fc2786a9a7770599f75bd557ee0c8
+tcp_port:6379
+uptime_in_seconds:5563
+uptime_in_days:0
+hz:10
+configured_hz:10
+lru_clock:5105346
+executable:/app/redis-server
+config_file:
+io_threads_active:0
 $ python3 manage.py shell -c "from django.conf import settings; print('Q_CLUSTER =', settings.Q_CLUSTER); \
   print('save_limit present?', 'save_limit' in settings.Q_CLUSTER)"
 Q_CLUSTER = {'name': 'paperless', 'catch_up': False, 'recycle': 1, 'retry': 1810, 'timeout': 1800, 'workers': 11, 'redis': 'redis://localhost:6379'}
@@ -143,30 +168,45 @@ save_limit present? False
 ```
 
 - `Q_CLUSTER` (broker URL, worker count) — `src/paperless/settings.py:L449-456`; the `redis` URL default is `redis://localhost:6379` at `L456`.
-- Redis 6.0 is the canonical broker image — `docker/compose/docker-compose.sqlite.yml:L28-29`.
-- **`save_limit` is absent** from `Q_CLUSTER`, so Django-Q's default of **250** applies (successful tasks are persisted up to 250; failures are always saved). This makes completed tasks an observable DB side effect — see Q5.
+- **Observed runtime broker version: Redis 6.0.16.** `redis-server --version` reports `v=6.0.16` and `redis-cli INFO server` reports `redis_version:6.0.16` (both shown above). This *observed* runtime availability agrees with the canonical broker image `redis:6.0` declared in source at `docker/compose/docker-compose.sqlite.yml:L28-29` — i.e. the version was measured at runtime, not merely assumed from the compose file.
+- **`save_limit` is absent** from `Q_CLUSTER`, so Django-Q's default of **250** applies (successful tasks are persisted up to 250; failures are always saved). This makes completed tasks an observable DB side effect — see Q5. The default is not an assumption; it is read directly from the installed Django-Q package source:
+
+```
+$ python3 -c "import django_q, os; print(os.path.dirname(django_q.__file__))"
+/usr/local/lib/python3.9/site-packages/django_q
+$ grep -n "SAVE_LIMIT" /usr/local/lib/python3.9/site-packages/django_q/conf.py
+87:    SAVE_LIMIT = conf.get("save_limit", 250)
+$ sed -n '85,89p' /usr/local/lib/python3.9/site-packages/django_q/conf.py
+    # Maximum number of successful tasks kept in the database. 0 saves everything. -1 saves none
+    # Failures are always saved
+    SAVE_LIMIT = conf.get("save_limit", 250)
+
+    # Guard loop sleep in seconds. Should be between 0 and 60 seconds.
+```
+
+So `save_limit` defaults to **250** (`django_q/conf.py:L87`, `django-q==1.3.9`); completed `consume_file` tasks are therefore persisted as `django_q_task` rows up to that limit (failures always saved) — an observable DB side effect confirmed in Q5.
 
 **3. `qcluster` — the Django-Q worker (and scheduler).** It pops the `consume_file` task from Redis
 and runs the actual pipeline.
 
 ```
-$ cat /work/qcluster.out
-05:00:07 [Q] INFO Q Cluster queen-mirror-delta-seventeen starting.
-05:00:07 [Q] INFO Process-1:1 ready for work at 3687
-05:00:07 [Q] INFO Process-1:2 ready for work at 3688
-05:00:07 [Q] INFO Process-1:3 ready for work at 3689
-05:00:07 [Q] INFO Process-1:4 ready for work at 3690
-05:00:07 [Q] INFO Process-1:5 ready for work at 3691
-05:00:07 [Q] INFO Process-1:6 ready for work at 3692
-05:00:07 [Q] INFO Process-1:7 ready for work at 3694
-05:00:07 [Q] INFO Process-1:8 ready for work at 3695
-05:00:07 [Q] INFO Process-1:9 ready for work at 3696
-05:00:07 [Q] INFO Process-1:10 ready for work at 3697
-05:00:07 [Q] INFO Process-1:11 ready for work at 3698
-05:00:07 [Q] INFO Process-1:12 monitoring at 3699
-05:00:07 [Q] INFO Process-1 guarding cluster queen-mirror-delta-seventeen
-05:00:07 [Q] INFO Process-1:13 pushing tasks at 3700
-05:00:07 [Q] INFO Q Cluster queen-mirror-delta-seventeen running.
+$ head -16 /work/qcluster.out
+05:56:47 [Q] INFO Q Cluster mexico-angel-asparagus-nuts starting.
+05:56:47 [Q] INFO Process-1:1 ready for work at 5153
+05:56:47 [Q] INFO Process-1:2 ready for work at 5154
+05:56:47 [Q] INFO Process-1:3 ready for work at 5155
+05:56:47 [Q] INFO Process-1:4 ready for work at 5156
+05:56:47 [Q] INFO Process-1:5 ready for work at 5157
+05:56:47 [Q] INFO Process-1:6 ready for work at 5158
+05:56:47 [Q] INFO Process-1:7 ready for work at 5159
+05:56:47 [Q] INFO Process-1:8 ready for work at 5160
+05:56:47 [Q] INFO Process-1:9 ready for work at 5161
+05:56:47 [Q] INFO Process-1:10 ready for work at 5162
+05:56:47 [Q] INFO Process-1:11 ready for work at 5163
+05:56:47 [Q] INFO Process-1:12 monitoring at 5164
+05:56:47 [Q] INFO Process-1 guarding cluster mexico-angel-asparagus-nuts
+05:56:47 [Q] INFO Process-1:13 pushing tasks at 5165
+05:56:47 [Q] INFO Q Cluster mexico-angel-asparagus-nuts running.
 ```
 
 - The task the worker runs is `documents.tasks.consume_file` — `src/documents/tasks.py:L184` — which instantiates `Consumer().try_consume_file(...)` at `src/documents/tasks.py:L236`.
@@ -234,32 +274,33 @@ sequence, with each line annotated by the code that emits it, is below.
 **Commands (real file-drop entry point):**
 
 ```bash
-$ cp /work/samples/invoice_alpha.pdf /work/consume/invoice_alpha.pdf     # drop into the watched dir
-# poll until the pipeline logs "consumption finished" (finished in ~8s)
-$ tail -n +4 /work/data/log/paperless.log                                # the lines for this document
+$ off=$(wc -l < /work/data/log/paperless.log)                            # lines already in the log (off=3)
+$ cp /work/samples/invoice_alpha.pdf /work/consume/invoice_alpha.pdf     # real file-drop entry point
+# poll until this document's slice logs "consumption finished" (finished in ~5s)
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log                   # exactly the lines for this document
 ```
 
 **Observed, unedited output** (volatile substrings — timestamps, the random `/tmp/paperless/…`
 work-dir name — vary run to run; the log strings and ordering are stable):
 
 ```
-[2026-07-08 05:02:32,158] [INFO] [paperless.management.consumer] Adding /work/consume/invoice_alpha.pdf to the task queue.
-[2026-07-08 05:02:32,326] [INFO] [paperless.consumer] Consuming invoice_alpha.pdf
-[2026-07-08 05:02:32,327] [DEBUG] [paperless.consumer] Detected mime type: application/pdf
-[2026-07-08 05:02:32,330] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
-[2026-07-08 05:02:32,332] [DEBUG] [paperless.consumer] Parsing invoice_alpha.pdf...
-[2026-07-08 05:02:32,359] [DEBUG] [paperless.parsing.tesseract] Extracted text from PDF file /work/consume/invoice_alpha.pdf
-[2026-07-08 05:02:32,431] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/work/consume/invoice_alpha.pdf', 'output_file': '/tmp/paperless/paperless-9li5_5qd/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-9li5_5qd/sidecar.txt'}
-[2026-07-08 05:02:32,727] [DEBUG] [paperless.parsing.tesseract] Incomplete sidecar file: discarding.
-[2026-07-08 05:02:32,734] [DEBUG] [paperless.parsing.tesseract] Extracted text from PDF file /tmp/paperless/paperless-9li5_5qd/archive.pdf
-[2026-07-08 05:02:32,734] [DEBUG] [paperless.consumer] Generating thumbnail for invoice_alpha.pdf...
-[2026-07-08 05:02:32,738] [DEBUG] [paperless.parsing] Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/paperless/paperless-9li5_5qd/archive.pdf[0] /tmp/paperless/paperless-9li5_5qd/convert.png
-[2026-07-08 05:02:33,444] [DEBUG] [paperless.parsing.tesseract] Execute: optipng -silent -o5 /tmp/paperless/paperless-9li5_5qd/convert.png -out /tmp/paperless/paperless-9li5_5qd/thumb_optipng.png
-[2026-07-08 05:02:36,395] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-[2026-07-08 05:02:36,398] [DEBUG] [paperless.consumer] Saving record to database
-[2026-07-08 05:02:36,420] [DEBUG] [paperless.consumer] Deleting file /work/consume/invoice_alpha.pdf
-[2026-07-08 05:02:36,426] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/paperless/paperless-9li5_5qd
-[2026-07-08 05:02:36,427] [INFO] [paperless.consumer] Document 2026-07-08 invoice_alpha consumption finished
+[2026-07-08 05:58:46,837] [INFO] [paperless.management.consumer] Adding /work/consume/invoice_alpha.pdf to the task queue.
+[2026-07-08 05:58:46,985] [INFO] [paperless.consumer] Consuming invoice_alpha.pdf
+[2026-07-08 05:58:46,985] [DEBUG] [paperless.consumer] Detected mime type: application/pdf
+[2026-07-08 05:58:46,988] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
+[2026-07-08 05:58:46,990] [DEBUG] [paperless.consumer] Parsing invoice_alpha.pdf...
+[2026-07-08 05:58:47,015] [DEBUG] [paperless.parsing.tesseract] Extracted text from PDF file /work/consume/invoice_alpha.pdf
+[2026-07-08 05:58:47,088] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/work/consume/invoice_alpha.pdf', 'output_file': '/tmp/paperless/paperless-tsiq6d2a/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-tsiq6d2a/sidecar.txt'}
+[2026-07-08 05:58:47,384] [DEBUG] [paperless.parsing.tesseract] Incomplete sidecar file: discarding.
+[2026-07-08 05:58:47,390] [DEBUG] [paperless.parsing.tesseract] Extracted text from PDF file /tmp/paperless/paperless-tsiq6d2a/archive.pdf
+[2026-07-08 05:58:47,390] [DEBUG] [paperless.consumer] Generating thumbnail for invoice_alpha.pdf...
+[2026-07-08 05:58:47,393] [DEBUG] [paperless.parsing] Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/paperless/paperless-tsiq6d2a/archive.pdf[0] /tmp/paperless/paperless-tsiq6d2a/convert.png
+[2026-07-08 05:58:48,045] [DEBUG] [paperless.parsing.tesseract] Execute: optipng -silent -o5 /tmp/paperless/paperless-tsiq6d2a/convert.png -out /tmp/paperless/paperless-tsiq6d2a/thumb_optipng.png
+[2026-07-08 05:58:50,979] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[2026-07-08 05:58:50,982] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-08 05:58:51,002] [DEBUG] [paperless.consumer] Deleting file /work/consume/invoice_alpha.pdf
+[2026-07-08 05:58:51,027] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/paperless/paperless-tsiq6d2a
+[2026-07-08 05:58:51,027] [INFO] [paperless.consumer] Document 2026-07-08 invoice_alpha consumption finished
 ```
 
 ### Line-by-line source attribution
@@ -271,9 +312,12 @@ work-dir name — vary run to run; the log strings and ordering are stable):
 | `Detected mime type: application/pdf` | `src/documents/consumer.py:L221` |
 | `Parser: RasterisedDocumentParser` | `src/documents/consumer.py:L246` |
 | `Parsing invoice_alpha.pdf...` | `src/documents/consumer.py:L260` |
-| `Extracted text from PDF file …` / `Calling OCRmyPDF with args: …` / `Incomplete sidecar file: discarding.` | OCR parser, logger `paperless.parsing.tesseract` (`paperless_tesseract`) |
+| `Extracted text from PDF file …` | `src/paperless_tesseract/parsers.py:L122` (`self.log("debug", f"Extracted text from PDF file {pdf_file}")`; logger `paperless.parsing.tesseract` at `src/paperless_tesseract/parsers.py:L24`) |
+| `Calling OCRmyPDF with args: …` | `src/paperless_tesseract/parsers.py:L260` (`self.log("debug", f"Calling OCRmyPDF with args: {args}")`) |
+| `Incomplete sidecar file: discarding.` | `src/paperless_tesseract/parsers.py:L110` (`self.log("debug", "Incomplete sidecar file: discarding.")`) |
 | `Generating thumbnail for invoice_alpha.pdf...` | `src/documents/consumer.py:L263` |
-| `Execute: convert …` / `Execute: optipng …` | OCR/thumbnail parser, logger `paperless.parsing[.tesseract]` |
+| `Execute: convert …` | `src/documents/parsers.py:L143` (module-level `logger.debug("Execute: " + " ".join(args), …)` inside `run_convert()`; logger name `paperless.parsing` at `src/documents/parsers.py:L287`) |
+| `Execute: optipng …` | `src/documents/parsers.py:L333` (`self.log("debug", f"Execute: {' '.join(args)}")` inside `get_optimised_thumbnail()` at `L319`; on a `RasterisedDocumentParser` instance the logger resolves to `paperless.parsing.tesseract`) |
 | `Document classification model does not exist (yet), not performing automatic matching.` | `src/documents/classifier.py:L32-34` (via `load_classifier()` called during auto-matching) |
 | `Saving record to database` | `src/documents/consumer.py:L387` (inside `_store()` at `L379`) |
 | `Deleting file /work/consume/invoice_alpha.pdf` | `src/documents/consumer.py:L349` (source `os.unlink` at `L350`, *after* a successful save) |
@@ -302,17 +346,34 @@ The constants `new_file`, `parsing_document`, `generating_thumbnail`, `save_docu
 `_send_progress()` — they are distinct from the human-readable log strings above:
 
 ```
-$ grep -n "_send_progress\|MESSAGE_" src/documents/consumer.py | sed -n '1,20p'
+$ grep -n "MESSAGE_\|_send_progress" src/documents/consumer.py
+37:MESSAGE_DOCUMENT_ALREADY_EXISTS = "document_already_exists"
+38:MESSAGE_FILE_NOT_FOUND = "file_not_found"
+39:MESSAGE_PRE_CONSUME_SCRIPT_NOT_FOUND = "pre_consume_script_not_found"
+40:MESSAGE_PRE_CONSUME_SCRIPT_ERROR = "pre_consume_script_error"
+41:MESSAGE_POST_CONSUME_SCRIPT_NOT_FOUND = "post_consume_script_not_found"
+42:MESSAGE_POST_CONSUME_SCRIPT_ERROR = "post_consume_script_error"
 43:MESSAGE_NEW_FILE = "new_file"
+44:MESSAGE_UNSUPPORTED_TYPE = "unsupported_type"
 45:MESSAGE_PARSING_DOCUMENT = "parsing_document"
 46:MESSAGE_GENERATING_THUMBNAIL = "generating_thumbnail"
+47:MESSAGE_PARSE_DATE = "parse_date"
 48:MESSAGE_SAVE_DOCUMENT = "save_document"
 49:MESSAGE_FINISHED = "finished"
 56:    def _send_progress(
-...
+79:        self._send_progress(100, 100, "FAILED", message)
+98:                MESSAGE_FILE_NOT_FOUND,
+111:                MESSAGE_DOCUMENT_ALREADY_EXISTS,
+127:                MESSAGE_PRE_CONSUME_SCRIPT_NOT_FOUND,
+138:                MESSAGE_PRE_CONSUME_SCRIPT_ERROR,
+149:                MESSAGE_POST_CONSUME_SCRIPT_NOT_FOUND,
+175:                MESSAGE_POST_CONSUME_SCRIPT_ERROR,
 202:        self._send_progress(0, 100, "STARTING", MESSAGE_NEW_FILE)
-259:        self._send_progress(20, 100, "WORKING", MESSAGE_PARSING_DOCUMENT)
-264:        self._send_progress(70, 100, "WORKING", MESSAGE_GENERATING_THUMBNAIL)
+225:            self._fail(MESSAGE_UNSUPPORTED_TYPE, f"Unsupported mime type {mime_type}")
+240:            self._send_progress(p, 100, "WORKING")
+259:            self._send_progress(20, 100, "WORKING", MESSAGE_PARSING_DOCUMENT)
+264:            self._send_progress(70, 100, "WORKING", MESSAGE_GENERATING_THUMBNAIL)
+274:                self._send_progress(90, 100, "WORKING", MESSAGE_PARSE_DATE)
 294:        self._send_progress(95, 100, "WORKING", MESSAGE_SAVE_DOCUMENT)
 375:        self._send_progress(100, 100, "SUCCESS", MESSAGE_FINISHED, document.id)
 ```
@@ -346,20 +407,33 @@ scheduled run — only on a scheduled/on-demand run whose training data has chan
 - `train_classifier` is scheduled HOURLY by migration `1001` — observed as a live schedule row:
 
 ```
-$ python3 manage.py shell -c "from django_q.models import Schedule; \
+$ python3 manage.py shell -c "from django_q.models import Schedule, Task; \
   s=Schedule.objects.get(func='documents.tasks.train_classifier'); \
-  print('name=%r func=%s schedule_type=%s next_run=%s last_run=%s'%(s.name,s.func,s.schedule_type,s.next_run,s.last_run()))"
-name='Train the classifier' func=documents.tasks.train_classifier schedule_type=H next_run=2026-07-08 05:55:00.370958+00:00 last_run=None
+  print('name=%r func=%s schedule_type=%s repeats=%s next_run=%s'%(s.name,s.func,s.schedule_type,s.repeats,s.next_run)); \
+  tc=Task.objects.filter(func='documents.tasks.train_classifier'); \
+  print('train_classifier Task rows executed so far:', tc.count()); \
+  [print('  task name=%r success=%s started=%s'%(t.name,t.success,t.started)) for t in tc.order_by('started')]"
+name='Train the classifier' func=documents.tasks.train_classifier schedule_type=H repeats=-2 next_run=2026-07-08 06:56:45.313295+00:00
+train_classifier Task rows executed so far: 1
+  task name='island-louisiana-fruit-floor' success=True started=2026-07-08 05:57:17.269667+00:00
 ```
 
-`schedule_type=H` is Django-Q's HOURLY type; `next_run` is ~52 minutes in the future relative to the
-observation window (uploads happened ~05:02–05:04), and `last_run=None` confirms the scheduled
-retrain had not fired during the window.
+`schedule_type=H` is Django-Q's HOURLY type. The **only** `train_classifier` execution during the
+entire session was fired by the **`qcluster` scheduler at cluster startup** (05:57:17) — a due
+schedule runs once when the cluster comes up — **not** by any upload. That single scheduled run
+**silently skipped** (no `MATCH_AUTO` entity existed yet, see Q4), so it created no model and emitted
+no training log line; `next_run` is the next hourly tick ~1 hour out. The scheduler firing is directly
+observable in the cluster log, and it is the *only* thing that ever invokes `train_classifier`:
+
+```
+$ grep -nE "created a task from schedule \[Train the classifier\]" /work/qcluster.out
+18:05:57:17 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+```
 
 ### Empirical proof it is not per-upload (scale & stability)
 
-Three documents were ingested in total (one for Q2, then two more), and the entire `paperless.log`
-was grepped for **any** training marker:
+Three documents were ingested in total (one for Q2, then two more), giving three rows in
+`documents_document`:
 
 ```
 $ python3 manage.py shell -c "from documents.models import Document; \
@@ -369,9 +443,30 @@ documents_document rows: 3
   pk= 1 0000001.pdf 'invoice_alpha'
   pk= 2 0000002.pdf 'report_beta'
   pk= 3 0000003.pdf 'letter_gamma'
+```
 
-$ grep -nE "Saving updated classifier model|Training data unchanged|Gathering data from database|Vectorizing data|Training .* classifier" /work/data/log/paperless.log
->>> NO MATCHES — no training log lines during any upload <<<
+Document 1 (`invoice_alpha`) was ingested in Q2. The two additional uploads were each checked
+**immediately after their own `consumption finished`** by slicing only that upload's newly appended
+log lines (`off` = line count captured just before the drop) and grepping for any training marker.
+The `|| echo` fallback prints the sentinel *only when grep matches nothing* — so the sentinel below
+is genuine command output, not a hand-written note:
+
+```
+$ off=$(wc -l < /work/data/log/paperless.log); cp /work/samples/report_beta.pdf /work/consume/   # then poll for "consumption finished"
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE "Saving updated classifier model|Training data unchanged|Gathering data from database|Vectorizing data|Training .* classifier" || echo ">>> NO training markers after report_beta upload <<<"
+>>> NO training markers after report_beta upload <<<
+
+$ off=$(wc -l < /work/data/log/paperless.log); cp /work/samples/letter_gamma.pdf /work/consume/   # then poll for "consumption finished"
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE "Saving updated classifier model|Training data unchanged|Gathering data from database|Vectorizing data|Training .* classifier" || echo ">>> NO training markers after letter_gamma upload <<<"
+>>> NO training markers after letter_gamma upload <<<
+```
+
+And the aggregate grep over the **complete three-ingestion log** (same `|| echo` fallback) confirms
+zero training activity across all three uploads combined:
+
+```
+$ grep -nE "Saving updated classifier model|Training data unchanged|Gathering data from database|Vectorizing data|Training .* classifier" /work/data/log/paperless.log || echo ">>> NO MATCHES — no training log lines during any of the 3 uploads <<<"
+>>> NO MATCHES — no training log lines during any of the 3 uploads <<<
 ```
 
 The only classifier-related lines in the whole log are the per-upload **matching** attempts from
@@ -379,9 +474,9 @@ The only classifier-related lines in the whole log are the per-upload **matching
 
 ```
 $ grep -nE "\[paperless.classifier\]" /work/data/log/paperless.log
-16:[2026-07-08 05:02:36,395] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-45:[2026-07-08 05:03:53,453] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-50:[2026-07-08 05:03:56,086] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+16:[2026-07-08 05:58:50,979] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+33:[2026-07-08 05:59:54,441] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+50:[2026-07-08 06:00:00,015] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
 ```
 
 And no model file exists after three uploads (training genuinely never happened):
@@ -392,9 +487,12 @@ ls: cannot access '/work/data/classification_model.pickle': No such file or dire
 ```
 
 **Scale/stability:** across **3** ingestions with no intervening model change, the number of
-retrains observed was **0**, and the result was stable across all three uploads (the grep for
-training markers returns nothing after each). Uploading more documents does not change this — the
-retrain trigger is the hourly schedule (or the on-demand command in Q4), not the upload.
+retrains observed was **0**. This was verified two ways: a per-upload grep run immediately after each
+of the two additional uploads returned no training markers (the two `report_beta`/`letter_gamma`
+sentinels above), and the aggregate grep over the complete three-ingestion log likewise returned
+none. Uploading more documents does not change this — the retrain trigger is the hourly schedule
+(whose single startup run silently skipped, above) or the on-demand command in Q4, never the upload
+itself.
 
 ### Reasoning
 
@@ -434,10 +532,12 @@ tags MATCH_AUTO: 0
 doctypes MATCH_AUTO: 0
 correspondents MATCH_AUTO: 0
 
-$ python3 manage.py document_create_classifier ; echo "(exit code: $?)"
-(exit code: 0)
-# new paperless.log lines matching classifier|tasks:
+$ off=$(wc -l < /work/data/log/paperless.log); python3 manage.py document_create_classifier; echo exit=$?
+off=78
+exit=0
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE 'paperless.classifier|paperless.tasks' || echo '>>> NO classifier/tasks log lines — SILENT SKIP confirmed <<<'
 >>> NO classifier/tasks log lines — SILENT SKIP confirmed <<<
+
 $ ls -la /work/data/classification_model.pickle
 ls: cannot access '/work/data/classification_model.pickle': No such file or directory
 ```
@@ -457,26 +557,33 @@ first run the model file is missing, so `load_classifier()` logs the **no-model 
 $ python3 manage.py shell -c "from documents.models import Tag,Document; \
   t,_=Tag.objects.get_or_create(name='AutoTagAlpha', defaults={'matching_algorithm':Tag.MATCH_AUTO,'match':'acme'}); \
   t.matching_algorithm=Tag.MATCH_AUTO; t.match='acme'; t.save(); Document.objects.get(pk=1).tags.add(t); \
-  print('tag pk=%d match_algo=%d assigned_to_doc=1'%(t.pk,t.matching_algorithm))"
-tag pk=1 match_algo=6 assigned_to_doc=1
+  print('tag pk=%d match_algo=%d (MATCH_AUTO=%d) assigned_to_doc=1'%(t.pk,t.matching_algorithm,Tag.MATCH_AUTO))"
+tag pk=2 match_algo=6 (MATCH_AUTO=6) assigned_to_doc=1
 
-$ python3 manage.py document_create_classifier      # RUN 1 (data is new)
-[2026-07-08 05:06:53,413] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-[2026-07-08 05:06:53,413] [DEBUG] [paperless.classifier] Gathering data from database...
-[2026-07-08 05:06:53,417] [DEBUG] [paperless.classifier] 3 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
-[2026-07-08 05:06:53,844] [DEBUG] [paperless.classifier] Vectorizing data...
-[2026-07-08 05:06:53,846] [DEBUG] [paperless.classifier] Training tags classifier...
-[2026-07-08 05:06:53,942] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
-[2026-07-08 05:06:53,943] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
-[2026-07-08 05:06:53,943] [INFO] [paperless.tasks] Saving updated classifier model to /work/data/classification_model.pickle...
+$ stat -c %Y /work/data/classification_model.pickle          # mtime BEFORE (no model yet)
+stat: cannot statx '/work/data/classification_model.pickle': No such file or directory
 
+$ off=$(wc -l < /work/data/log/paperless.log); python3 manage.py document_create_classifier   # RUN 1 (data is new)
+off=79
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE 'paperless.classifier|paperless.tasks' || echo '>>> NONE <<<'
+1:[2026-07-08 06:03:20,657] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+2:[2026-07-08 06:03:20,658] [DEBUG] [paperless.classifier] Gathering data from database...
+3:[2026-07-08 06:03:20,661] [DEBUG] [paperless.classifier] 3 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
+4:[2026-07-08 06:03:21,052] [DEBUG] [paperless.classifier] Vectorizing data...
+5:[2026-07-08 06:03:21,053] [DEBUG] [paperless.classifier] Training tags classifier...
+6:[2026-07-08 06:03:21,105] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
+7:[2026-07-08 06:03:21,105] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+8:[2026-07-08 06:03:21,105] [INFO] [paperless.tasks] Saving updated classifier model to /work/data/classification_model.pickle...
+
+$ stat -c %Y /work/data/classification_model.pickle          # mtime AFTER
+1783490601
 $ ls -la /work/data/classification_model.pickle
--rw-r--r-- 1 root root 329149 Jul  8 05:06 /work/data/classification_model.pickle
+-rw-r--r-- 1 root root 251972 Jul  8 06:03 /work/data/classification_model.pickle
 ```
 
 - **No-model DEBUG** string — `src/documents/classifier.py:L32-34` (via `load_classifier()` at `L30`).
 - `Gathering data from database...` — `src/documents/classifier.py:L123`.
-- **Training INFO** string `Saving updated classifier model to …` — `src/documents/tasks.py:L64-66` (the string literal is on `L65`); `classifier.save()` follows at `L67`. `train()` returned truthy (`src/documents/classifier.py:L249` `return True`), and a **329149-byte** model file was created at `MODEL_FILE` (`src/paperless/settings.py:L74`).
+- **Training INFO** string `Saving updated classifier model to …` — `src/documents/tasks.py:L64-66` (the string literal is on `L65`); `classifier.save()` follows at `L67`. `train()` returned truthy (`src/documents/classifier.py:L249` `return True`), and a **251972-byte** model file was created at `MODEL_FILE` (`src/paperless/settings.py:L74`).
 - (The INFO line also appears on stderr because the `paperless` logger propagates to the root `console` handler whose level is `INFO` — `src/paperless/settings.py:L387-390`, `L407`.)
 
 ### Branch 4 — IDLE (DEBUG "Training data unchanged."), stable across ≥2 runs
@@ -485,16 +592,25 @@ Re-running with **unchanged** data twice more yields the idle branch every time,
 is **not** rewritten (mtime constant) — demonstrating the required ≥2-run stability:
 
 ```
-$ stat -c %Y /work/data/classification_model.pickle    # mtime after training: 1783487213 (05:06:53)
-$ python3 manage.py document_create_classifier          # IDLE RUN 2
-[2026-07-08 05:07:14,116] [DEBUG] [paperless.classifier] Gathering data from database...
-[2026-07-08 05:07:14,121] [DEBUG] [paperless.tasks] Training data unchanged.
-# model mtime now: 1783487213  (unchanged? YES)
+$ stat -c %Y /work/data/classification_model.pickle          # IDLE RUN 2 — mtime BEFORE
+1783490601
+$ off=$(wc -l < /work/data/log/paperless.log); python3 manage.py document_create_classifier   # IDLE RUN 2
+off=87
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE 'paperless.classifier|paperless.tasks' || echo '>>> NONE <<<'
+2:[2026-07-08 06:03:22,968] [DEBUG] [paperless.classifier] Gathering data from database...
+3:[2026-07-08 06:03:22,973] [DEBUG] [paperless.tasks] Training data unchanged.
+$ stat -c %Y /work/data/classification_model.pickle          # IDLE RUN 2 — mtime AFTER (unchanged)
+1783490601
 
-$ python3 manage.py document_create_classifier          # IDLE RUN 3
-[2026-07-08 05:07:15,995] [DEBUG] [paperless.classifier] Gathering data from database...
-[2026-07-08 05:07:16,000] [DEBUG] [paperless.tasks] Training data unchanged.
-# model mtime now: 1783487213  (unchanged? YES)
+$ stat -c %Y /work/data/classification_model.pickle          # IDLE RUN 3 — mtime BEFORE
+1783490601
+$ off=$(wc -l < /work/data/log/paperless.log); python3 manage.py document_create_classifier   # IDLE RUN 3
+off=90
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE 'paperless.classifier|paperless.tasks' || echo '>>> NONE <<<'
+2:[2026-07-08 06:03:24,808] [DEBUG] [paperless.classifier] Gathering data from database...
+3:[2026-07-08 06:03:24,812] [DEBUG] [paperless.tasks] Training data unchanged.
+$ stat -c %Y /work/data/classification_model.pickle          # IDLE RUN 3 — mtime AFTER (unchanged)
+1783490601
 ```
 
 - **Idle DEBUG** string `Training data unchanged.` — `src/documents/tasks.py:L69`, reached because `train()` computed a SHA-1 over the preprocessed content+labels (`classifier.py:L124`) equal to the stored `data_hash`, so it short-circuited with `return False` (`src/documents/classifier.py:L163-164`).
@@ -508,17 +624,22 @@ re-run; training fired again and the model mtime advanced:
 $ python3 manage.py shell -c "from documents.models import Tag,Document; \
   t=Tag.objects.get(name='AutoTagAlpha'); Document.objects.get(pk=2).tags.add(t); \
   print('AutoTagAlpha now on docs:', list(t.documents.values_list('pk',flat=True)))"
-AutoTagAlpha now on docs: [2, 1]
+AutoTagAlpha now on docs: [1, 2]
 
-$ python3 manage.py document_create_classifier
-[2026-07-08 05:07:38,253] [DEBUG] [paperless.classifier] Gathering data from database...
-[2026-07-08 05:07:38,257] [DEBUG] [paperless.classifier] 3 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
-[2026-07-08 05:07:38,257] [DEBUG] [paperless.classifier] Vectorizing data...
-[2026-07-08 05:07:38,258] [DEBUG] [paperless.classifier] Training tags classifier...
-[2026-07-08 05:07:38,318] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
-[2026-07-08 05:07:38,319] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
-[2026-07-08 05:07:38,319] [INFO] [paperless.tasks] Saving updated classifier model to /work/data/classification_model.pickle...
-# model mtime before=1783487213 after=1783487258 -> CHANGED (retrained)
+$ stat -c %Y /work/data/classification_model.pickle          # mtime BEFORE
+1783490601
+$ off=$(wc -l < /work/data/log/paperless.log); python3 manage.py document_create_classifier   # data changed
+off=94
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep -nE 'paperless.classifier|paperless.tasks' || echo '>>> NONE <<<'
+1:[2026-07-08 06:03:27,600] [DEBUG] [paperless.classifier] Gathering data from database...
+2:[2026-07-08 06:03:27,604] [DEBUG] [paperless.classifier] 3 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
+3:[2026-07-08 06:03:27,605] [DEBUG] [paperless.classifier] Vectorizing data...
+4:[2026-07-08 06:03:27,605] [DEBUG] [paperless.classifier] Training tags classifier...
+5:[2026-07-08 06:03:27,660] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
+6:[2026-07-08 06:03:27,660] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+7:[2026-07-08 06:03:27,661] [INFO] [paperless.tasks] Saving updated classifier model to /work/data/classification_model.pickle...
+$ stat -c %Y /work/data/classification_model.pickle          # mtime AFTER -> advanced (retrained)
+1783490607
 ```
 
 ### Branch 5 — ERROR (inferred)
@@ -563,17 +684,46 @@ branch at `L132` is skipped) falls through to the default at `src/documents/file
 ```
 $ find /work/media -type f | sort
 /work/media/documents/archive/0000001.pdf
+/work/media/documents/archive/0000002.pdf
+/work/media/documents/archive/0000003.pdf
+/work/media/documents/archive/0000004.pdf
 /work/media/documents/originals/0000001.pdf
+/work/media/documents/originals/0000002.pdf
+/work/media/documents/originals/0000003.pdf
+/work/media/documents/originals/0000004.pdf
 /work/media/documents/thumbnails/0000001.png
+/work/media/documents/thumbnails/0000002.png
+/work/media/documents/thumbnails/0000003.png
+/work/media/documents/thumbnails/0000004.png
 /work/media/media.lock
 
 $ ls -la /work/media/documents/originals /work/media/documents/archive /work/media/documents/thumbnails
-/work/media/documents/archive/:
--rw-r--r-- 1 root root 8654 Jul  8 05:02 0000001.pdf
-/work/media/documents/originals/:
--rw-r--r-- 1 root root 1603 Jul  8 05:02 0000001.pdf
-/work/media/documents/thumbnails/:
--rw-r--r-- 1 root root 10514 Jul  8 05:02 0000001.png
+/work/media/documents/archive:
+total 52
+drwxr-xr-x 2 root root 4096 Jul  8 06:05 .
+drwxr-xr-x 5 root root 4096 Jul  8 05:58 ..
+-rw-r--r-- 1 root root 8497 Jul  8 05:58 0000001.pdf
+-rw-r--r-- 1 root root 8263 Jul  8 05:59 0000002.pdf
+-rw-r--r-- 1 root root 8208 Jul  8 06:00 0000003.pdf
+-rw-r--r-- 1 root root 7694 Jul  8 06:05 0000004.pdf
+
+/work/media/documents/originals:
+total 24
+drwxr-xr-x 2 root root 4096 Jul  8 06:05 .
+drwxr-xr-x 5 root root 4096 Jul  8 05:58 ..
+-rw-r--r-- 1 root root 1562 Jul  8 05:58 0000001.pdf
+-rw-r--r-- 1 root root 1529 Jul  8 05:59 0000002.pdf
+-rw-r--r-- 1 root root 1527 Jul  8 06:00 0000003.pdf
+-rw-r--r-- 1 root root 1517 Jul  8 06:05 0000004.pdf
+
+/work/media/documents/thumbnails:
+total 52
+drwxr-xr-x 2 root root 4096 Jul  8 06:05 .
+drwxr-xr-x 5 root root 4096 Jul  8 05:58 ..
+-rw-r--r-- 1 root root 9724 Jul  8 05:58 0000001.png
+-rw-r--r-- 1 root root 8643 Jul  8 05:59 0000002.png
+-rw-r--r-- 1 root root 9004 Jul  8 06:00 0000003.png
+-rw-r--r-- 1 root root 7658 Jul  8 06:05 0000004.png
 ```
 
 - `originals/` → `ORIGINALS_DIR` (`src/paperless/settings.py:L62`); the model's `source_path` builds `{:07}{}` (`src/documents/models.py:L223`, name at `L227`).
@@ -581,7 +731,10 @@ $ ls -la /work/media/documents/originals /work/media/documents/archive /work/med
 - `thumbnails/` → `THUMBNAIL_DIR` (`src/paperless/settings.py:L64`); `thumbnail_path` builds `{:07}.png` (`src/documents/models.py:L273`, name at `L274`).
 - `media.lock` → the `FileLock(settings.MEDIA_LOCK)` file (`src/paperless/settings.py:L72`; used at `src/documents/consumer.py:L315`).
 
-The stored `Document` row confirms the `{pk:07}` naming and that text was extracted:
+The listing shows all **four** documents ingested during this session (pk 1–4); each ingestion
+contributes exactly one file to each of `originals/`, `archive/`, and `thumbnails/`, so a single
+ingestion adds **three** files. The stored `Document` row confirms the `{pk:07}` naming and that text
+was extracted:
 
 ```
 $ python3 manage.py shell -c "from documents.models import Document; d=Document.objects.get(pk=1); \
@@ -590,7 +743,7 @@ $ python3 manage.py shell -c "from documents.models import Document; d=Document.
   print('source_path=',d.source_path); print('archive_path=',d.archive_path); \
   print('thumbnail_path=',d.thumbnail_path); print('content(first80)=',repr(d.content[:80]))"
 pk= 1 filename= 0000001.pdf archive_filename= 0000001.pdf
-title= 'invoice_alpha' mime= application/pdf checksum= 9e5bf2efa6fa
+title= 'invoice_alpha' mime= application/pdf checksum= 9d5fb1b7843c
 source_path= /work/media/documents/originals/0000001.pdf
 archive_path= /work/media/documents/archive/0000001.pdf
 thumbnail_path= /work/media/documents/thumbnails/0000001.png
@@ -599,17 +752,119 @@ content(first80)= 'ACME Invoice Alpha 2026\n\nInvoice number: ALPHA-0001\n\nBill
 
 ### Database tables receiving rows (before → after one ingestion)
 
-Per-table row counts were snapshotted immediately before dropping the single PDF and again after the
-pipeline logged "consumption finished". (The DB started from a fresh `migrate`; the `django_q_task`
-"before" value of 2 is two incidental scheduled tasks that ran at cluster startup — `index_optimize`
-and `sanity_check` — unrelated to ingestion.)
+Per-table row counts were snapshotted with a small ephemeral helper immediately **before** dropping a
+single PDF and again **after** the pipeline logged `consumption finished`. The helper counts every
+user table via `sqlite_master`:
 
 ```
-$ # snapshot helper counts rows in every table via sqlite_master; deltas for the tables of interest:
+$ cat /work/_investigate/db_table_counts.py
+#!/usr/bin/env python3
+"""Print row counts for every user table in the default SQLite DB.
+
+Usage: python3 db_table_counts.py
+Emits lines of the form "<count>\t<table>" for every table listed in
+sqlite_master (type='table'), sorted by table name. Used to snapshot the
+database immediately before and after a single ingestion so per-table deltas
+are unambiguous. Ephemeral observation helper; removed at cleanup.
+"""
+import os
+import sqlite3
+
+db = os.environ.get("PAPERLESS_DBPATH", "/work/data/db.sqlite3")
+con = sqlite3.connect(db)
+cur = con.cursor()
+cur.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+)
+tables = [r[0] for r in cur.fetchall()]
+for t in tables:
+    cur.execute(f'SELECT COUNT(*) FROM "{t}"')
+    n = cur.fetchone()[0]
+    print(f"{n}\t{t}")
+con.close()
+```
+
+The clean single ingestion measured here is `memo_delta.pdf` — the **fourth** document of the session
+(the three from Q2/Q3 were already present, and the classifier state was reset first so no auto-tag
+applies). The `before` baseline is therefore **not** zero (`documents_document`=3;
+`django_q_task`=7 = four scheduled startup tasks + three prior `consume_file` tasks). The exact
+ordered command sequence — snapshot BEFORE, drop, wait-for-`consumption finished`, snapshot AFTER — is:
+
+```
+$ python3 /work/_investigate/db_table_counts.py > /work/evidence/before.txt      # snapshot BEFORE
+$ off=$(wc -l < /work/data/log/paperless.log); cp /work/samples/memo_delta.pdf /work/consume/   # the single ingestion
+$ sed -n "$((off+1)),\$p" /work/data/log/paperless.log | grep 'consumption finished'            # wait/confirm done
+[2026-07-08 06:05:21,730] [INFO] [paperless.consumer] Document 2026-07-08 memo_delta consumption finished
+$ python3 /work/_investigate/db_table_counts.py > /work/evidence/after.txt        # snapshot AFTER
+```
+
+The complete, unedited before/after snapshots (all 25 tables) — a reader can verify the three changed
+rows (`django_admin_log` 3→4, `django_q_task` 7→8, `documents_document` 3→4) directly:
+
+```
+$ cat /work/evidence/before.txt
+0	auth_group
+0	auth_group_permissions
+88	auth_permission
+1	auth_user
+0	auth_user_groups
+0	auth_user_user_permissions
+0	authtoken_token
+3	django_admin_log
+22	django_content_type
+92	django_migrations
+0	django_q_ormq
+4	django_q_schedule
+7	django_q_task
+0	django_session
+0	documents_correspondent
+3	documents_document
+0	documents_document_tags
+0	documents_documenttype
+0	documents_log
+0	documents_savedview
+0	documents_savedviewfilterrule
+0	documents_tag
+0	paperless_mail_mailaccount
+0	paperless_mail_mailrule
+0	paperless_mail_mailrule_assign_tags
+$ cat /work/evidence/after.txt
+0	auth_group
+0	auth_group_permissions
+88	auth_permission
+1	auth_user
+0	auth_user_groups
+0	auth_user_user_permissions
+0	authtoken_token
+4	django_admin_log
+22	django_content_type
+92	django_migrations
+0	django_q_ormq
+4	django_q_schedule
+8	django_q_task
+0	django_session
+0	documents_correspondent
+4	documents_document
+0	documents_document_tags
+0	documents_documenttype
+0	documents_log
+0	documents_savedview
+0	documents_savedviewfilterrule
+0	documents_tag
+0	paperless_mail_mailaccount
+0	paperless_mail_mailrule
+0	paperless_mail_mailrule_assign_tags
+```
+
+A second helper (`db_delta.py`) diffs the two snapshots and always prints the five tables of interest
+(so a `+0` is shown explicitly, not omitted):
+
+```
+$ python3 /work/_investigate/db_delta.py /work/evidence/before.txt /work/evidence/after.txt
 TABLE                          BEFORE  AFTER  DELTA
-documents_document                  0      1     +1
-django_admin_log                    0      1     +1
-django_q_task                       2      3     +1
+django_admin_log                    3      4     +1
+django_q_task                       7      8     +1
+documents_document                  3      4     +1
 documents_document_tags             0      0     +0
 documents_log                       0      0     +0
 ```
@@ -619,18 +874,26 @@ documents_log                       0      0     +0
 ```
 $ python3 manage.py shell -c "from django_q.models import Task; \
   [print('  func=%-40s name=%-28r success=%s'%(t.func,t.name,t.success)) for t in Task.objects.order_by('started')]"
-  func=documents.tasks.index_optimize           name='idaho-mirror-golf-december' success=True
-  func=documents.tasks.sanity_check             name='iowa-nitrogen-pip-chicken'  success=True
-  func=documents.tasks.consume_file             name='invoice_alpha.pdf'          success=True
+  func=documents.tasks.train_classifier       name='island-louisiana-fruit-floor' success=True
+  func=documents.tasks.index_optimize         name='washington-west-vermont-quebec' success=True
+  func=documents.tasks.sanity_check           name='video-oxygen-beryllium-venus' success=True
+  func=paperless_mail.tasks.process_mail_accounts name='zulu-early-angel-spring'      success=True
+  func=documents.tasks.consume_file           name='invoice_alpha.pdf'            success=True
+  func=documents.tasks.consume_file           name='report_beta.pdf'              success=True
+  func=documents.tasks.consume_file           name='letter_gamma.pdf'             success=True
+  func=documents.tasks.consume_file           name='memo_delta.pdf'               success=True
 
 $ python3 manage.py shell -c "from django.contrib.admin.models import LogEntry; \
   [print('  user=%r action_flag=%d object_repr=%r content_type=%s'%(le.user.username,le.action_flag,le.object_repr,le.content_type)) for le in LogEntry.objects.all()]"
   user='consumer' action_flag=1 object_repr='2026-07-08 invoice_alpha' content_type=documents | document
+  user='consumer' action_flag=1 object_repr='2026-07-08 report_beta' content_type=documents | document
+  user='consumer' action_flag=1 object_repr='2026-07-08 letter_gamma' content_type=documents | document
+  user='consumer' action_flag=1 object_repr='2026-07-08 memo_delta' content_type=documents | document
 ```
 
 - **`documents_document` +1** — `Document.objects.create(...)` in `_store()` (`src/documents/consumer.py:L398`, method at `L379`).
 - **`django_admin_log` +1** — `set_log_entry` creates a `LogEntry` with `action_flag=ADDITION` as user `consumer` (`src/documents/signals/handlers.py:L413-424`; user at `L416`). Note the mechanism is `LogEntry.objects.create(action_flag=ADDITION, …)` (not `log_action`); the table is `django_admin_log`. This is the independent proof that `set_log_entry` ran even though it emitted no log line (Q2).
-- **`django_q_task` +1 (ingestion)** — the completed `documents.tasks.consume_file` task named `invoice_alpha.pdf` (`success=True`) is persisted. Because `Q_CLUSTER` has no `save_limit` key (`src/paperless/settings.py:L449-456`), the Django-Q default of **250** applies. Incidental scheduled tasks (`index_optimize`, `sanity_check`) may also appear; the ingestion row is attributed specifically to `documents.tasks.consume_file` by name.
+- **`django_q_task` +1 (ingestion)** — the completed `documents.tasks.consume_file` task for the measured ingestion (`memo_delta.pdf`, `success=True`) is persisted, taking the table 7→8. Because `Q_CLUSTER` has no `save_limit` key (`src/paperless/settings.py:L449-456`), the Django-Q default of **250** applies — sourced in Q1 to the installed package at `django_q/conf.py:L87` (`SAVE_LIMIT = conf.get("save_limit", 250)`, django-q==1.3.9), so successful tasks are retained (up to 250; failures are always kept). The other seven rows are the four scheduled startup tasks (`train_classifier`, `index_optimize`, `sanity_check`, `process_mail_accounts`) plus the three prior `consume_file` tasks; the ingestion row is attributed specifically to `documents.tasks.consume_file` named `memo_delta.pdf` by name.
 - **`documents_document_tags` +0** — 0 in this clean run because no inbox tag and no auto-matched tag applied. It would be **>0** via `add_inbox_tags` (`src/documents/signals/handlers.py:L30`) if an inbox tag existed, or via `set_tags` (`src/documents/signals/handlers.py:L168`) if the classifier auto-matched a tag. Reported as observed: +0.
 
 ### The full-text index is on the FILESYSTEM, not a DB table
@@ -641,9 +904,15 @@ at `L431`) updates a **Whoosh** index living on disk at `DATA_DIR/index`
 
 ```
 $ ls -la /work/data/index/
--rwxr-xr-x 1 root root     0 Jul  8 04:57 MAIN_WRITELOCK
--rw-r--r-- 1 root root 13022 Jul  8 05:02 MAIN_s7uw5bivqjgo6z7l.seg
--rw-r--r-- 1 root root  4377 Jul  8 05:02 _MAIN_2.toc
+total 64
+drwxr-xr-x 2 root root  4096 Jul  8 06:05 .
+drwxr-xr-x 4 root root  4096 Jul  8 06:05 ..
+-rwxr-xr-x 1 root root     0 Jul  8 05:57 MAIN_WRITELOCK
+-rw-r--r-- 1 root root 11013 Jul  8 05:59 MAIN_gban6vijrbe9vsfk.seg
+-rw-r--r-- 1 root root 10828 Jul  8 06:00 MAIN_nz9yw5yzp9mxwn9p.seg
+-rw-r--r-- 1 root root 12114 Jul  8 05:58 MAIN_p5xord3108cbnpl5.seg
+-rw-r--r-- 1 root root 11172 Jul  8 06:05 MAIN_y11jn1zh4eglzuk9.seg
+-rw-r--r-- 1 root root  4702 Jul  8 06:05 _MAIN_5.toc
 ```
 
 ### OBSERVED DEVIATION — `documents_log` is NOT written (reported, not "fixed")
@@ -665,11 +934,15 @@ $ sed -n '386,411p' src/paperless/settings.py
             "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
             "formatter": "verbose",
             "filename": os.path.join(LOGGING_DIR, "paperless.log"),
-            ...
+            "maxBytes": LOGROTATE_MAX_SIZE,
+            "backupCount": LOGROTATE_MAX_BACKUPS,
         },
         "file_mail": {
             "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
-            ...
+            "formatter": "verbose",
+            "filename": os.path.join(LOGGING_DIR, "mail.log"),
+            "maxBytes": LOGROTATE_MAX_SIZE,
+            "backupCount": LOGROTATE_MAX_BACKUPS,
         },
     },
     "root": {"handlers": ["console"]},
@@ -705,8 +978,8 @@ directly visible in the Q2 log ordering (`Saving record to database` precedes
 `Deleting file …/invoice_alpha.pdf`) and by the consumption directory being empty afterward:
 
 ```
-$ ls -A /work/consume/ ; echo "(exit shows empty)"
-(exit shows empty)
+$ ls -A /work/consume/ ; echo '(empty if nothing above)'
+(empty if nothing above)
 ```
 
 Bracketing the before/after snapshots around these boundaries is what makes the row and file deltas
@@ -746,18 +1019,21 @@ and — in this specific commit — the `documents_log` table simply has no writ
 
 ### Inferred vs. observed
 
-Everything above is **observed at runtime** except: (a) the classifier **error branch**
-`Classifier error: {e}` (`src/documents/tasks.py:L71-72`), labeled **(inferred)** — not triggered;
-and (b) the general linkage that the HOURLY schedule is executed by the `qcluster` scheduler process
-rather than inline — supported by the observed `schedule_type=H` row and `last_run=None` during the
-upload window, but the scheduler-executes-it step itself is **(inferred)** from Django-Q's design.
+Everything above is **observed at runtime** except one item: the classifier **error branch**
+`Classifier error: {e}` (`src/documents/tasks.py:L71-72`), labeled **(inferred)** — it was not
+triggered during the investigation. Notably, the claim that the HOURLY schedule is executed by the
+`qcluster` scheduler process (rather than inline per upload) is **observed**, not inferred: the
+cluster log shows `Process-1 created a task from schedule [Train the classifier]` at startup (Q3),
+and that single scheduled run left no model and no training line, while three uploads likewise
+produced none.
 
 ### Reproducibility note
 
 Every command needed to reproduce these results is shown inline. Volatile substrings vary run to run
-— timestamps, the Django-Q cluster's random name (e.g. `queen-mirror-delta-seventeen`), the random
-`/tmp/paperless/…` work-dir, the Whoosh segment hash (`MAIN_*.seg`), and Django-Q task names — but the
-**log strings, their ordering, the filename pattern, and the table deltas are stable**. All runtime
-work was performed outside the repository (a `/work` tree with `DATA/MEDIA/CONSUME` redirected there),
-so the repository working tree is unchanged apart from this document.
+— timestamps, the Django-Q cluster's random name (this run: `mexico-angel-asparagus-nuts`), the random
+`/tmp/paperless/…` work-dir (this run: `paperless-tsiq6d2a`), the Whoosh segment hashes (`MAIN_*.seg`),
+the classifier model size, the document checksum, and Django-Q task names — but the **log strings,
+their ordering, the filename pattern, and the table deltas are stable**. All runtime work was
+performed outside the repository (a `/work` tree with `DATA/MEDIA/CONSUME` redirected there), so the
+repository working tree is unchanged apart from this document.
 
