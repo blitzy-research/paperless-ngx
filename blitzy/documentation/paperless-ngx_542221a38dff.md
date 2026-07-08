@@ -336,7 +336,7 @@ $ docker exec -u testuser -w /app/src pngx-qna-fix python3 manage.py document_sa
 [2026-07-08 05:11:11,106] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
 ```
 
-Cause→effect: the missing thumbnail and missing original each append an ERROR (`sanity_checker.py:64,77`); the empty `content` field appends an INFO (`:128`); the extra file that does not belong to any document is reported as a WARNING (`:131`). Because `has_error()` is `True`, in the scheduled path `sanity_check()` would `raise SanityCheckFailedException` (`tasks.py:260`) — which is exactly how a sanity failure becomes a recorded Django-Q _failure_ (see Q8). Step 4/Step 5 show the temporary document and orphan file were deleted afterward, restoring the database to zero issues, so no observation artifact remains.
+Cause→effect: the missing thumbnail and missing original each append an ERROR (`sanity_checker.py:64,77`); the empty `content` field appends an INFO (`:128`); the extra file that does not belong to any document is reported as a WARNING (`:131`). Because `has_error()` is `True`, the scheduled task `sanity_check()` raises `SanityCheckFailedException` (`tasks.py:260-261`) — **[inferred from source]**: the on-demand `document_sanity_checker` command used above only logs the messages and does **not** raise (its `handle()` calls `check_sanity()` + `log_messages()` with no `has_error()` check — `document_sanity_checker.py`), so the raise on the scheduled path is reasoned from the `sanity_check()` source rather than observed in this on-demand run. This is exactly how a sanity failure becomes a recorded Django-Q _failure_ (see Q8). Step 4/Step 5 show the temporary document and orphan file were deleted afterward, restoring the database to zero issues, so no observation artifact remains.
 
 ---
 
@@ -375,7 +375,14 @@ $ echo "exit code: $?"
 exit code: 0
 ```
 
-```
+```console
+$ python3 manage.py shell -c "
+from documents import index, tasks
+from django.conf import settings
+ix = index.open_index()
+print('Whoosh index opened:', ix, 'doc_count=', ix.doc_count())
+tasks.index_optimize()
+print('index_optimize() completed: writer.commit(optimize=True) executed on Whoosh index at', settings.INDEX_DIR)"
 Whoosh index opened: FileIndex(FileStorage('/app/src/../data/index'), 'MAIN') doc_count= 0
 index_optimize() completed: writer.commit(optimize=True) executed on Whoosh index at /app/src/../data/index
 ```
@@ -1052,4 +1059,4 @@ exit code: 0
 4. **No application-level alerting** — `grep -rniwE 'sentry|rollbar|slack|pagerduty|opsgenie|datadog|bugsnag|mail_admins|send_mail' src/ --include=*.py` exits 1 (zero matches; full evidence in Q8); failures surface only via logs and `Task.result`.
 5. **No per-schedule enable/disable setting** — `grep -rniE '(ENABLE|DISABLE).*(SANITY|CLASSIFIER|INDEX|OPTIMIZE|MAIL|SCHEDULE|TASK|TRAIN)' src/paperless/settings.py paperless.conf.example` exits 1 (zero matches; full evidence in Q11); control is coarse (worker env vars, `repeats=0` pause, `train_classifier` self-guard, `catch_up=False`).
 
-**Methodology notes:** all interval/behavioral values were obtained from the canonical `python3 manage.py qcluster` process executing the seeded `django_q_schedule` rows; intervals were confirmed stable across two sweeps within a ~3.5-minute window (observed poll cadence ~30 s). Django-Q 1.3.x internals (the `Task`/`Schedule`/`Success`/`Failure`/`OrmQ` models, `save_limit`=250 default, `repeats`/`catch_up`/`retry`/`timeout` semantics) were grounded against the official Django-Q documentation (django-q.readthedocs.io) and the `Koed00/django-q` source, and independently confirmed by runtime introspection of the installed `django-q==1.3.9`. All observation artifacts (temporary documents, tags, the classifier model file, orphan file, and the failing test task) were removed after capture; the source repository is left byte-for-byte unchanged, with this document as the only addition.
+**Methodology notes:** all interval/behavioral values were obtained from the canonical `python3 manage.py qcluster` process executing the seeded `django_q_schedule` rows; intervals were confirmed stable across two sweeps within a ~3.5-minute window (observed poll cadence ~30 s). Django-Q 1.3.x internals (the `Task`/`Schedule`/`Success`/`Failure`/`OrmQ` models, `save_limit`=250 default, `repeats`/`catch_up`/`retry`/`timeout` semantics) were grounded against the official Django-Q documentation (django-q.readthedocs.io) and the `Koed00/django-q` source, and independently confirmed by runtime introspection of the installed `django-q==1.3.9`. The observation artifacts that touched the filesystem — the temporary documents, tags, the classifier model file, and the orphan file — were explicitly deleted after capture (see the cleanup steps shown with command and output in Q3 and Q11). The runtime task-history rows — including the forced-failure task shown in Q8/Q10 — existed only inside the disposable observation container's SQLite database and Whoosh index under the gitignored `/data/` directory (`DATA_DIR` at `settings.py:66`; `/data/` at `.gitignore:83`), which was discarded when the container was removed; none of that runtime state was written to the repository. The source repository is left byte-for-byte unchanged, with this document as the only addition.
