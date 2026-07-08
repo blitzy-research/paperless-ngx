@@ -16,7 +16,7 @@ Every claim below is grounded in one or more of three evidence types, which are 
 | **🔵 CODE** | A `file:line` reference into the pinned source tree (or the installed Django REST Framework 3.13.1 wheel) that explains the mechanism. |
 | **🟠 WEB** | Corroboration from authoritative external documentation (Django REST Framework guide, paperless-ngx docs). See the [Web Corroboration appendix](#appendix-a--web-corroboration). |
 
-**Token redaction.** The API token minted for this investigation is a throwaway credential that has already been destroyed (see [Cleanup](#cleanup--repository-integrity)). It is shown **redacted** everywhere as `b91e…c7f7` (first 4 + last 4 hex characters of the 40-character key). It is never printed in full. For the same reason, no other 40-character token-like string appears anywhere in this document either: the illustrative Django REST Framework example key is shortened to `9944…ee4b`, and the deliberately-invalid key used in the Q9 edge case is shortened to `dead…beef`. The only full-length hex string kept in full is the 40-character **git commit hash** in the header, which is clearly labelled as such.
+**Token redaction.** The API token minted for this investigation is a throwaway credential that has already been destroyed (see [Cleanup](#cleanup--repository-integrity)). It is shown **redacted** everywhere as `b91e…c7f7` (first 4 + last 4 hex characters of the 40-character key). It is never printed in full. For the same reason, no other 40-character token-like string appears anywhere in this document either: the illustrative Django REST Framework example key is shortened to `9944…ee4b`, the deliberately-invalid key used in the Q9 edge case is shortened to `dead…beef`, and the second throwaway token — minted for the non-superuser used in the Q9 authorization re-verification — is shortened to `d3c1…c88a`. The only full-length hex string kept in full is the 40-character **git commit hash** in the header, which is clearly labelled as such.
 
 ---
 
@@ -220,7 +220,7 @@ The banner confirms the server bound to `http://127.0.0.1:8000/` using the `pape
 
 **Question.** Create a test user through a real management entry point.
 
-A **superuser** was created deliberately. The reason is a subtle DRF distinction that matters for Q4 vs Q9: a request that **authenticates successfully but lacks object/model permission** returns **HTTP 403** (`{"detail":"You do not have permission to perform this action."}`), which is a *different* case from the unauthenticated **401** we report in Q9. Using a superuser guarantees the authenticated path in Q4 is a clean **200**, keeping the only 4xx we report the genuine unauthenticated 401. (This exact real-world gotcha — a non-superuser getting a 403 on `/api/documents/` and fixing it by upgrading to superuser — is documented in the paperless-ngx community; see 🟠 [WEB-4](#appendix-a--web-corroboration).)
+A **superuser** was created because it is the simplest, standard way to obtain a fully-privileged principal for the whole investigation. It is worth being precise about what that choice does and does **not** affect, because Django REST Framework distinguishes two rejection cases: an *unauthenticated* request → **HTTP 401** (Q9), versus an *authenticated-but-unauthorized* request → **HTTP 403** (`{"detail":"You do not have permission to perform this action."}`). The 403 case is a genuine DRF possibility in general (🟠 [WEB-3](#appendix-a--web-corroboration)), **but it does not arise for `/api/documents/` at the pinned v1.7.0 under test.** The endpoint's only permission gate is `permission_classes = (IsAuthenticated,)` (🔵 `src/documents/views.py:L183`), its `get_queryset` returns `Document.objects.distinct()` with no owner/permission filtering (🔵 `src/documents/views.py:L198-L199`), and `REST_FRAMEWORK` declares **no** `DEFAULT_PERMISSION_CLASSES` (🔵 `src/paperless/settings.py:L116-L127`). Consequently **any** authenticated user — superuser or not — receives **200**; this was reproduced live in [Q9](#q9--unauthenticated-response-exact-status-code-and-error-body) with a genuine non-superuser holding a valid token. The object-level permission system that would deny a *limited* user (yielding 403 / owner-filtered results) was introduced in paperless **2.x** (🟠 [WEB-4](#appendix-a--web-corroboration)), not in the pinned 1.7.0. The superuser is therefore a **convenience, not a requirement** for the clean Q4 200.
 
 ### Exact command used
 
@@ -579,7 +579,35 @@ Cross-Origin-Opener-Policy: same-origin
 
 **Cause → effect for the edge cases.** In case (a), `TokenAuthentication.authenticate_credentials()` fails the DB lookup `model.objects.select_related('user').get(key=key)` (🔵 `rest_framework/authentication.py:L201`) and raises `AuthenticationFailed('Invalid token.')` (🔵 `L203`). In case (b), `authenticate()` finds the header has only one part (`if len(auth) == 1:`) and raises the "Invalid token header. No credentials provided." error (🔵 `L183`-`L185`). Note that in **both** cases the `WWW-Authenticate` header is still `Basic realm="api"` — **not** `Token` — because, per the rule in step 2, the *first* authenticator (`BasicAuthentication`) always sets the challenge, regardless of which authenticator raised the failure.
 
-> **Distinction from 403.** Had we used a *non-superuser* with a valid token, the request would have **authenticated** but could be **denied permission**, yielding **403** `{"detail":"You do not have permission to perform this action."}` — a genuinely different case (🟠 [WEB-3](#appendix-a--web-corroboration), [WEB-4](#appendix-a--web-corroboration)). Using a superuser (Q2) kept Q4 a clean 200 and this Q9 the only 4xx, avoiding that confusion.
+> **Distinction from 403 (verified at the pinned v1.7.0).** The 401 above is the *unauthenticated* case. Django REST Framework separates it from a second, genuinely different case — an *authenticated-but-unauthorized* request, which yields **403** `{"detail":"You do not have permission to perform this action."}` (🟠 [WEB-3](#appendix-a--web-corroboration)). It is tempting to assume a *non-superuser* would hit that 403 on `/api/documents/` — but rather than assume, the exact scenario was **reproduced live** with a genuine non-superuser (`is_staff=False`, `is_superuser=False`) holding a valid 40-hex token.
+
+### 🟢 OBSERVED — a non-superuser with a valid token still gets HTTP 200 (not 403)
+
+```bash
+# A non-superuser was created (is_staff=False, is_superuser=False, is_active=True) and given a
+# token via Token.objects.get_or_create(user=…) — a valid 40-hex key (redacted d3c1…c88a).
+curl -i -H "Authorization: Token d3c1…c88a" http://127.0.0.1:8000/api/documents/
+```
+```http
+HTTP/1.1 200 OK
+Date: Wed, 08 Jul 2026 06:16:54 GMT
+Server: WSGIServer/0.2 CPython/3.9.25
+Content-Type: application/json
+Vary: Accept, Accept-Language, Origin, Cookie
+Allow: GET, HEAD, OPTIONS
+X-Frame-Options: SAMEORIGIN
+X-Api-Version: 2
+X-Version: 1.7.0
+Content-Length: 52
+Content-Language: en-us
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin
+
+{"count":0,"next":null,"previous":null,"results":[]}
+```
+
+**Cause → effect.** `/api/documents/` binds to `UnifiedSearchViewSet` (🔵 `src/documents/views.py:L377`), which subclasses `DocumentViewSet` (🔵 `src/documents/views.py:L172`). Its **only** permission gate is `permission_classes = (IsAuthenticated,)` (🔵 `src/documents/views.py:L183`); `get_queryset` returns `Document.objects.distinct()` with no owner/permission filtering (🔵 `src/documents/views.py:L198-L199`); and `REST_FRAMEWORK` declares **no** `DEFAULT_PERMISSION_CLASSES` (🔵 `src/paperless/settings.py:L116-L127`). A valid token authenticates the request, so `IsAuthenticated` passes **regardless of the user's privilege level** — hence the non-superuser also receives **200**, not 403. (The empty envelope simply reflects that this focused re-verification ran against a fresh, document-free database; the load-bearing fact is the **200** status, which is governed by authentication/authorization and is independent of how many documents exist.) The object-level permission system that *would* deny a limited user (returning 403 or owner-filtered results) was introduced in paperless **2.x** (🟠 [WEB-4](#appendix-a--web-corroboration)); it does not exist in the pinned 1.7.0. Using a superuser in Q2 was therefore a **convenience, not a requirement** — the only 4xx in this whole investigation remains the genuine unauthenticated **401** shown above.
 
 ---
 
@@ -701,7 +729,7 @@ The following authoritative sources corroborate the observed behavior. Quotation
 - **WEB-1 — DRF token header format.** Django REST Framework, *Authentication* guide — `https://www.django-rest-framework.org/api-guide/authentication/`. The token key is sent in the `Authorization` header prefixed by the literal string "Token" with whitespace, e.g. `Authorization: Token 9944…ee4b`. To enable it you configure `TokenAuthentication`, add `rest_framework.authtoken` to `INSTALLED_APPS`, and run `manage.py migrate`.
 - **WEB-2 — DRF `Token` model.** Same guide + DRF source `https://github.com/encode/django-rest-framework/blob/main/rest_framework/authentication.py`. Tokens are the `rest_framework.authtoken.models.Token` model; `migrate` creates the `authtoken_token` table.
 - **WEB-3 — DRF 401-vs-403 rule.** Same guide. HTTP 401 responses must include a `WWW-Authenticate` header while 403 responses do not; "The first authentication class set on the view is used when determining the type of response." A request that authenticates but is denied permission always yields 403.
-- **WEB-4 — paperless-ngx API conventions.** paperless-ngx docs `https://docs.paperless-ngx.com/api/` + in-repo `docs/api.rst`. "POST a username and password … to /api/token/ and paperless will respond with a token"; the token is then supplied via an HTTP header; list endpoints use the `{count, next, previous, results}` envelope and full-text search is available on `/api/documents/`. Community discussion `https://github.com/paperless-ngx/paperless-ngx/discussions/3865` confirms the superuser nuance: a limited user receives `{"detail":"You do not have permission to perform this action."}` on `/api/documents/`, resolved by upgrading the account to superuser.
+- **WEB-4 — paperless-ngx API conventions.** paperless-ngx docs `https://docs.paperless-ngx.com/api/` + in-repo `docs/api.rst`. "POST a username and password … to /api/token/ and paperless will respond with a token"; the token is then supplied via an HTTP header; list endpoints use the `{count, next, previous, results}` envelope and full-text search is available on `/api/documents/`. Community discussion `https://github.com/paperless-ngx/paperless-ngx/discussions/3865` describes the **object-level permission behavior of paperless 2.x**, where a *limited* user can receive `{"detail":"You do not have permission to perform this action."}` and is resolved by upgrading the account. **That is a 2.x behavior and does not apply to the pinned v1.7.0 under test**, where `/api/documents/` is gated only by `IsAuthenticated` (🔵 `src/documents/views.py:L183`) with no object-level permission system, so any authenticated user — superuser or not — receives **200** (reproduced live in [Q9](#q9--unauthenticated-response-exact-status-code-and-error-body)).
 
 ---
 
