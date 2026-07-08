@@ -17,7 +17,7 @@ $ docker run -d --name pl paperless-ngx-ready:latest -c "sleep infinity"
 $ docker exec pl /usr/local/bin/start-paperless.sh
 ```
 
-**Complete output of `start-paperless.sh`** (starts redis, applies migrations idempotently, launches the three supervised processes, checks the API):
+**Complete output of `start-paperless.sh`** (starts redis, applies migrations idempotently, launches the three supervised processes, checks the API). The process list is the raw, unfiltered output of the launcher's `ps -eo pid,user,cmd | grep -E "manage.py (qcluster|document_consumer)|gunicorn.*paperless.asgi|redis-server"` line, reproduced here in full with no rows elided:
 
 ```
 Starting redis-server...
@@ -30,11 +30,28 @@ Stack started. Processes:
      17 root     redis-server *:6379
      42 testuser python3 manage.py qcluster
      45 testuser python3 manage.py document_consumer
-     48 testuser gunicorn -c /app/gunicorn.conf.py paperless.asgi:application (+ workers 51,52)
-     ... 11 qcluster workers ...
+     48 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+     51 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+     52 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+     76 testuser python3 manage.py qcluster
+     77 testuser python3 manage.py qcluster
+     78 testuser python3 manage.py qcluster
+     79 testuser python3 manage.py qcluster
+     80 testuser python3 manage.py qcluster
+     81 testuser python3 manage.py qcluster
+     82 testuser python3 manage.py qcluster
+     83 testuser python3 manage.py qcluster
+     84 testuser python3 manage.py qcluster
+     85 testuser python3 manage.py qcluster
+     86 testuser python3 manage.py qcluster
+     87 testuser python3 manage.py qcluster
+     88 testuser python3 manage.py qcluster
+     89 testuser python3 manage.py qcluster
 API check:
 200
 ```
+
+Every process row is shown unedited: one `redis-server` (PID 17); **15** `python3 manage.py qcluster` rows — the cluster process launched at startup (PID 42) plus its 14 forked child processes (PIDs 76–89); one `document_consumer` (PID 45); and **3** `gunicorn` rows — the master (PID 48) plus its 2 workers (PIDs 51, 52). These counts reflect the shipped defaults: the Django-Q cluster runs `PAPERLESS_TASK_WORKERS = floor(√128) = 11` worker processes on this 128-core host (`default_task_workers()`, `src/paperless/settings.py:L427-L435`) in addition to its own internal management children, and gunicorn runs `PAPERLESS_WEBSERVER_WORKERS = 2` workers (`/app/gunicorn.conf.py`). Run-specific PIDs differ between runs; the process set and counts were byte-stable across repeated fresh launches.
 
 **Runtime confirmed:**
 
@@ -342,7 +359,7 @@ This is `load_classifier` (`src/documents/classifier.py:L30`) returning `None` b
 
 ### Indexing (answered by name)
 
-Indexing is the last handler in the fan-out: `add_to_index` (`src/documents/signals/handlers.py:L428-L430`) calls `index.add_or_update_document` (`src/documents/index.py:L118-L120`) → `update_document` (`src/documents/index.py:L87-L107`), which writes the Whoosh schema fields defined in `get_schema` (`src/documents/index.py:L31-L49`). Indexing itself emits **no** log line (verified — there is no `paperless.index` message in the timeline); its observable evidence is the resulting index entry, shown under Q4.
+Indexing is the last handler in the fan-out: `add_to_index` (`src/documents/signals/handlers.py:L428-L431`) calls `index.add_or_update_document` (`src/documents/index.py:L118-L120`) → `update_document` (`src/documents/index.py:L87-L107`), which writes the Whoosh schema fields defined in `get_schema` (`src/documents/index.py:L31-L49`). Indexing itself emits **no** log line (verified — there is no `paperless.index` message in the timeline); its observable evidence is the resulting index entry, shown under Q4.
 
 ### Fan-out order (state change ordering)
 
@@ -1027,7 +1044,7 @@ The FAILED-frame `message` differs by cause: `document_already_exists` (duplicat
 
 ## Methodology notes, labels, and coverage pass
 
-**Labels used above.** For the email entry point the **real paperless IMAP client transport** was exercised end-to-end (`get_mailbox().login().fetch()` over a live TCP socket, with genuine `SELECT`/`SEARCH (UNSEEN)`/`FETCH`), labelled **[local mail server — real transport]** in Q1; only the mail *server* was a local minimal RFC3501 server. Two statements are labelled **[inferred]**: (i) that a parser returning a date would skip the `parse_date(90)` frame (not reproducible with the tesseract parser, which never sets a date); and (ii) that a trained `classification_model.pickle` would additionally run the ML predict path (the default fresh stack has no model). Everything else is directly observed.
+**Labels used above.** For the email entry point the **real paperless IMAP client transport** was exercised end-to-end (`get_mailbox().login().fetch()` over a live TCP socket, with genuine `SELECT`/`SEARCH (UNSEEN)`/`FETCH`), labelled **[local mail server — real transport]** in Q1; only the mail *server* was a local minimal RFC3501 server. Three statements carry an inference label: (i) that a parser returning a date would skip the `parse_date(90)` frame — **[inferred]** (not reproducible with the tesseract parser, which never sets a date; see Q3); (ii) that a trained `classification_model.pickle` would additionally run the ML predict path — **[inferred]** (the default fresh stack has no model; see Q2); and (iii) that the system does not track when a document "needs further work" — **[inferred from observed absence]** (see Q5), grounded in the observed absence of any per-document status column and the absence of a `Document` row after a failed run. Everything else is directly observed.
 
 **Stability.** The progress checkpoint set `{0,20,70,90,95,100}` and the six-frame success shape were stable across **six** independent successful runs (EP1/EP2/Q2/Q3-image-OCR/Q4-state/EP3-email); no run-to-run variation in the emitted values was observed.
 
