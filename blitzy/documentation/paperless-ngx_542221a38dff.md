@@ -40,7 +40,7 @@ Answers by name:
 
 **Which path actually manifests it (nuance):** the instability is *latent* in both list paths, but the two paths behave differently at runtime:
 
-- **Database path** (structured filters, default browse): the `ORDER BY -created` has no tiebreaker, but PostgreSQL's `SELECT DISTINCT` on the full row *accidentally* rescues stability in the simplest plan by folding the unique `id` into the sort key. That rescue is **fragile**: adding a many‑to‑many filter (a "common filter") exposes a second, equally valid `HashAggregate` plan whose `ORDER BY` sort keeps only `created` (no `id`). The planner can even choose *different* plans for *different pages of the same list*, so — as proven in §6.3 — the real endpoint returns docs 6, 7, 8 on **both** page 1 and page 4 while docs 15, 16, 17 vanish, all with `count` constant and no re‑sorting.
+- **Database path** (structured filters, default browse): the `ORDER BY -created` has no tiebreaker, but PostgreSQL's `SELECT DISTINCT` on the full row *accidentally* rescues stability in the simplest plan by folding the unique `id` into the sort key. That rescue is **fragile**: adding a many‑to‑many filter (a "common filter") exposes a second, equally valid `HashAggregate` plan whose `ORDER BY` sort keeps only `created` (no `id`). The planner can even choose *different* plans for *different pages of the same list*, so — as proven in §6.3 — the real endpoint returns doc 14 on **both** page 3 and the neighbouring page 4 while doc 16 vanishes, all with `count` constant and no re‑sorting.
 - **Whoosh full‑text path** (`?query=`): there is **no rescue at all**. Results tie on relevance score, the sort map has no `id` key, and `?ordering=id` is silently ignored. A single ordinary background re‑index (which fires on every document consumption) deterministically reshuffles the tied block, reproducing both the duplicate and the skip.
 
 The remainder of this document proves each of these with captured output.
@@ -49,7 +49,7 @@ The remainder of this document proves each of these with captured output.
 
 ## 3. Environment & exact build/invocation commands (canonical)
 
-The system was run in its default, canonical configuration inside the provided image (`ghcr.io/scaleapi/swe-atlas:…paperless-ngx…qna_1.01`), which bakes the repository at `/app` on Python 3.9 with a **PostgreSQL** backing store (the backend on which non‑deterministic tie ordering manifests). Docker‑in‑Docker containers: `paperless-app` (app), `paperless-db` (postgres:13), `paperless-broker` (redis:6.0) on network `paperless-net`; the app publishes `0.0.0.0:8000`.
+The system was run in its default, canonical configuration inside the provided image (`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01`), which bakes the repository at `/app` on Python 3.9 with a **PostgreSQL** backing store (the backend on which non‑deterministic tie ordering manifests). Docker‑in‑Docker containers: `paperless-app` (app), `paperless-db` (postgres:13), `paperless-broker` (redis:6.0) on network `paperless-net`; the app publishes `0.0.0.0:8000`.
 
 **Interpreter and dependency versions**
 
@@ -92,14 +92,19 @@ $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py migrate &
 
 # migrations already applied:
 $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py migrate --check'
+Operations to perform:
+  Apply all migrations: admin, auth, authtoken, contenttypes, django_q, documents, paperless_mail, sessions
 Running migrations:
   No migrations to apply.
 
-# server process actually running:
-PID 4048: python3 manage.py runserver 0.0.0.0:8000 --noreload --insecure
+# server process actually running (exact command + unedited output):
+$ docker top paperless-app -eo pid,cmd
+PID                 CMD
+12115               sleep infinity
+23775               python3 manage.py runserver 0.0.0.0:8000 --noreload --insecure
 ```
 
-The API was driven from the host with `curl` against the mapped port `http://localhost:8000` (the `paperless-app` image ships without `curl`, so requests were issued from the host, which is equivalent — the port is published). Authentication used the two throwaway local users provided by the canonical image: `admin` (superuser) and `viewer` (non‑admin), via Basic auth (`-u admin:admin123` / `-u viewer:viewer123`) or their DRF tokens (abbreviated below as `2fd38fc8…` / `0e772509…`; these are disposable local‑only tokens, redacted to 8 chars). DRF enables Basic, Session, and Token authentication (`src/paperless/settings.py:117-121`).
+The API was driven from the host with `curl` against the mapped port `http://localhost:8000` (the `paperless-app` image ships without `curl`, so requests were issued from the host, which is equivalent — the port is published). Authentication used the two throwaway local users provided by the canonical image: `admin` (superuser) and `viewer` (non‑admin), via ordinary Basic auth (`-u admin:admin123` / `-u viewer:viewer123`); every command in this document uses Basic auth so each is runnable as-is. DRF enables Basic, Session, and Token authentication (`src/paperless/settings.py:117-121`).
 
 ### 3.1 Seeding the tie condition (the crux)
 
@@ -340,20 +345,20 @@ print(\"  plan:\", \" / \".join(p[:3]))
 SQL matches API path (two INNER JOINs): True
 enable_hashagg=OFF order: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
   plan: Unique / ->  Sort / Sort Key: documents_document.created DESC, documents_document.id, documents_document.correspondent_id, documents_document.title, documents_document.document_type_id, documents_document.content, documents_document.mime_type, documents_document.checksum, documents_document.archive_checksum, documents_document.modified, documents_document.storage_type, documents_document.added, documents_document.filename, documents_document.archive_filename, documents_document.archive_serial_number
-enable_hashagg=ON  order: [12, 11, 9, 17, 10, 13, 14, 16, 15, 8, 6, 7]
+enable_hashagg=ON  order: [12, 11, 10, 9, 7, 13, 8, 6, 16, 17, 15, 14]
   plan: Sort / Sort Key: documents_document.created DESC / ->  HashAggregate
 ```
 
 Cause → effect, read directly off the two plans:
 - `enable_hashagg=OFF` → `Unique → Sort` with `Sort Key: created DESC, id, …` → the unique `id` makes it a **total** order → `[6,7,8,…,17]`.
-- `enable_hashagg=ON` → `Sort (Sort Key: created DESC only) → HashAggregate` → the `HashAggregate` does the de‑duplication and the top `Sort` orders by `created` **only**, so the 12 tied rows emerge in hash‑bucket order → `[12,11,9,17,10,13,14,16,15,8,6,7]`.
+- `enable_hashagg=ON` → `Sort (Sort Key: created DESC only) → HashAggregate` → the `HashAggregate` does the de‑duplication and the top `Sort` orders by `created` **only**, so the 12 tied rows emerge in hash‑bucket order → `[12,11,10,9,7,13,8,6,16,17,15,14]`.
 
 Both are correct answers to the same SQL; which one runs is a **cost decision** that shifts with table statistics (autovacuum/`ANALYZE`), row counts, PostgreSQL version, and config. The default plan on this data is the `HashAggregate` one — so the real endpoint returns the scrambled order:
 
 ```text
 $ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=true&page_size=100&fields=id" \
   | python3 -c "import sys,json;print([r['id'] for r in json.load(sys.stdin)['results']])"
-[12, 11, 9, 17, 10, 13, 14, 16, 15, 8, 6, 7]
+[12, 11, 10, 9, 7, 13, 8, 6, 16, 17, 15, 14]
 ```
 
 ### 6.3 The haunting itself: different pages of one list, different plans (the smoking gun)
@@ -366,12 +371,12 @@ $ for run in 1 2 3; do echo -n "run$run: "; \
       curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=true&page=$p&page_size=3&fields=id" \
       | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; \
     done; echo; done
-run1: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [8, 6, 7]
-run2: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [8, 6, 7]
-run3: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [8, 6, 7]
+run1: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
+run2: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
+run3: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
 ```
 
-Read the union of the four pages: **docs 6, 7, 8 appear on page 1 _and again_ on page 4 (duplicates); docs 15, 16, 17 never appear at all (skips)** — while `count` is 12 the whole time and no `?ordering=` was ever sent. This is *precisely* "the same document twice across neighbouring pages" and "a document disappears for a page," in a single, unchanging snapshot of the data. `EXPLAIN`ing each page's exact query shows why — the pages are served by two different plans:
+Read the union of the four pages: **doc 14 appears on page 3 _and again_ on the very next page, page 4 — the same document on two neighbouring pages; and doc 16 never appears at all (a skip)** — while `count` is 12 the whole time and no `?ordering=` was ever sent. This is *precisely* the user's report: "the same document twice across neighbouring pages" (doc 14 on **adjacent** pages 3 and 4) and "a document disappears for a page" (doc 16 is gone from the browse), in a single, unchanging snapshot of the data. `EXPLAIN`ing each page's exact query shows why — the pages are served by two different plans:
 
 ```text
 $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py shell -c "
@@ -397,11 +402,11 @@ page 2 (OFFSET 3 LIMIT 3) -> ids [9, 10, 11] | DISTINCT via Sort+Unique
        Sort Key: documents_document.created DESC, documents_document.id, docu
 page 3 (OFFSET 6 LIMIT 3) -> ids [12, 13, 14] | DISTINCT via Sort+Unique
        Sort Key: documents_document.created DESC, documents_document.id, docu
-page 4 (OFFSET 9 LIMIT 3) -> ids [8, 6, 7] | DISTINCT via HashAggregate
+page 4 (OFFSET 9 LIMIT 3) -> ids [17, 15, 14] | DISTINCT via HashAggregate
        Sort Key: documents_document.created DESC
 ```
 
-Cause → effect: pages 1–3 (`OFFSET 0/3/6`) are planned as `Sort+Unique`, whose `Sort Key` includes the unique `id`, so they slice the `id`‑ordered total order `[6,7,8 | 9,10,11 | 12,13,14 | …]`. Page 4 (`OFFSET 9`) is planned as `HashAggregate`, whose top `Sort Key` is `created DESC` **only**, so it slices the *hash* order `[…,8,6,7]` — its tail is `[8,6,7]`. The two plans encode **two different orderings**, and the paginator stitches slices from both into one browse. The result is that `6,7,8` (front of the total order) collide with the tail of the hash order, and `15,16,17` (which the total order would place on page 4) are never emitted by either. No row was edited; the sort the user sees ("newest first") never changed; only the invisible tie order differed between two of the page queries — the definition of a "haunted" list.
+Cause → effect: pages 1–3 (`OFFSET 0/3/6`) are planned as `Sort+Unique`, whose `Sort Key` includes the unique `id`, so they slice the `id`‑ordered total order `[6,7,8 | 9,10,11 | 12,13,14 | …]`. Page 4 (`OFFSET 9`) is planned as `HashAggregate`, whose top `Sort Key` is `created DESC` **only**, so it slices the *hash* order `[12,11,10,9,7,13,8,6,16,17,15,14]` — its tail (positions 9–11) is `[17,15,14]`. The two plans encode **two different orderings**, and the paginator stitches slices from both into one browse. The result is that doc `14` — which the `id`‑ordered total order placed at the tail of page 3 (`[12,13,14]`) — reappears in the tail of the hash order on the *immediately following* page 4, so the user meets the same document twice on two neighbouring pages; meanwhile doc `16` (which the total order would place on page 4 as part of `[15,16,17]`) is emitted by neither plan and simply vanishes from the browse. No row was edited; the sort the user sees ("newest first") never changed; only the invisible tie order differed between two of the page queries — the definition of a "haunted" list.
 
 ### 6.4 Summary of H3
 
@@ -479,14 +484,39 @@ admin:admin123 -> count 12 ids [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
 viewer:viewer123 -> count 12 ids [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
 ```
 
-To prove *byte‑for‑byte* equality (not just the same ids), the full response bodies were hashed. Using Token auth (so the two requests differ only by identity), the SHA‑256 of the full JSON body is identical:
+The result *sets* being equal is necessary but not sufficient — the user's symptom is about the **unstable page walk**, so the identical `page_size=3` walk was run as both users on both paths. Every page is byte-identical between the two identities, so the duplicate/skip distribution is identical too — the haunting is in no way modulated by who is looking. On the **DB path** (the unstable H3 walk of §6.3), both users see doc 14 on neighbouring pages 3 and 4 and doc 16 skipped:
 
 ```text
-$ A=$(curl -s -H "Authorization: Token 2fd38fc8…" "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
-$ B=$(curl -s -H "Authorization: Token 0e772509…" "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
+$ for u in admin:admin123 viewer:viewer123; do echo -n "$u -> "; \
+    for p in 1 2 3 4; do \
+      curl -s -u "$u" "http://localhost:8000/api/documents/?is_in_inbox=true&page=$p&page_size=3&fields=id" \
+      | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; \
+    done; echo; done
+admin:admin123 -> p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
+viewer:viewer123 -> p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
+```
+
+On the **Whoosh path**, from a quiescent index, the per-page walk is likewise identical for both identities:
+
+```text
+$ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py document_index reindex --no-progress-bar'   # quiescent baseline; prints nothing
+$ for u in admin:admin123 viewer:viewer123; do echo -n "$u -> "; \
+    for p in 1 2 3 4; do \
+      curl -s -u "$u" "http://localhost:8000/api/documents/?query=haunted&page=$p&page_size=3&fields=id" \
+      | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; \
+    done; echo; done
+admin:admin123 -> p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
+viewer:viewer123 -> p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
+```
+
+To prove *byte-for-byte* equality (not just the same ids), the full response bodies were hashed. Both requests use ordinary Basic auth with the two local accounts, and a **total** order (`ordering=id`) so the body is deterministic and differs only by identity; the SHA-256 of the full JSON body is identical:
+
+```text
+$ A=$(curl -s -u admin:admin123  "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
+$ B=$(curl -s -u viewer:viewer123 "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
 $ echo "admin  $A"; echo "viewer $B"; [ "$A" = "$B" ] && echo "IDENTICAL" || echo "DIFFERENT"
-admin  70be2df25bf02da8ff1e966c845637d3ba99af8314131f59f8145b0bce215e8c
-viewer 70be2df25bf02da8ff1e966c845637d3ba99af8314131f59f8145b0bce215e8c
+admin  591e5eeeb75088f08b3cc01f0889ba41a479e548b293b649a8ca8c3326437a12
+viewer 591e5eeeb75088f08b3cc01f0889ba41a479e548b293b649a8ca8c3326437a12
 IDENTICAL
 ```
 
@@ -549,35 +579,111 @@ $ sed -n '165,190p' src/documents/index.py
 
 There is no `"id"` entry in that map. Each page is an independent `searcher.search_page(pagenum, pagelen, sortedby, reverse)` call (`src/documents/index.py:203-221`), so equal‑score ties order by internal Whoosh **docnum**, which changes whenever a document is re‑indexed.
 
-**`?ordering=id` is silently ignored on the search path** (proof): after touching one document (below), asking for `ordering=id` does *not* sort by id — doc 7 ends up last, not in id order:
+**Reproducing the haunting on the real search endpoint.** A normal document consumption re-indexes the touched document via `add_to_index` (`src/documents/signals/handlers.py:428-431` → `index.add_or_update_document`, `src/documents/index.py:118-120`), wired to `document_consumption_finished` (`src/documents/apps.py:27`). Whoosh's `update_document` is delete+append, so the touched doc gets a **new, higher docnum**, moving it to the **end** of the equal-score tie block. The throwaway re-index helper makes exactly the call the signal makes:
 
 ```text
+$ cat /tmp/touch_index.py
+import os
+from documents.models import Document
+from documents import index
+did = int(os.environ["TOUCH_ID"])
+d = Document.objects.get(id=did)
+# the EXACT call add_to_index makes on document_consumption_finished
+# (signals/handlers.py:428-431 -> index.add_or_update_document -> index.py:118-120)
+index.add_or_update_document(d)
+print("TOUCHED", d.id)
+```
+
+**(a) On a quiescent index the same request set is perfectly stable — 0 duplicates, 0 skips over repeated runs.** Rebuild the index, then walk pages 1→4 three times, unchanged:
+
+```text
+$ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py document_index reindex --no-progress-bar'   # rebuild index; prints nothing
+$ for run in 1 2 3; do echo -n "run$run: "; \
+    for p in 1 2 3 4; do \
+      curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=$p&page_size=3&fields=id" \
+      | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; \
+    done; echo; done
+run1: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
+run2: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
+run3: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
+```
+
+So the run-to-run inconsistency on this path is **not** produced by re-issuing the same request against an unchanged index (distribution there: **0 duplicates, 0 skips**); it is produced by the **ordinary background re-index** that fires on every consume. Each such event is itself deterministic — it moves exactly the touched doc to the tie-block end — so the resulting duplicate/skip is reproducible, as the next two demonstrations show (each is repeated to confirm the post-event state is itself stable).
+
+**(b) "The same document twice across neighbouring pages" — from ONE ordinary re-index.** The user views page 3, a background consume re-indexes one of the documents currently on page 3 (doc 14), then the user clicks *Next* to page 4:
+
+```text
+$ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=3&page_size=3&fields=id" \
+  | python3 -c "import sys,json;print('page3 =',[r['id'] for r in json.load(sys.stdin)['results']])"
+page3 = [12, 13, 14]
+
+$ docker exec -i -e TOUCH_ID=14 paperless-app bash -lc 'cd /app/src && python3 manage.py shell' < /tmp/touch_index.py
+TOUCHED 14
+
+$ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=4&page_size=3&fields=id" \
+  | python3 -c "import sys,json;print('page4 =',[r['id'] for r in json.load(sys.stdin)['results']])"
+page4 = [16, 17, 14]
+```
+
+Doc **14** was on **page 3** and, after one ordinary re-index, appears again on the **immediately following page 4** — the same document on two **neighbouring** pages. Walking all four pages afterwards (repeated 2× to show the new state is itself stable) also reveals the matching skip — doc 15 slid up into page 3, which the user already passed, so it is never seen in the forward browse:
+
+```text
+$ for run in 1 2; do echo -n "run$run: "; \
+    for p in 1 2 3 4; do \
+      curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=$p&page_size=3&fields=id" \
+      | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; \
+    done; echo; done
+run1: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 15]  p4 [16, 17, 14]
+run2: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 15]  p4 [16, 17, 14]
+```
+
+The faithful forward browse the user experienced is therefore `6,7,8 | 9,10,11 | 12,13,14 | 16,17,14`: doc **14** appears on adjacent pages 3 and 4 (**duplicate**), and doc **15** is never seen (**skip**) — `count` stays 12 and the "relevance" sort never changed.
+
+**(c) "A document disappears for a page and then comes back."** Poll a *single* page (page 3) while ordinary background consumption continues. Doc 12 starts on page 3, drops off after it is itself re-indexed, and rotates back onto page 3 as three further documents are consumed (each consume shifts the tie block by one position):
+
+```text
+$ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py document_index reindex --no-progress-bar'   # rebuild index; prints nothing
+
+# t0 — doc 12 is present on page 3:
+$ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=3&page_size=3&fields=id" \
+  | python3 -c "import sys,json;print('page3 =',[r['id'] for r in json.load(sys.stdin)['results']])"
+page3 = [12, 13, 14]
+
+# a background consume re-indexes doc 12 (exact add_to_index call):
+$ docker exec -i -e TOUCH_ID=12 paperless-app bash -lc 'cd /app/src && python3 manage.py shell' < /tmp/touch_index.py
+TOUCHED 12
+
+# t1 — doc 12 has DISAPPEARED from page 3:
+$ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=3&page_size=3&fields=id" \
+  | python3 -c "import sys,json;print('page3 =',[r['id'] for r in json.load(sys.stdin)['results']])"
+page3 = [13, 14, 15]
+
+# three further ordinary consumes re-index docs 6, 7, 8:
+$ for did in 6 7 8; do docker exec -i -e TOUCH_ID=$did paperless-app bash -lc 'cd /app/src && python3 manage.py shell' < /tmp/touch_index.py; done
+TOUCHED 6
+TOUCHED 7
+TOUCHED 8
+
+# t2 — doc 12 has COME BACK onto page 3:
+$ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=3&page_size=3&fields=id" \
+  | python3 -c "import sys,json;print('page3 =',[r['id'] for r in json.load(sys.stdin)['results']])"
+page3 = [16, 17, 12]
+```
+
+Doc **12** is on page 3 (t0), gone from page 3 (t1, right after it was re-indexed), and back on page 3 (t2, after further consumes rotate the tie block) — exactly "a document disappears for a page and then comes back," with `count` constant at 12 and the visible "relevance" sort unchanged throughout.
+
+**`?ordering=id` is silently ignored on the search path**, so the user cannot even opt into a stable order here. Rebuild the index, re-index doc 7, then ask for `ordering=id`: doc 7 ends up **last**, not in id order — the ordering param had no effect:
+
+```text
+$ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py document_index reindex --no-progress-bar'   # rebuild index; prints nothing
+$ docker exec -i -e TOUCH_ID=7 paperless-app bash -lc 'cd /app/src && python3 manage.py shell' < /tmp/touch_index.py
+TOUCHED 7
 $ for p in 1 2 3 4; do curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&ordering=id&page=$p&page_size=3&fields=id" \
     | python3 -c "import sys,json;print([r['id'] for r in json.load(sys.stdin)['results']],end=' ')"; done; echo
 [6, 8, 9] [10, 11, 12] [13, 14, 15] [16, 17, 7]
 ```
 
-(If `ordering=id` were honoured, page 4 would end `…16, 17` with 7 near the front; instead 7 is last — the ordering param had no effect.)
-
-**Reproducing the exact haunting from ONE ordinary re‑index.** A normal document consumption re‑indexes the touched document via `add_to_index` (`src/documents/signals/handlers.py:428-431` → `index.add_or_update_document`, `src/documents/index.py:118`), which is wired to `document_consumption_finished` (`src/documents/apps.py:27`). Whoosh's `update_document` is delete+append, so the touched doc gets a **new, higher docnum**, moving it to the end of the equal‑score tie block. A throwaway script performed exactly that one call for doc 7 (the same call the consumption signal makes). Before and after, paging the real search endpoint at `page_size=3`:
-
-```text
-# BEFORE (index fresh from reindex):
-p1 [6, 7, 8]   p2 [9, 10, 11]   p3 [12, 13, 14]   p4 [15, 16, 17]     count=12
-
-# perform the ordinary re-index of doc 7 (exact call add_to_index makes):
-$ docker exec -i paperless-app bash -lc 'cd /app/src && python3 manage.py shell' < /tmp/touch_index.py
-TOUCHED 7
-
-# AFTER (one document re-indexed, nothing edited in the DB):
-p1 [6, 8, 9]   p2 [10, 11, 12]  p3 [13, 14, 15]  p4 [16, 17, 7]      count=12
-```
-
-Now read it as a user browsing pages 1→4 once (the "faithful browse"): the rows actually seen are `6,7,8 | 10,11,12 | 13,14,15 | 16,17,7`.
-
-- **Duplicate:** doc **7** appears on **page 1 and again on page 4** — "the same document twice across neighbouring pages" (here across the run as the block shifted).
-- **Skip:** doc **9**, which was on page 2 before, is **never seen** in the after‑browse — "a document disappears for a page."
-- `count` stayed **12** throughout, and the visible sort ("relevance") never changed — matching "nobody is editing anything and the sort order looks unchanged."
+(If `ordering=id` were honoured, doc 7 would sort near the front; instead it is last — confirming `sort_fields_map` has no `id` key, `src/documents/index.py:171-179`.)
 
 Cause → effect: relevance ties + no `id` tiebreaker in `sort_fields_map` (`src/documents/index.py:171-179`) + per‑page independent `search_page` (`src/documents/index.py:203-221`) + docnum churn on re‑index (`update_document` = delete+append, `src/documents/index.py:87`) ⇒ the tied block reorders between page fetches ⇒ duplicate + skip. This is the full‑text twin of H3, and unlike §6.1 it has **no** accidental rescue, so a single background consume is enough to trigger it.
 
@@ -626,10 +732,10 @@ Per the read‑only scope, **no source file was modified**; the following is doc
 |---|---|---|---|---|---|---|
 | **H1** — backend duplicates collapsed later? | **Partially yes; collapsed in the DB, not later** | raw JOIN = **24** rows → `.distinct()` = **12**; API body has **0** duplicate ids | `src/documents/views.py:198-199`; `src/documents/filters.py:63-70,52-58` | §4: shell shows 24→12; `?is_in_inbox=true` API → `has_duplicates=False`, ids 6–17 | `is_in_inbox`, `tags__id__all`, `tags__id__in` branches | M2M JOIN fans out rows; `SELECT DISTINCT` in `get_queryset` collapses them in‑DB |
 | **H2** — pagination before de‑dup? | **No** | SQL = `SELECT DISTINCT … ORDER BY "created" DESC LIMIT 3 OFFSET 3` | `src/paperless/views.py:8-11`; `src/documents/views.py:198-199` | §5: `str(qs.query)` + live `CaptureQueriesContext` | page 1/2/3 slices | `.distinct()` is in the queryset **before** the paginator's `LIMIT/OFFSET` |
-| **H3** — unstable ordering on ties? | **Yes — ROOT CAUSE** | filtered page walk `p1[6,7,8] p2[9,10,11] p3[12,13,14] p4[8,6,7]` → docs 6,7,8 duplicated (p1 & p4), 15,16,17 skipped; `count`=12 | `src/documents/models.py:152,207-208`; `src/paperless/views.py:8-11`; `src/documents/views.py:198-199` | §6.1 unfiltered stable + `EXPLAIN ANALYZE` (`id` in Sort Key); §6.2 same query two plans (`enable_hashagg` off/on) → two orders; §6.3 per‑page `EXPLAIN` (pages 1‑3 Sort+Unique, page 4 HashAggregate) | tie vs no‑tie; unfiltered vs M2M‑filtered; Sort+Unique vs HashAggregate plan; per‑page boundaries | non‑unique `created`, no tiebreaker, per‑page `LIMIT/OFFSET`; `id` appears in the sort only when the plan is Sort+Unique, so different pages/plans slice different tie orders |
+| **H3** — unstable ordering on ties? | **Yes — ROOT CAUSE** | filtered page walk `p1[6,7,8] p2[9,10,11] p3[12,13,14] p4[17,15,14]` → doc 14 duplicated (neighbouring pages 3 & 4), doc 16 skipped; `count`=12 | `src/documents/models.py:152,207-208`; `src/paperless/views.py:8-11`; `src/documents/views.py:198-199` | §6.1 unfiltered stable + `EXPLAIN ANALYZE` (`id` in Sort Key); §6.2 same query two plans (`enable_hashagg` off/on) → two orders; §6.3 per‑page `EXPLAIN` (pages 1‑3 Sort+Unique, page 4 HashAggregate) | tie vs no‑tie; unfiltered vs M2M‑filtered; Sort+Unique vs HashAggregate plan; per‑page boundaries | non‑unique `created`, no tiebreaker, per‑page `LIMIT/OFFSET`; `id` appears in the sort only when the plan is Sort+Unique, so different pages/plans slice different tie orders |
 | **Control** — `ordering=id` | **Stable** (confirms tie‑specificity) | pages `[6,7,8][9,10,11][12,13,14][15,16,17]` identical over 3 runs, even with M2M filter; every page's Sort Key leads with `id` | `src/documents/views.py:187-196` | §7: 3 identical runs + per‑page `EXPLAIN` Sort Key `id` | with/without M2M filter; OFFSET 0 & 9 | `id` is unique → total order → deterministic boundaries regardless of plan |
-| **Non‑admin / sharing** | **No permission scoping; viewer‑independent** | admin vs viewer identical ids; full‑body SHA‑256 identical `70be2df2…e215e8c` | `src/documents/views.py:183,198-199,461-463`; `src/documents/models.py:88-205`; `requirements.txt` (no guardian) | §8: paired requests + `sha256sum` → IDENTICAL | DB path & Whoosh path; Basic & Token auth | only `IsAuthenticated`; no `owner` field; no guardian; only `SavedView` is user‑scoped |
-| **Whoosh path** (`?query=`) | **Same instability class; no rescue** | all scores `1.0`; one re‑index → dup(7) + skip(9), `count`=12 | `src/documents/index.py:165-190,203-221,87`; `src/documents/views.py:388-411` | §9: before/after page walks + `ordering=id` ignored | relevance tie; `ordering=id` ignored; before/after re‑index | no `id` in `sort_fields_map`; per‑page `search_page`; `update_document`=delete+append churns docnum |
+| **Non‑admin / sharing** | **No permission scoping; viewer‑independent** | admin vs viewer identical ids; full‑body SHA‑256 identical `591e5eee…437a12` | `src/documents/views.py:183,198-199,461-463`; `src/documents/models.py:88-205`; `requirements.txt` (no guardian) | §8: paired full‑list + per‑page walks + `sha256sum` → IDENTICAL | DB & Whoosh paths; full‑list ids, per‑page walk & full‑body hash | only `IsAuthenticated`; no `owner` field; no guardian; only `SavedView` is user‑scoped |
+| **Whoosh path** (`?query=`) | **Same instability class; no rescue** | all scores `1.0`; quiescent walk 0 dup/0 skip (×3); one re‑index → doc 14 dup on neighbouring pages 3 & 4 + doc 15 skip; doc 12 disappears then returns; `count`=12 | `src/documents/index.py:165-190,203-221,87`; `src/documents/views.py:388-411` | §9: quiescent walk ×3 (0/0) + neighbouring dup + disappears/comeback + `ordering=id` ignored | relevance tie; quiescent vs post‑re‑index; neighbouring dup; disappears/comeback; `ordering=id` ignored | no `id` in `sort_fields_map`; per‑page `search_page`; `update_document`=delete+append churns docnum |
 
 Every named item (H1, H2, H3, non‑admin) is answered by name with a concrete observed value, a `file:line`, captured evidence, sibling variants, and a cause→effect reason.
 
