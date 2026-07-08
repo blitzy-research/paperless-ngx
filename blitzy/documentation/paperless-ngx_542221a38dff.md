@@ -321,6 +321,7 @@ work-dir name — vary run to run; the log strings and ordering are stable):
 | `Document classification model does not exist (yet), not performing automatic matching.` | `src/documents/classifier.py:L32-34` (via `load_classifier()` called during auto-matching) |
 | `Saving record to database` | `src/documents/consumer.py:L387` (inside `_store()` at `L379`) |
 | `Deleting file /work/consume/invoice_alpha.pdf` | `src/documents/consumer.py:L349` (source `os.unlink` at `L350`, *after* a successful save) |
+| `Deleting directory /tmp/paperless/…` | `src/documents/parsers.py:L349` (`self.log("debug", f"Deleting directory {self.tempdir}")` in `DocumentParser.cleanup()` at `L348`; on a `RasterisedDocumentParser` instance the logger resolves to `paperless.parsing.tesseract`, matching the `optipng` row above) |
 | `Document 2026-07-08 invoice_alpha consumption finished` | `src/documents/consumer.py:L373` |
 
 ### The three named loggers, and the observed truth about the handlers
@@ -389,6 +390,115 @@ parse (OCR) → thumbnail → attempt auto-match (loads the classifier) → pers
 source → "consumption finished". The watcher line precedes everything because the watcher runs in a
 separate process and enqueues the task before any worker picks it up.
 
+### The second real entry point — `POST /api/documents/post_document/` (same pipeline, observed)
+
+The file-drop above is one of the **two** real ingestion entry points. The other is the REST upload
+endpoint `POST /api/documents/post_document/`, served by `PostDocumentView`
+(`src/documents/views.py:L491`). It requires authentication
+(`permission_classes = (IsAuthenticated,)`, `src/documents/views.py:L493`), so a superuser was created
+right after `migrate` — the canonical step a normal user takes to obtain API access:
+
+```bash
+$ DJANGO_SUPERUSER_PASSWORD=admin python3 manage.py createsuperuser \
+    --noinput --username admin --email admin@example.com
+Superuser created successfully.
+```
+
+**Command (real API entry point).** A single PDF was uploaded with `curl`. The log offset was taken
+just before the upload so the captured slice belongs to exactly this document:
+
+```bash
+$ off=$(wc -l < /work/data/log/paperless.log)   # lines already in the log (off=2)
+$ curl -sS -i -u admin:admin -F "document=@/work/tmp/api_upload_demo.pdf;type=application/pdf" http://127.0.0.1:8000/api/documents/post_document/
+```
+
+**Observed, unedited HTTP response** (the endpoint returns `HTTP/1.1 200 OK` with the JSON body `"OK"`;
+`server: uvicorn` is the ASGI worker running under gunicorn):
+
+```
+HTTP/1.1 200 OK
+date: Wed, 08 Jul 2026 08:40:17 GMT
+server: uvicorn
+content-type: application/json
+vary: Accept, Accept-Language, Origin
+allow: POST, OPTIONS
+x-frame-options: SAMEORIGIN
+x-api-version: 2
+x-version: 1.7.0
+content-length: 4
+content-language: en-us
+x-content-type-options: nosniff
+referrer-policy: same-origin
+cross-origin-opener-policy: same-origin
+
+"OK"
+```
+
+**The view enqueues the same task on the same broker.** `PostDocumentView.post()` writes the upload to
+a `NamedTemporaryFile` (`src/documents/views.py:L512`) and calls
+`async_task("documents.tasks.consume_file", …)` (`src/documents/views.py:L523-524`) — the *same* task
+the watcher enqueues. The web (gunicorn) process logs the enqueue, and the `qcluster` worker picks it
+up and runs the identical pipeline:
+
+```
+$ grep -n "Enqueued" /work/gunicorn.out
+13:08:40:18 [Q] INFO Enqueued 1
+$ grep -n "api_upload_demo" /work/qcluster.out
+17:08:40:18 [Q] INFO Process-1:1 processing [api_upload_demo.pdf]
+18:[2026-07-08 08:40:18,146] [INFO] [paperless.consumer] Consuming api_upload_demo.pdf
+19:[2026-07-08 08:40:22,107] [INFO] [paperless.consumer] Document 2026-07-08 api_upload_demo consumption finished
+21:08:40:22 [Q] INFO Processed [api_upload_demo.pdf]
+```
+
+**Observed, unedited pipeline log slice** — captured the instant this document logged *"consumption
+finished"* (`sed -n "$((off+1)),\$p" /work/data/log/paperless.log`; same volatile-substring caveat as
+the file-drop block):
+
+```
+[2026-07-08 08:40:18,146] [INFO] [paperless.consumer] Consuming api_upload_demo.pdf
+[2026-07-08 08:40:18,147] [DEBUG] [paperless.consumer] Detected mime type: application/pdf
+[2026-07-08 08:40:18,149] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
+[2026-07-08 08:40:18,152] [DEBUG] [paperless.consumer] Parsing api_upload_demo.pdf...
+[2026-07-08 08:40:18,175] [DEBUG] [paperless.parsing.tesseract] Extracted text from PDF file /tmp/paperless/paperless-upload-9coyy6mz
+[2026-07-08 08:40:18,244] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/paperless/paperless-upload-9coyy6mz', 'output_file': '/tmp/paperless/paperless-t5o1qsfl/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/paperless/paperless-t5o1qsfl/sidecar.txt'}
+[2026-07-08 08:40:18,519] [DEBUG] [paperless.parsing.tesseract] Incomplete sidecar file: discarding.
+[2026-07-08 08:40:18,524] [DEBUG] [paperless.parsing.tesseract] Extracted text from PDF file /tmp/paperless/paperless-t5o1qsfl/archive.pdf
+[2026-07-08 08:40:18,524] [DEBUG] [paperless.consumer] Generating thumbnail for api_upload_demo.pdf...
+[2026-07-08 08:40:18,527] [DEBUG] [paperless.parsing] Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/paperless/paperless-t5o1qsfl/archive.pdf[0] /tmp/paperless/paperless-t5o1qsfl/convert.png
+[2026-07-08 08:40:19,181] [DEBUG] [paperless.parsing.tesseract] Execute: optipng -silent -o5 /tmp/paperless/paperless-t5o1qsfl/convert.png -out /tmp/paperless/paperless-t5o1qsfl/thumb_optipng.png
+[2026-07-08 08:40:22,061] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[2026-07-08 08:40:22,064] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-08 08:40:22,082] [DEBUG] [paperless.consumer] Deleting file /tmp/paperless/paperless-upload-9coyy6mz
+[2026-07-08 08:40:22,106] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/paperless/paperless-t5o1qsfl
+[2026-07-08 08:40:22,107] [INFO] [paperless.consumer] Document 2026-07-08 api_upload_demo consumption finished
+```
+
+**The pipeline is identical; only the entry differs.** Compared with the file-drop sequence above, this
+slice has exactly **two** differences, both expected from the code:
+
+1. **No `[paperless.management.consumer] Adding … to the task queue.` line.** The directory watcher is
+   not involved on the API path — `PostDocumentView` enqueues the task directly
+   (`src/documents/views.py:L523-524`). The slice therefore begins at `Consuming …` and is **16** lines
+   rather than the watcher path's 17.
+2. **The source file is the upload temp file**, `/tmp/paperless/paperless-upload-9coyy6mz` (the
+   `NamedTemporaryFile`, `src/documents/views.py:L512`), instead of a `/work/consume/…` path — so the
+   `Extracted text from PDF file …` and `Deleting file …` lines reference that temp file, and
+   `Deleting file` unlinks it after a successful save.
+
+Everything else — mime detection, parser selection, OCR (`Calling OCRmyPDF …`), thumbnailing
+(`convert`/`optipng`), the classifier `…model does not exist (yet)…` DEBUG, `Saving record to
+database`, `Deleting directory …`, and `Document … consumption finished` — is the same as the watcher
+path, because **both entry points converge on `documents.tasks.consume_file`**.
+
+The upload produced a real `Document` row with the default `{pk:07}` filename (Q5), confirming the API
+path is exercised end-to-end and is not a stand-in:
+
+```
+$ python3 manage.py shell -c "from documents.models import Document as D; d=D.objects.get(); \
+  print(d.pk, repr(d.title), d.filename, d.archive_filename); print(d.source_path)"
+1 'api_upload_demo' 0000001.pdf 0000001.pdf
+/work/media/documents/originals/0000001.pdf
+```
 
 ---
 
