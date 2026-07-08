@@ -78,36 +78,47 @@ The scratch SQLite database lived at `DATA_DIR/db.sqlite3`; media lived under
 
 ---
 
-## Environment Deviation (disclosed honestly)
+## Environment (canonical, disclosed)
 
-The canonical container targets **Python 3.9** with **`scikit-learn==1.0.2`** (the Dockerfile base
-is `python:3.9-slim-bullseye`). That exact toolchain could **not** be provisioned on the
-investigation host: `scikit-learn==1.0.2` fails to build on Python 3.12 because its legacy build
-backend references the removed `pkgutil.ImpImporter`. The investigation therefore ran on
-**Python 3.12.3** with **`scikit-learn==1.9.0`**. Other transitive pins deviated because no
-`cp312` wheels exist for the canonical versions:
+The behaviors were exercised on the **canonical toolchain**: **Python 3.9** with
+**`scikit-learn==1.0.2`**, matching the Dockerfile base `python:3.9-slim-bullseye`. Concretely, the
+interpreter was **Python 3.9.25** (built from source via `pyenv`, because the host OS default is a
+newer Python), and **every Python dependency was installed at its canonical pin** taken from the
+project's `requirements.txt`. The runtime versions verified via `pip freeze` were:
 
 | Package | Canonical pin | Used in investigation |
 |---------|---------------|-----------------------|
-| Python | 3.9 | 3.12.3 |
-| scikit-learn | 1.0.2 | 1.9.0 |
-| numpy | 1.22.3 | 2.5.1 |
-| scipy | 1.8.0 | 1.18.0 |
-| pikepdf | 5.1.1 | 10.9.1 |
-| pillow | 9.1.0 | 12.3.0 |
+| Python | 3.9 | 3.9.25 |
+| scikit-learn | 1.0.2 | 1.0.2 |
+| numpy | 1.22.3 | 1.22.3 |
+| scipy | 1.8.0 | 1.8.0 |
+| Django | 4.0.4 | 4.0.4 |
+| channels | 3.0.4 | 3.0.4 |
+| channels-redis | 3.4.0 | 3.4.0 |
+| filelock | 3.6.0 | 3.6.0 |
+| concurrent-log-handler | 0.9.20 | 0.9.20 |
+| Whoosh | 2.7.4 | 2.7.4 |
+| python-magic | 0.4.25 | 0.4.25 |
+| pikepdf | 5.1.1 | 5.1.1 |
+| pillow | 9.1.0 | 9.1.0 |
+| djangorestframework | 3.13.1 | 3.13.1 |
+| django-q | 1.3.9 | 1.3.9 |
+| pathvalidate | 2.5.0 | 2.5.0 |
+| python-dateutil | 2.8.2 | 2.8.2 |
 
-Plus helper installs (`setuptools<81`, `python-dotenv`, `python-gnupg`) needed for
-`django.setup()` / migrations.
+The scratch runtime (virtualenv `/tmp/pngx-venv`, the SQLite database, and the media tree) lived
+entirely under `/tmp`, and a local Redis served the default `CHANNEL_LAYERS` / `Q_CLUSTER`
+backends. The only tools installed on top of the canonical pins were the test runners
+(`pytest`, `pytest-django`, `factory-boy`) — not part of `requirements.txt` and **not imported by
+any of the six code paths** — used solely to run the project's own test suite as a cross-check. No
+behavior-relevant package deviated from its canonical pin; the only differences from the canonical
+Debian-bullseye image are OS-level (host distribution and system libraries such as Ghostscript),
+none of which are touched by the six code paths investigated here.
 
-**All behavior-relevant packages were installed at their canonical pins:** `Django==4.0.4`,
-`channels==3.0.4`, `channels-redis==3.4.0`, `filelock==3.6.0`, `concurrent-log-handler==0.9.20`,
-`Whoosh==2.7.4`, `python-magic==0.4.25`, `djangorestframework==3.13.1`, `django-q==1.3.9`,
-`pathvalidate==2.5.0`, `python-dateutil==2.8.2`.
-
-**The reported values are version-agnostic.** The captured filesystem paths, MD5/SHA-1 digests,
-and log strings depend only on Paperless-NGX's own source code and the input bytes — not on the
-numeric library versions. Two distinct grounds support this, and they are *not* the same kind of
-thing:
+**The reported values are additionally version-agnostic.** The captured filesystem paths,
+MD5/SHA-1 digests, and log strings depend only on Paperless-NGX's own source code and the input
+bytes — not on the numeric library versions. Two distinct grounds support this, and they are *not*
+the same kind of thing:
 
 - The **MD5 fixtures** (`42995833e01aea9b3edee44bbfdd7ce1` original and
   `62acb0bcbfbcaa62ca6ad3668e4e404b` archive, Q4/Q5) are the project's own **test-fixture
@@ -117,10 +128,10 @@ thing:
   literal source constant; it is **derived at runtime** by the application's own `hashlib.sha1`
   (`src/documents/classifier.py:124`, `:161`) over the deterministic canonical fixture data
   (`generate_test_data`) — content plus auto-classification labels — and was reproduced
-  **identically across ≥2 runs** and across the version deviation.
+  **identically across ≥2 runs** on the canonical toolchain.
 
-Because none of these digests is produced by a version-pinned library artifact, the Python/
-scikit-learn deviation does not change them.
+Because none of these digests is produced by a version-pinned library artifact, they are stable
+across any supported interpreter.
 
 ---
 
@@ -414,7 +425,7 @@ was **stable across ≥2 runs**. Because the digest is computed by the applicati
 `hashlib.sha1` over deterministic inputs — the preprocessed document content **plus** the
 auto-classification labels (document-type, correspondent, and tag pks;
 `src/documents/classifier.py:129,136,143,154-155`) — and never over any library-versioned
-artifact, its exact match across the environment/version deviation confirms the value is
+artifact, its exact, repeated match on the canonical toolchain confirms the value is
 **version-agnostic**: it depends only on the fixture data and the hashing algorithm, not on the
 scikit-learn build.
 The reproduction pattern mirrors the project's own test
@@ -592,7 +603,7 @@ Q4c ARCHIVE_CHECKSUM OR-ARM MATCH:
   captured logs: ['[ERROR] [paperless.consumer] Not consuming sample2.pdf: It is a duplicate.']
 
 Q4d GENUINELY DIFFERENT CONTENT:
-  incoming md5(genuinely_different.pdf) = 874cb10cabb2e73251598c5557593c1d
+  incoming md5(genuinely_different.pdf) = a2158a25cbc0f4f6307f0bfedf35f7cf
   (stored checksum on file = 42995833e01aea9b3edee44bbfdd7ce1 )
   pre_check_duplicate() returned: None (None => no duplicate, no raise)
   captured logs: []
@@ -617,15 +628,17 @@ parsing:
   This is the direct answer to "two files that look completely different can still be rejected."
 - **Q4c** — the match can occur on the `archive_checksum` OR-arm: the incoming original's MD5
   equals a stored document's `archive_checksum`, and it is rejected.
-- **Q4d** — a genuinely different file (MD5 `874cb10cabb2e73251598c5557593c1d`) is **not** flagged;
+- **Q4d** — a genuinely different file (MD5 `a2158a25cbc0f4f6307f0bfedf35f7cf`) is **not** flagged;
   `pre_check_duplicate()` returns `None` and raises nothing.
 - **Q4e** — with `CONSUMER_DELETE_DUPLICATES=True`, the incoming file is `os.unlink`-ed
   (`src/documents/consumer.py:109`) before the `ConsumerError` is raised, so it no longer exists
   afterward.
 
-**Note (honesty):** the Q4d different-content bytes are arbitrary throwaway bytes, so the observed
-MD5 (`874cb10c…`) is simply "not any stored checksum"; the salient point is content-difference →
-no match. The stored/incoming values in Q4a–Q4c are the canonical sample MD5
+**Note (honesty):** the Q4d file holds a **fixed, documented byte sequence** chosen only to differ
+from the sample — `b"This is a genuinely different document, not a duplicate.\n"` — whose MD5 is
+`a2158a25cbc0f4f6307f0bfedf35f7cf`. That value is simply "not any stored checksum"; the salient
+point is content-difference → no match, and the exact bytes make it byte-for-byte reproducible.
+The stored/incoming values in Q4a–Q4c are the canonical sample MD5
 `42995833e01aea9b3edee44bbfdd7ce1`.
 
 ---
@@ -682,10 +695,10 @@ tasks.sanity_check() returned: 'No issues detected.'
 
 [CHECKSUM MISMATCH — corrupted original]
 stored checksum      = 42995833e01aea9b3edee44bbfdd7ce1
-actual md5 (on disk) = 13ee2f3091c70d8e650a67f8ea5dfbe1
+actual md5 (on disk) = 50e989d22f252fb3a2b1c060bec1a76b
 len(messages) = 1 | has_error = True
 log_messages() emitted:
-  [ERROR] [paperless.sanity_checker] Checksum mismatch of document 1. Stored: 42995833e01aea9b3edee44bbfdd7ce1, actual: 13ee2f3091c70d8e650a67f8ea5dfbe1.
+  [ERROR] [paperless.sanity_checker] Checksum mismatch of document 1. Stored: 42995833e01aea9b3edee44bbfdd7ce1, actual: 50e989d22f252fb3a2b1c060bec1a76b.
 tasks.sanity_check() raised SanityCheckFailedException: 'Sanity check failed with errors. See log.'
 ```
 
@@ -696,15 +709,17 @@ tasks.sanity_check() raised SanityCheckFailedException: 'Sanity check failed wit
   (`src/documents/sanity_checker.py:27`), and `sanity_check()` returns `'No issues detected.'`
   (`src/documents/tasks.py:267`).
 - **Mismatch:** after corrupting the original, its on-disk MD5 becomes
-  `13ee2f3091c70d8e650a67f8ea5dfbe1`, which no longer equals the stored
+  `50e989d22f252fb3a2b1c060bec1a76b`, which no longer equals the stored
   `42995833e01aea9b3edee44bbfdd7ce1`. The ERROR message names **both** hashes — the **stored** MD5
   and the **actual** on-disk MD5 — exactly as templated at `src/documents/sanity_checker.py:88-91`,
   and `sanity_check()` raises `SanityCheckFailedException` (`src/documents/tasks.py:261`).
 
-**Note (honesty):** the "actual" hash `13ee2f3091c70d8e650a67f8ea5dfbe1` depends on the (arbitrary
-but deterministic) corrupt bytes written to the original; the stored checksum
-`42995833e01aea9b3edee44bbfdd7ce1` is the canonical fixture value. The mechanism that matters is
-`MD5(original)` vs. the stored `checksum` at `src/documents/sanity_checker.py:83-91`.
+**Note (honesty):** the "actual" hash `50e989d22f252fb3a2b1c060bec1a76b` is the MD5 of the **fixed,
+documented** corrupt bytes written over the original —
+`b"corrupted sanity-check bytes (fixed for reproducibility)\n"` — so it is byte-for-byte
+reproducible; the stored checksum `42995833e01aea9b3edee44bbfdd7ce1` is the canonical fixture
+value. The mechanism that matters is `MD5(original)` vs. the stored `checksum` at
+`src/documents/sanity_checker.py:83-91`.
 
 ---
 
@@ -810,10 +825,10 @@ Every question and every named sub-item is addressed:
 - **Q4 — Duplicate detection.** ✅ *Actual checksums at the moment of judgment shown:* incoming MD5
   `42995833e01aea9b3edee44bbfdd7ce1` vs. stored `checksum` / `archive_checksum`. ✅ *Content-based*
   (Q4b renamed-identical). ✅ *archive_checksum OR-arm* (Q4c). ✅ *Non-duplicate* (Q4d,
-  `874cb10cabb2e73251598c5557593c1d`, returns `None`). ✅ *delete-duplicates* (Q4e).
+  `a2158a25cbc0f4f6307f0bfedf35f7cf`, returns `None`). ✅ *delete-duplicates* (Q4e).
 - **Q5 — Sanity checker healthy vs. mismatch.** ✅ *Healthy output:* 0 messages + INFO + `'No
   issues detected.'`. ✅ *Mismatch output with specific hashes:* stored
-  `42995833e01aea9b3edee44bbfdd7ce1` vs. actual `13ee2f3091c70d8e650a67f8ea5dfbe1`; raises
+  `42995833e01aea9b3edee44bbfdd7ce1` vs. actual `50e989d22f252fb3a2b1c060bec1a76b`; raises
   `SanityCheckFailedException`.
 - **Q6 — Orphaned files.** ✅ *Do they linger?* Yes. ✅ *What is reported?* WARNING
   `Orphaned file in media dir: …` and `sanity_check()` returns the warnings string; file is never
@@ -824,10 +839,12 @@ Every question and every named sub-item is addressed:
 ## Reproducibility note
 
 All runtime scaffolding — the `/tmp/pngx-venv` virtual environment, the scratch SQLite database,
-the media tree, and every temporary observation script — lived under `/tmp` and was removed after
-the evidence above was captured. The source repository was verified unchanged
-(`git status --porcelain` empty) on branch `paperless-ngx_542221a38dff`. The only artifact added
-to the repository is this document.
+the media tree, and the temporary observation scripts — lived entirely under `/tmp`, **outside the
+repository**, and is investigation-only. The temporary observation scripts and the scratch
+database/media tree were removed after the evidence above was captured; the shared virtual
+environment is host scaffolding and is not part of the deliverable. The source repository contains
+no change other than this document (`git status --porcelain` is empty once it is committed). The
+only artifact added to the repository is this document.
 
 ---
 
