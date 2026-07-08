@@ -1,18 +1,18 @@
 # Why the Paperless‑ngx documents list "feels haunted": a runtime root‑cause analysis
 
-**Branch:** `paperless-ngx_542221a38dff`  ·  **Commit (HEAD):** `542221a38dff06361e07976452f9aea24d210542`
+**Branch:** `paperless-ngx_542221a38dff` · **Commit (HEAD):** `542221a38dff06361e07976452f9aea24d210542`
 **Method:** strictly read‑only investigation. The relevant code paths were **built and run first**; every behavioural claim below is backed by the exact command that produced it and its **unedited output**, plus a `file:line` reference into the source. Statements that were only read (not executed) are labelled **(inferred)**. No source file was modified; this Markdown file is the only artifact added. All temporary scripts and seeded data were removed afterwards (see §13).
 
 ---
 
 ## 1. The question
 
-A user reports that the documents list *"can feel haunted during normal browsing"*:
+A user reports that the documents list _"can feel haunted during normal browsing"_:
 
 - with **a couple of common filters enabled**, the **same document appears twice across neighbouring pages**, or
 - a document **disappears for a page and then comes back**,
 
-…while **nobody is editing anything** and **the visible sort order looks unchanged**. It reportedly gets **stranger when the viewer is not an all‑powerful admin** and visibility is *"shaped by sharing rules."* Three named hypotheses were posed, each of which is answered explicitly and by name below:
+…while **nobody is editing anything** and **the visible sort order looks unchanged**. It reportedly gets **stranger when the viewer is not an all‑powerful admin** and visibility is _"shaped by sharing rules."_ Three named hypotheses were posed, each of which is answered explicitly and by name below:
 
 - **H1** — Is the backend producing **duplicates** that get collapsed somewhere later?
 - **H2** — Is **pagination happening before any de‑duplication**?
@@ -20,7 +20,7 @@ A user reports that the documents list *"can feel haunted during normal browsing
 
 …plus the **non‑admin / sharing‑rules** dimension.
 
-The request was to *"watch what the API actually returns across consecutive page requests, and line that up with what the UI thinks pagination means, until the exact condition that destabilizes the list becomes clear."* That is exactly what this document does.
+The request was to _"watch what the API actually returns across consecutive page requests, and line that up with what the UI thinks pagination means, until the exact condition that destabilizes the list becomes clear."_ That is exactly what this document does.
 
 ---
 
@@ -30,17 +30,17 @@ The request was to *"watch what the API actually returns across consecutive page
 
 Answers by name:
 
-| Hypothesis | Verdict |
-|---|---|
-| **H1** — backend produces duplicates collapsed later? | **Partially yes.** A many‑to‑many filter JOIN *does* fan out duplicate `Document` rows, but they are collapsed by **`SELECT DISTINCT` inside the database** (`Document.objects.distinct()`), **not** in a later Python/UI step. |
-| **H2** — pagination before de‑duplication? | **No.** The emitted SQL is `SELECT DISTINCT … ORDER BY … LIMIT 25 OFFSET N`; `DISTINCT` is part of the query **before** the page slice. De‑duplication happens *before* `LIMIT`, not after. |
-| **H3** — ordering unstable on ties? | **Yes — this is the root cause.** There is no unique tiebreaker anywhere (`Meta.ordering = ("-created",)`, the DB `ordering_fields` default, and the Whoosh sort map all lack a unique key). |
+| Hypothesis                                            | Verdict                                                                                                                                                                                                                         |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **H1** — backend produces duplicates collapsed later? | **Partially yes.** A many‑to‑many filter JOIN _does_ fan out duplicate `Document` rows, but they are collapsed by **`SELECT DISTINCT` inside the database** (`Document.objects.distinct()`), **not** in a later Python/UI step. |
+| **H2** — pagination before de‑duplication?            | **No.** The emitted SQL is `SELECT DISTINCT … ORDER BY … LIMIT 25 OFFSET N`; `DISTINCT` is part of the query **before** the page slice. De‑duplication happens _before_ `LIMIT`, not after.                                     |
+| **H3** — ordering unstable on ties?                   | **Yes — this is the root cause.** There is no unique tiebreaker anywhere (`Meta.ordering = ("-created",)`, the DB `ordering_fields` default, and the Whoosh sort map all lack a unique key).                                    |
 
 **Honest negative result on the "non‑admin / sharing rules" premise (stated plainly, first):** at this commit there are **no object‑level permissions, no document ownership, and no sharing/ACL model at all**. Every documents request is gated only by `IsAuthenticated`; there is no `owner` field on `Document`, no `django-guardian` dependency, and the only per‑user‑scoped queryset in the whole viewset module is for `SavedView`, **not** `Document`. Observed directly: an admin and a non‑admin user receive **byte‑for‑byte identical** responses (identical SHA‑256, §8). So the glitch **cannot** arise from a permission‑scoped queryset here; it is **viewer‑independent** and attributable entirely to H3. The user's intuition that it "gets stranger for non‑admins" is a red herring at this commit — the same instability is present for everyone.
 
-**Which path actually manifests it (nuance):** the instability is *latent* in both list paths, but the two paths behave differently at runtime:
+**Which path actually manifests it (nuance):** the instability is _latent_ in both list paths, but the two paths behave differently at runtime:
 
-- **Database path** (structured filters, default browse): the `ORDER BY -created` has no tiebreaker, but PostgreSQL's `SELECT DISTINCT` on the full row *accidentally* rescues stability in the simplest plan by folding the unique `id` into the sort key. That rescue is **fragile**: adding a many‑to‑many filter (a "common filter") exposes a second, equally valid `HashAggregate` plan whose `ORDER BY` sort keeps only `created` (no `id`). The planner can even choose *different* plans for *different pages of the same list*, so — as proven in §6.3 — the real endpoint returns doc 14 on **both** page 3 and the neighbouring page 4 while doc 16 vanishes, all with `count` constant and no re‑sorting.
+- **Database path** (structured filters, default browse): the `ORDER BY -created` has no tiebreaker, but PostgreSQL's `SELECT DISTINCT` on the full row _accidentally_ rescues stability in the simplest plan by folding the unique `id` into the sort key. That rescue is **fragile**: adding a many‑to‑many filter (a "common filter") exposes a second, equally valid `HashAggregate` plan whose `ORDER BY` sort keeps only `created` (no `id`). The planner can even choose _different_ plans for _different pages of the same list_, so — as proven in §6.3 — the real endpoint returns doc 14 on **both** page 3 and the neighbouring page 4 while doc 16 vanishes, all with `count` constant and no re‑sorting.
 - **Whoosh full‑text path** (`?query=`): there is **no rescue at all**. Results tie on relevance score, the sort map has no `id` key, and `?ordering=id` is silently ignored. A single ordinary background re‑index (which fires on every document consumption) deterministically reshuffles the tied block, reproducing both the duplicate and the skip.
 
 The remainder of this document proves each of these with captured output.
@@ -195,11 +195,12 @@ tags__id__in=2,3 count 12
 ```
 
 Cause → effect, by branch:
+
 - `InboxFilter.filter` returns `qs.filter(tags__is_inbox_tag=True)` with **no** `distinct()` (`src/documents/filters.py:63-70`) → relies entirely on the view‑level `distinct()`.
 - The non‑`in_list` `TagsFilter` branch loops `qs.filter(tags__id=tag_id)` per id with **no per‑filter distinct** (`src/documents/filters.py:53-58`).
 - Only the `in_list` branch adds its own `.distinct()` (`src/documents/filters.py:52`).
 
-In all cases the client sees a de‑duplicated list of 12 — the duplicates are collapsed **in the DB**, answering H1 as *partially yes, but not "collapsed later."*
+In all cases the client sees a de‑duplicated list of 12 — the duplicates are collapsed **in the DB**, answering H1 as _partially yes, but not "collapsed later."_
 
 ---
 
@@ -258,12 +259,11 @@ The single page query executed by the live viewset is exactly `SELECT DISTINCT �
 
 Cause → effect: because `.distinct()` is baked into the queryset (`src/documents/views.py:198-199`) **before** DRF's paginator slices it (`src/paperless/views.py:8-11`), pagination is applied to an already‑de‑duplicated stream. So H2's proposed mechanism — "we paginate a list that still has duplicates, then de‑dup per page" — is **not** what happens. The duplicate/skip symptom therefore cannot be explained by H2; it comes from H3 (§6).
 
-
 ---
 
 ## 6. H3 — Is the ordering quietly unstable when rows tie on the primary sort key? (ROOT CAUSE)
 
-**Verdict: Yes. This is the root cause.** The list is ordered by `created` — a non‑unique column — with **no unique tiebreaker anywhere**, and each page is an independent `LIMIT/OFFSET` query. That is not a *total* order: the relative order of rows that tie on `created` is unspecified. When that unspecified order changes between two page fetches, tied rows duplicate across a boundary or fall through the gap.
+**Verdict: Yes. This is the root cause.** The list is ordered by `created` — a non‑unique column — with **no unique tiebreaker anywhere**, and each page is an independent `LIMIT/OFFSET` query. That is not a _total_ order: the relative order of rows that tie on `created` is unspecified. When that unspecified order changes between two page fetches, tied rows duplicate across a boundary or fall through the gap.
 
 The three ingredients, each grounded:
 
@@ -276,12 +276,12 @@ $ sed -n '152p;207,208p' src/documents/models.py
 
 - Primary sort key `created` is **non‑unique** (`src/documents/models.py:152`).
 - Default order is `-created` with no secondary key (`src/documents/models.py:207-208`); DRF's `OrderingFilter` falls back to this `Meta.ordering` when no `?ordering=` param is sent, so **the default browse is already tie‑exposed** — the user need not choose any special sort.
-- The page slice is per‑page `LIMIT/OFFSET` (`src/paperless/views.py:8-11`), so every page is a *separate* query — a separate evaluation of that non‑total order.
+- The page slice is per‑page `LIMIT/OFFSET` (`src/paperless/views.py:8-11`), so every page is a _separate_ query — a separate evaluation of that non‑total order.
 - The only unique field among the orderable ones is `id`; `archive_serial_number` is `unique=True` **but nullable** (`src/documents/models.py:196-205`), so it is not a total order over all rows. `ordering_fields` (`src/documents/views.py:187-196`) offers no composite/tiebreaker default.
 
-The crucial consequence: **whether the result is stable depends entirely on whether some unique column happens to end up in the effective sort — which is decided by the PostgreSQL query plan, not by the code.** The next three subsections show (6.1) the unfiltered path is *accidentally* stabilized by the plan, (6.2) the same query has a second, equally valid plan that is *not* stabilized, and (6.3) the two plans can serve *different pages of the same list*, producing the exact duplicate/skip symptom in a single quiescent snapshot.
+The crucial consequence: **whether the result is stable depends entirely on whether some unique column happens to end up in the effective sort — which is decided by the PostgreSQL query plan, not by the code.** The next three subsections show (6.1) the unfiltered path is _accidentally_ stabilized by the plan, (6.2) the same query has a second, equally valid plan that is _not_ stabilized, and (6.3) the two plans can serve _different pages of the same list_, producing the exact duplicate/skip symptom in a single quiescent snapshot.
 
-### 6.1 The unfiltered path is *accidentally* stabilized by the plan
+### 6.1 The unfiltered path is _accidentally_ stabilized by the plan
 
 On a quiescent table, repeatedly paging the unfiltered list (no `?ordering=`, `page_size=3`) is stable, and — perhaps surprisingly — comes back in `id`‑ascending order within the tie:
 
@@ -296,7 +296,7 @@ run2: [6, 7, 8] [9, 10, 11] [12, 13, 14] [15, 16, 17]
 run3: [6, 7, 8] [9, 10, 11] [12, 13, 14] [15, 16, 17]
 ```
 
-Why is a "non‑total order" stable here? Because `SELECT DISTINCT` over the **full row** makes PostgreSQL sort by *all* selected columns to find duplicates, and that column list includes the unique `id`. `EXPLAIN (ANALYZE)` of the exact executed query shows `id` folded into the sort key as the **first tiebreaker** after `created` (this is the actual executed plan, not an estimate):
+Why is a "non‑total order" stable here? Because `SELECT DISTINCT` over the **full row** makes PostgreSQL sort by _all_ selected columns to find duplicates, and that column list includes the unique `id`. `EXPLAIN (ANALYZE)` of the exact executed query shows `id` folded into the sort key as the **first tiebreaker** after `created` (this is the actual executed plan, not an estimate):
 
 ```text
 $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py shell -c "
@@ -317,11 +317,11 @@ Unique (actual rows=12 loops=1)
         ->  Seq Scan on documents_document (actual rows=12 loops=1)
 ```
 
-The `Sort Key` begins `created DESC, id, …`: the unique `id` is an *accidental* tiebreaker, so the order is total and therefore stable. This is why the bug can lie dormant on a simple browse for a long time — **exactly the user's "worked fine, then haunted" experience.** **This rescue is not written anywhere in the code — it is an artifact of the plan** that PostgreSQL chose to compute `DISTINCT`, and it disappears the moment the plan changes (§6.2, §6.3) or the path changes (§9).
+The `Sort Key` begins `created DESC, id, …`: the unique `id` is an _accidental_ tiebreaker, so the order is total and therefore stable. This is why the bug can lie dormant on a simple browse for a long time — **exactly the user's "worked fine, then haunted" experience.** **This rescue is not written anywhere in the code — it is an artifact of the plan** that PostgreSQL chose to compute `DISTINCT`, and it disappears the moment the plan changes (§6.2, §6.3) or the path changes (§9).
 
 ### 6.2 The same filtered query has a second valid plan with **no** `id` — and a different order
 
-Enabling a "common filter" (the many‑to‑many inbox filter) adds two JOINs, and PostgreSQL then has two equally reasonable ways to compute `DISTINCT`: fold everything into one sort (`Sort → Unique`, which keeps `id`), or hash‑group to de‑duplicate and sort only by the `ORDER BY` afterwards (`HashAggregate → Sort`, which keeps only `created`). These two plans return the **same 12 rows** (`count` constant) in **different orders**. Forcing each plan on the *exact* SQL the endpoint emits (verified to contain the two `INNER JOIN`s of the real filter path):
+Enabling a "common filter" (the many‑to‑many inbox filter) adds two JOINs, and PostgreSQL then has two equally reasonable ways to compute `DISTINCT`: fold everything into one sort (`Sort → Unique`, which keeps `id`), or hash‑group to de‑duplicate and sort only by the `ORDER BY` afterwards (`HashAggregate → Sort`, which keeps only `created`). These two plans return the **same 12 rows** (`count` constant) in **different orders**. Forcing each plan on the _exact_ SQL the endpoint emits (verified to contain the two `INNER JOIN`s of the real filter path):
 
 ```text
 $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py shell -c "
@@ -350,6 +350,7 @@ enable_hashagg=ON  order: [12, 11, 10, 9, 7, 13, 8, 6, 16, 17, 15, 14]
 ```
 
 Cause → effect, read directly off the two plans:
+
 - `enable_hashagg=OFF` → `Unique → Sort` with `Sort Key: created DESC, id, …` → the unique `id` makes it a **total** order → `[6,7,8,…,17]`.
 - `enable_hashagg=ON` → `Sort (Sort Key: created DESC only) → HashAggregate` → the `HashAggregate` does the de‑duplication and the top `Sort` orders by `created` **only**, so the 12 tied rows emerge in hash‑bucket order → `[12,11,10,9,7,13,8,6,16,17,15,14]`.
 
@@ -361,7 +362,7 @@ $ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=tr
 [12, 11, 10, 9, 7, 13, 8, 6, 16, 17, 15, 14]
 ```
 
-**Reproducibility note — this scrambled order is one representative single‑snapshot capture, not a fixed constant of the bug.** The 12‑element permutation above is the hash‑bucket order that PostgreSQL's `HashAggregate` happened to emit for *this* seed under *this* plan. `HashAggregate` de‑duplicates by hashing the **full row tuple**, which includes per‑row‑unique bytes this analysis never pins (`checksum`, `title`, `content`, `filename`); an independent re‑seed with the *same* tie structure but *different* row bytes therefore drops the rows into *different* hash buckets and returns a *different* order — and which of the two near‑cost‑tied plans the planner picks is itself the cost decision noted above (it shifts with table statistics, row counts, PostgreSQL version, and config). An independent re‑seed of the identical structure (12 rows sharing one `created`, same IDs 6–17, fresh row bytes) shows a *different* order with `count` still 12:
+**Reproducibility note — this scrambled order is one representative single‑snapshot capture, not a fixed constant of the bug.** The 12‑element permutation above is the hash‑bucket order that PostgreSQL's `HashAggregate` happened to emit for _this_ seed under _this_ plan. `HashAggregate` de‑duplicates by hashing the **full row tuple**, which includes per‑row‑unique bytes this analysis never pins (`checksum`, `title`, `content`, `filename`); an independent re‑seed with the _same_ tie structure but _different_ row bytes therefore drops the rows into _different_ hash buckets and returns a _different_ order — and which of the two near‑cost‑tied plans the planner picks is itself the cost decision noted above (it shifts with table statistics, row counts, PostgreSQL version, and config). An independent re‑seed of the identical structure (12 rows sharing one `created`, same IDs 6–17, fresh row bytes) shows a _different_ order with `count` still 12:
 
 ```text
 $ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=true&page_size=100&fields=id" | python3 -c "import sys,json;d=json.load(sys.stdin);print('count',d['count']);print('order',[r['id'] for r in d['results']])"
@@ -369,7 +370,7 @@ count 12
 order [11, 15, 16, 17, 8, 7, 13, 10, 12, 9, 14, 6]
 ```
 
-What *is* exactly reproducible — and what actually answers H3 — is independent of the particular sequence: the verdict (root cause), the **mechanism** (the `HashAggregate` plan drops the `id` tiebreaker, leaving a non‑total order that per‑page `LIMIT/OFFSET` then slices inconsistently), and the constant `count`. Only the *specific* scrambled order is snapshot‑specific.
+What _is_ exactly reproducible — and what actually answers H3 — is independent of the particular sequence: the verdict (root cause), the **mechanism** (the `HashAggregate` plan drops the `id` tiebreaker, leaving a non‑total order that per‑page `LIMIT/OFFSET` then slices inconsistently), and the constant `count`. Only the _specific_ scrambled order is snapshot‑specific.
 
 ### 6.3 The haunting itself: different pages of one list, different plans (the smoking gun)
 
@@ -386,7 +387,7 @@ run2: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
 run3: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [17, 15, 14]
 ```
 
-Read the union of the four pages: **doc 14 appears on page 3 _and again_ on the very next page, page 4 — the same document on two neighbouring pages; and doc 16 never appears at all (a skip)** — while `count` is 12 the whole time and no `?ordering=` was ever sent. This is *precisely* the user's report: "the same document twice across neighbouring pages" (doc 14 on **adjacent** pages 3 and 4) and "a document disappears for a page" (doc 16 is gone from the browse), in a single, unchanging snapshot of the data. `EXPLAIN`ing each page's exact query shows why — the pages are served by two different plans:
+Read the union of the four pages: **doc 14 appears on page 3 _and again_ on the very next page, page 4 — the same document on two neighbouring pages; and doc 16 never appears at all (a skip)** — while `count` is 12 the whole time and no `?ordering=` was ever sent. This is _precisely_ the user's report: "the same document twice across neighbouring pages" (doc 14 on **adjacent** pages 3 and 4) and "a document disappears for a page" (doc 16 is gone from the browse), in a single, unchanging snapshot of the data. `EXPLAIN`ing each page's exact query shows why — the pages are served by two different plans:
 
 ```text
 $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py shell -c "
@@ -416,9 +417,9 @@ page 4 (OFFSET 9 LIMIT 3) -> ids [17, 15, 14] | DISTINCT via HashAggregate
        Sort Key: documents_document.created DESC
 ```
 
-Cause → effect: pages 1–3 (`OFFSET 0/3/6`) are planned as `Sort+Unique`, whose `Sort Key` includes the unique `id`, so they slice the `id`‑ordered total order `[6,7,8 | 9,10,11 | 12,13,14 | …]`. Page 4 (`OFFSET 9`) is planned as `HashAggregate`, whose top `Sort Key` is `created DESC` **only**, so it slices the *hash* order `[12,11,10,9,7,13,8,6,16,17,15,14]` — its tail (positions 9–11) is `[17,15,14]`. The two plans encode **two different orderings**, and the paginator stitches slices from both into one browse. The result is that doc `14` — which the `id`‑ordered total order placed at the tail of page 3 (`[12,13,14]`) — reappears in the tail of the hash order on the *immediately following* page 4, so the user meets the same document twice on two neighbouring pages; meanwhile doc `16` (which the total order would place on page 4 as part of `[15,16,17]`) is emitted by neither plan and simply vanishes from the browse. No row was edited; the sort the user sees ("newest first") never changed; only the invisible tie order differed between two of the page queries — the definition of a "haunted" list.
+Cause → effect: pages 1–3 (`OFFSET 0/3/6`) are planned as `Sort+Unique`, whose `Sort Key` includes the unique `id`, so they slice the `id`‑ordered total order `[6,7,8 | 9,10,11 | 12,13,14 | …]`. Page 4 (`OFFSET 9`) is planned as `HashAggregate`, whose top `Sort Key` is `created DESC` **only**, so it slices the _hash_ order `[12,11,10,9,7,13,8,6,16,17,15,14]` — its tail (positions 9–11) is `[17,15,14]`. The two plans encode **two different orderings**, and the paginator stitches slices from both into one browse. The result is that doc `14` — which the `id`‑ordered total order placed at the tail of page 3 (`[12,13,14]`) — reappears in the tail of the hash order on the _immediately following_ page 4, so the user meets the same document twice on two neighbouring pages; meanwhile doc `16` (which the total order would place on page 4 as part of `[15,16,17]`) is emitted by neither plan and simply vanishes from the browse. No row was edited; the sort the user sees ("newest first") never changed; only the invisible tie order differed between two of the page queries — the definition of a "haunted" list.
 
-**Reproducibility note — the *specific* duplicated/skipped IDs and the "neighbouring pages 3 & 4" adjacency are snapshot‑specific; the duplicate‑and‑skip *phenomenon* is the invariant.** Which document duplicates, which is skipped, and whether the duplicate lands on adjacent or non‑adjacent pages all follow from the hash‑bucket order of §6.2, which (as shown there) varies per seed and per plan choice. On the independent re‑seed of §6.2, the identical forward browse instead duplicates rows on **non‑adjacent** pages and drops three different rows — while `count` stays 12 and no `?ordering=` is sent:
+**Reproducibility note — the _specific_ duplicated/skipped IDs and the "neighbouring pages 3 & 4" adjacency are snapshot‑specific; the duplicate‑and‑skip _phenomenon_ is the invariant.** Which document duplicates, which is skipped, and whether the duplicate lands on adjacent or non‑adjacent pages all follow from the hash‑bucket order of §6.2, which (as shown there) varies per seed and per plan choice. On the independent re‑seed of §6.2, the identical forward browse instead duplicates rows on **non‑adjacent** pages and drops three different rows — while `count` stays 12 and no `?ordering=` is sent:
 
 ```text
 $ for p in 1 2 3 4; do curl -s -u admin:admin123 "http://localhost:8000/api/documents/?is_in_inbox=true&page=$p&page_size=3&fields=id" | python3 -c "import sys,json;print('p%d'%$p,[r['id'] for r in json.load(sys.stdin)['results']],end='  ')"; done; echo
@@ -430,16 +431,15 @@ Here the union duplicates doc 6 on pages **1 and 4** and doc 9 on pages **2 and 
 ### 6.4 Summary of H3
 
 - The code provides **no unique tiebreaker** at any layer (`Meta.ordering`, the DB `ordering_fields` default, the Whoosh sort map).
-- Stability is therefore **left to chance**: it depends on whether the query plan happens to include a unique column in its effective sort. On the unfiltered path the `SELECT DISTINCT`‑over‑all‑columns plan *incidentally* includes `id` (§6.1) → **latent** bug.
+- Stability is therefore **left to chance**: it depends on whether the query plan happens to include a unique column in its effective sort. On the unfiltered path the `SELECT DISTINCT`‑over‑all‑columns plan _incidentally_ includes `id` (§6.1) → **latent** bug.
 - Adding a common M2M filter exposes a second, equally valid `HashAggregate` plan whose `ORDER BY` sort has **no** `id` (§6.2); the planner can even pick different plans for different pages of the same list (§6.3) → **manifest** duplicates and skips in one snapshot, `count` constant.
 - The Whoosh path (§9) has **no** accidental rescue at all and manifests the same symptom from a single ordinary re‑index.
-
 
 ---
 
 ## 7. Control — page by a unique key (`ordering=id`)
 
-This is a **labelled control**, not the headline. To confirm the instability is *tie‑specific* (and not some other pagination defect), the identical page walk was repeated with `ordering=id` — a unique, total order. Pages are stable across repeated runs, with no duplicates and no skips, even with the M2M filter that reshuffles the default order:
+This is a **labelled control**, not the headline. To confirm the instability is _tie‑specific_ (and not some other pagination defect), the identical page walk was repeated with `ordering=id` — a unique, total order. Pages are stable across repeated runs, with no duplicates and no skips, even with the M2M filter that reshuffles the default order:
 
 ```text
 $ for run in 1 2 3; do echo -n "run$run: "; \
@@ -473,7 +473,7 @@ OFFSET 0 ids [6, 7, 8] | Sort Key:  documents_document.id, documen
 OFFSET 9 ids [15, 16, 17] | Sort Key:  documents_document.id
 ```
 
-Cause → effect: `id` is unique, so `ORDER BY id` is a **total** order; there are no ties to resolve arbitrarily, so every page boundary is deterministic and the union across pages is exactly the 12 rows with no repeats — even when one page uses `Sort+Unique` and another uses `HashAggregate`, because the leading key is `id` either way. `id` is the only always‑present unique member of `ordering_fields` (`src/documents/views.py:187-196`; `archive_serial_number` is unique but nullable, `src/documents/models.py:196-205`). This isolates the root cause to the *absence of a unique tiebreaker* under the non‑unique default sort — i.e. H3.
+Cause → effect: `id` is unique, so `ORDER BY id` is a **total** order; there are no ties to resolve arbitrarily, so every page boundary is deterministic and the union across pages is exactly the 12 rows with no repeats — even when one page uses `Sort+Unique` and another uses `HashAggregate`, because the leading key is `id` either way. `id` is the only always‑present unique member of `ordering_fields` (`src/documents/views.py:187-196`; `archive_serial_number` is unique but nullable, `src/documents/models.py:196-205`). This isolates the root cause to the _absence of a unique tiebreaker_ under the non‑unique default sort — i.e. H3.
 
 ---
 
@@ -503,7 +503,7 @@ admin:admin123 -> count 12 ids [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
 viewer:viewer123 -> count 12 ids [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
 ```
 
-The result *sets* being equal is necessary but not sufficient — the user's symptom is about the **unstable page walk**, so the identical `page_size=3` walk was run as both users on both paths. Every page is byte-identical between the two identities, so the duplicate/skip distribution is identical too — the haunting is in no way modulated by who is looking. On the **DB path** (the unstable H3 walk of §6.3), both users see doc 14 on neighbouring pages 3 and 4 and doc 16 skipped:
+The result _sets_ being equal is necessary but not sufficient — the user's symptom is about the **unstable page walk**, so the identical `page_size=3` walk was run as both users on both paths. Every page is byte-identical between the two identities, so the duplicate/skip distribution is identical too — the haunting is in no way modulated by who is looking. On the **DB path** (the unstable H3 walk of §6.3), both users see doc 14 on neighbouring pages 3 and 4 and doc 16 skipped:
 
 ```text
 $ for u in admin:admin123 viewer:viewer123; do echo -n "$u -> "; \
@@ -528,7 +528,7 @@ admin:admin123 -> p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
 viewer:viewer123 -> p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
 ```
 
-To prove *byte-for-byte* equality (not just the same ids), the full response bodies were hashed. Both requests use ordinary Basic auth with the two local accounts, and a **total** order (`ordering=id`) so the body is deterministic and differs only by identity; the SHA-256 of the full JSON body is identical:
+To prove _byte-for-byte_ equality (not just the same ids), the full response bodies were hashed. Both requests use ordinary Basic auth with the two local accounts, and a **total** order (`ordering=id`) so the body is deterministic and differs only by identity; the SHA-256 of the full JSON body is identical:
 
 ```text
 $ A=$(curl -s -u admin:admin123  "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
@@ -544,11 +544,11 @@ Cause → effect, grounded in the code:
 - The documents endpoint's only gate is `permission_classes = (IsAuthenticated,)` — any logged‑in user, admin or not, sees everything (`src/documents/views.py:183`).
 - `get_queryset` returns `Document.objects.distinct()` with **no** `filter(owner=…)` or permission scoping (`src/documents/views.py:198-199`).
 - There is **no `owner` field** on the `Document` model (the field list runs `src/documents/models.py:88-205` with no ownership/ACL field), and **no `django-guardian`** dependency in `requirements.txt`.
-- The **only** per‑user‑scoped queryset anywhere in the viewset module is `SavedViewViewSet.get_queryset → SavedView.objects.filter(user=user)` (`src/documents/views.py:461-463`) — that scopes *saved filter presets*, not documents.
+- The **only** per‑user‑scoped queryset anywhere in the viewset module is `SavedViewViewSet.get_queryset → SavedView.objects.filter(user=user)` (`src/documents/views.py:461-463`) — that scopes _saved filter presets_, not documents.
 
 So the "non‑admin" angle is a **negative result**: no sharing model exists to shape visibility. The reproducible haunting is the same for everyone and is fully explained by H3. **(inferred, then confirmed):** reading the model and requirements suggested no ownership/ACL; the identical‑hash observation above confirms it at runtime.
 
-**Reproducibility note — the literal SHA‑256 digest is a single‑snapshot value; the *equality* is the reproducible, load‑bearing fact.** The digest `591e5eee…437a12` is taken over the entire JSON body, which embeds seed‑specific bytes (titles, checksums, `created`/`added`/`modified` timestamps, ids), so it necessarily changes on any re‑seed. What is invariant — and what actually settles the non‑admin question — is that the admin body and the viewer body hash to the **same** value as each other. An independent re‑seed confirms both halves at once — a *different* digest, still **identical** between the two identities:
+**Reproducibility note — the literal SHA‑256 digest is a single‑snapshot value; the _equality_ is the reproducible, load‑bearing fact.** The digest `591e5eee…437a12` is taken over the entire JSON body, which embeds seed‑specific bytes (titles, checksums, `created`/`added`/`modified` timestamps, ids), so it necessarily changes on any re‑seed. What is invariant — and what actually settles the non‑admin question — is that the admin body and the viewer body hash to the **same** value as each other. An independent re‑seed confirms both halves at once — a _different_ digest, still **identical** between the two identities:
 
 ```text
 $ A=$(curl -s -u admin:admin123  "http://localhost:8000/api/documents/?ordering=id&page_size=100" | sha256sum | cut -d' ' -f1)
@@ -642,7 +642,7 @@ run3: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 14]  p4 [15, 16, 17]
 
 So the run-to-run inconsistency on this path is **not** produced by re-issuing the same request against an unchanged index (distribution there: **0 duplicates, 0 skips**); it is produced by the **ordinary background re-index** that fires on every consume. Each such event is itself deterministic — it moves exactly the touched doc to the tie-block end — so the resulting duplicate/skip is reproducible, as the next two demonstrations show (each is repeated to confirm the post-event state is itself stable).
 
-**(b) "The same document twice across neighbouring pages" — from ONE ordinary re-index.** The user views page 3, a background consume re-indexes one of the documents currently on page 3 (doc 14), then the user clicks *Next* to page 4:
+**(b) "The same document twice across neighbouring pages" — from ONE ordinary re-index.** The user views page 3, a background consume re-indexes one of the documents currently on page 3 (doc 14), then the user clicks _Next_ to page 4:
 
 ```text
 $ curl -s -u admin:admin123 "http://localhost:8000/api/documents/?query=haunted&page=3&page_size=3&fields=id" \
@@ -671,7 +671,7 @@ run2: p1 [6, 7, 8]  p2 [9, 10, 11]  p3 [12, 13, 15]  p4 [16, 17, 14]
 
 The faithful forward browse the user experienced is therefore `6,7,8 | 9,10,11 | 12,13,14 | 16,17,14`: doc **14** appears on adjacent pages 3 and 4 (**duplicate**), and doc **15** is never seen (**skip**) — `count` stays 12 and the "relevance" sort never changed.
 
-**(c) "A document disappears for a page and then comes back."** Poll a *single* page (page 3) while ordinary background consumption continues. Doc 12 starts on page 3, drops off after it is itself re-indexed, and rotates back onto page 3 as three further documents are consumed (each consume shifts the tie block by one position):
+**(c) "A document disappears for a page and then comes back."** Poll a _single_ page (page 3) while ordinary background consumption continues. Doc 12 starts on page 3, drops off after it is itself re-indexed, and rotates back onto page 3 as three further documents are consumed (each consume shifts the tie block by one position):
 
 ```text
 $ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py document_index reindex --no-progress-bar'   # rebuild index; prints nothing
@@ -719,14 +719,13 @@ $ for p in 1 2 3 4; do curl -s -u admin:admin123 "http://localhost:8000/api/docu
 
 Cause → effect: relevance ties + no `id` tiebreaker in `sort_fields_map` (`src/documents/index.py:171-179`) + per‑page independent `search_page` (`src/documents/index.py:203-221`) + docnum churn on re‑index (`update_document` = delete+append, `src/documents/index.py:87`) ⇒ the tied block reorders between page fetches ⇒ duplicate + skip. This is the full‑text twin of H3, and unlike §6.1 it has **no** accidental rescue, so a single background consume is enough to trigger it.
 
-
 ---
 
-## 10. Backend ↔ UI correlation — why it *feels* haunted
+## 10. Backend ↔ UI correlation — why it _feels_ haunted
 
 The backend returns a constant `count` and a stream of independently‑fetched pages; the Angular UI trusts that stream as one stable, totally‑ordered sequence and never de‑duplicates across pages. Lining the two up explains the perception exactly.
 
-**The API contract per page** is `{count, next, previous, results[]}`; `count` is constant (12) across all requests above, so the page count and the "sort order" the user sees never change — only the *membership* of individual pages shifts.
+**The API contract per page** is `{count, next, previous, results[]}`; `count` is constant (12) across all requests above, so the page count and the "sort order" the user sees never change — only the _membership_ of individual pages shifts.
 
 **The UI treats each page independently.** `document-list-view.service.ts.reload()` replaces the row list with the page's `results` and sets the paginator's total from `count`, with **no cross‑page bookkeeping or de‑duplication**:
 
@@ -754,22 +753,22 @@ Per the read‑only scope, **no source file was modified**; the following is doc
 - **Or switch to DRF `CursorPagination`,** which requires a unique, unchanging ordering and paginates by an opaque cursor rather than by `OFFSET`, eliminating the boundary‑shuffle class entirely.
 - **For the Whoosh path,** add a stable final tiebreaker (e.g. an `id` sort key in `sort_fields_map`, `src/documents/index.py:171-179`) so equal‑relevance ties order deterministically regardless of docnum churn.
 
-**Why this hid for so long (inferred, from framework behaviour):** Django/DRF emit `UnorderedObjectListWarning` only when a queryset is *entirely* unordered; ordering by a **non‑unique** column raises **no** warning. So `ORDER BY -created` looks correct, passes silently, and — thanks to the accidental `DISTINCT`‑driven `id` tiebreaker on the simplest plan (§6.1) — even behaves correctly until a plan flip or a full‑text query removes the rescue.
+**Why this hid for so long (inferred, from framework behaviour):** Django/DRF emit `UnorderedObjectListWarning` only when a queryset is _entirely_ unordered; ordering by a **non‑unique** column raises **no** warning. So `ORDER BY -created` looks correct, passes silently, and — thanks to the accidental `DISTINCT`‑driven `id` tiebreaker on the simplest plan (§6.1) — even behaves correctly until a plan flip or a full‑text query removes the rescue.
 
 ---
 
 ## 12. Coverage pass
 
-| Named item | Verdict | Concrete observed value | Key `file:line` | Evidence (command → output) | Sibling variants covered | Causal reason |
-|---|---|---|---|---|---|---|
-| **H1** — backend duplicates collapsed later? | **Partially yes; collapsed in the DB, not later** | raw JOIN = **24** rows → `.distinct()` = **12**; API body has **0** duplicate ids | `src/documents/views.py:198-199`; `src/documents/filters.py:63-70,52-58` | §4: shell shows 24→12; `?is_in_inbox=true` API → `has_duplicates=False`, ids 6–17 | `is_in_inbox`, `tags__id__all`, `tags__id__in` branches | M2M JOIN fans out rows; `SELECT DISTINCT` in `get_queryset` collapses them in‑DB |
-| **H2** — pagination before de‑dup? | **No** | SQL = `SELECT DISTINCT … ORDER BY "created" DESC LIMIT 3 OFFSET 3` | `src/paperless/views.py:8-11`; `src/documents/views.py:198-199` | §5: `str(qs.query)` + live `CaptureQueriesContext` | page 1/2/3 slices | `.distinct()` is in the queryset **before** the paginator's `LIMIT/OFFSET` |
-| **H3** — unstable ordering on ties? | **Yes — ROOT CAUSE** | filtered page walk `p1[6,7,8] p2[9,10,11] p3[12,13,14] p4[17,15,14]` → doc 14 duplicated (neighbouring pages 3 & 4), doc 16 skipped; `count`=12 | `src/documents/models.py:152,207-208`; `src/paperless/views.py:8-11`; `src/documents/views.py:198-199` | §6.1 unfiltered stable + `EXPLAIN ANALYZE` (`id` in Sort Key); §6.2 same query two plans (`enable_hashagg` off/on) → two orders; §6.3 per‑page `EXPLAIN` (pages 1‑3 Sort+Unique, page 4 HashAggregate) | tie vs no‑tie; unfiltered vs M2M‑filtered; Sort+Unique vs HashAggregate plan; per‑page boundaries | non‑unique `created`, no tiebreaker, per‑page `LIMIT/OFFSET`; `id` appears in the sort only when the plan is Sort+Unique, so different pages/plans slice different tie orders |
-| **Control** — `ordering=id` | **Stable** (confirms tie‑specificity) | pages `[6,7,8][9,10,11][12,13,14][15,16,17]` identical over 3 runs, even with M2M filter; every page's Sort Key leads with `id` | `src/documents/views.py:187-196` | §7: 3 identical runs + per‑page `EXPLAIN` Sort Key `id` | with/without M2M filter; OFFSET 0 & 9 | `id` is unique → total order → deterministic boundaries regardless of plan |
-| **Non‑admin / sharing** | **No permission scoping; viewer‑independent** | admin vs viewer identical ids; full‑body SHA‑256 identical `591e5eee…437a12` | `src/documents/views.py:183,198-199,461-463`; `src/documents/models.py:88-205`; `requirements.txt` (no guardian) | §8: paired full‑list + per‑page walks + `sha256sum` → IDENTICAL | DB & Whoosh paths; full‑list ids, per‑page walk & full‑body hash | only `IsAuthenticated`; no `owner` field; no guardian; only `SavedView` is user‑scoped |
-| **Whoosh path** (`?query=`) | **Same instability class; no rescue** | all scores `1.0`; quiescent walk 0 dup/0 skip (×3); one re‑index → doc 14 dup on neighbouring pages 3 & 4 + doc 15 skip; doc 12 disappears then returns; `count`=12 | `src/documents/index.py:165-190,203-221,87`; `src/documents/views.py:388-411` | §9: quiescent walk ×3 (0/0) + neighbouring dup + disappears/comeback + `ordering=id` ignored | relevance tie; quiescent vs post‑re‑index; neighbouring dup; disappears/comeback; `ordering=id` ignored | no `id` in `sort_fields_map`; per‑page `search_page`; `update_document`=delete+append churns docnum |
+| Named item                                   | Verdict                                           | Concrete observed value                                                                                                                                             | Key `file:line`                                                                                                  | Evidence (command → output)                                                                                                                                                                            | Sibling variants covered                                                                                | Causal reason                                                                                                                                                                 |
+| -------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **H1** — backend duplicates collapsed later? | **Partially yes; collapsed in the DB, not later** | raw JOIN = **24** rows → `.distinct()` = **12**; API body has **0** duplicate ids                                                                                   | `src/documents/views.py:198-199`; `src/documents/filters.py:63-70,52-58`                                         | §4: shell shows 24→12; `?is_in_inbox=true` API → `has_duplicates=False`, ids 6–17                                                                                                                      | `is_in_inbox`, `tags__id__all`, `tags__id__in` branches                                                 | M2M JOIN fans out rows; `SELECT DISTINCT` in `get_queryset` collapses them in‑DB                                                                                              |
+| **H2** — pagination before de‑dup?           | **No**                                            | SQL = `SELECT DISTINCT … ORDER BY "created" DESC LIMIT 3 OFFSET 3`                                                                                                  | `src/paperless/views.py:8-11`; `src/documents/views.py:198-199`                                                  | §5: `str(qs.query)` + live `CaptureQueriesContext`                                                                                                                                                     | page 1/2/3 slices                                                                                       | `.distinct()` is in the queryset **before** the paginator's `LIMIT/OFFSET`                                                                                                    |
+| **H3** — unstable ordering on ties?          | **Yes — ROOT CAUSE**                              | filtered page walk `p1[6,7,8] p2[9,10,11] p3[12,13,14] p4[17,15,14]` → doc 14 duplicated (neighbouring pages 3 & 4), doc 16 skipped; `count`=12                     | `src/documents/models.py:152,207-208`; `src/paperless/views.py:8-11`; `src/documents/views.py:198-199`           | §6.1 unfiltered stable + `EXPLAIN ANALYZE` (`id` in Sort Key); §6.2 same query two plans (`enable_hashagg` off/on) → two orders; §6.3 per‑page `EXPLAIN` (pages 1‑3 Sort+Unique, page 4 HashAggregate) | tie vs no‑tie; unfiltered vs M2M‑filtered; Sort+Unique vs HashAggregate plan; per‑page boundaries       | non‑unique `created`, no tiebreaker, per‑page `LIMIT/OFFSET`; `id` appears in the sort only when the plan is Sort+Unique, so different pages/plans slice different tie orders |
+| **Control** — `ordering=id`                  | **Stable** (confirms tie‑specificity)             | pages `[6,7,8][9,10,11][12,13,14][15,16,17]` identical over 3 runs, even with M2M filter; every page's Sort Key leads with `id`                                     | `src/documents/views.py:187-196`                                                                                 | §7: 3 identical runs + per‑page `EXPLAIN` Sort Key `id`                                                                                                                                                | with/without M2M filter; OFFSET 0 & 9                                                                   | `id` is unique → total order → deterministic boundaries regardless of plan                                                                                                    |
+| **Non‑admin / sharing**                      | **No permission scoping; viewer‑independent**     | admin vs viewer identical ids; full‑body SHA‑256 identical `591e5eee…437a12`                                                                                        | `src/documents/views.py:183,198-199,461-463`; `src/documents/models.py:88-205`; `requirements.txt` (no guardian) | §8: paired full‑list + per‑page walks + `sha256sum` → IDENTICAL                                                                                                                                        | DB & Whoosh paths; full‑list ids, per‑page walk & full‑body hash                                        | only `IsAuthenticated`; no `owner` field; no guardian; only `SavedView` is user‑scoped                                                                                        |
+| **Whoosh path** (`?query=`)                  | **Same instability class; no rescue**             | all scores `1.0`; quiescent walk 0 dup/0 skip (×3); one re‑index → doc 14 dup on neighbouring pages 3 & 4 + doc 15 skip; doc 12 disappears then returns; `count`=12 | `src/documents/index.py:165-190,203-221,87`; `src/documents/views.py:388-411`                                    | §9: quiescent walk ×3 (0/0) + neighbouring dup + disappears/comeback + `ordering=id` ignored                                                                                                           | relevance tie; quiescent vs post‑re‑index; neighbouring dup; disappears/comeback; `ordering=id` ignored | no `id` in `sort_fields_map`; per‑page `search_page`; `update_document`=delete+append churns docnum                                                                           |
 
-**Note on the illustrative DB‑path values in this table.** The specific DB‑path figures quoted in the **H3** row (`p4[17,15,14]`; doc 14 duplicated on neighbouring pages 3 & 4; doc 16 skipped) and the **Non‑admin** row (the literal SHA‑256 `591e5eee…437a12`) are one representative single‑snapshot capture — they vary per re‑seed and per query plan, as demonstrated in §6.2, §6.3, and §8. Everything else is exactly reproducible: the verdicts, the underlying mechanism (a `HashAggregate` plan drops the `id` tiebreaker → non‑total order under per‑page `LIMIT/OFFSET`), the constant `count`, the `ordering=id` control, the admin==viewer *equality*, and the **Whoosh** row (whose neighbouring‑page duplicate is *deterministic* — an ordinary re‑index moves the touched doc to the tie‑block end, so it reproduces byte‑for‑byte).
+**Note on the illustrative DB‑path values in this table.** The specific DB‑path figures quoted in the **H3** row (`p4[17,15,14]`; doc 14 duplicated on neighbouring pages 3 & 4; doc 16 skipped) and the **Non‑admin** row (the literal SHA‑256 `591e5eee…437a12`) are one representative single‑snapshot capture — they vary per re‑seed and per query plan, as demonstrated in §6.2, §6.3, and §8. Everything else is exactly reproducible: the verdicts, the underlying mechanism (a `HashAggregate` plan drops the `id` tiebreaker → non‑total order under per‑page `LIMIT/OFFSET`), the constant `count`, the `ordering=id` control, the admin==viewer _equality_, and the **Whoosh** row (whose neighbouring‑page duplicate is _deterministic_ — an ordinary re‑index moves the touched doc to the tie‑block end, so it reproduces byte‑for‑byte).
 
 Every named item (H1, H2, H3, non‑admin) is answered by name with a concrete observed value, a `file:line`, captured evidence, sibling variants, and a cause→effect reason.
 
