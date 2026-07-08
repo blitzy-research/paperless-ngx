@@ -1146,4 +1146,3 @@ the classifier model size, the document checksum, and Django-Q task names — bu
 their ordering, the filename pattern, and the table deltas are stable**. All runtime work was
 performed outside the repository (a `/work` tree with `DATA/MEDIA/CONSUME` redirected there), so the
 repository working tree is unchanged apart from this document.
-
