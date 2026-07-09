@@ -724,7 +724,7 @@ id=9 mime_type=application/pdf
 
 ### Q2.5 — How OCR-generated vs pre-existing text is distinguished *internally*: the sidecar markers
 
-Internally, paperless tells OCR-generated text apart from pre-existing text via the OCRmyPDF sidecar. `extract_text` (`parsers.py:L99`) discards the sidecar and falls back to pdfminer.six when the sidecar contains the marker `[OCR skipped on page` (the check is at `parsers.py:L104`). `sidecar_demo.py` (Appendix 5.1) runs OCRmyPDF on `multi-page-mixed.pdf` (pages 1–3 have text, pages 4–6 are images) under canonical `skip` and prints the exact sidecar bytes:
+Internally, paperless tells OCR-generated text apart from pre-existing text via the OCRmyPDF sidecar. `extract_text` (`parsers.py:L99`) discards the sidecar and falls back to pdfminer.six when the sidecar contains the marker `[OCR skipped on page` (the check is at `parsers.py:L104`). `sidecar_demo.py` (Appendix 5.1) runs OCRmyPDF on `multi-page-mixed.pdf` (pages 1–3 are images, pages 4–6 have text) under canonical `skip` and prints the exact sidecar bytes:
 
 ```text
 $ bash /tmp/inv/scripts/restart_qcluster.sh skip
