@@ -3,7 +3,7 @@
 > **Source branch:** `paperless-ngx_542221a38dff`
 > **HEAD commit:** `542221a38dff06361e07976452f9aea24d210542`
 > **Nature of this document:** A run-first, evidence-backed answer. Every behavioral claim below is paired with the exact command that produced it, the complete unedited output, and a `file:line` reference into the source tree. Nothing here is derived from reading source alone — the OCR ingestion pipeline was built and exercised through its real entry points (the upload API, the django-q worker, and the `RasterisedDocumentParser`), and the observations were captured live.
-> **When observed:** all runs below were captured on the container clock date `2026-07-08`.
+> **When observed:** the Q1–Q4 behavioral observations were captured on the container clock date `2026-07-08`. Two blocks were re-captured on `2026-07-09` from a fresh run of the identical canonical image, with the source tree unchanged at `542221a38dff` — the complete `qcluster` startup banner (§1.3) and the Q4.4 hard-failure fixture generation plus run — so that the startup output is shown complete (every pooled worker) and the corrupt-fixture md5 is reproducible from a committed command. Both re-captures are byte-consistent with the original observations except for the expected ephemeral values (timestamps, cluster name, PIDs, task ids, and temporary paths).
 
 ---
 
@@ -88,11 +88,27 @@ $ python3 manage.py manage_superuser   # PAPERLESS_ADMIN_USER/PASSWORD/MAIL
 ```text
 ########## QCLUSTER WORKER (django-q) START ##########
 $ python3 manage.py qcluster    # backgrounded; log -> /tmp/inv/out/qcluster.log
-22:45:28 [Q] INFO Q Cluster september-thirteen-emma-grey starting.
-22:45:28 [Q] INFO Process-1:1 ready for work at 18014
-22:45:28 [Q] INFO Process-1:2 ready for work at 18015
-(one further "Process-1:N ready for work" line is emitted per pooled worker at startup)
+01:52:45 [Q] INFO Q Cluster avocado-stairway-romeo-beer starting.
+01:52:45 [Q] INFO Process-1:1 ready for work at 636
+01:52:45 [Q] INFO Process-1:2 ready for work at 637
+01:52:45 [Q] INFO Process-1:3 ready for work at 638
+01:52:45 [Q] INFO Process-1:4 ready for work at 639
+01:52:45 [Q] INFO Process-1:5 ready for work at 640
+01:52:45 [Q] INFO Process-1:6 ready for work at 641
+01:52:45 [Q] INFO Process-1:7 ready for work at 642
+01:52:45 [Q] INFO Process-1:8 ready for work at 643
+01:52:45 [Q] INFO Process-1:9 ready for work at 644
+01:52:45 [Q] INFO Process-1:10 ready for work at 645
+01:52:45 [Q] INFO Process-1:11 ready for work at 646
+01:52:45 [Q] INFO Process-1:12 monitoring at 647
+01:52:45 [Q] INFO Process-1 guarding cluster avocado-stairway-romeo-beer
+01:52:45 [Q] INFO Process-1:13 pushing tasks at 648
+01:52:45 [Q] INFO Q Cluster avocado-stairway-romeo-beer running.
+```
 
+The block above is the **complete, unedited** `qcluster` startup banner (re-captured `2026-07-09`; see the *When observed* note above). With the default worker count — `TASK_WORKERS` (`settings.py:L438`) resolved by `default_task_workers()` (`settings.py:L427-L435`, the `floor(sqrt(CPU_count))` branch at `L433`) — the cluster pools **11** task workers (`Process-1:1`–`Process-1:11`) on this 128-core host, plus a monitor (`Process-1:12`), the guard process (`Process-1`), and a task pusher (`Process-1:13`), then logs `Q Cluster … running.`. The number of `ready for work` lines therefore scales with the host CPU count, while the monitor, guard, pusher, and `running.` lines are always present. This is the `qcluster` process referenced throughout Q1–Q4 (it dequeues and executes `documents.tasks.consume_file`, `tasks.py:L184`).
+
+```text
 ########## ASGI WEB + WEBSOCKET (gunicorn) START ##########
 $ gunicorn -c /app/gunicorn.conf.py paperless.asgi:application   # 0.0.0.0:8000
 [2026-07-08 22:45:40 +0000] [18033] [INFO] Listening at: http://0.0.0.0:8000 (18033)
@@ -287,6 +303,8 @@ The AAP notes a `progress_callback` can emit page-by-page `WORKING` frames spann
 ```
 
 This empty list held for **every** fixture in this investigation, including the multi-page ones. Reported exactly as observed: at these scales the only in-flight signal is the dwell time at `WORKING @ 20`, not a stream of per-page frames.
+
+> **Source-comment note (code hygiene).** The `progress_callback` (`consumer.py:L237`) carries the comment `# recalculate progress to be within 20 and 80` (`consumer.py:L238`), but the formula on the following line — `p = int((current_progress / max_progress) * 50 + 20)` (`consumer.py:L239`) — actually caps at **70**, not 80: on the final page `current_progress == max_progress`, so `p = int(1 * 50 + 20) = 70`. The observed `20 → 70` ceiling matches the *formula*, not the comment; the "80" is a stale in-source comment and does not affect the emitted frames (which is why every capture above tops out at `WORKING @ 70`).
 
 ### Q1.4 — Worker (`qcluster`) behavior during the phase
 
@@ -1099,25 +1117,28 @@ The full field set is 16 fields, and the targeted search for any status-like nam
 
 ### Q4.4 — The contrasting hard-failure path: `corrupt.pdf` → `FAILED`, and NO row persisted
 
-A deliberately malformed PDF (a temporary 74-byte fixture, md5 `275e5352ad888574113f18dfe5db4143`, containing a PDF header followed by garbage, no xref/trailer/root) drives the *hard-failure* path. Unlike weak OCR, this ends `FAILED` and persists nothing:
+A deliberately malformed PDF drives the *hard-failure* path. It is generated deterministically by the temporary `make_corrupt.py` script (reproduced in Appendix §5.1): a 74-byte fixture whose bytes are a valid `%PDF-1.7` header followed by fixed garbage, with **no** xref table, **no** trailer, and **no** `/Root` object. Because the bytes are fixed, its md5 is reproducible — `4e9aabcce0798543709d88b3f1a9b473`. Unlike weak OCR, this ends `FAILED` and persists nothing (the generation and run below were re-captured `2026-07-09`; behavior is identical to the original observation):
 
 ```text
+$ PYTHONPATH=/app/src python3 /tmp/inv/scripts/make_corrupt.py /tmp/inv/fixtures/corrupt.pdf
+wrote 74-byte corrupt PDF -> /tmp/inv/fixtures/corrupt.pdf
+$ md5sum /tmp/inv/fixtures/corrupt.pdf
+4e9aabcce0798543709d88b3f1a9b473  /tmp/inv/fixtures/corrupt.pdf
 $ PYTHONPATH=/app/src python3 /tmp/inv/scripts/reset_docs.py
+deleted 0 document(s); media cleared; count now = 0
 $ bash /tmp/inv/scripts/cap_scenario.sh q4fail /tmp/inv/fixtures/corrupt.pdf corrupt.pdf application/pdf
-
-############### Q4: corrupt.pdf -> FAILED path (ParseError -> _fail) ###############
 [BEFORE] document count = 0
 [WS] connected to ws/status/ ; subscribed to status_updates group
-[FRAME t+ 0.145s] {"filename": "corrupt.pdf", "task_id": "dfd62e4c-6275-453e-aa84-e47977c15ceb", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
-[FRAME t+ 0.150s] {"filename": "corrupt.pdf", "task_id": "dfd62e4c-6275-453e-aa84-e47977c15ceb", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
-[FRAME t+ 0.503s] {"filename": "corrupt.pdf", "task_id": "dfd62e4c-6275-453e-aa84-e47977c15ceb", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "InputFileError: ", "document_id": null}
+[FRAME t+ 0.153s] {"filename": "corrupt.pdf", "task_id": "e2ee8ea5-eb56-4d35-9bd0-08071bedd850", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[FRAME t+ 0.160s] {"filename": "corrupt.pdf", "task_id": "e2ee8ea5-eb56-4d35-9bd0-08071bedd850", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
+[FRAME t+ 0.512s] {"filename": "corrupt.pdf", "task_id": "e2ee8ea5-eb56-4d35-9bd0-08071bedd850", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "InputFileError: ", "document_id": null}
 [UPLOAD] POST /api/documents/post_document/ -> 200 "OK"
 
 ===== FRAME SUMMARY (q4fail) =====
-('0.145', 0, 'STARTING', 'new_file')
-('0.150', 20, 'WORKING', 'parsing_document')
-('0.503', 100, 'FAILED', 'InputFileError: ')
-[DUR] total STARTING->terminal = 0.358s
+('0.153', 0, 'STARTING', 'new_file')
+('0.160', 20, 'WORKING', 'parsing_document')
+('0.512', 100, 'FAILED', 'InputFileError: ')
+[DUR] total STARTING->terminal = 0.359s
 [PERPAGE] per-page WORKING frames (message=null) progress values: []
 [AFTER] terminal status=FAILED document_id=null ; document count = 0
 ```
@@ -1125,10 +1146,10 @@ $ bash /tmp/inv/scripts/cap_scenario.sh q4fail /tmp/inv/fixtures/corrupt.pdf cor
 The status feed goes straight from `WORKING @ 20` to **`FAILED @ 100`** with `message = "InputFileError: "` (there is no `70/90/95/SUCCESS` progression), the terminal `document_id` is `null`, and the document count remains **0** — no row was persisted. The complete worker-log block (exact line range, no elision) shows the full causal chain from pdfminer through OCRmyPDF's two attempts to the `ParseError`/`ConsumerError`:
 
 ```text
-===== WORKER LOG for q4fail (qcluster.log lines 262-403, complete) =====
-23:03:03 [Q] INFO Process-1:4 processing [corrupt.pdf]
-[2026-07-08 23:03:03,206] [INFO] [paperless.consumer] Consuming corrupt.pdf
-[2026-07-08 23:03:03,231] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
+===== WORKER LOG for q4fail (qcluster.log lines 46-187, complete) =====
+01:54:38 [Q] INFO Process-1:5 processing [corrupt.pdf]
+[2026-07-09 01:54:38,951] [INFO] [paperless.consumer] Consuming corrupt.pdf
+[2026-07-09 01:54:38,976] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
 Traceback (most recent call last):
   File "/app/src/paperless_tesseract/parsers.py", line 120, in extract_text
     stripped = post_process_text(pdfminer_extract_text(pdf_file))
@@ -1139,8 +1160,8 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 752, in __init__
     raise PDFSyntaxError("No /Root object! - Is this really a PDF?")
 pdfminer.pdfparser.PDFSyntaxError: No /Root object! - Is this really a PDF?
-[2026-07-08 23:03:03,465] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: . Attempting force OCR to get the text.
-[2026-07-08 23:03:03,562] [ERROR] [paperless.consumer] Error while consuming document corrupt.pdf: InputFileError: 
+[2026-07-09 01:54:39,212] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: . Attempting force OCR to get the text.
+[2026-07-09 01:54:39,307] [ERROR] [paperless.consumer] Error while consuming document corrupt.pdf: InputFileError: 
 Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
     return PdfInfo(
@@ -1148,7 +1169,7 @@ Traceback (most recent call last):
     with Pdf.open(infile) as pdf:
   File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
     pdf = Pdf._open(
-pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.t6pcgz4n/origin.pdf: unable to find trailer dictionary while recovering damaged file
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.zmz5zmb_/origin.pdf: unable to find trailer dictionary while recovering damaged file
 
 The above exception was the direct cause of the following exception:
 
@@ -1172,7 +1193,7 @@ Traceback (most recent call last):
     with Pdf.open(infile) as pdf:
   File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
     pdf = Pdf._open(
-pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.kd9i98j1/origin.pdf: unable to find trailer dictionary while recovering damaged file
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.b6rvpw9b/origin.pdf: unable to find trailer dictionary while recovering damaged file
 
 The above exception was the direct cause of the following exception:
 
@@ -1195,15 +1216,15 @@ Traceback (most recent call last):
   File "/app/src/paperless_tesseract/parsers.py", line 310, in parse
     raise ParseError(f"{e.__class__.__name__}: {str(e)}")
 documents.parsers.ParseError: InputFileError: 
-23:03:03 [Q] INFO Process-1:4 stopped doing work
-23:03:03 [Q] ERROR Failed [corrupt.pdf] - corrupt.pdf: Error while consuming document corrupt.pdf: InputFileError:  : Traceback (most recent call last):
+01:54:39 [Q] INFO Process-1:5 stopped doing work
+01:54:39 [Q] ERROR Failed [corrupt.pdf] - corrupt.pdf: Error while consuming document corrupt.pdf: InputFileError:  : Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
     return PdfInfo(
   File "/usr/local/lib/python3.9/site-packages/ocrmypdf/pdfinfo/info.py", line 901, in __init__
     with Pdf.open(infile) as pdf:
   File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
     pdf = Pdf._open(
-pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.t6pcgz4n/origin.pdf: unable to find trailer dictionary while recovering damaged file
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.zmz5zmb_/origin.pdf: unable to find trailer dictionary while recovering damaged file
 
 The above exception was the direct cause of the following exception:
 
@@ -1227,7 +1248,7 @@ Traceback (most recent call last):
     with Pdf.open(infile) as pdf:
   File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
     pdf = Pdf._open(
-pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.kd9i98j1/origin.pdf: unable to find trailer dictionary while recovering damaged file
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.b6rvpw9b/origin.pdf: unable to find trailer dictionary while recovering damaged file
 
 The above exception was the direct cause of the following exception:
 
@@ -1266,8 +1287,8 @@ Traceback (most recent call last):
     raise ConsumerError(f"{self.filename}: {log_message or message}")
 documents.consumer.ConsumerError: corrupt.pdf: Error while consuming document corrupt.pdf: InputFileError: 
 
-23:03:03 [Q] INFO recycled worker Process-1:4
-23:03:03 [Q] INFO Process-1:17 ready for work at 23981
+01:54:39 [Q] INFO recycled worker Process-1:5
+01:54:39 [Q] INFO Process-1:18 ready for work at 907
 
 ===== ORM inspection (should be ZERO rows persisted) =====
 Traceback (most recent call last):
@@ -2181,6 +2202,33 @@ finally:
         os.remove(work)
 ```
 
+#### `make_corrupt.py` — generate the deterministic 74-byte hard-failure fixture (Q4.4)
+
+```python
+#!/usr/bin/env python3
+"""make_corrupt.py [outpath] - write a deterministic, malformed 74-byte PDF:
+a valid "%PDF-1.7" header followed by garbage, with NO xref table, NO trailer,
+and NO /Root object. This is the temporary hard-failure fixture used in Q4.4.
+The byte content is fixed, so the md5 is reproducible across machines."""
+import sys
+
+out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/inv/fixtures/corrupt.pdf"
+
+# 74 bytes total = 9-byte PDF header + 65 bytes of deterministic garbage.
+# There is no xref/trailer/Root, so pikepdf (qpdf) and pdfminer both reject it.
+header = b"%PDF-1.7\n"                                                   # 9 bytes
+body = b"corrupt: no xref, no trailer, no /Root object; deliberate junk\n"  # padded below
+data = header + body
+if len(data) < 74:
+    data = data + b"\x00" * (74 - len(data))
+else:
+    data = data[:74]
+assert len(data) == 74, f"expected 74 bytes, got {len(data)}"
+
+with open(out, "wb") as f:
+    f.write(data)
+print(f"wrote {len(data)}-byte corrupt PDF -> {out}")
+```
 
 ### 5.2 Read-only proof: the source repository is unchanged
 
@@ -2210,20 +2258,17 @@ f4adf4460cbc7e05ac1890016a22d360  src/paperless_tesseract/tests/samples/encrypte
 
 `git status --porcelain` and `git diff --stat` both produced **no output** — the tree is clean and no tracked file was modified. The fixture md5s are shown to prove the in-repo inputs were never altered (`RasterisedDocumentParser` rewrites only its own scratch copies, never the originals — see `direct_parse.py`/`checksum_probe.py`, which copy to `SCRATCH_DIR` first).
 
-**In the destination working tree (where this answer document is committed):** the only change over the source baseline is the addition of this single Markdown file.
+**In the destination working tree (where this answer document is committed):** the only change over the frozen source baseline is the addition of this single Markdown file. The destination `HEAD` is, *by definition*, the commit that introduces this very document — so printing its hash here would be self-referential and would go stale on the next commit (each re-commit produces a new hash). The stable, **commit-hash-invariant** proof is therefore the diff of `HEAD` against the frozen source baseline (`542221a38dff06361e07976452f9aea24d210542`) together with a clean working tree: both hold no matter what hash the destination commit receives.
 
 ```text
-$ git rev-parse HEAD
-a8c2a1aa68462c8331ea591ff634c1f4005918d3
-
 $ git diff --name-status 542221a38dff06361e07976452f9aea24d210542..HEAD
 A	blitzy/documentation/paperless-ngx_542221a38dff.md
 
 $ git status --porcelain
-(empty above = clean)
+(empty above = clean working tree in the committed state)
 ```
 
-`git diff --name-status` against the source baseline shows exactly one added path — `blitzy/documentation/paperless-ngx_542221a38dff.md` — and nothing modified or deleted. This satisfies the read-only constraint: the repository is left byte-for-byte unchanged apart from this answer document.
+`git diff --name-status` against the frozen source baseline shows exactly one added path — `blitzy/documentation/paperless-ngx_542221a38dff.md` — with nothing modified or deleted, and `git status --porcelain` is empty (clean working tree once this document is committed). This satisfies the read-only constraint: the repository is left byte-for-byte unchanged apart from this answer document, and — because the proof is stated against the fixed baseline rather than a volatile `HEAD` hash — it remains valid regardless of the exact destination commit hash.
 
 ---
 
