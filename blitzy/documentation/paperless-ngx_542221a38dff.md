@@ -1,24 +1,67 @@
-# Paperless‑NGX Steady‑State ("Up and Idle") Runtime Behavior
+# Paperless-NGX Steady-State ("Up and Idle") Runtime Behavior
 
-**Repository:** paperless‑ngx
+**Repository:** paperless-ngx
 **Commit (pinned):** `542221a38dff06361e07976452f9aea24d210542`
-**Investigation type:** Read‑only runtime characterization (observe by RUNNING; no source file modified)
-**Captured:** 2026‑07‑10, single continuous run 07:47:30 → 08:11:43 UTC (≈24 min), plus two Redis interrupt/restart cycles
+**Investigation type:** Read-only runtime characterization (observe by RUNNING; no source file modified).
 
-This document answers five questions about how Paperless‑NGX behaves once it is **up and idle** (running, stable, with **no documents being ingested**). Every behavioral claim below is backed by **actual, unedited log output that I captured at runtime**, together with the **exact command** that produced it and a **`file:line` citation** to the code that emits it. Statements that are *inferred from reading code* rather than observed at runtime are explicitly marked **[INFERRED]**. Environment‑specific values are marked **[NON‑CANONICAL]** with their canonical counterpart.
+This document answers five questions about how Paperless-NGX behaves once it is **up and idle** (running, stable, with **no documents being ingested**). Every behavioral claim is backed by log output captured at runtime, together with the **exact command** that produced it and a **`file:line` citation** to the code that emits it.
+
+---
+
+## 0. Provenance and evidence conventions
+
+### 0.1 The single run all evidence comes from
+
+All log lines, counts, and timestamps in this document come from **one** continuous run inside **one** container. Nothing here is blended from any other run.
+
+| Provenance field | Value | How captured |
+|---|---|---|
+| Container name | `pngx_obs_20260710_090348` | `docker run` (see §1.2) |
+| Container id | `97b1eec8f7d16beb3e7eb551b696f9d255bf1fba83d9945646bb7b8a1731664e` | `docker inspect` |
+| Image ref | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01` | setup instructions |
+| Image digest | `sha256:6e699f225ced49182033cf995daf2a07d3628fe29bb573f5aa4c4188c253969f` | `docker inspect` |
+| Repo commit (in-container) | `542221a38dff06361e07976452f9aea24d210542` | `git -C /app rev-parse HEAD` (§1.3) |
+| Repo worktree | clean (`git status --porcelain` empty) | §1.3 |
+| Container timezone | `Etc/UTC` (`+0000`) — **all timestamps below are UTC** | `date`, `/etc/timezone` |
+| Process launch time | `2026-07-10T09:06:33Z` | `launch_meta.txt` |
+| django-q cluster name (this run) | `kilo-whiskey-artist-uranus` | observed banner |
+
+The three long-lived processes were launched to their own log files inside the container (`/app/obs_logs/{gunicorn,consumer,qcluster}.log`); those raw files were copied to the investigation host and hashed (SHA-256) before the container was destroyed. The digests below are recorded here as the **audit anchor** — the raw files themselves, being temporary observation artifacts, were removed during cleanup (§6); the run is reproducible from the exact commands in §1.2 and verifiable against these digests:
+
+```
+raw/qcluster.log   sha256 43cb699b6ebfcb4c22340c21dd748863d1ee09897f27976fcaf201fb0b92333d   (1255 lines)
+raw/gunicorn.log   sha256 f39353122f62b3b472552a2f8d785d35cfc1840f66e2cd84bf2e83ee2f86bdcd   (4 lines)
+raw/consumer.log   sha256 0de11e0ab8aec3c4bf1ee1eca354c675a5b5432405a7b00a839fdc5746efd1d4   (1 line)
+raw/launch_meta.txt sha256 f163fb58717bf19990302a0aad337a26a13a9a9c7add239bbe129d83acad0d42
+```
+
+### 0.2 How to read the log blocks (raw vs annotated; truncation)
+
+To keep every claim auditable, the log blocks below follow strict conventions:
+
+- **RAW** blocks reproduce log lines exactly as written by the process. They contain no editorial text.
+- Where a block is labeled **[annotated]**, any text after a `#` on a line — or a `# ...` marker on its own line — is **my annotation**, not part of the log. `# ...` explicitly marks lines I elided (always with the count/kind of what was elided). This convention is used sparingly and only where noted; it replaces the earlier document's blanket "unedited" claim, which was inaccurate.
+- Counts (line counts, error counts) were produced by the exact `grep -c` / `wc -l` command shown next to them, run against the retained raw files.
+
+### 0.3 Labels
+
+- **[OBSERVED]** — seen directly in this run's captured output.
+- **[CONFIGURED / SOURCE-DERIVED]** — a value read from configuration or a database row in this run, or read from source code; used where a full period was **not** observed end-to-end in this run (e.g. the hourly/daily/weekly cadences).
+- **[INFERRED]** — derived from reading code, not exercised at runtime.
+- **[NON-CANONICAL]** — an environment-specific value or a deviation from the published product packaging, always paired with its canonical counterpart.
 
 ---
 
 ## TL;DR — the two key findings
 
-1. **There is NO dedicated periodic "healthy" heartbeat INFO log line.** When Paperless‑NGX is idle and healthy, all three processes are **silent at INFO level**; the only recurring log activity is the firing of the **four django‑q scheduled tasks** (mail every 10 min, classifier hourly, index optimize daily, sanity check weekly). Two other health mechanisms — the Docker Compose `curl` liveness probe (every 30 s) and the django‑q `Stat` heartbeat to Redis (every 0.5 s) — are **deliberately silent** while healthy.
-2. **There is NO dedicated "reconnected" log message after a component restart.** When the Redis broker is interrupted and restarted, "operational again" is confirmed by **two co‑occurring signals**: (a) the `[Q] ERROR ... Connection refused` stream **ceases** the instant Redis returns, and (b) a fresh **`[Q] INFO Process-1:N pushing tasks at <pid>`** line appears with **no further errors** following it.
+1. **There is NO dedicated periodic "healthy" heartbeat INFO log line.** When Paperless-NGX is idle and healthy, all three processes are **silent at INFO level**; the only recurring log activity naturally observed in this run is the firing of the **`Check all e-mail accounts` schedule every ~10 minutes**. The three lower-frequency schedules (classifier hourly, index daily, sanity weekly) did not recur within the observation window — their cadence is **[CONFIGURED / SOURCE-DERIVED]** (§3.1, §3.3). Two other health mechanisms — the Docker Compose `curl` liveness probe (configured every 30 s) and the django-q `Stat` write to Redis (every 0.5 s) — are **silent while healthy** (§3.4).
+2. **There is NO dedicated "reconnected" log message after a component restart.** When the Redis broker is interrupted and restarted, django-q's return to operation is confirmed by **two co-occurring signals**: (a) the `[Q] ERROR ... Connection refused` stream **stops** (last error at the restart second ±1 s), and (b) a fresh **`[Q] INFO Process-1:N pushing tasks at <pid>`** line appears — within one 10 s reincarnation cycle of the restart — and then runs with **no further errors** (§4). This was verified for the **django-q broker/status path only**; the Channels/websocket path was not exercised (§4.5).
 
 ---
 
 ## The five questions (preserved verbatim from the user)
 
-> "Get Paperless‑NGX running at the specified commit. Once it's idle and stable, **(R2)** what background processes or tasks continue executing automatically? **(R3)** What are the actual log entries that appear periodically showing the system is healthy and ready? I need the specific log messages, their frequency, and what they indicate. **(R4)** Also, if you briefly interrupt and restart part of the system, what specific log messages confirm everything has reconnected and is operational again? **(R5)** What components or processes keep running continuously to maintain Paperless‑NGX in a ready state, even when no documents are being processed? You may use temporary helper commands or inspection tools if needed, but don't modify any source files and clean up any temporary artifacts when you're done."
+> "Get Paperless-NGX running at the specified commit. Once it's idle and stable, **(R2)** what background processes or tasks continue executing automatically? **(R3)** What are the actual log entries that appear periodically showing the system is healthy and ready? I need the specific log messages, their frequency, and what they indicate. **(R4)** Also, if you briefly interrupt and restart part of the system, what specific log messages confirm everything has reconnected and is operational again? **(R5)** What components or processes keep running continuously to maintain Paperless-NGX in a ready state, even when no documents are being processed? You may use temporary helper commands or inspection tools if needed, but don't modify any source files and clean up any temporary artifacts when you're done."
 
 - **R1** — Bring the system up at the pinned commit and reach a stable idle state.
 - **R2** — Enumerate the background processes/tasks that keep running automatically while idle.
@@ -30,163 +73,239 @@ This document answers five questions about how Paperless‑NGX behaves once it i
 
 ## 1. Environment and exact invocation commands
 
-### 1.1 How the runtime was provisioned
+### 1.1 Canonical (product) topology vs. this reproduction
 
-Paperless‑NGX at this commit is a Django application whose canonical deployment is **three long‑lived processes plus a Redis dependency**, as declared by its process supervisor (`docker/supervisord.conf`) and mirrored by three systemd units (`scripts/paperless-*.service`):
+Paperless-NGX at this commit is a Django application whose canonical deployment is **three long-lived processes plus a Redis dependency**, declared by its process supervisor (`docker/supervisord.conf`) and mirrored by three systemd units (`scripts/paperless-*.service`):
 
-- `[program:gunicorn]` → `command=gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application` — `docker/supervisord.conf:10-11`
-- `[program:consumer]` → `command=python3 manage.py document_consumer` — `docker/supervisord.conf:19-20`
-- `[program:scheduler]` → `command=python3 manage.py qcluster` — `docker/supervisord.conf:28-29`
+- `[program:gunicorn]` -> `command=gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application` — `docker/supervisord.conf:10-11`
+- `[program:consumer]` -> `command=python3 manage.py document_consumer` — `docker/supervisord.conf:19-20`
+- `[program:scheduler]` -> `command=python3 manage.py qcluster` — `docker/supervisord.conf:28-29`
 - Each systemd unit declares `Requires=redis.service` — `scripts/paperless-webserver.service:5`, `scripts/paperless-consumer.service:3`, `scripts/paperless-scheduler.service:3`.
 
-I reproduced this runtime **inside the project's own canonical Docker image** (the image designated by the setup instructions), which ships **Python 3.9.23** — matching the Dockerfile base `FROM python:3.9-slim-bullseye as main-app` (`Dockerfile:18`) — with all of the repository's pinned dependencies pre‑installed. I launched a **fresh, isolated container** and ran the three processes exactly as the supervisor/systemd units invoke them. The repository git checkout was never written to; the only artifact added to the repository is **this document**.
+**The published product image vs. the image used here — they are different, and this is labeled [NON-CANONICAL — packaging].** The two are distinguished explicitly so no claim conflates them:
 
-**Exact commands (run in order):**
+| Aspect | Published product image (`Dockerfile` @ this commit) | This reproduction image (SWE-Atlas coding-agent image, designated by the setup instructions) |
+|---|---|---|
+| Base | `FROM python:3.9-slim-bullseye as main-app` — `Dockerfile:18` | same Python 3.9 base (interpreter observed `Python 3.9.23`, §1.5) |
+| Working dir | `/usr/src/paperless/src/` — `Dockerfile:77,150` | repo checked out at **`/app`**; processes run from `/app/src` |
+| Service user | `useradd ... paperless` (uid 1000) — `Dockerfile:158` | `testuser` (uid 1000); container default login is `root` (§1.4) |
+| Entrypoint / CMD | `ENTRYPOINT /sbin/docker-entrypoint.sh` (`Dockerfile:168`), `CMD supervisord -c /etc/supervisord.conf` (`Dockerfile:172`) | `ENTRYPOINT /bin/bash`; **no Paperless CMD** — the three processes are launched manually (§1.2) |
+| Redis | **NOT** in the image. `RUNTIME_PACKAGES` (`Dockerfile:35-75`) lists curl, file, ghostscript, imagemagick, libzbar0, poppler-utils, pngquant, tesseract-ocr, etc. but **no redis-server**; the only redis artifact baked in is `wait-for-redis.py` copied to `/sbin` (`Dockerfile:141-142`). Redis is a **separate `redis:6.0` service** in `docker/compose/docker-compose.sqlite.yml:28-32`, reached via `PAPERLESS_REDIS=redis://broker:6379` (`docker-compose.sqlite.yml:53`). | `redis-server` was `apt`-installed into the container (§1.2) to stand in for that external service. |
+| Process supervision | `supervisord` runs the three programs | the three processes launched directly (identical commands), each to its own log file (§1.2) |
+
+**Bottom line:** the Python code paths exercised here are identical to the product's (same commit, same pinned dependencies), so all logging/task/recovery behavior is faithful. Only the **packaging** differs: user, working directory, entrypoint/supervisor, and the fact that Redis is a co-located `apt` package here rather than a separate `redis:6.0` container. Each such difference is flagged **[NON-CANONICAL — packaging]** where relevant.
+
+### 1.2 Exact, executable invocation commands (as actually run)
+
+All commands were issued **from the investigation host** against the container via `docker exec`. The long-lived processes were run as **`testuser`**, with `HOME=/app`, working directory **`/app/src`**, each **detached** (`setsid ... &`) to its own log file, capturing the PID (`echo $!`). This block is directly runnable (it names the host-vs-container boundary, the user, cwd, env, redirections, backgrounding, log paths, and PID capture that the processes actually used):
 
 ```bash
-# 1. Fresh, isolated container from the canonical image (Python 3.9.23), no repo writes
-docker run -d --name pngx_obs --entrypoint sleep \
-  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01 infinity
+# ---- HOST: create a fresh, uniquely-named, isolated container from the designated image ----
+docker run -d --name pngx_obs_20260710_090348 --entrypoint sleep \
+  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01 \
+  infinity
+CN=pngx_obs_20260710_090348
 
-# 2. Runtime prerequisites installed inside the container (see caveat 1.3)
-apt-get install -y redis-server libzbar0 poppler-utils pngquant curl
+# ---- CONTAINER: prerequisites (see caveat, §1.7). apt runs as root ----
+docker exec "$CN" bash -lc 'apt-get update && apt-get install -y redis-server libzbar0 poppler-utils pngquant procps'
 
-# 3. Redis broker + Channels layer (canonical start command)
-redis-server --daemonize yes --bind 127.0.0.1 --port 6379
+# ---- CONTAINER: Redis broker + Channels layer (canonical command), as testuser ----
+docker exec -u testuser "$CN" bash -lc 'redis-server --daemonize yes --bind 127.0.0.1 --port 6379'
 
-# 4. Database migrations (SQLite default) + full-text index + startup check — run from /app/src
-cd /app/src
-python3 manage.py migrate
-python3 manage.py document_index reindex
-python3 manage.py check
+# ---- CONTAINER: runtime dirs, migrations (SQLite default), full-text index, startup check (from /app/src) ----
+docker exec -u testuser -e HOME=/app -w /app/src "$CN" bash -lc '
+  mkdir -p /app/consume /app/media /app/data /app/data/index /app/data/log /app/export /app/static
+  python3 manage.py migrate
+  python3 manage.py document_index reindex
+  python3 manage.py check'
 
-# 5. The three canonical long-lived processes (each to its own log file)
-gunicorn -c /app/gunicorn.conf.py paperless.asgi:application     # web + websockets (:8000)
-python3 manage.py document_consumer                             # directory watcher
-python3 manage.py qcluster                                      # django-q task cluster
+# ---- CONTAINER: the three canonical long-lived processes, each detached to its own log, PID captured ----
+docker exec -u testuser -e HOME=/app -w /app/src "$CN" bash -lc '
+  mkdir -p /app/obs_logs
+  setsid gunicorn -c /app/gunicorn.conf.py paperless.asgi:application \
+    >/app/obs_logs/gunicorn.log 2>&1 & echo "gunicorn_pid=$!"  >/app/obs_logs/launch_meta.txt
+  setsid python3 manage.py document_consumer \
+    >/app/obs_logs/consumer.log 2>&1 & echo "consumer_pid=$!" >>/app/obs_logs/launch_meta.txt
+  setsid python3 manage.py qcluster \
+    >/app/obs_logs/qcluster.log 2>&1 & echo "qcluster_pid=$!" >>/app/obs_logs/launch_meta.txt'
 ```
 
-`manage.py check` output (canonical startup check passes cleanly):
+Captured launch metadata (`/app/obs_logs/launch_meta.txt`, RAW):
 
 ```
-System check identified no issues (0 silenced).
+LAUNCH_UTC=2026-07-10T09:06:33Z
+gunicorn_pid=790
+consumer_pid=793
+qcluster_pid=796
 ```
 
-### 1.2 Dependency versions actually used (from the project's own pins)
+### 1.3 Provenance: pinned commit and clean worktree inside the container
 
-These versions were confirmed inside the running container (`pip show ...`) and match `requirements.txt` / `Pipfile.lock` at this commit:
+Producing command and output (RAW) — confirms the code is exactly the pinned commit and that **no repository file was modified** by the run:
+
+```bash
+# docker exec -u testuser "$CN" bash -lc 'git config --global --add safe.directory /app; \
+#   git -C /app rev-parse HEAD; git -C /app status --porcelain'
+542221a38dff06361e07976452f9aea24d210542
+# (git status --porcelain produced NO output -> worktree clean)
+```
+
+### 1.4 Effective environment (what is actually overridden)
+
+Producing command and output (RAW):
+
+```bash
+# docker exec "$CN" bash -lc 'env | grep ^PAPERLESS_ ; echo "--- default user ---"; whoami; id testuser'
+PAPERLESS_DISABLE_DBHANDLER=true
+--- default user ---
+root
+uid=1000(testuser) gid=1000(testuser) groups=1000(testuser)
+```
+
+The **only** `PAPERLESS_*` variable set by the image is `PAPERLESS_DISABLE_DBHANDLER=true`. **This has no functional effect at this commit:** the name `PAPERLESS_DISABLE_DBHANDLER` is not referenced anywhere under `src/` at `542221a38dff` (it appears only in `src/setup.cfg:12` as a flake8 setting name fragment, unrelated to logging), and the `LOGGING` configuration defines **no database log handler** — only a console `StreamHandler` plus two `ConcurrentRotatingFileHandler`s (`src/paperless/settings.py:373-411`). Every other runtime path uses the **repository defaults**: `BASE_DIR=/app/src`, media `/app/media`, consume `/app/consume`, data `/app/data`, index `/app/data/index`, log `/app/data/log` (`src/paperless/settings.py`). The container default login user is `root`, but the processes were run as `testuser` (uid 1000); see §1.7.
+
+### 1.5 Dependency versions actually used (from the project's own pins)
+
+Confirmed inside the running container; these match `requirements.txt` / `Pipfile.lock` at this commit. Producing command: `redis-server --version` and `python3 -c "import importlib.metadata ..."`.
 
 | Package | Version | Role |
 |---|---|---|
-| Python | 3.9.23 | Canonical interpreter (`Dockerfile:18`) |
-| redis‑server | 6.0.16 | django‑q broker + Channels group layer |
+| Python | 3.9.23 | Canonical interpreter (`Dockerfile:18` base `python:3.9-slim-bullseye`) |
+| redis-server | 6.0.16 | django-q broker + Channels group layer |
 | Django | 4.0.4 | Web framework / ORM / management commands |
-| django‑q | 1.3.9 | Task queue + scheduler (`qcluster`), source of `[Q]` logs (`Pipfile:17` `django-q = "~=1.3"`) |
+| django-q | 1.3.9 | Task queue + scheduler (`qcluster`), source of `[Q]` logs (`Pipfile` `django-q = "~=1.3"`) |
 | channels | 3.0.4 | ASGI websocket framework (status updates) |
-| channels‑redis | 3.4.0 | Redis‑backed Channels layer |
+| channels-redis | 3.4.0 | Redis-backed Channels layer |
+| daphne | 3.0.2 | ASGI server library (Channels dependency) |
 | gunicorn | 20.1.0 | ASGI process manager for the web server |
 | uvicorn | 0.17.6 | ASGI worker (`ConfigurableWorker` base) |
-| redis (py client) | 3.5.3 | Python Redis client used by django‑q |
-| concurrent‑log‑handler | 0.9.20 | Rotating file handler for `paperless`/`paperless_mail` loggers |
-| Whoosh | 2.7.4 | Full‑text index (drives daily `index_optimize`) |
-| scikit‑learn | 1.0.2 | Document classifier (drives hourly `train_classifier`) |
+| redis (py client) | 3.5.3 | Python Redis client used by django-q |
+| djangorestframework | 3.13.1 | REST API layer |
+| whitenoise | 6.0.0 | Static-file serving |
+| concurrent-log-handler | 0.9.20 | Rotating file handler for `paperless`/`paperless_mail` loggers |
+| Whoosh | 2.7.4 | Full-text index (drives daily `index_optimize`) |
+| scikit-learn | 1.0.2 | Document classifier (drives hourly `train_classifier`) |
 | watchdog | 2.1.7 | Filesystem event monitoring for the consumer |
 | inotifyrecursive | 0.3.5 | Recursive inotify support for the consumer |
 
-**Default configuration observed** (no overrides): database = **SQLite** at `/app/data/db.sqlite3` (`src/paperless/settings.py:297-302`; PostgreSQL is used only when `PAPERLESS_DBHOST` is set, `settings.py:304-318`); `PAPERLESS_REDIS` default `redis://localhost:6379` (`settings.py:182`, `settings.py:456`); `DEBUG` default `NO` so the console log handler runs at **INFO** (`settings.py:50`, `settings.py:388`).
+**Default configuration in effect:** database = **SQLite** at `/app/data/db.sqlite3` (`src/paperless/settings.py:297`; PostgreSQL is used only when `PAPERLESS_DBHOST` is set — `settings.py:304,311`); `PAPERLESS_REDIS` default `redis://localhost:6379` (`settings.py:182`, `settings.py:456`); `DEBUG` default `NO`, so the console log handler runs at **INFO** (`settings.py:50`, `settings.py:388`).
 
-### 1.3 Non‑canonical caveats (explicitly labeled)
+### 1.6 Startup checks (full transcripts)
 
-- **[NON‑CANONICAL — packaging] Direct process launch vs. supervisord/docker‑compose.** I launched the three processes directly (as the setup instructions prescribe, and exactly as `docker/supervisord.conf:11,20,29` and `scripts/*.service` invoke them) rather than under `supervisord` or `docker compose`. The **process invocations and code paths are identical**; only the supervisor wrapper differs. *Canonical counterpart:* the same three commands, started by supervisord (Docker) or systemd (bare metal).
-- **[NON‑CANONICAL — prerequisites installed at runtime]** `redis-server`, `libzbar0`, `poppler-utils`, `pngquant`, and `curl` were `apt`‑installed into the container because the minimal base image lacks them; the published Paperless‑NGX image bakes these in. Versions match the canonical toolchain (e.g. `redis-server 6.0.16`).
-- **[NON‑CANONICAL — user]** Processes ran as `root` inside the container rather than the `paperless`/`testuser` service account. This does not affect the logging or task behavior examined here.
-- **[NON‑CANONICAL — worker count] 11 django‑q workers.** The container observed `multiprocessing.cpu_count() == 128`, so `default_task_workers()` returned `floor(sqrt(128)) = 11` (`src/paperless/settings.py:427-433`, `TASK_WORKERS` `settings.py:438`). *Canonical counterpart:* the default depends on the host CPU count (and `PAPERLESS_TASK_WORKERS`); on a 4‑core host it would be `floor(sqrt(4)) = 2`. The **worker‑count value is host‑specific; the formula is canonical.**
-- **[NON‑CANONICAL — volatile fields]** Timestamps, PIDs, the django‑q cluster word‑name (e.g. `montana-tennis-winner-tango`) and the per‑task word‑names vary per run. All output below is my own freshly captured run.
-- **The web server healthcheck returned HTTP 302** (redirect to the login page for an unauthenticated request); `curl -f` treats this as success. This is expected for the root URL at idle.
+**Migrations** (SQLite). Producing command `python3 manage.py migrate`; the three schedule-defining migrations applied cleanly and the command exited 0 (RAW excerpt + exit code):
+
+```
+Applying documents.1001_auto_20201109_1636... OK
+Applying documents.1004_sanity_check_schedule... OK
+Applying paperless_mail.0002_auto_20201117_1334... OK
+MIGRATE_EXIT=0
+```
+
+**Full-text index** (`python3 manage.py document_index reindex`) — zero documents to index at idle (RAW + exit code):
+
+```
+0it [00:00, ?it/s]
+0it [00:00, ?it/s]
+REINDEX_EXIT=0
+```
+
+**System check** (`python3 manage.py check`) — the canonical startup check passes cleanly (RAW + exit code):
+
+```
+System check identified no issues (0 silenced).
+CHECK_EXIT=0
+```
+
+### 1.7 Non-canonical caveats (explicitly labeled)
+
+- **[NON-CANONICAL — packaging] Direct process launch vs. supervisord/docker-compose.** The three processes were launched directly (exactly as `docker/supervisord.conf:11,20,29` and `scripts/*.service` invoke them) rather than under `supervisord`/`docker compose`. The process invocations and code paths are identical; only the supervisor wrapper differs. *Canonical counterpart:* the same three commands started by supervisord (Docker) or systemd (bare metal).
+- **[NON-CANONICAL — packaging] Prerequisites installed at runtime.** `redis-server`, `libzbar0`, `poppler-utils`, `pngquant`, and `procps` were `apt`-installed into the container. Of these, `libzbar0`/`poppler-utils`/`pngquant` **are** part of the product image's `RUNTIME_PACKAGES` (`Dockerfile:35-75`); **`redis-server` is not** — in the product deployment Redis is a separate `redis:6.0` service (`docker/compose/docker-compose.sqlite.yml:28-32`). Here it is co-located in the same container. Versions match the canonical toolchain (e.g. `redis-server 6.0.16`).
+- **[NON-CANONICAL — user]** The container's default login user is `root`; the Paperless processes were run as **`testuser`** (uid 1000). The product image uses a `paperless` service account (uid 1000). This does not affect the logging/task behavior examined here.
+- **[NON-CANONICAL — worker count] 11 django-q workers.** `multiprocessing.cpu_count()` reported **128** in this container, so `default_task_workers()` returned `floor(sqrt(128)) = 11` (`src/paperless/settings.py:427-433`; `TASK_WORKERS` `settings.py:438`; passed to `Q_CLUSTER["workers"]` `settings.py:455`). *Canonical counterpart:* the default depends on the host CPU count (and `PAPERLESS_TASK_WORKERS`); on a 4-core host it would be `floor(sqrt(4)) = 2`. **The worker-count value is host-specific; the formula is canonical.**
+- **[NON-CANONICAL — volatile fields]** Timestamps, PIDs, the django-q cluster word-name (`kilo-whiskey-artist-uranus`) and per-task word-names vary per run.
+- **The web-server liveness probe returns HTTP 302** (redirect to the login page for an unauthenticated request to `/`); `curl -f` treats this as success (§3.4).
 
 ---
 
-## 2. R1 — The system up at a stable idle state; R2/R5 — idle background processes
+## 2. R1 — the system up at a stable idle state; R2/R5 — idle background processes
 
 ### 2.1 Reaching idle (R1)
 
-After the commands in §1.1, the system reached a stable idle state at **2026‑07‑10 07:47:29 UTC**. "Idle" here means the consume directory is empty and no tasks are executing:
+After the commands in §1.2, the system reached a stable idle state at process launch (`2026-07-10 09:06:33Z`). "Idle" means the consume directory is empty and no tasks are executing. Producing command and output (RAW):
 
-```
-# ls -la /app/consume        (the watched consumption directory)
-total 8
-drwxr-sr-x 2 root     testuser 4096 Jul 10 07:47 .
-drwxr-sr-x 1 testuser testuser 4096 Jul 10 07:46 ..
-```
-
-The four periodic schedules that django‑q must drive were created by the migrations and confirmed present in the database (`python3 manage.py shell`):
-
-```
-[["Train the classifier","documents.tasks.train_classifier","H",null],
- ["Optimize the index","documents.tasks.index_optimize","D",null],
- ["Perform sanity check","documents.tasks.sanity_check","W",null],
- ["Check all e-mail accounts","paperless_mail.tasks.process_mail_accounts","I",10]]
+```bash
+# docker exec -u testuser "$CN" bash -lc 'ls -la /app/consume'
+total 12
+drwxr-sr-x 2 testuser testuser 4096 Jul 10 09:06 .
+drwxr-sr-x 1 testuser testuser 4096 Jul 10 09:05 ..
 ```
 
-These correspond exactly to the schedule‑defining migrations: `Train the classifier` (HOURLY) and `Optimize the index` (DAILY) from `src/documents/migrations/1001_auto_20201109_1636.py:10-19`; `Perform sanity check` (WEEKLY) from `src/documents/migrations/1004_sanity_check_schedule.py:10-14`; `Check all e-mail accounts` (MINUTES, `minutes=10`) from `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15`.
+The four periodic schedules that django-q must drive were created by the migrations (§1.6) and confirmed present in the database. Producing command `python3 manage.py shell -c "...Schedule.objects..."`; output (RAW):
+
+```
+[["Train the classifier", "documents.tasks.train_classifier", "H", null],
+ ["Optimize the index", "documents.tasks.index_optimize", "D", null],
+ ["Perform sanity check", "documents.tasks.sanity_check", "W", null],
+ ["Check all e-mail accounts", "paperless_mail.tasks.process_mail_accounts", "I", 10]]
+```
+
+These correspond exactly to the schedule-defining migrations: `Train the classifier` (HOURLY) and `Optimize the index` (DAILY) from `src/documents/migrations/1001_auto_20201109_1636.py:10-19`; `Perform sanity check` (WEEKLY) from `src/documents/migrations/1004_sanity_check_schedule.py:10-14`; `Check all e-mail accounts` (MINUTES, `minutes=10`) from `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15`.
 
 ### 2.2 The three processes and their startup banners (R2/R5)
 
-Each process was launched with the exact command shown, writing its own stdout+stderr to a separate log file. The banners below are **unedited**.
+Each process was launched with the exact command shown in §1.2, writing its stdout+stderr to its own log file. The producing command for each banner is `docker exec "$CN" cat <logfile>`; the PIDs are cross-referenced to the process tree in §2.3.
 
 #### (a) `gunicorn` — web server + websockets (gunicorn master + 2 uvicorn ASGI workers)
 
-**Command:** `gunicorn -c /app/gunicorn.conf.py paperless.asgi:application` (from `/app/src`)
+**Command:** `gunicorn -c /app/gunicorn.conf.py paperless.asgi:application` (from `/app/src`, as `testuser`). Producing command: `cat /app/obs_logs/gunicorn.log`. Output (RAW — the complete file is 4 lines):
 
 ```
-[2026-07-10 07:47:30 +0000] [671] [INFO] Starting gunicorn 20.1.0
-[2026-07-10 07:47:30 +0000] [671] [INFO] Listening at: http://0.0.0.0:8000 (671)
-[2026-07-10 07:47:30 +0000] [671] [INFO] Using worker: paperless.workers.ConfigurableWorker
-[2026-07-10 07:47:30 +0000] [671] [INFO] Server is ready. Spawning workers
+[2026-07-10 09:06:34 +0000] [790] [INFO] Starting gunicorn 20.1.0
+[2026-07-10 09:06:34 +0000] [790] [INFO] Listening at: http://0.0.0.0:8000 (790)
+[2026-07-10 09:06:34 +0000] [790] [INFO] Using worker: paperless.workers.ConfigurableWorker
+[2026-07-10 09:06:34 +0000] [790] [INFO] Server is ready. Spawning workers
 ```
 
 - `bind = 0.0.0.0:8000`, `workers = 2`, `worker_class = "paperless.workers.ConfigurableWorker"`, `timeout = 120` — `gunicorn.conf.py:3-6`.
-- `Server is ready. Spawning workers` is emitted by the repo's `when_ready(server)` hook — `gunicorn.conf.py:17-18`. The `Listening at: http://0.0.0.0:8000` and `Starting gunicorn 20.1.0` lines are gunicorn's own stdlib startup logs **[emitted by gunicorn core, not by repo config]**.
-- `ConfigurableWorker` subclasses the uvicorn `UvicornWorker` (an ASGI worker) — `src/paperless/workers.py:9`. The ASGI application wires both `http` and `websocket` protocols via `ProtocolTypeRouter` — `src/paperless/asgi.py:17-20`; the websocket route is `re_path(r"ws/status/$", StatusConsumer.as_asgi())` — `src/paperless/urls.py:136-137`, and `StatusConsumer` joins the Channels group `status_updates` — `src/paperless/consumers.py:9,17-19`.
-- **Observed processes:** master **PID 671** with **two** uvicorn ASGI worker children **PID 682** and **PID 686** (`PPid 671`), i.e. `workers=2` as configured.
+- `Server is ready. Spawning workers` is emitted by the repo's `when_ready(server)` hook — `gunicorn.conf.py:17-18`. The `Listening at:` and `Starting gunicorn 20.1.0` lines are gunicorn's own core startup logs.
+- `ConfigurableWorker` subclasses the uvicorn `UvicornWorker` (an ASGI worker) — `src/paperless/workers.py:9`. The ASGI application wires both `http` and `websocket` protocols via `ProtocolTypeRouter` — `src/paperless/asgi.py:17`, `asgi.py:19-20`; the websocket route is `re_path(r"ws/status/$", StatusConsumer.as_asgi())` — `src/paperless/urls.py:136-137`, and `StatusConsumer` joins the Channels group `status_updates` — `src/paperless/consumers.py:9,17-20`.
+- **Observed processes:** master **PID 790** with **two** uvicorn ASGI worker children **PID 801** and **PID 802** (`PPid 790`), i.e. `workers=2` as configured (§2.3).
 
-*(One benign one‑time startup warning also appears — `UserWarning: No directory at: /app/static/` from whitenoise — because static files were not collected in this minimal run. It is emitted only at startup, never periodically, and does not affect the runtime behavior examined here.)*
+#### (b) `document_consumer` — the consumption-directory watcher
 
-#### (b) `document_consumer` — the consumption‑directory watcher
-
-**Command:** `python3 manage.py document_consumer`
+**Command:** `python3 manage.py document_consumer`. Producing command: `cat /app/obs_logs/consumer.log`. Output (RAW — the complete file is 1 line):
 
 ```
-[2026-07-10 07:47:30,893] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
+[2026-07-10 09:06:34,932] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
 ```
 
-- This readiness banner is emitted by `handle_inotify()` — `src/documents/management/commands/document_consumer.py:200` (logger `paperless.management.consumer`, defined at `document_consumer.py:24`). If inotify were unavailable it would instead log `Polling directory for changes: <dir>` — `document_consumer.py:186`.
-- At idle this watcher is **silent**. It only logs when a file arrives: `Adding {filepath} to the task queue.` — `document_consumer.py:85`. That line **did not appear** during the idle window (no documents ingested).
+- This readiness banner is emitted by `handle_inotify()` — `src/documents/management/commands/document_consumer.py:200` (logger `paperless.management.consumer`, defined at `document_consumer.py:24`). If inotify were unavailable it would instead log `Polling directory for changes: <dir>` — `document_consumer.py:186` **[INFERRED — inotify was actually used]**.
+- At idle this watcher is **silent**. It only logs when a file arrives: `Adding {filepath} to the task queue.` — `document_consumer.py:85`. That line **did not appear** during the idle window (no documents ingested). **PID 793** (§2.3).
 
-#### (c) `qcluster` — the django‑q task cluster (guard/sentinel + monitor + pusher + worker pool)
+#### (c) `qcluster` — the django-q task cluster (guard/sentinel + monitor + pusher + worker pool)
 
-**Command:** `python3 manage.py qcluster`
+**Command:** `python3 manage.py qcluster`. Producing command: `head -16 /app/obs_logs/qcluster.log`. Output (RAW — first 16 lines, the complete startup banner):
 
 ```
-07:47:30 [Q] INFO Q Cluster montana-tennis-winner-tango starting.
-07:47:30 [Q] INFO Process-1:1 ready for work at 702
-07:47:30 [Q] INFO Process-1:2 ready for work at 703
-07:47:30 [Q] INFO Process-1:3 ready for work at 704
-07:47:30 [Q] INFO Process-1:4 ready for work at 706
-07:47:30 [Q] INFO Process-1:5 ready for work at 709
-07:47:30 [Q] INFO Process-1:6 ready for work at 710
-07:47:30 [Q] INFO Process-1:7 ready for work at 711
-07:47:30 [Q] INFO Process-1:8 ready for work at 712
-07:47:30 [Q] INFO Process-1:9 ready for work at 713
-07:47:30 [Q] INFO Process-1:10 ready for work at 714
-07:47:30 [Q] INFO Process-1:11 ready for work at 715
-07:47:30 [Q] INFO Process-1:12 monitoring at 716
-07:47:30 [Q] INFO Process-1 guarding cluster montana-tennis-winner-tango
-07:47:30 [Q] INFO Process-1:13 pushing tasks at 717
-07:47:30 [Q] INFO Q Cluster montana-tennis-winner-tango running.
+09:06:34 [Q] INFO Q Cluster kilo-whiskey-artist-uranus starting.
+09:06:34 [Q] INFO Process-1:1 ready for work at 827
+09:06:34 [Q] INFO Process-1:2 ready for work at 828
+09:06:34 [Q] INFO Process-1:3 ready for work at 829
+09:06:34 [Q] INFO Process-1:4 ready for work at 830
+09:06:34 [Q] INFO Process-1:5 ready for work at 831
+09:06:34 [Q] INFO Process-1:6 ready for work at 832
+09:06:34 [Q] INFO Process-1:7 ready for work at 833
+09:06:34 [Q] INFO Process-1:8 ready for work at 834
+09:06:34 [Q] INFO Process-1:9 ready for work at 835
+09:06:34 [Q] INFO Process-1:10 ready for work at 836
+09:06:34 [Q] INFO Process-1:11 ready for work at 837
+09:06:35 [Q] INFO Process-1:12 monitoring at 838
+09:06:35 [Q] INFO Process-1 guarding cluster kilo-whiskey-artist-uranus
+09:06:35 [Q] INFO Process-1:13 pushing tasks at 839
+09:06:35 [Q] INFO Q Cluster kilo-whiskey-artist-uranus running.
 ```
 
-The django‑q logger uses its own format `HH:MM:SS [Q] LEVEL msg` (`django_q/conf.py:213-214`, with `propagate = False` at `django_q/conf.py:212`, so `[Q]` lines are independent of Paperless's Django `LOGGING`). Mapping each role to the code that emits it (all in the pip‑installed `django-q 1.3.9` package):
+The django-q logger uses its own format `HH:MM:SS [Q] LEVEL msg` (`django_q/conf.py:213-214`) with `propagate = False` (`django_q/conf.py:212`), so `[Q]` lines are independent of Paperless's Django `LOGGING`. Each role maps to the code that emits it (all in the pip-installed `django-q 1.3.9`):
 
 | Banner line | Role | Source |
 |---|---|---|
@@ -194,318 +313,431 @@ The django‑q logger uses its own format `HH:MM:SS [Q] LEVEL msg` (`django_q/co
 | `Process-1:1..11 ready for work at <pid>` | **11 worker processes** | `django_q/cluster.py:410` |
 | `Process-1:12 monitoring at <pid>` | **monitor** (persists task results) | `django_q/cluster.py:378` |
 | `Process-1 guarding cluster <name>` | **guard/sentinel** (0.5 s health loop) | `django_q/cluster.py:256` |
-| `Process-1:13 pushing tasks at <pid>` | **pusher** (BLPOP‑polls the broker) | `django_q/cluster.py:342` |
+| `Process-1:13 pushing tasks at <pid>` | **pusher** (BLPOP-polls the broker) | `django_q/cluster.py:342` |
 | `Q Cluster <name> running.` | cluster ready | `django_q/cluster.py:261` |
 
-- **Worker count = 11** = `floor(sqrt(128))` on this host — see caveat §1.3. Formula: `default_task_workers()` at `src/paperless/settings.py:427-433`; used by `TASK_WORKERS` at `settings.py:438` and passed into `Q_CLUSTER["workers"]` at `settings.py:455`.
-- **Observed process tree:** the `qcluster` master/guard is **PID 655**; it forked the 11 workers (PIDs 702–715), the monitor (PID 716) and the pusher (PID 717).
+- **Worker count = 11** = `floor(sqrt(128))` on this host — caveat §1.7. Formula: `default_task_workers()` at `src/paperless/settings.py:427-433`.
+- **Observed process tree:** the `qcluster` management command is **PID 796**; it spawned the guard/sentinel **PID 826**, which forked the 11 workers (PIDs 827-837), the monitor (PID 838) and the pusher (PID 839) — §2.3.
 
-**Full idle process topology (observed):**
+### 2.3 Full idle process topology (observed)
+
+Producing command and output (RAW), captured at `2026-07-10T09:07:02Z`:
+
+```bash
+# docker exec "$CN" bash -lc 'ps -eo pid,ppid,user,args | grep -E "redis-server|gunicorn|document_consumer|qcluster" | grep -v grep'
+    652       1 testuser redis-server 127.0.0.1:6379
+    790       1 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    793       1 testuser python3 manage.py document_consumer
+    796       1 testuser python3 manage.py qcluster
+    801     790 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    802     790 testuser /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    826     796 testuser python3 manage.py qcluster
+    827     826 testuser python3 manage.py qcluster   # worker Process-1:1 ... (827-837 = 11 workers)
+    838     826 testuser python3 manage.py qcluster   # monitor Process-1:12
+    839     826 testuser python3 manage.py qcluster   # pusher  Process-1:13
+```
+
+(The block is **[annotated]**: text after `#` is mine; PIDs 828-836 — the remaining nine workers — were elided for space and are contiguous in the RAW capture.) Summary:
 
 ```
-redis-server (PID 485, 127.0.0.1:6379)
-qcluster    (guard/sentinel PID 655) ── 11 workers (702-715) + monitor (716) + pusher (717)
-document_consumer (PID 663)  ── inotify watch on /app/consume
-gunicorn    (master PID 671) ── 2 uvicorn ASGI workers (682, 686) on :8000
+redis-server (PID 652, 127.0.0.1:6379)
+qcluster mgmt (PID 796) -> guard/sentinel (PID 826) -> 11 workers (827-837) + monitor (838) + pusher (839)
+document_consumer (PID 793)  -- inotify watch on /app/consume
+gunicorn master (PID 790) -> 2 uvicorn ASGI workers (801, 802) on :8000
 ```
-
 
 ---
 
-## 3. R3 — Periodic health/readiness log entries: messages, frequency, and meaning
+## 3. R3 — periodic health/readiness log entries: messages, frequency, and meaning
 
-**KEY FINDING (proven below): there is no dedicated periodic "healthy" heartbeat INFO log line.** While idle and healthy, the three processes are silent at INFO. The only recurring log activity is the firing of the four django‑q scheduled tasks. Two additional health mechanisms run continuously but are **silent** unless something is wrong.
+**KEY FINDING (proven below): there is no dedicated periodic "healthy" heartbeat INFO log line.** While idle and healthy, the three processes are silent at INFO. The only recurring log activity **observed in this run** is the firing of the `Check all e-mail accounts` schedule every ~10 minutes. Two additional health mechanisms run continuously but are **silent** unless something is wrong.
 
-### 3.1 The measured cadence table
+### 3.1 The cadence table
 
-Each cadence below was **measured**, not assumed (frequency confirmed either by observing ≥2 firings, or by reading the schedule `next_run` increments from the live database — both shown in §3.2/§3.3).
+| Recurring signal | Frequency | Basis | Meaning / Source |
+|---|---|---|---|
+| `... created a task from schedule [Check all e-mail accounts]` | every **10 minutes** | **[OBSERVED]** — fired on-schedule 3x in-window; two clean intervals measured (§3.3) | Scheduler enqueues the mail-poll task; `process_mail_accounts` — `src/paperless_mail/tasks.py:11`; schedule `Schedule.MINUTES, minutes=10` — `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15` |
+| `... created a task from schedule [Train the classifier]` | **hourly** | **[CONFIGURED / SOURCE-DERIVED]** — fired once in the startup burst; `next_run` stepped +1 h; did not recur in-window (§3.3) | Enqueues classifier retrain; `train_classifier` — `src/documents/tasks.py:48`; `Schedule.HOURLY` — `src/documents/migrations/1001_auto_20201109_1636.py:10-14` |
+| `... created a task from schedule [Optimize the index]` | **daily** | **[CONFIGURED / SOURCE-DERIVED]** — `next_run` +1 day; did not recur in-window | Enqueues Whoosh index optimize; `index_optimize` — `src/documents/tasks.py:32`; `Schedule.DAILY` — `src/documents/migrations/1001_auto_20201109_1636.py:15-19` |
+| `... created a task from schedule [Perform sanity check]` | **weekly** | **[CONFIGURED / SOURCE-DERIVED]** — `next_run` +7 days; did not recur in-window | Enqueues integrity sweep; `sanity_check` — `src/documents/tasks.py:255`; `Schedule.WEEKLY` — `src/documents/migrations/1004_sanity_check_schedule.py:10-14`; emits `Sanity checker detected no issues.` — `src/documents/sanity_checker.py:27` |
+| Docker Compose healthcheck `curl -f http://localhost:8000` | every **30 seconds** (configured) | **[CONFIGURED]** — Compose not executed here; command reproduced manually (§3.4) | Liveness probe — **SILENT** (no access log by default) — `docker/compose/docker-compose.sqlite.yml:41-45` |
+| django-q guard `Stat` write to Redis | every **0.5 seconds** | **[OBSERVED silent + SOURCE-DERIVED cadence]** | Cluster status write — **SILENT** unless Redis is unreachable — `django_q/cluster.py:288`, `django_q/status.py:71-75` |
 
-| Recurring signal | Frequency | Meaning / Source |
-|---|---|---|
-| `... created a task from schedule [Check all e-mail accounts]` | every **10 minutes** (most frequent) | Mail polling; `process_mail_accounts` — `src/paperless_mail/tasks.py:11`; schedule `Schedule.MINUTES, minutes=10` — `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10-15` |
-| `... created a task from schedule [Train the classifier]` | **hourly** | Retrain document classifier; `train_classifier` — `src/documents/tasks.py:48`; schedule `Schedule.HOURLY` — `src/documents/migrations/1001_auto_20201109_1636.py:10-14` |
-| `... created a task from schedule [Optimize the index]` | **daily** | Optimize Whoosh full‑text index; `index_optimize` — `src/documents/tasks.py:32`; schedule `Schedule.DAILY` — `src/documents/migrations/1001_auto_20201109_1636.py:15-19` |
-| `... created a task from schedule [Perform sanity check]` | **weekly** | Integrity sweep; `sanity_check` — `src/documents/tasks.py:255`; schedule `Schedule.WEEKLY` — `src/documents/migrations/1004_sanity_check_schedule.py:10-14`; emits `Sanity checker detected no issues.` — `src/documents/sanity_checker.py:27` |
-| Docker Compose healthcheck `curl -f http://localhost:8000` | every **30 seconds** | Liveness probe — **SILENT** (no access log by default) — `docker/compose/docker-compose.sqlite.yml:41-45` |
-| django‑q guard `Stat` heartbeat write to Redis | every **0.5 seconds** | Cluster status write — **SILENT** unless Redis is unreachable — `django_q/cluster.py:288`, `django_q/status.py:71-75` |
+**What each visible signal indicates (narrowly).** A `created a task from schedule [<name>]` line proves the django-q **scheduler** fired that schedule and the **pusher/worker** pool accepted and completed the enqueued task (the following `processing [...]` / `Processed [...]` lines). That is a liveness signal for the **scheduler -> broker -> worker** path specifically. It does **not**, by itself, prove the whole system is healthy (e.g. the web server or Channels layer), and the mail/classifier/index tasks are effectively no-ops **only because nothing is configured/queued at idle** (no mail accounts; empty index/consume) — not a guarantee they are always no-ops. The sanity task additionally emits `Sanity checker detected no issues.` when it finds no problems. The two silent mechanisms (healthcheck, `Stat` heartbeat) are continuous liveness checks that by design print nothing while healthy (§3.4).
 
-**What these signals indicate about health.** The four scheduled‑task firings are the visible proof that the django‑q **scheduler + pusher + worker pool** are alive and processing the queue on time — a healthy idle cluster fires them on schedule and each completes immediately (the mail/classifier/index tasks are no‑ops at idle, and the sanity task reports "no issues"). Their absence, or `[Q] ERROR` lines instead, would indicate a broker or worker problem. The two silent mechanisms are the continuous liveness checks: the healthcheck confirms the web server answers HTTP, and the `Stat` heartbeat confirms the cluster can reach Redis — but by design **neither prints anything while healthy** (see §3.4).
+### 3.2 The one-time startup burst (overdue schedules; `catch_up: False`)
 
-### 3.2 The one‑time startup burst (overdue schedules; `catch_up: False`)
-
-About **30 seconds** after the cluster reported `running.` (07:47:30 → **07:48:00**), the guard's scheduler ran for the first time and fired all four overdue schedules **once**. django‑q's scheduler is gated in the guard loop by `if counter >= 30 and Conf.SCHEDULER:` (`django_q/cluster.py:284-286`), and Paperless sets `"catch_up": False` (`src/paperless/settings.py:451`), so overdue schedules fire a **single** time rather than replaying every missed run. Unedited:
+About **30 s** after the cluster reported `running.` (`09:06:35` -> **`09:07:04`**), the guard's scheduler ran for the first time and fired all four overdue schedules **once**. django-q's scheduler is gated in the guard loop by `if counter >= 30 and Conf.SCHEDULER:` (`django_q/cluster.py:284`), and Paperless sets `"catch_up": False` (`src/paperless/settings.py:451`), so overdue schedules fire a **single** time rather than replaying every missed run. Producing command: `sed -n '17,45p' qcluster.log`. Output (RAW):
 
 ```
-07:48:00 [Q] INFO Enqueued 1
-07:48:00 [Q] INFO Process-1 created a task from schedule [Train the classifier]
-07:48:00 [Q] INFO Enqueued 1
-07:48:00 [Q] INFO Process-1:1 processing [mountain-crazy-happy-july]
-07:48:00 [Q] INFO Process-1 created a task from schedule [Optimize the index]
-07:48:00 [Q] INFO Process-1:2 processing [fillet-georgia-earth-sodium]
-07:48:00 [Q] INFO Enqueued 1
-07:48:00 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
-07:48:00 [Q] INFO Process-1:3 processing [washington-pluto-black-november]
-07:48:00 [Q] INFO Enqueued 1
-07:48:00 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-07:48:00 [Q] INFO Process-1:4 processing [connecticut-berlin-ohio-sixteen]
-07:48:00 [Q] INFO Process-1:4 stopped doing work
-07:48:00 [Q] INFO Processed [connecticut-berlin-ohio-sixteen]
-[2026-07-10 07:48:00,559] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
-07:48:00 [Q] INFO Process-1:3 stopped doing work
-07:48:00 [Q] INFO Process-1:1 stopped doing work
-07:48:00 [Q] INFO Process-1:2 stopped doing work
-07:48:00 [Q] INFO Processed [washington-pluto-black-november]
-07:48:00 [Q] INFO Processed [mountain-crazy-happy-july]
-07:48:00 [Q] INFO Processed [fillet-georgia-earth-sodium]
-07:48:00 [Q] INFO recycled worker Process-1:1
-07:48:00 [Q] INFO Process-1:14 ready for work at 821
-07:48:00 [Q] INFO recycled worker Process-1:3
-07:48:00 [Q] INFO Process-1:15 ready for work at 822
-07:48:01 [Q] INFO recycled worker Process-1:2
-07:48:01 [Q] INFO Process-1:16 ready for work at 823
-07:48:01 [Q] INFO recycled worker Process-1:4
-07:48:01 [Q] INFO Process-1:17 ready for work at 824
+09:07:04 [Q] INFO Enqueued 1
+09:07:04 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+09:07:04 [Q] INFO Enqueued 1
+09:07:04 [Q] INFO Process-1 created a task from schedule [Optimize the index]
+09:07:04 [Q] INFO Process-1:1 processing [red-charlie-uranus-bravo]
+09:07:04 [Q] INFO Process-1:2 processing [low-venus-quiet-high]
+09:07:04 [Q] INFO Enqueued 1
+09:07:04 [Q] INFO Process-1 created a task from schedule [Perform sanity check]
+09:07:04 [Q] INFO Process-1:3 processing [enemy-paris-saturn-yankee]
+09:07:04 [Q] INFO Enqueued 1
+09:07:04 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+09:07:04 [Q] INFO Process-1:4 processing [tennis-bacon-lake-november]
+09:07:04 [Q] INFO Process-1:4 stopped doing work
+09:07:04 [Q] INFO Processed [tennis-bacon-lake-november]
+09:07:04 [Q] INFO Process-1:1 stopped doing work
+[2026-07-10 09:07:04,710] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
+09:07:04 [Q] INFO Process-1:3 stopped doing work
+09:07:04 [Q] INFO Process-1:2 stopped doing work
+09:07:04 [Q] INFO Processed [red-charlie-uranus-bravo]
+09:07:04 [Q] INFO Processed [enemy-paris-saturn-yankee]
+09:07:04 [Q] INFO Processed [low-venus-quiet-high]
+09:07:05 [Q] INFO recycled worker Process-1:1
+09:07:05 [Q] INFO Process-1:14 ready for work at 885
+09:07:05 [Q] INFO recycled worker Process-1:3
+09:07:05 [Q] INFO Process-1:15 ready for work at 886
+09:07:05 [Q] INFO recycled worker Process-1:2
+09:07:05 [Q] INFO Process-1:16 ready for work at 887
+09:07:06 [Q] INFO recycled worker Process-1:4
+09:07:06 [Q] INFO Process-1:17 ready for work at 888
 ```
 
-Notes on the lines above:
+Notes:
 - `Enqueued 1` — `django_q/tasks.py:74`; `Process-1 created a task from schedule [<name>]` — `django_q/cluster.py:669`.
-- `Sanity checker detected no issues.` prints in the **Paperless verbose format** `[{asctime}] [{levelname}] [{name}] {message}` (`src/paperless/settings.py:378`), **not** the `[Q]` format, because it comes from the `paperless.sanity_checker` logger (`src/documents/sanity_checker.py:24,27`), which writes to its rotating file handler **and** propagates to the root console handler (no `propagate:False`; root handler = `console`) — `settings.py:407-410`. I confirmed it also landed in the rotating file `/app/data/log/paperless.log`:
-  ```
-  [2026-07-10 07:48:00,559] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
-  ```
-- `recycled worker Process-1:N` + a new `ready for work at <pid>` — django‑q recycles each worker after the task because Paperless sets `"recycle": 1` (`src/paperless/settings.py:452`), a memory‑hygiene measure. This is why worker index numbers climb over time.
+- `Sanity checker detected no issues.` prints in the **Paperless verbose format** `[{asctime}] [{levelname}] [{name}] {message}` (`src/paperless/settings.py:378`), **not** the `[Q]` format, because it comes from the `paperless.sanity_checker` logger (`src/documents/sanity_checker.py:24,27`), which writes to its rotating file handler **and** propagates to the root console handler (`settings.py:407-410`).
+- `recycled worker Process-1:N` + a new `ready for work at <pid>` — django-q recycles each worker after a task because Paperless sets `"recycle": 1` (`src/paperless/settings.py:452`), a memory-hygiene measure; this is why worker index numbers climb over time.
 
-### 3.3 The 10‑minute mail cadence — measured across THREE firings (≥2 observations)
+### 3.3 The 10-minute mail cadence — measured across FOUR firings (two clean intervals)
 
-The `Check all e-mail accounts` task is the most frequent recurring signal. I observed it fire **three times** during the run:
+The `Check all e-mail accounts` task is the most frequent recurring signal and the only one whose full period was observed to repeat in this run. Producing command and output (RAW, `[annotated]` with the firing sequence):
 
-```
-# grep 'created a task from schedule [Check all e-mail accounts]' qcluster.log
-07:48:00 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #1 (overdue burst)
-07:56:31 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #2
-08:06:33 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #3
+```bash
+# grep 'created a task from schedule \[Check all e-mail accounts\]' /app/obs_logs/qcluster.log
+09:07:04 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #1 (overdue burst)
+09:16:05 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #2
+09:26:07 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #3
+09:36:08 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]   # #4
 ```
 
-The consecutive **on‑schedule** interval **#2 → #3 = 07:56:31 → 08:06:33 = 10 min 02 s ≈ 10 minutes** (the ~2 s jitter is the ~30 s scheduler poll granularity; the underlying `next_run` steps are exactly 10:00 — see below). Interval #1 → #2 is 8 min 31 s only because #1 was the *delayed overdue* firing (the schedule's `next_run` anchor predates cluster start). Full firing #3 block, unedited:
+Two consecutive **on-schedule** intervals (two independent measurements, satisfying the >=2 requirement):
+- **#2 -> #3 = `09:16:05` -> `09:26:07` = 10 min 02 s**
+- **#3 -> #4 = `09:26:07` -> `09:36:08` = 10 min 01 s**
+
+(Interval #1 -> #2 is shorter because #1 was the *delayed overdue* firing from the startup burst, §3.2.) Full firing #4 block, producing command `sed -n '60,66p' qcluster.log`, output (RAW):
 
 ```
-08:06:33 [Q] INFO Enqueued 1
-08:06:33 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-08:06:33 [Q] INFO Process-1:6 processing [summer-jig-beer-one]
-08:06:33 [Q] INFO Process-1:6 stopped doing work
-08:06:33 [Q] INFO Processed [summer-jig-beer-one]
-08:06:33 [Q] INFO recycled worker Process-1:6
-08:06:33 [Q] INFO Process-1:19 ready for work at 1173
+09:36:08 [Q] INFO Enqueued 1
+09:36:08 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+09:36:08 [Q] INFO Process-1:7 processing [dakota-happy-alpha-massachusetts]
+09:36:08 [Q] INFO Process-1:7 stopped doing work
+09:36:08 [Q] INFO Processed [dakota-happy-alpha-massachusetts]
+09:36:09 [Q] INFO recycled worker Process-1:7
+09:36:09 [Q] INFO Process-1:20 ready for work at 2145
 ```
 
-*(The `process_mail_accounts` function itself logs nothing at idle — no mail accounts are configured, so its loop over accounts is empty (`src/paperless_mail/tasks.py:11-17`). The only evidence it ran is the `[Q]` scheduler/worker lines above.)*
+The `process_mail_accounts` function itself logs nothing at idle — no mail accounts are configured, so its loop over accounts is empty (`src/paperless_mail/tasks.py:13`). The only evidence it ran is the `[Q]` scheduler/worker lines above.
 
-**Independent confirmation of all four cadences from the live database.** Reading each schedule's `next_run` (captured at 07:59:33) proves the frequencies directly, because django‑q advances `next_run` by the schedule's period:
+**Cross-check of all four cadences from the live database.** django-q advances each schedule's `next_run` by its period. Reading `next_run` at two points in the run (producing command: `python3 manage.py shell -c "...Schedule.objects..."`) shows only the mail schedule advancing in-window; the other three keep a fixed future `next_run`:
 
+At `now=2026-07-10 09:08:58` (RAW):
 ```
-'Check all e-mail accounts'  type=I minutes=10  next_run=2026-07-10 08:06:12   # +10 minutes
-'Train the classifier'       type=H             next_run=2026-07-10 08:46:11   # +1 hour   (HOURLY)
-'Optimize the index'         type=D             next_run=2026-07-11 07:46:11   # +1 day    (DAILY)
-'Perform sanity check'       type=W             next_run=2026-07-17 07:46:11   # +7 days   (WEEKLY)
-now= 2026-07-10 07:59:33
+Train the classifier      | type=H | next_run=2026-07-10 10:05:55   # +1 hour
+Optimize the index        | type=D | next_run=2026-07-11 09:05:55   # +1 day
+Perform sanity check      | type=W | next_run=2026-07-17 09:05:55   # +7 days
+Check all e-mail accounts | type=I minutes=10 | next_run=2026-07-10 09:15:55
+```
+At `now=2026-07-10 09:37:25` (RAW):
+```
+Train the classifier      | type=H | next_run=2026-07-10 10:05:55   # UNCHANGED
+Optimize the index        | type=D | next_run=2026-07-11 09:05:55   # UNCHANGED
+Perform sanity check      | type=W | next_run=2026-07-17 09:05:55   # UNCHANGED
+Check all e-mail accounts | type=I minutes=10 | next_run=2026-07-10 09:45:55   # advanced by 3x10 min
 ```
 
-So: mail = +10 min, classifier = +1 h, index = +1 day, sanity = +7 days — matching the schedule types in the migrations cited in §3.1.
+So the mail `next_run` stepped `09:15:55 -> 09:25:55 -> 09:35:55 -> 09:45:55` (exactly +600 s each), while classifier/index/sanity `next_run` did **not** change (their periods exceed the ~31-minute window). This is why the mail cadence is **[OBSERVED]** end-to-end while the hourly/daily/weekly cadences are **[CONFIGURED / SOURCE-DERIVED]**.
+
+**On the ~2 s jitter (corrected).** The database `next_run` steps are exactly 600 s; the observed 10 m 02 s / 10 m 01 s intervals are **compatible with a 10-minute period plus scheduling/polling jitter** (the guard evaluates the scheduler roughly every ~30 s — `counter >= 30`, `django_q/cluster.py:284`). The +1-2 s deltas are within that jitter budget; they do **not** by themselves measure the scheduler's poll granularity.
 
 ### 3.4 Proof that the idle system is otherwise SILENT (the KEY FINDING)
 
-**(i) The processes emit nothing between task firings.** Over two quiet windows the `qcluster` log did not grow at all:
-
-- **Window A** — 07:48:01 → 07:56:31 (~8.5 min): `qcluster.log` stayed at **45 lines** (the last line's timestamp remained `07:48:01`). Verified at 07:56:16:
-  ```
-  # wc -l qcluster.log  → 45
-  # tail -1 qcluster.log → 07:48:01 [Q] INFO Process-1:17 ready for work at 824
-  ```
-- **Window B** — 07:56:32 → 08:06:33 (10.0 min): no new lines until the mail firing at 08:06:33.
-
-The web server and consumer logs were **flat for the entire ~20‑minute idle window**:
+**(i) The processes emit nothing between task firings.** A background poller recorded `wc -l` of each log every ~30 s (`line_count_snapshots.csv`). Producing command per row: `wc -l <log>` + `tail -1 qcluster.log`. Representative RAW rows (`utc,qcluster_lines,gunicorn_lines,consumer_lines,qcluster_last_ts`):
 
 ```
-gunicorn.log = 12 lines   (unchanged from startup, incl. through the healthcheck probes)
-consumer.log =  1 line    (just the inotify readiness banner)
+09:16:23,52,4,1,09:16:06
+09:17:23,52,4,1,09:16:06
+09:18:23,52,4,1,09:16:06
+09:23:24,52,4,1,09:16:06
+09:24:55,52,4,1,09:16:06
+09:25:25,52,4,1,09:16:06
+09:30:26,59,4,1,09:26:07
+09:31:56,59,4,1,09:26:07
+09:32:26,59,4,1,09:26:07
 ```
 
-**(ii) The Docker Compose healthcheck is silent.** I ran the exact probe command (`docker/compose/docker-compose.sqlite.yml:42`, interval 30 s, timeout 10 s, retries 5, `:43-45`) six times and compared the gunicorn log before and after:
+Between the mail firings the `qcluster` log stays **flat** (52 lines after firing #2, 59 after #3; each firing adds exactly 7 lines: `Enqueued`/`created a task`/`processing`/`stopped doing work`/`Processed`/`recycled`/`ready for work`) and its last-line timestamp does not move. The web server and consumer logs were flat for the **entire ~30-minute idle window**: `gunicorn.log = 4`, `consumer.log = 1`. Producing command and output (RAW):
 
-```
-# curl -f http://localhost:8000  (x6)
-curl #1 -> HTTP 302 (exit=0)
-curl #2 -> HTTP 302 (exit=0)
-curl #3 -> HTTP 302 (exit=0)
-curl #4 -> HTTP 302 (exit=0)
-curl #5 -> HTTP 302 (exit=0)
-curl #6 -> HTTP 302 (exit=0)
-# gunicorn.log line count:  BEFORE = 12   AFTER = 12   (identical)
+```bash
+# docker exec "$CN" bash -lc 'wc -l /app/obs_logs/gunicorn.log /app/obs_logs/consumer.log; \
+#   echo ---; tail -1 /app/obs_logs/gunicorn.log; tail -1 /app/obs_logs/consumer.log'
+gunicorn.log = 4 lines; tail -1:
+[2026-07-10 09:06:34 +0000] [790] [INFO] Server is ready. Spawning workers
+consumer.log = 1 lines; tail -1:
+[2026-07-10 09:06:34,932] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /app/src/../consume
 ```
 
-The probe succeeds (`-f` accepts the 302 redirect) yet adds **zero** log lines — gunicorn/uvicorn emits **no access log by default**. So the 30‑second liveness probe is invisible in the logs. **[This is why there is no periodic "healthy" line from the web server.]**
+=> **No dedicated periodic "healthy" INFO line** is emitted by any of the three processes; idle activity is limited to the scheduled-task firings (only mail recurs in-window).
 
-**(iii) The django‑q `Stat` heartbeat is silent while healthy.** The guard loop writes a `Stat(self).save()` to Redis every `GUARD_CYCLE = 0.5 s` (`django_q/cluster.py:288`; `GUARD_CYCLE` default `0.5` at `django_q/conf.py:90`). `Stat.save()` only logs **on failure** — `try: self.broker.set_stat(...) except Exception as e: logger.error(e)` (`django_q/status.py:71-75`). While Redis is reachable it writes silently; it becomes a loud `[Q] ERROR` stream only during an outage — demonstrated directly in §4.
+**(ii) The web-server liveness probe is silent [manual reproduction of the configured Compose probe].** Docker Compose was **not** executed in this run; I reproduced its configured probe command `["CMD","curl","-f","http://localhost:8000"]` (`docker/compose/docker-compose.sqlite.yml:42`; interval 30 s, timeout 10 s, retries 5 — `:43-45`) manually, with explicit status/header capture. Producing commands: `curl -f -s -o /dev/null -w "HTTP:%{http_code}"` (x6) and `curl -sI http://localhost:8000`. Output (RAW):
+
+```
+gunicorn.log BEFORE probes = 4 lines  @ 09:10:23
+probe #1 -> curl exit=0  HTTP:302
+probe #2 -> curl exit=0  HTTP:302
+probe #3 -> curl exit=0  HTTP:302
+probe #4 -> curl exit=0  HTTP:302
+probe #5 -> curl exit=0  HTTP:302
+probe #6 -> curl exit=0  HTTP:302
+--- headers via curl -sI http://localhost:8000 ---
+HTTP/1.1 302 Found
+date: Fri, 10 Jul 2026 09:10:22 GMT
+server: uvicorn
+content-type: text/html; charset=utf-8
+gunicorn.log AFTER probes  = 4 lines  @ 09:10:23
+DELTA = 0 new log lines from the probes
+```
+
+The probe succeeds (`-f` accepts the `302` redirect to the login page) yet adds **zero** log lines — gunicorn/uvicorn emits **no access log by default**. So the configured 30-second liveness probe is invisible in the logs.
+
+**(iii) The django-q `Stat` heartbeat is silent while healthy.** The guard loop writes `Stat(self).save()` to Redis every `GUARD_CYCLE = 0.5 s` (`django_q/cluster.py:288`; `GUARD_CYCLE` default `0.5` at `django_q/conf.py:90`). `Stat.save()` only logs **on failure** — `try: self.broker.set_stat(...) except Exception as e: logger.error(e)` (`django_q/status.py:71-75`). While Redis is reachable it writes silently (confirmed by the flat `qcluster.log` above); it becomes a loud `[Q] ERROR` stream only during an outage — demonstrated directly in §4.
 
 ### 3.5 Log formats (for reference)
 
 Two distinct formats appear at idle:
-- **Paperless (Django `LOGGING`)** — `[{asctime}] [{levelname}] [{name}] {message}` — `src/paperless/settings.py:378`. Console handler at INFO by default (`settings.py:388`, `DEBUG=NO` `settings.py:50`); the `paperless` and `paperless_mail` loggers additionally write rotating files (`settings.py:392-405`) and propagate to the root console handler (`settings.py:407-410`). Example: the `document_consumer` banner and the `Sanity checker detected no issues.` line.
-- **django‑q** — `HH:MM:SS [Q] LEVEL msg` — `django_q/conf.py:213-214`, with `propagate = False` (`django_q/conf.py:212`) so `[Q]` lines are independent of the Django config. Example: every `[Q]` line above.
+- **Paperless (Django `LOGGING`)** — `[{asctime}] [{levelname}] [{name}] {message}` — `src/paperless/settings.py:378`. Console handler at INFO by default (`settings.py:388`, `DEBUG=NO` `settings.py:50`); the `paperless`/`paperless_mail` loggers additionally write rotating files and propagate to the root console handler (`settings.py:407-410`). Example: the consumer banner and the `Sanity checker detected no issues.` line.
+- **django-q** — `HH:MM:SS [Q] LEVEL msg` — `django_q/conf.py:213-214`, with `propagate = False` (`django_q/conf.py:212`). Example: every `[Q]` line above.
 
 
 ---
 
-## 4. R4 — Interrupt and restart a component: the reconnection / "operational again" messages
+## 4. R4 — interrupt and restart a component: the reconnection / "operational again" messages
 
-The natural target is the **Redis broker**, because it is the shared dependency of both the django‑q task queue (`src/paperless/settings.py:456`) and the Channels group layer (`settings.py:178-187`). I interrupted and restarted it **twice** to prove the pattern is stable.
+The natural target is the **Redis broker**, the shared dependency of both the django-q task queue (`src/paperless/settings.py:456`) and the Channels group layer (`settings.py:178-187`). I interrupted and restarted it **twice** to confirm the pattern is stable.
 
-**Interrupt / restart commands:**
-```bash
-redis-cli -h 127.0.0.1 -p 6379 shutdown nosave          # interrupt
-redis-server --daemonize yes --bind 127.0.0.1 --port 6379   # restart
-```
+**KEY FINDING (R4): there is no dedicated "reconnected"/"connected" message.** django-q's return to operation is confirmed by **two co-occurring signals**: (1) the `[Q] ERROR ... Connection refused` stream **stops** (last error at the restart second ±1 s), and (2) a fresh **`[Q] INFO Process-1:N pushing tasks at <pid>`** line appears within one 10 s reincarnation cycle and then runs with **no further errors**.
 
-**KEY FINDING (R4): there is no dedicated "reconnected"/"connected" message.** Operational‑again is confirmed by **two co‑occurring signals**: (1) the `[Q] ERROR ... Connection refused` stream **stops** the instant Redis returns, and (2) a fresh **`[Q] INFO Process-1:N pushing tasks at <pid>`** line appears with **no further errors** after it.
+**Scope of this test (read this before the conclusion):** only the **django-q broker/status/pusher path** (plus, in Trial 2, a post-recovery scheduled task) was exercised. An authenticated websocket/Channels client, the `channels-redis` group layer's own recovery, and consumer file-enqueue were **NOT** exercised (§4.5). The conclusion is scoped accordingly.
 
 ### 4.1 The causal mechanism (grounded in code)
 
-- **The ~2/second error stream** is the guard's heartbeat failing: the guard calls `Stat(self).save()` every 0.5 s (`django_q/cluster.py:288`); when Redis is down, `Stat.save()` catches the write failure and calls `logger.error(e)` (`django_q/status.py:71-75`) → one `[Q] ERROR` per guard cycle ≈ 2/s.
-- **The pusher dies and is reincarnated every ~10 s.** The pusher's `broker.dequeue()` uses `BLPOP` with a 1 s timeout (`django_q/brokers/redis_broker.py:20-21`). When Redis is down it raises; the pusher logs the error, `sleep(10)`, then `break`s out of its loop (`django_q/cluster.py:345-350`) and the function ends (`cluster.py:366` logs `stopped pushing tasks`). The guard detects the dead pusher (`if not self.pusher.is_alive(): self.reincarnate(self.pusher)` — `cluster.py:280-281`) and reincarnates it, logging `reincarnated pusher <name> after sudden death` (`cluster.py:223`) followed by a new `pushing tasks at <pid>` (`cluster.py:342`). The `sleep(10)` is why reincarnations are exactly 10 s apart.
+- **The ~2/second error stream** is the guard's heartbeat failing: the guard calls `Stat(self).save()` every 0.5 s (`django_q/cluster.py:288`); when Redis is down, `Stat.save()` catches the write failure and calls `logger.error(e)` (`django_q/status.py:71-75`) -> one `[Q] ERROR` per guard cycle ≈ 2/s.
+- **The pusher dies and is reincarnated every ~10 s.** The pusher's `broker.dequeue()` uses `BLPOP` with a 1 s timeout (`django_q/brokers/redis_broker.py:20-21`). When Redis is down it raises; the pusher logs the error, `sleep(10)`, then `break`s out of its loop (`django_q/cluster.py:345-350`) and the function ends (`cluster.py:366` logs `stopped pushing tasks`). The guard detects the dead pusher (`if not self.pusher.is_alive(): self.reincarnate(self.pusher)` — `cluster.py:280`) and reincarnates it, logging `reincarnated pusher <name> after sudden death` (`cluster.py:223`) then a new `pushing tasks at <pid>` (`cluster.py:342`). The `sleep(10)` is why reincarnations are exactly 10 s apart.
 
-### 4.2 Run #1 — before / during / after
+### 4.2 Ownership verification before each interrupt
 
-**BEFORE:** idle and stable; the pusher had been `Process-1:13 pushing tasks at 717` since cluster start (07:47:30).
+Before stopping Redis I verified the target belonged to **this** container (not some other local/host Redis), then used a container-scoped, port-specific command. Producing command and output (RAW), Trial 1 BEFORE:
 
-**DURING (Redis stopped at 08:08:50).** `PING` confirms the outage, then the error stream and pusher reincarnations begin. Representative unedited `[Q]` lines (the ~2/second `Connection refused` stream is shown trimmed to a few lines for space; it repeats continuously):
-
-```
-08:08:50 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
-08:08:50 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
-08:08:51 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
-   ... (repeats ~2x/second — 52 such lines over the ~28 s outage) ...
-08:09:00 [Q] INFO Process-1:13 stopped pushing tasks
-08:09:00 [Q] ERROR reincarnated pusher Process-1:13 after sudden death
-08:09:00 [Q] INFO Process-1:20 pushing tasks at 1216
-08:09:10 [Q] INFO Process-1:20 stopped pushing tasks
-08:09:10 [Q] ERROR reincarnated pusher Process-1:20 after sudden death
-08:09:10 [Q] INFO Process-1:21 pushing tasks at 1217
-08:09:20 [Q] INFO Process-1:21 stopped pushing tasks
-08:09:20 [Q] ERROR reincarnated pusher Process-1:21 after sudden death
-08:09:20 [Q] INFO Process-1:22 pushing tasks at 1221
+```bash
+# docker exec "$CN" bash -lc 'redis-cli -h 127.0.0.1 -p 6379 info server | grep -E "run_id|process_id|tcp_port"; \
+#   ps -C redis-server -o pid,user,args --no-headers'
+process_id:652
+run_id:b3e9c8a6979c4e24945585bb031f0ba71fd4316d
+tcp_port:6379
+    652 testuser redis-server 127.0.0.1:6379
 ```
 
-`PING` during the outage:
+The interrupt/restart commands (all scoped to `127.0.0.1:6379` inside the container; no host-wide destructive command was used):
+
+```bash
+docker exec "$CN" bash -lc 'redis-cli -h 127.0.0.1 -p 6379 shutdown nosave'        # interrupt
+docker exec -u testuser "$CN" bash -lc 'redis-server --daemonize yes --bind 127.0.0.1 --port 6379'   # restart
 ```
-# redis-cli -h 127.0.0.1 -p 6379 ping
+
+### 4.3 Trial 1 — complete before / during / restart / after
+
+**BEFORE:** idle and stable; the pusher had been `Process-1:13 pushing tasks at 839` since cluster start (`09:06:35`). `redis-cli ... ping` -> `PONG`. `qcluster.log` marker = 66 lines.
+
+**INTERRUPT at `09:39:59`.** `PING` during the outage confirms it (RAW):
+```bash
+# docker exec "$CN" bash -lc 'redis-cli -h 127.0.0.1 -p 6379 ping'
 Could not connect to Redis at 127.0.0.1:6379: Connection refused
 ```
 
-The error‑code text is the **canonical** message for a downed local Redis: `Error 111 ... Connection refused` (the exception class is `redis.exceptions.ConnectionError`). Each pusher death also produces one verbose Python `--- Logging error --- ... TypeError: not all arguments converted during string formatting` traceback dump, because django‑q calls `logger.error(e, traceback.format_exc())` with a second positional argument (`django_q/cluster.py:347`); a trimmed representative slice of that traceback (which names the exact failing call path) is:
+**DURING.** The error stream begins immediately. The first failing `dequeue()` raises `ConnectionError: Connection closed by server.` (the in-flight BLPOP), after which reconnect attempts raise `Error 111 ... Connection refused`. Each pusher death also emits a verbose Python `--- Logging error ---` dump, because django-q calls `logger.error(e, traceback.format_exc())` with a second positional argument (`django_q/cluster.py:347`), which the stdlib logger rejects with `TypeError: not all arguments converted during string formatting`. One such dump appears per pusher death (**5 in Trial 1, 5 in Trial 2**). A disclosed excerpt of that verbose dump (producing command `sed -n '67,89p' qcluster.log`), which names the exact failing call path (RAW, one dump, truncated at the marked `# ...`):
 
 ```
-File ".../django_q/cluster.py", line 345, in pusher
+--- Logging error ---
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 345, in pusher
     task_set = broker.dequeue()
-File ".../django_q/brokers/redis_broker.py", line 21, in dequeue
+  File "/usr/local/lib/python3.9/site-packages/django_q/brokers/redis_broker.py", line 21, in dequeue
     task = self.connection.blpop(self.list_key, 1)
-   ...
-redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
+  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 429, in read_from_socket
+    raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+redis.exceptions.ConnectionError: Connection closed by server.
+# ... (stdlib logging frames elided; ends with) ...
+TypeError: not all arguments converted during string formatting
 ```
 
-**AFTER (Redis restarted at 08:09:28, `PING → PONG`).** The `[Q] ERROR` stream stops immediately, and the next reincarnated pusher stays up with no errors after it:
+The recurring heartbeat error line and the first pusher death+reincarnation (producing command `sed -n '174,179p' qcluster.log`), RAW:
 
 ```
-08:09:28 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.   <-- LAST error (== restart second)
-08:09:30 [Q] INFO Process-1:22 stopped pushing tasks
-08:09:30 [Q] ERROR reincarnated pusher Process-1:22 after sudden death
-08:09:30 [Q] INFO Process-1:23 pushing tasks at 1253                              <-- operational again; NO further errors
+09:40:08 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+09:40:09 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+09:40:09 [Q] INFO Process-1:13 stopped pushing tasks
+09:40:09 [Q] ERROR reincarnated pusher Process-1:13 after sudden death
+09:40:09 [Q] INFO Process-1:21 pushing tasks at 2305
 ```
 
-Reincarnation timestamps in run #1 — **08:09:00, 08:09:10, 08:09:20, 08:09:30** — are exactly **10 s** apart (the `sleep(10)`). The last `[Q] ERROR` is at **08:09:28**, the same second Redis was restarted; `Process-1:23` (the pusher spawned after Redis returned) produces no further errors → the cluster is operational again.
+**Error-stream rate (exact arithmetic).** Producing command:
+```bash
+# grep -cE '^[0-9]{2}:[0-9]{2}:[0-9]{2} \[Q\] ERROR Error 111 connecting' <trial-1 slice of qcluster.log>
+```
+Count = **98**; first at `09:39:59`, last at `09:40:48`. Outage = `09:39:59` -> restart `09:40:48` = **49 s** => **98 / 49 s = 2.00 errors/s**, matching the 0.5 s guard `Stat` cycle.
 
-### 4.3 Run #2 — reproduction (proves stability)
+**Reincarnations** at `09:40:09, :19, :29, :39, :49` — exactly **10 s** apart; pusher lineage `13 -> 21 -> 22 -> 23 -> 24 -> 25`.
 
-**BEFORE:** stable pusher `Process-1:23` (from run #1's recovery). The web‑server and consumer logs were unaffected by the idle outage (no active websocket clients / no enqueues): `gunicorn.log` stayed at 12 lines, `consumer.log` at 1 line.
-
-**DURING (Redis stopped at 08:10:52; 75 `[Q] ERROR` lines over ~37 s ≈ 2/s).** Pusher reincarnations, unedited:
+**RESTART at `09:40:48`** (new `run_id b2469aec...`, `ping -> PONG`). Recovery block (producing command `sed -n '655,660p' qcluster.log`), RAW:
 
 ```
-08:11:03 [Q] INFO Process-1:23 stopped pushing tasks
-08:11:03 [Q] ERROR reincarnated pusher Process-1:23 after sudden death
-08:11:03 [Q] INFO Process-1:24 pushing tasks at 1285
-08:11:13 [Q] INFO Process-1:24 stopped pushing tasks
-08:11:13 [Q] ERROR reincarnated pusher Process-1:24 after sudden death
-08:11:13 [Q] INFO Process-1:25 pushing tasks at 1286
-08:11:23 [Q] INFO Process-1:25 stopped pushing tasks
-08:11:23 [Q] ERROR reincarnated pusher Process-1:25 after sudden death
-08:11:23 [Q] INFO Process-1:26 pushing tasks at 1290
-08:11:33 [Q] INFO Process-1:26 stopped pushing tasks
-08:11:33 [Q] ERROR reincarnated pusher Process-1:26 after sudden death
-08:11:33 [Q] INFO Process-1:27 pushing tasks at 1308
+09:40:47 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+09:40:48 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+09:40:49 [Q] INFO Process-1:24 stopped pushing tasks
+09:40:49 [Q] ERROR reincarnated pusher Process-1:24 after sudden death
+09:40:49 [Q] INFO Process-1:25 pushing tasks at 2328
 ```
 
-**AFTER (Redis restarted at 08:11:30, `PING → PONG`).** First `[Q] ERROR` at 08:10:53; **last `[Q] ERROR` at 08:11:30** (== restart second); the final reincarnated pusher `Process-1:27 pushing tasks at 1308` (08:11:33) runs with no subsequent errors. Reincarnation timestamps **08:11:03, 08:11:13, 08:11:23, 08:11:33** are again exactly **10 s** apart — identical to run #1.
+The last `[Q] ERROR` is at `09:40:48` (= restart second); the reincarnation cycle at `09:40:49` produced pusher **`Process-1:25 pushing tasks at 2328`** — the first pusher to spawn after Redis returned — a **1 s** lag, i.e. within one 10 s reincarnation cycle. **Zero** `[Q] ERROR` lines follow it. Producing command + measured error-free window:
+```bash
+# awk 'NR>660' qcluster.log | grep -cE '^[0-9:]+ \[Q\] ERROR Error 111 connecting'   -> 0
+```
+The cluster then ran silent (healthy idle) from `09:40:49` to at least `09:43:34` — a **2 m 45 s** measured error-free window — with `ping -> PONG`.
 
-### 4.4 Summary of the reconnection signal
+### 4.4 Trial 2 — reproduction with a longer post-recovery window + a post-recovery scheduled task
 
-| Aspect | Run #1 | Run #2 |
+**BEFORE:** stable pusher `Process-1:25 pushing tasks at 2328` (from Trial 1's recovery, stable ~3 min); ownership re-verified (`run_id b2469aec...`, pid 2318); `ping -> PONG`; `qcluster.log` marker = 660 lines.
+
+**INTERRUPT at `09:43:59`; RESTART at `09:44:45`** (new `run_id 27bb1ccb...`, `ping -> PONG`). Outage = **46 s**.
+
+**Error-stream rate.** Count = **90**; first `09:44:00`, last `09:44:44`. `90 / 46 s = 1.96 errors/s` (≈2/s; the errors span `09:44:00`-`09:44:44` = 44 s, giving 2.05/s over the active span). **Reincarnations** at `09:44:09, :19, :29, :39, :49` — 10 s apart; lineage `25 -> 26 -> 27 -> 28 -> 29 -> 30`.
+
+**RECOVERY + post-recovery scheduled task.** Producing command `sed -n '1243,1255p' qcluster.log`, RAW (the tail of the log):
+
+```
+09:44:43 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+09:44:44 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+09:44:49 [Q] INFO Process-1:29 stopped pushing tasks
+09:44:49 [Q] ERROR reincarnated pusher Process-1:29 after sudden death
+09:44:49 [Q] INFO Process-1:30 pushing tasks at 2411
+09:46:10 [Q] INFO Enqueued 1
+09:46:10 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+09:46:10 [Q] INFO Process-1:8 processing [gee-fruit-maine-rugby]
+09:46:10 [Q] INFO Process-1:8 stopped doing work
+09:46:10 [Q] INFO Processed [gee-fruit-maine-rugby]
+09:46:10 [Q] INFO recycled worker Process-1:8
+09:46:10 [Q] INFO Process-1:31 ready for work at 2414
+```
+
+Last `[Q] ERROR` at `09:44:44`; recovered pusher **`Process-1:30 pushing tasks at 2411`** at `09:44:49` (a **4 s** lag, again within one 10 s cycle); **zero** `[Q] ERROR` after it. Crucially, at `09:46:10` the recovered cluster **fired the mail schedule normally** — `created a task from schedule [Check all e-mail accounts]` -> `processing` -> `Processed` -> `recycled` — which proves the full **scheduler -> pusher -> worker -> monitor** path is operational again, not merely that the error stream stopped.
+
+### 4.5 Summary and scope of the reconnection signal
+
+| Aspect | Trial 1 | Trial 2 |
 |---|---|---|
-| Redis stopped | 08:08:50 | 08:10:52 |
-| Redis restarted (`PONG`) | 08:09:28 | 08:11:30 |
-| `[Q] ERROR ... Connection refused` count during outage | 52 (~2/s) | 75 (~2/s) |
-| Last `[Q] ERROR` timestamp | 08:09:28 (= restart) | 08:11:30 (= restart) |
-| Pusher reincarnation interval | 10 s (…00/10/20/30) | 10 s (…03/13/23/33) |
-| Recovery marker (fresh pusher, no later errors) | `Process-1:23 pushing tasks at 1253` | `Process-1:27 pushing tasks at 1308` |
+| Redis stopped | 09:39:59 | 09:43:59 |
+| Redis restarted (`PONG`) | 09:40:48 | 09:44:45 |
+| Outage duration | 49 s | 46 s |
+| `[Q] ERROR Error 111 ... Connection refused` count | 98 | 90 |
+| Error rate (count / outage) | 98/49 s = **2.00/s** | 90/46 s = **1.96/s** |
+| Last `[Q] ERROR` timestamp | 09:40:48 (= restart) | 09:44:44 |
+| Reincarnation interval | 10 s (…09/19/29/39/49) | 10 s (…09/19/29/39/49) |
+| Recovered pusher | `Process-1:25 pushing tasks at 2328` @09:40:49 (1 s after restart) | `Process-1:30 pushing tasks at 2411` @09:44:49 (4 s after restart) |
+| `[Q] ERROR` after recovered pusher | 0 | 0 |
+| Measured error-free window after recovery | 2 m 45 s | 2 m 14 s+ (incl. normal mail firing @09:46:10) |
 
-**Conclusion (R4):** "everything reconnected and is operational again" is confirmed by the **cessation of the `[Q] ERROR ... Connection refused` stream** together with a fresh **`[Q] INFO Process-1:N pushing tasks at <pid>`** line that has no errors after it. There is **no explicit "reconnected" message** at this commit.
-
-
----
-
-## 5. R5 — Components/processes that run continuously to maintain a ready state
-
-At idle, the following are **always‑on** (they keep running to keep the system ready even with zero documents), distinguished from **transient** work that only runs briefly when triggered.
-
-### 5.1 Always‑on (continuously running at idle) — observed
-
-1. **Redis server** (`redis-server 127.0.0.1:6379`, PID 485) — the shared backbone: django‑q broker (`src/paperless/settings.py:456`) **and** Channels group‑messaging layer (`settings.py:178-187`). Stopping it degrades the cluster (§4).
-2. **The django‑q cluster (`qcluster`)** — a set of long‑lived processes under one master (guard/sentinel, PID 655):
-   - **Guard / sentinel** — a 0.5 s health loop that reincarnates dead workers/monitor/pusher and invokes the scheduler ~every 30 s (`django_q/cluster.py:253-289`). Observed banner: `Process-1 guarding cluster montana-tennis-winner-tango`.
-   - **Monitor** (PID 716) — persists task results (`django_q/cluster.py:378`). Observed: `Process-1:12 monitoring at 716`.
-   - **Pusher** (PID 717) — continuously `BLPOP`‑polls the broker for new task packages (`django_q/cluster.py:342`, `django_q/brokers/redis_broker.py:20-21`). Observed: `Process-1:13 pushing tasks at 717`.
-   - **Worker pool** — 11 idle worker processes waiting for work (`Process-1:1..11 ready for work`), sized by `floor(sqrt(cores))` (`src/paperless/settings.py:427-433`).
-3. **gunicorn master + 2 uvicorn ASGI workers** (PIDs 671, 682, 686) — listening on `:8000` for HTTP **and** the `ws/status/$` websocket (`gunicorn.conf.py:3-5`, `src/paperless/workers.py:9`, `src/paperless/asgi.py:17-20`, `src/paperless/urls.py:136-137`). They stay up to answer the API, serve the UI, and hold websocket status connections.
-4. **`document_consumer`** (PID 663) — an inotify watcher on the consumption directory, blocking on filesystem events (`src/documents/management/commands/document_consumer.py:200`). It runs continuously so a dropped‑in document is picked up immediately.
-
-### 5.2 Transient (NOT continuously running) — observed / inferred
-
-- **The four scheduled task executions** (mail / classifier / index / sanity) — each briefly occupies a django‑q worker when the scheduler fires it, then finishes (see the burst in §3.2 and the mail firings in §3.3). They are periodic events, not continuously‑running processes.
-- **Document ingestion work** — `consume_file` (`src/documents/tasks.py:184`) runs only when a document is added; it did **not** run during the idle window (empty consume dir, `document_consumer.py:85` "Adding … to the task queue." never logged). **[The absence at idle is observed; the trigger path is INFERRED from code, as no document was ingested.]**
-- **Worker recycling** — after each task a worker is recycled and replaced (`"recycle": 1`, `src/paperless/settings.py:452`); observed as `recycled worker Process-1:N` in §3.2. This is triggered by task completion, not a standalone loop.
+**Conclusion (R4), scoped.** For the **django-q broker/status/pusher path**, "operational again" is confirmed by the **cessation of the `[Q] ERROR ... Connection refused` stream** (last error at the restart second ±1 s) together with a fresh **`[Q] INFO Process-1:N pushing tasks at <pid>`** line that appears within one 10 s reincarnation cycle and has no errors after it; Trial 2 additionally shows a normal scheduled-task firing after recovery. There is **no explicit "reconnected" message** at this commit. **Not tested here:** authenticated websocket/Channels client reconnection, `channels-redis` group-layer recovery, and consumer file-enqueue — so this conclusion does **not** claim "everything reconnected", only that the django-q broker/status path recovered (as observed) and resumed scheduled work.
 
 ---
 
-## 6. Coverage pass
+## 5. R5 — components/processes that run continuously to maintain a ready state
 
-Every named item in the five questions, mapped to the observed evidence and citation above.
+At idle, the following are **always-on**, distinguished from **transient** work that runs only briefly when triggered.
 
-- **R1 — up at the pinned commit, stable idle.** ✅ Ran at commit `542221a38dff` (verified `git rev-parse HEAD`), Python 3.9.23; reached idle at 07:47:29 with an **empty consume directory** and the four schedules present (§2.1). Exact build/run commands in §1.1; `manage.py check` → "System check identified no issues".
-- **R2 — background processes/tasks running automatically at idle.** ✅ Enumerated with observed startup banners (§2.2): gunicorn master + 2 uvicorn ASGI workers; `document_consumer` inotify watcher; the django‑q cluster = guard/sentinel + monitor + pusher + 11 workers; all over Redis. Plus the four periodic scheduled tasks (§3).
-- **R3 — periodic health/readiness entries: specific messages, frequency, meaning.** ✅ The measured cadence table (§3.1): mail `[Check all e-mail accounts]` every **10 min** (measured across firings at 07:48:00, 07:56:31, 08:06:33 — consecutive interval 10 m 02 s; DB `next_run` +10 min), classifier **hourly**, index **daily**, sanity **weekly** (all confirmed via DB `next_run` in §3.3), plus the sanity line `Sanity checker detected no issues.`. Meaning of each explained in §3.1. **Specific messages** quoted verbatim with `file:line`.
-  - **KEY FINDING:** no dedicated periodic "healthy" heartbeat INFO line — proven by the quiet windows and the flat gunicorn/consumer logs (§3.4(i)).
-  - **Named silent mechanisms both addressed:** the 30‑second Compose healthcheck `curl :8000` (proven silent — HTTP 302, zero new log lines, §3.4(ii)); the 0.5‑second django‑q `Stat` heartbeat (silent while healthy; loud only during the §4 outage, §3.4(iii)).
-- **R4 — messages confirming reconnection/operational‑again after interrupt+restart.** ✅ Redis interrupted and restarted **twice** (§4.2–§4.3), with before/during/after states. During: `[Q] ERROR Error 111 ... Connection refused` ~2/s + pusher `reincarnated pusher … after sudden death` every 10 s. After: the error stream **ceases** at the restart second and a fresh `[Q] INFO Process-1:N pushing tasks at <pid>` line appears with no later errors.
-  - **KEY FINDING:** there is **no dedicated "reconnected" message**; operational status = (error stream stops) + (new `pushing tasks at <pid>` line). Reproduced identically in both runs (§4.4).
-- **R5 — components/processes that keep running continuously at idle.** ✅ Always‑on vs. transient split (§5): always‑on = Redis; django‑q guard/monitor/pusher/worker‑pool; gunicorn master + 2 uvicorn workers; `document_consumer`. Transient = the four scheduled task executions and (not at idle) `consume_file`.
+### 5.1 Always-on (continuously running at idle) — [OBSERVED]
 
-### 6.1 Labels used in this document
+1. **Redis server** (`redis-server 127.0.0.1:6379`, PID 652) — the shared backbone: django-q broker (`src/paperless/settings.py:456`) **and** Channels group-messaging layer (`settings.py:178-187`). Stopping it degrades the cluster (§4).
+2. **The django-q cluster (`qcluster`)** — long-lived processes under the management command (PID 796) and its guard/sentinel (PID 826):
+   - **Guard / sentinel** — a 0.5 s health loop that reincarnates dead workers/monitor/pusher and invokes the scheduler ~every 30 s (`django_q/cluster.py:253-289`). Observed: `Process-1 guarding cluster kilo-whiskey-artist-uranus`.
+   - **Monitor** (PID 838) — persists task results (`django_q/cluster.py:378`). Observed: `Process-1:12 monitoring at 838`.
+   - **Pusher** (PID 839) — continuously `BLPOP`-polls the broker (`django_q/cluster.py:342`, `django_q/brokers/redis_broker.py:20-21`). Observed: `Process-1:13 pushing tasks at 839`.
+   - **Worker pool** — 11 idle workers waiting for work (`Process-1:1..11 ready for work`), sized `floor(sqrt(cores))` (`src/paperless/settings.py:427-433`; §1.7).
+3. **gunicorn master + 2 uvicorn ASGI workers** (PIDs 790, 801, 802) — listening on `:8000` for HTTP **and** the `ws/status/$` websocket (`gunicorn.conf.py:3-5`, `src/paperless/workers.py:9`, `src/paperless/asgi.py:17,19-20`, `src/paperless/urls.py:136-137`). They stay up to answer the API/UI and to accept websocket status connections.
+4. **`document_consumer`** (PID 793) — an inotify watcher on the consumption directory, blocking on filesystem events (`src/documents/management/commands/document_consumer.py:200`). It runs continuously so a dropped-in document is picked up immediately.
 
-- **[INFERRED]** — statements derived from reading code rather than observed at runtime: (a) the `Polling directory for changes` fallback (inotify was actually used); (b) the `Adding … to the task queue.` ingestion path (no document was ingested at idle); (c) `consume_file` ingestion work.
-- **[NON‑CANONICAL]** — environment‑specific values, each with its canonical counterpart: direct process launch vs. supervisord/compose; runtime‑installed prerequisites; running as `root`; **11 workers** = `floor(sqrt(128))` (canonical: depends on host CPU count / `PAPERLESS_TASK_WORKERS`); volatile timestamps/PIDs/word‑names. The observed outage error `Error 111 ... Connection refused` **is** the canonical message for a downed local Redis (the exception class `redis.exceptions.ConnectionError` and host/port are the canonical parts).
-- **Everything else** in this document is backed by the actual, unedited runtime output shown alongside it and a `file:line` citation to the emitting code.
+### 5.2 Transient (NOT continuously running) — [OBSERVED] / [INFERRED]
 
-### 6.2 Reproduction summary
+- **The four scheduled task executions** (mail / classifier / index / sanity) — each briefly occupies a django-q worker when the scheduler fires it, then finishes (§3.2, §3.3). Periodic events, not standalone processes.
+- **`docker/wait-for-redis.py` — a startup-only gate, NOT a continuous process.** In the product deployment the entrypoint runs this once before the main processes start: it attempts `client.ping()` in a retry loop of `MAX_RETRY_COUNT = 5` (`docker/wait-for-redis.py:16`) with `RETRY_SLEEP_SECONDS = 5`-spaced sleeps (constant at `wait-for-redis.py:17`; `Redis.from_url(...)` + `while`/`ping()`/`time.sleep(...)` loop at `wait-for-redis.py:24-35`), then **exits** `EX_OK` on success or `EX_UNAVAILABLE` on failure (`wait-for-redis.py:37-42`). It is a transient readiness gate, not part of the always-on set. **[SOURCE-DERIVED — the product entrypoint was not executed in this manual run (§1.1).]**
+- **Authenticated websocket `StatusConsumer` instances — per-client, connection-triggered, NOT always-on.** The web server is always listening for `ws/status/$` (§5.1.3), but a `StatusConsumer` object exists only for the lifetime of an authenticated client connection: `connect()` denies unauthenticated clients (`raise DenyConnection`, `src/paperless/consumers.py:13-15`) and otherwise joins the `status_updates` group (`consumers.py:9,17-20`), leaving it on disconnect via `group_discard` (`consumers.py:24-27`). No client connected during this idle run, so none existed. **[INFERRED — no websocket client was connected at idle.]**
+- **Document ingestion work** — `consume_file` (`src/documents/tasks.py:184`) runs only when a document is added; it did **not** run during the idle window (empty consume dir; `document_consumer.py:85` "Adding … to the task queue." never logged). **[INFERRED — no document was ingested.]**
+- **Worker recycling** — after each task a worker is recycled and replaced (`"recycle": 1`, `src/paperless/settings.py:452`); observed as `recycled worker Process-1:N` (§3.2). Triggered by task completion, not a standalone loop.
 
-- Idle observation window: **07:47:30 → 08:11:43 UTC** (~24 minutes), single continuous run.
-- Mail cadence: **3 firings** (≥2 observations); consecutive on‑schedule interval **≈10 min**; all four cadences cross‑checked against DB `next_run`.
-- Redis interrupt/restart: **2 runs**; reincarnation interval **10 s** in both; recovery pattern identical.
+---
+
+## 6. Cleanup (temporary artifacts removed; repository unchanged)
+
+Per the read-only mandate, the only repository change is **this document**. Every temporary runtime artifact was removed and the removal captured. Producing commands and results (RAW excerpts from the cleanup transcript):
+
+```bash
+# 1. Graceful stop of the 3 captured PIDs (exact PIDs; NO pkill/killall)
+# docker exec $CN kill -TERM 790 793 796
+# -> qcluster.log tail:
+09:52:39 [Q] INFO Q Cluster kilo-whiskey-artist-uranus has stopped.
+# -> gunicorn.log tail:
+[2026-07-10 09:52:37 +0000] [790] [INFO] Handling signal: term
+[2026-07-10 09:52:38 +0000] [790] [INFO] Shutting down: Master
+
+# 2. Stop Redis, container-scoped, after re-verifying ownership (run_id 27bb1ccb..., pid 2401)
+# docker exec $CN redis-cli -h 127.0.0.1 -p 6379 shutdown nosave
+# docker exec $CN redis-cli -h 127.0.0.1 -p 6379 ping   -> Could not connect ... Connection refused
+
+# 3. Remove the container by exact name (NO prune, NO broad rm)
+# docker stop pngx_obs_20260710_090348 && docker rm pngx_obs_20260710_090348
+# docker ps -a --filter name=pngx_obs_20260710_090348   -> (empty; container removed)
+```
+
+The three processes stopped gracefully (`Q Cluster ... has stopped.`; gunicorn `Shutting down: Master`); Redis was stopped only after confirming the `run_id` belonged to this container; the container was removed by exact name, destroying all in-container temporary state (data/media/consume/index/log directories and the SQLite DB). The raw logs were captured **outside** the repository tree on the investigation host and hashed; their SHA-256 digests are embedded in §0.1 as the audit anchor, and the raw files — like all other temporary observation artifacts (the isolated container, scratch logs, and helper captures under `/tmp`) — were then removed. Repository state after cleanup — producing command and output (RAW):
+
+```bash
+# git -C /tmp/blitzy/paperless-ngx/blitzy-4fecd6d9-f2f1-4a67-ac76-b5521a549dfb_3abcd3 status --porcelain
+# (no output -> working tree clean; the only change staged for commit is this document)
+```
+
+---
+
+## 7. Coverage pass
+
+Every named item in the five questions, mapped to observed evidence and citations.
+
+- **R1 — up at the pinned commit, stable idle.** Ran at commit `542221a38dff` (verified in-container `git rev-parse HEAD`, worktree clean — §1.3), Python 3.9.23; reached idle at `09:06:33Z` with an **empty consume directory** and the four schedules present (§2.1). Exact host/container build+run commands in §1.2; `manage.py migrate/reindex/check` transcripts in §1.6 (`check` -> "System check identified no issues (0 silenced).").
+- **R2 — background processes/tasks running automatically at idle.** Enumerated with observed startup banners and producing commands (§2.2) and the full process tree (§2.3): gunicorn master + 2 uvicorn ASGI workers (790/801/802); `document_consumer` inotify watcher (793); the django-q cluster = mgmt (796) -> guard/sentinel (826) -> 11 workers (827-837) + monitor (838) + pusher (839); all over Redis (652). Plus the periodic scheduled tasks (§3).
+- **R3 — periodic health/readiness entries: specific messages, frequency, meaning.** Cadence table (§3.1). **Specific messages** quoted verbatim with `file:line`. Frequencies: mail `[Check all e-mail accounts]` every **10 min** — **measured** across firings at `09:16:05`, `09:26:07`, `09:36:08` (two clean intervals: 10 m 02 s and 10 m 01 s; DB `next_run` stepped +600 s) (§3.3); classifier **hourly**, index **daily**, sanity **weekly** — **[CONFIGURED / SOURCE-DERIVED]** (fired once in the startup burst; `next_run` +1 h / +1 day / +7 days; did not recur in-window) (§3.1, §3.3), sanity emitting `Sanity checker detected no issues.`. Meaning of each explained narrowly (scheduler-enqueue + worker-completion) in §3.1.
+  - **KEY FINDING:** no dedicated periodic "healthy" heartbeat INFO line — proven by the flat quiet-window snapshots and flat gunicorn/consumer logs (§3.4(i)).
+  - **Both named silent mechanisms addressed:** the configured 30-second Compose healthcheck `curl :8000` — manual reproduction, HTTP 302, **zero** new log lines (§3.4(ii)); the 0.5-second django-q `Stat` heartbeat — silent while healthy, loud only during the §4 outage (§3.4(iii)).
+- **R4 — messages confirming reconnection/operational-again after interrupt+restart.** Redis interrupted+restarted **twice** with complete before/during/restart/after transcripts and ownership verification (§4.2-§4.4). During: `[Q] ERROR Error 111 ... Connection refused` at **2.00/s** (Trial 1) and **1.96/s** (Trial 2) + pusher `reincarnated pusher … after sudden death` every 10 s. After: the error stream **ceases** (last error at the restart second ±1 s) and a fresh `[Q] INFO Process-1:N pushing tasks at <pid>` appears within one 10 s cycle with no later errors; Trial 2 shows a normal mail firing after recovery (§4.4).
+  - **KEY FINDING:** **no dedicated "reconnected" message**; operational-again = (error stream stops) + (new `pushing tasks at <pid>` line). Reproduced in both trials (§4.5). **Scope:** django-q broker/status path only; Channels/websocket/all-client recovery **NOT** tested (§4.5).
+- **R5 — components/processes that keep running continuously at idle.** Always-on vs. transient split (§5): always-on = Redis; django-q guard/monitor/pusher/worker-pool; gunicorn master + 2 uvicorn workers; `document_consumer`. Transient = the four scheduled task executions, the startup-only `wait-for-redis.py` gate, per-client `StatusConsumer` instances, and (not at idle) `consume_file` / worker recycling.
+
+### 7.1 Labels used in this document
+
+- **[OBSERVED]** — seen in this run's captured output (all quoted log blocks; the mail cadence; the silent windows; the two Redis trials).
+- **[CONFIGURED / SOURCE-DERIVED]** — read from config/DB/source, full period not observed end-to-end in-window: the hourly/classifier, daily/index, weekly/sanity cadences (fired once in the startup burst; confirmed via `next_run` and migrations); the configured 30 s healthcheck interval (Compose not executed); the `wait-for-redis.py` startup gate (product entrypoint not executed).
+- **[INFERRED]** — from reading code, not exercised: the `Polling directory for changes` fallback (inotify was actually used); `consume_file` ingestion and `Adding … to the task queue.` (no document ingested); per-client `StatusConsumer` behavior (no websocket client connected).
+- **[NON-CANONICAL]** — environment-specific, each with its canonical counterpart (§1.1, §1.7): reproduction image vs. published product image (user/paths/entrypoint/supervisor); Redis co-located here vs. separate `redis:6.0` service; **11 workers** = `floor(sqrt(128))` (canonical: depends on host CPU count / `PAPERLESS_TASK_WORKERS`); direct launch vs. supervisord/compose; volatile timestamps/PIDs/word-names. The observed outage error `Error 111 ... Connection refused` (Errno 111, `ECONNREFUSED`) **is** the canonical message for a downed local Redis (exception class `redis.exceptions.ConnectionError`).
+
+### 7.2 Reproduction summary
+
+- Single run in container `pngx_obs_20260710_090348` (image digest `sha256:6e699f225ced...`), commit `542221a38dff`, Python 3.9.23, all timestamps UTC.
+- Idle observation window: process launch `09:06:33Z` -> ~`09:37Z` (~31 minutes), then two Redis trials -> ~`09:47Z`; cleanup at ~`09:52Z`.
+- Mail cadence: **4 firings** (two clean on-schedule intervals, 10 m 02 s / 10 m 01 s); all four cadences cross-checked against DB `next_run`.
+- Redis interrupt/restart: **2 trials**; reincarnation interval **10 s** in both; error rate **2.00/s** and **1.96/s**; recovery pattern identical; Trial 2 confirmed a post-recovery scheduled-task firing.
+- Raw logs retained and SHA-256-hashed (§0.1); all temporary artifacts removed; repository worktree clean (§6).
+
