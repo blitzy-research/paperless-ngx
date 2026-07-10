@@ -108,6 +108,11 @@ CN=pngx_obs_20260710_090348
 
 # ---- CONTAINER: prerequisites (see caveat, §1.7). apt runs as root ----
 docker exec "$CN" bash -lc 'apt-get update && apt-get install -y redis-server libzbar0 poppler-utils pngquant procps'
+# NOTE: curl (the binary in the canonical Compose liveness probe, docker/compose/docker-compose.sqlite.yml:42,
+#   and shipped in the product image's RUNTIME_PACKAGES, Dockerfile:36) is NOT present in this reproduction
+#   image. The silent-probe check in §3.4(ii) therefore uses the equivalent Python http.client that ships in
+#   the image; run `apt-get install -y curl` here if the literal curl command is desired (verified
+#   byte-identical). See the tooling caveat in §1.7.
 
 # ---- CONTAINER: Redis broker + Channels layer (canonical command), as testuser ----
 docker exec -u testuser "$CN" bash -lc 'redis-server --daemonize yes --bind 127.0.0.1 --port 6379'
@@ -162,7 +167,7 @@ root
 uid=1000(testuser) gid=1000(testuser) groups=1000(testuser)
 ```
 
-The **only** `PAPERLESS_*` variable set by the image is `PAPERLESS_DISABLE_DBHANDLER=true`. **This has no functional effect at this commit:** the name `PAPERLESS_DISABLE_DBHANDLER` is not referenced anywhere under `src/` at `542221a38dff` (it appears only in `src/setup.cfg:12` as a flake8 setting name fragment, unrelated to logging), and the `LOGGING` configuration defines **no database log handler** — only a console `StreamHandler` plus two `ConcurrentRotatingFileHandler`s (`src/paperless/settings.py:373-411`). Every other runtime path uses the **repository defaults**: `BASE_DIR=/app/src`, media `/app/media`, consume `/app/consume`, data `/app/data`, index `/app/data/index`, log `/app/data/log` (`src/paperless/settings.py`). The container default login user is `root`, but the processes were run as `testuser` (uid 1000); see §1.7.
+The **only** `PAPERLESS_*` variable set by the image is `PAPERLESS_DISABLE_DBHANDLER=true`. **This has no functional effect at this commit:** the name `PAPERLESS_DISABLE_DBHANDLER` is not referenced anywhere under `src/` at `542221a38dff` (it appears only in `src/setup.cfg:12`, as the pytest environment-variable assignment `PAPERLESS_DISABLE_DBHANDLER=true` under that file's `[tool:pytest]` `env =` section — a test-time setting, unrelated to runtime logging), and the `LOGGING` configuration defines **no database log handler** — only a console `StreamHandler` plus two `ConcurrentRotatingFileHandler`s (`src/paperless/settings.py:373-411`). Every other runtime path uses the **repository defaults**: `BASE_DIR=/app/src`, media `/app/media`, consume `/app/consume`, data `/app/data`, index `/app/data/index`, log `/app/data/log` (`src/paperless/settings.py`). The container default login user is `root`, but the processes were run as `testuser` (uid 1000); see §1.7.
 
 ### 1.5 Dependency versions actually used (from the project's own pins)
 
@@ -224,6 +229,7 @@ CHECK_EXIT=0
 - **[NON-CANONICAL — worker count] 11 django-q workers.** `multiprocessing.cpu_count()` reported **128** in this container, so `default_task_workers()` returned `floor(sqrt(128)) = 11` (`src/paperless/settings.py:427-433`; `TASK_WORKERS` `settings.py:438`; passed to `Q_CLUSTER["workers"]` `settings.py:455`). *Canonical counterpart:* the default depends on the host CPU count (and `PAPERLESS_TASK_WORKERS`); on a 4-core host it would be `floor(sqrt(4)) = 2`. **The worker-count value is host-specific; the formula is canonical.**
 - **[NON-CANONICAL — volatile fields]** Timestamps, PIDs, the django-q cluster word-name (`kilo-whiskey-artist-uranus`) and per-task word-names vary per run.
 - **The web-server liveness probe returns HTTP 302** (redirect to the login page for an unauthenticated request to `/`); `curl -f` treats this as success (§3.4).
+- **[NON-CANONICAL — tooling] `curl` is not present in this reproduction image.** Verified absent (`command -v curl` → not found; not in `dpkg -l`), as is `wget`. `curl` is nonetheless the **canonical** liveness-probe binary: it is the exact Docker Compose healthcheck command (`docker/compose/docker-compose.sqlite.yml:42`) and ships in the product image's `RUNTIME_PACKAGES` (`Dockerfile:36`). The §3.4(ii) silent-probe check was therefore exercised with the **equivalent Python `http.client`** that ships in the image (issuing the same `GET http://localhost:8000/`); installing curl (`apt-get install -y curl`, exactly as the other prerequisites were added in §1.2) reproduces byte-identical status and headers. *Canonical counterpart:* `curl` in the product image.
 
 ---
 
@@ -486,26 +492,38 @@ consumer.log = 1 lines; tail -1:
 
 => **No dedicated periodic "healthy" INFO line** is emitted by any of the three processes; idle activity is limited to the scheduled-task firings (only mail recurs in-window).
 
-**(ii) The web-server liveness probe is silent [manual reproduction of the configured Compose probe].** Docker Compose was **not** executed in this run; I reproduced its configured probe command `["CMD","curl","-f","http://localhost:8000"]` (`docker/compose/docker-compose.sqlite.yml:42`; interval 30 s, timeout 10 s, retries 5 — `:43-45`) manually, with explicit status/header capture. Producing commands: `curl -f -s -o /dev/null -w "HTTP:%{http_code}"` (x6) and `curl -sI http://localhost:8000`. Output (RAW):
+**(ii) The web-server liveness probe is silent [manual reproduction of the configured Compose probe].** Docker Compose was **not** executed in this run; I reproduced its configured probe command `["CMD","curl","-f","http://localhost:8000"]` (`docker/compose/docker-compose.sqlite.yml:42`; interval 30 s, timeout 10 s, retries 5 — `:43-45`) manually, with explicit status/header capture.
+
+*Tooling note [NON-CANONICAL — tooling]:* `curl` is **not** installed in this reproduction image (verified absent — see §1.7), even though it is the canonical probe binary (the exact Compose healthcheck command and part of the product image's `RUNTIME_PACKAGES`, `Dockerfile:36`). The probe was therefore issued with the **equivalent Python `http.client`** that ships in the image (the same `GET http://localhost:8000/`); after `apt-get install -y curl`, the literal `curl -f -s -o /dev/null -w "HTTP:%{http_code}"` (run six times) and `curl -sI http://localhost:8000` commands produce **byte-identical** status and headers. The response headers are **deterministic** at this commit (produced by Django's `SecurityMiddleware`/`LocaleMiddleware` and the login redirect); only `date` is per-run.
+
+The block below is **[annotated]** (a composed transcript, per §0.2): the `gunicorn.log …`, `probe #…`, and `DELTA …` lines are my wrapper `echo`s and line-count annotations; the indented `HTTP/1.1 …` group is the client's verbatim response, shown **in full** (an earlier draft truncated it to four header lines). Producing commands: six `GET /` probes, then one full header dump (equivalent to `curl -sI`), with `wc -l /app/obs_logs/gunicorn.log` before and after:
 
 ```
 gunicorn.log BEFORE probes = 4 lines  @ 09:10:23
-probe #1 -> curl exit=0  HTTP:302
-probe #2 -> curl exit=0  HTTP:302
-probe #3 -> curl exit=0  HTTP:302
-probe #4 -> curl exit=0  HTTP:302
-probe #5 -> curl exit=0  HTTP:302
-probe #6 -> curl exit=0  HTTP:302
---- headers via curl -sI http://localhost:8000 ---
+probe #1 -> exit=0  HTTP:302
+probe #2 -> exit=0  HTTP:302
+probe #3 -> exit=0  HTTP:302
+probe #4 -> exit=0  HTTP:302
+probe #5 -> exit=0  HTTP:302
+probe #6 -> exit=0  HTTP:302
+--- response headers for GET http://localhost:8000/ (equivalent to curl -sI) ---
 HTTP/1.1 302 Found
 date: Fri, 10 Jul 2026 09:10:22 GMT
 server: uvicorn
 content-type: text/html; charset=utf-8
+location: /accounts/login/?next=/
+x-frame-options: SAMEORIGIN
+content-length: 0
+vary: Accept-Language, Origin, Cookie
+content-language: en-us
+x-content-type-options: nosniff
+referrer-policy: same-origin
+cross-origin-opener-policy: same-origin
 gunicorn.log AFTER probes  = 4 lines  @ 09:10:23
 DELTA = 0 new log lines from the probes
 ```
 
-The probe succeeds (`-f` accepts the `302` redirect to the login page) yet adds **zero** log lines — gunicorn/uvicorn emits **no access log by default**. So the configured 30-second liveness probe is invisible in the logs.
+The probe succeeds (`curl -f` — or any HTTP client — accepts the `302` redirect to the login page, `location: /accounts/login/?next=/`) yet adds **zero** log lines: gunicorn/uvicorn emits **no access log by default**. So the configured 30-second liveness probe is invisible in the logs.
 
 **(iii) The django-q `Stat` heartbeat is silent while healthy.** The guard loop writes `Stat(self).save()` to Redis every `GUARD_CYCLE = 0.5 s` (`django_q/cluster.py:288`; `GUARD_CYCLE` default `0.5` at `django_q/conf.py:90`). `Stat.save()` only logs **on failure** — `try: self.broker.set_stat(...) except Exception as e: logger.error(e)` (`django_q/status.py:71-75`). While Redis is reachable it writes silently (confirmed by the flat `qcluster.log` above); it becomes a loud `[Q] ERROR` stream only during an outage — demonstrated directly in §4.
 
