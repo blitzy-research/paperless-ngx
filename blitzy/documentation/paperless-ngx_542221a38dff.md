@@ -998,8 +998,12 @@ releases add those; they are out of scope here.
 
 ### 5.1 The default media tree
 
-Every consumed document produces exactly **three** files, split across three fixed sub-directories of
-the media tree. Listing the tree after the investigation's five consumptions (pks 1–5):
+Every consumed **OCR-processed (PDF) document** produces exactly **three** files, split across three
+fixed sub-directories of the media tree. The count is **parser-conditional**: `originals/` and
+`thumbnails/` are always written, but the `archive/` PDF/A is produced only when the parser performs OCR,
+so a text-only document (no OCR) yields just **two** files — demonstrated at runtime under *"Conditional
+archive"* below. All five documents in this investigation are PDFs, so each produced three files; listing
+the tree after the five consumptions (pks 1–5):
 
 ```text
 $ docker exec pngx bash -lc "find /app/media/documents -type f | sort"
@@ -1054,6 +1058,91 @@ copy (with an embedded text layer and PDF/A metadata), not the original. All fil
 non-root `testuser` (UID 1000), matching the services' run user. (The classifier model, when it exists,
 lives *outside* this tree at `MODEL_FILE = DATA_DIR/classification_model.pickle`,
 `src/paperless/settings.py:74`.)
+
+**Conditional archive — a non-PDF (text) document produces only two files (captured).** The three-file
+result above is specific to OCR-processed PDFs; the file count is **parser-conditional**. In the
+consumer's placement block the original (`src/documents/consumer.py:319`) and the thumbnail
+(`consumer.py:321-325`) are written **unconditionally**, but the archive copy is written **only inside a
+guard** — `if archive_path and os.path.isfile(archive_path):` (`consumer.py:327`). Whether a parser
+yields an `archive_path` is parser-specific: the base `DocumentParser` initialises
+`self.archive_path = None` (`src/documents/parsers.py:295`); the raster/PDF parser overwrites it with the
+OCRmyPDF-produced PDF/A, while the plain-text `TextDocumentParser` (`src/paperless_text/parsers.py`,
+handles `.txt`/`.md`/`.csv`) never assigns it — it only implements `get_thumbnail()` and `parse()`. A
+text document therefore keeps `archive_path = None`, the guard is skipped, no `archive/` file is written,
+and `Document.has_archive_version` (`src/documents/models.py:238-239`,
+`return self.archive_filename is not None`) is `False`.
+
+This was verified at runtime in a separate clean stack (fresh database), consuming — through the **same**
+canonical REST entry point used for the PDF — a PDF (→ `pk=1`) and then a plain-text `.txt` file
+(→ `pk=2`), so the two parsers contrast side by side:
+
+```text
+$ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/token/ \
+             -d "username=admin&password=admin" \
+         | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# (1) canonical REST upload of a PDF
+$ curl -s -w "\nHTTP %{http_code}\n" -H "Authorization: Token $TOKEN" \
+       -F "document=@qa_control.pdf" -F "title=QA Control PDF" \
+       http://127.0.0.1:8000/api/documents/post_document/
+"OK"
+HTTP 200
+
+# (2) canonical REST upload of a plain-text file (same endpoint)
+$ curl -s -w "\nHTTP %{http_code}\n" -H "Authorization: Token $TOKEN" \
+       -F "document=@qa_textonly.txt" -F "title=QA Text Only" \
+       http://127.0.0.1:8000/api/documents/post_document/
+"OK"
+HTTP 200
+```
+
+The text document is dispatched to `TextDocumentParser`; its complete, ordered `paperless.log` window has
+**no** `Calling OCRmyPDF` / archive-extraction line that the PDF path emits (contrast §3.3–§3.4) — its
+only `Execute:` line is the thumbnail's `optipng`:
+
+```text
+$ docker exec pngx sed -n "/Consuming qa_textonly.txt/,/QA Text Only consumption finished/p" /app/data/log/paperless.log
+[2026-07-13 21:28:03,532] [INFO] [paperless.consumer] Consuming qa_textonly.txt
+[2026-07-13 21:28:03,537] [DEBUG] [paperless.consumer] Detected mime type: text/plain
+[2026-07-13 21:28:03,541] [DEBUG] [paperless.consumer] Parser: TextDocumentParser
+[2026-07-13 21:28:03,555] [DEBUG] [paperless.consumer] Parsing qa_textonly.txt...
+[2026-07-13 21:28:03,556] [DEBUG] [paperless.consumer] Generating thumbnail for qa_textonly.txt...
+[2026-07-13 21:28:03,594] [DEBUG] [paperless.parsing.text] Execute: optipng -silent -o5 /tmp/paperless/paperless-xhv3oj8o/thumb.png -out /tmp/paperless/paperless-xhv3oj8o/thumb_optipng.png
+[2026-07-13 21:28:04,303] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+[2026-07-13 21:28:04,317] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-13 21:28:04,344] [DEBUG] [paperless.consumer] Deleting file /tmp/paperless/paperless-upload-iqemmxvs
+[2026-07-13 21:28:04,348] [DEBUG] [paperless.parsing.text] Deleting directory /tmp/paperless/paperless-xhv3oj8o
+[2026-07-13 21:28:04,349] [INFO] [paperless.consumer] Document 2026-07-13 QA Text Only consumption finished
+```
+
+The resulting database attributes and the on-disk file count differ by parser exactly as predicted — the
+PDF has an archive and three files; the text document has none and two files:
+
+```text
+$ docker exec -u 1000:1000 -w /app/src pngx python3 manage.py shell -c "
+from documents.models import Document
+for d in Document.objects.order_by('pk'):
+    print(f'pk={d.pk}  mime_type={d.mime_type}  has_archive_version={d.has_archive_version}  filename={d.filename!r}  archive_filename={d.archive_filename!r}')"
+pk=1  mime_type=application/pdf  has_archive_version=True  filename='0000001.pdf'  archive_filename='0000001.pdf'
+pk=2  mime_type=text/plain  has_archive_version=False  filename='0000002.txt'  archive_filename=None
+
+$ docker exec pngx bash -lc 'for f in 0000001 0000002; do echo "== $f =="; find /app/media/documents -type f -name "$f.*" | sort; done'
+== 0000001 ==
+/app/media/documents/archive/0000001.pdf
+/app/media/documents/originals/0000001.pdf
+/app/media/documents/thumbnails/0000001.png
+== 0000002 ==
+/app/media/documents/originals/0000002.txt
+/app/media/documents/thumbnails/0000002.png
+```
+
+**Cause → effect:** the PDF (`pk=1`) took the OCR path, so its parser produced a PDF/A and the
+`archive_path` guard (`consumer.py:327`) fired → **three** files. The text file (`pk=2`) took the
+`TextDocumentParser` path, which leaves `archive_path = None`, so the guard was skipped → **two** files
+(`originals/` + `thumbnails/`) with `has_archive_version = False`. The "three files" figure is therefore
+the **PDF/OCR case**, not a universal invariant: non-OCR document types omit the `archive/` artifact and
+produce two files. For the user's actual input (a test PDF) and all five of this investigation's own
+consumptions (pks 1–5, all PDFs), the three-file layout shown above holds exactly.
 
 ### 5.2 The default filename pattern (zero-padded 7-digit id)
 
@@ -1393,7 +1482,7 @@ so nothing is over-claimed:
 | Q2f | "Classifier idle" log message | §4.3 Branch 3, §4.7 | `[DEBUG] [paperless.tasks] Training data unchanged.`, stable across repeated runs (identical model MD5 `7701284a…`) | captured |
 | Q2g | Error branch (MATCH_AUTO set but no eligible data) | §4.3 Branch 4 | `[WARNING] [paperless.tasks] Classifier error: No training data available.` — reached non-destructively via inbox exclusion, state restored | captured |
 | Q3a | Where the document ends up on disk | §5.1 | `find` / `ls -l` of `/app/media/documents/{originals,archive,thumbnails}` | captured |
-| Q3b | Default directory structure | §5.1 | the three subdirectories, each holding one file per document | captured |
+| Q3b | Default directory structure | §5.1 | the three fixed subdirectories; `originals/` + `thumbnails/` always populated, `archive/` only for OCR-processed (PDF) documents | captured |
 | Q3c | Default filename pattern | §5.2 | ORM listing tying `pk=1…5` → `0000001.pdf … 0000005.pdf` | captured |
 | Q3c′ | Filename collision suffix (`_01`, `_02`) | §5.2 | `counter_str` in `generate_unique_filename()`; not triggered under the default pk scheme | inferred |
 | Q3d | Which DB tables receive new rows | §5.3 | exhaustive 26-table before/after snapshot via a read-only (`mode=ro`) helper, plus the exact changed rows | captured |
