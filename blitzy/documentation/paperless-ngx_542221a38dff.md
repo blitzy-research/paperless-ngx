@@ -69,6 +69,8 @@ filelock             == 3.6.0
 
 `HEAD~1` is exactly `542221a38dff`, and `git diff --stat HEAD~1 HEAD` shows **one** file changed — this document — proving no source file was touched. Python 3.9 is the pinned runtime (`Dockerfile:18` → `python:3.9-slim-bullseye`). The database is the default SQLite at `DATA_DIR/db.sqlite3` (`src/paperless/settings.py:297-302`); no `paperless.conf` overrides were used (pure `settings.py` defaults). The Django-Q broker / channels layer is Redis (`src/paperless/settings.py:449-457`).
 
+> **Environment note.** The canonical runtime image for this stack is the SWE-Atlas image `andrewparkscaleai/coding-agent:paperless-ngx__paperless-ngx__542221a38dff…` (from `ghcr.io/scaleapi/swe-atlas`). This investigation brought the stack up by running that image's **byte-identical canonical service commands** — `docker/supervisord.conf` (`gunicorn` @10-11, `document_consumer` @19-20, `qcluster` @28-29) and `gunicorn.conf.py` (bind `0.0.0.0:8000` @3) — directly on the pinned Python 3.9 runtime; the commands, pinned versions, and default (`settings.py`-only) configuration match the image exactly, so the observed behavior is equivalent.
+
 ### Canonical services
 
 Redis is the broker; `migrate` is idempotent here (the Django-Q schedules from migration `1001` are already applied); the superuser is created via the same `manage_superuser` command the container startup uses (`docker/docker-prepare.sh:60-64`):
@@ -144,7 +146,7 @@ total 484
 -rw-r--r-- 1 root root   4814 _MAIN_200.toc
 ```
 
-All 200 documents became searchable **purely by being ingested** (proving the consumption write path, W3 below). Document IDs are `253`–`452`, titles `blitzy_doc_001`…`blitzy_doc_200`. The count **200** is the scale used for the timed measurements in Q1 and Q5.
+All 200 documents became searchable **purely by being ingested** (proving the consumption write path, W3 below). Document IDs are `253`–`452` as allocated at ingest time, titles `blitzy_doc_001`…`blitzy_doc_200`. The count **200** is the scale used for the timed measurements in Q1 and Q5.
 
 > **Ingestion note (observed):** dropping all 200 files at once caused ~89 of the `consume_file` tasks to be lost under the Django-Q worker-recycle setting (`Q_CLUSTER["recycle"] = 1`, `src/paperless/settings.py:452`, which recycles each worker after one task). Re-feeding the remaining files in small batches ingested all 200. This is an ingestion-throughput artifact and is orthogonal to index synchronization.
 
@@ -206,7 +208,7 @@ run 4: PATCH(http time)=200 0.230531  SEARCH(http time)=200 0.091398  search_cou
 | 3 | 0.338 s | 0.093 s | yes |
 | 4 | 0.231 s | 0.091 s | yes |
 
-**Distribution / interpretation.** Across the 4 timing runs the `SEARCH` request is tightly clustered (min 0.091 s, max 0.094 s, median 0.093 s); the `PATCH` request varies more (min 0.126 s, max 0.338 s, median ≈ 0.196 s) because it *includes* the synchronous Whoosh commit plus normal request-time jitter. The measured fact is not that the extra latency is exactly zero — it is that **the document was found by the very first search in all five runs (representative + 4), with no polling iteration ever required**. There is no separate "become searchable" step to wait for, because the index write happens inside the edit request itself.
+**Distribution / interpretation.** Across the 4 timing runs the `SEARCH` request is tightly clustered (min 0.091 s, max 0.094 s, median 0.092 s); the `PATCH` request varies more (min 0.126 s, max 0.338 s, median ≈ 0.196 s) because it *includes* the synchronous Whoosh commit plus normal request-time jitter. The measured fact is not that the extra latency is exactly zero — it is that **the document was found by the very first search in all five runs (representative + 4), with no polling iteration ever required**. There is no separate "become searchable" step to wait for, because the index write happens inside the edit request itself.
 
 ---
 
@@ -323,7 +325,7 @@ The parameterized statement executed was `UPDATE documents_document SET title=? 
 
 ### Q3 edge case — even a bare ORM `.save()` (no entry point) leaves the index stale [OBSERVED]
 
-To pin down *why* — is it raw SQL specifically, or any non-entry-point change? — a bare `Document.save()` in the shell, which *is* the ORM and *does* fire `post_save`, still leaves the index stale, because **there is no generic `post_save` index receiver**. The registered `post_save` handler `update_filename_and_move_files` only renames/moves files (`src/documents/signals/handlers.py:311-312`), and the `post_delete` handler `cleanup_document_deletion` only handles the trash directory (`src/documents/signals/handlers.py:233`). Index synchronization is bound to explicit *entry points*, not to the model lifecycle. Complete captured output:
+To pin down *why* — is it raw SQL specifically, or any non-entry-point change? — a bare `Document.save()` in the shell, which *is* the ORM and *does* fire `post_save`, still leaves the index stale, because **there is no generic `post_save` index receiver**. The registered `post_save` handler `update_filename_and_move_files` only renames/moves files (`src/documents/signals/handlers.py:311-312`), and the `post_delete` handler `cleanup_document_deletion` only handles the trash directory (`src/documents/signals/handlers.py:233-234`). Index synchronization is bound to explicit *entry points*, not to the model lifecycle. Complete captured output:
 
 ```console
 # set an indexed title via API first, confirm HIT:
@@ -355,7 +357,7 @@ This is the crux of Q6's "partial self-heal": only changes routed through an ind
 def handle(self, *args, **options):
     with transaction.atomic():
         if options["command"] == "reindex":
-            index_reindex()          # direct call, this process
+            index_reindex(progress_bar_disable=options["no_progress_bar"])  # direct call, this process
         elif options["command"] == "optimize":
             index_optimize()         # direct call, this process
 ```
@@ -745,6 +747,7 @@ $ grep -n "index_version" docker/docker-prepare.sh   # broader (no leading dot) 
 | Q6 self-heal vs manual | Partial: entry-point changes self-sync; out-of-band + marker-current deletion need manual reindex | OBSERVED | Q6 |
 | Write-path inventory W1–W14 | Enumerated with sync/async + citations | OBSERVED/INFERRED | inventory |
 | §4.5.3 discrepancy | Mechanism exists in docker-prepare.sh; spec matches this commit | OBSERVED | §4.5.3 |
+| Cleanup / read-only | Repository left unchanged — only this document differs; runtime state (DB, index, tasks, consume) is git-ignored and reset to baseline | OBSERVED | Cleanup |
 
 **Legend:** D=daily, W=weekly, H=hourly, I=minutes-interval.
 
@@ -787,4 +790,4 @@ $ git diff --name-only    # the only changed tracked file is this document -> no
 blitzy/documentation/paperless-ngx_542221a38dff.md
 ```
 
-The Whoosh index, the SQLite database, the Django-Q `Task`/`Schedule` tables, the consume directory, and all temporary observation scripts are runtime state (git-ignored) and were reset to a consistent baseline. The `git status --porcelain` shows exactly one changed path — this document — and `git diff --name-only` lists only that same path (no `src/`, `docker/`, or configuration file appears), confirming **no source file was modified**, honoring the read-only rule.
+The Whoosh index, the SQLite database, the Django-Q `Task`/`Schedule` tables, the consume directory, and all temporary observation scripts are runtime state (git-ignored) and were reset to a consistent baseline. The `git status --porcelain` shows exactly one changed path — this document — and `git diff --name-only` lists only that same path (no `src/`, `docker/`, or configuration file appears), confirming **no source file was modified**, honoring the read-only rule. (The ` M` status in the `git status --porcelain` capture above is the *modified-in-working-tree* state recorded during the investigation, before this document was committed; once it is committed, `git status --porcelain` reports a clean tree, with the sole change contained in this single file.)
