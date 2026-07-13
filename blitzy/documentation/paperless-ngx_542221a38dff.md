@@ -616,7 +616,12 @@ parse(encrypted.pdf) done. self.text repr = ''
 
 `magic.from_file` still reports `application/pdf`; `pdfminer` raises `PDFPasswordIncorrect` at `src/paperless_tesseract/parsers.py:120`; the parser logs `This file is encrypted, OCR is impossible. Using any text present in the original file.` and finishes with empty text — the MIME is still the input's type, only `content` is empty.
 
-### 4.5 Observed — canonical Q3 tests — [observed]
+### 4.5 Observed — related repository tests under non-default `OCR_MODE` (corroborate parser wiring, not the canonical no-text outcome) — [observed] + [non-canonical]
+
+**Disclosure — [non-canonical / non-default `OCR_MODE`].** The two `test_parser.py` tests below are *related* repository tests, **not** the canonical Q3 no-extractable-text path. Each runs under a **non-default** `OCR_MODE` and asserts that text **is** extracted, so they corroborate the `RasterisedDocumentParser` → `ocrmypdf` wiring but do **not** exercise the default `OCR_MODE="skip"` no-text outcome that answers Q3 (that outcome is established through real runtime observation in §4.1 through §4.4 above):
+
+- `test_skip_noarchive_notext` is decorated `@override_settings(OCR_MODE="skip_noarchive")` (`src/paperless_tesseract/tests/test_parser.py:369`) and asserts the OCR'd text **contains** `"page 1"`, `"page 2"`, `"page 3"` on `multi-page-images.pdf` (`src/paperless_tesseract/tests/test_parser.py:377-380`) — i.e. it asserts text *is* found, the opposite of the canonical no-text case.
+- `test_with_form_error_notext` is decorated `@override_settings(OCR_MODE="redo")` (`src/paperless_tesseract/tests/test_parser.py:189`) and asserts the extracted text **contains** `"Please enter your name in here:"` and `"This is a PDF document with a form."` (`src/paperless_tesseract/tests/test_parser.py:197-200`) — again asserting text *is* found. (The `notext` in each name refers to the input lacking a pre-existing text layer, forcing OCR to run — not to an empty final result.)
 
 Command:
 
@@ -627,7 +632,48 @@ $ docker exec -u testuser -w /app/src -e DJANGO_SETTINGS_MODULE=paperless.settin
     -p no:cacheprovider -o addopts="" -v
 ```
 
-Result: `2 passed, 6 warnings in 9.56s` (exit 0). The complete, unedited capture of both tests is in Appendix §7.3.
+Both named tests pass. The `-o addopts=""` flag disables the repository's default `--numprocesses auto` (pytest-xdist) and coverage `addopts` so the per-test result lines are shown, and `-p no:cacheprovider` disables the cache. The result — `2 passed` — was stable across two runs (`in 9.88s` then `in 9.72s`; exit 0). The complete, unedited capture of run 1 follows:
+
+```text
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python3
+django: version: 4.0.4, settings: paperless.settings (from env)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 2 items
+
+paperless_tesseract/tests/test_parser.py::TestParser::test_skip_noarchive_notext PASSED [ 50%]
+paperless_tesseract/tests/test_parser.py::TestParser::test_with_form_error_notext PASSED [100%]
+
+=============================== warnings summary ===============================
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:67
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:67: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version = StrictVersion(hiredis.__version__)
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:69
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:69: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('0.1.3')
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:71
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:71: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('0.1.4')
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:73
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:73: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('1.0.0')
+
+../../usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229
+  /usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229: RemovedInDjango50Warning: The USE_L10N setting is deprecated. Starting with Django 5.0, localized formatting of data will always be enabled. For example Django will display numbers and dates using the format of the current locale.
+    warnings.warn(USE_L10N_DEPRECATED_MSG, RemovedInDjango50Warning)
+
+../../usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9
+  /usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9: RemovedInDjango50Warning: The django.utils.baseconv module is deprecated.
+    from django.utils import baseconv
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 2 passed, 6 warnings in 9.88s =========================
+```
 
 ---
 
