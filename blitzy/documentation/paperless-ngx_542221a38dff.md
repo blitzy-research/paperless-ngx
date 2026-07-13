@@ -932,14 +932,14 @@ correction to any "parse → classify → persist" simplification — F3):
    text parser optimising the thumbnail).
 4. Date resolution — `get_date()` then `parse_date()` if needed [`consumer.py:L271-L275`].
 5. **Then a single DB transaction** `with transaction.atomic():` [`consumer.py:L298`]:
-   - `self._store(...)` creates the `documents_document` row [`consumer.py:L303`] (`Saving record to
+   - `self._store(...)` creates the `documents_document` row [`consumer.py:L301`] (`Saving record to
      database`).
    - the `document_consumption_finished` signal fires [`consumer.py:L306`], running the six handlers
      of §3.2 — **classification and the index update happen here, *after* the row exists, inside the
      transaction**. (`Document classification model does not exist (yet)` is `set_correspondent`/etc.
      finding no trained model.)
    - original/thumbnail/archive files are written under a file lock [`consumer.py:L317-L343`];
-     `document.save()` [`consumer.py:L347`]; the source file is unlinked [`consumer.py:L350`]
+     `document.save()` [`consumer.py:L346`]; the source file is unlinked [`consumer.py:L350`]
      (`Deleting file …`).
 6. The transaction commits at the end of the block; `consumption finished` is logged
    [`consumer.py:L373`]; the final `SUCCESS/finished(100)` progress is sent [`consumer.py:L375`]; the
@@ -1824,7 +1824,7 @@ documents.consumer.ConsumerError: probe_dup.txt: Not consuming probe_dup.txt: It
 **Observed and grounded:** the traceback confirms the worker-side chain
 `django_q/cluster.py:worker` → `consume_file` [`tasks.py:L236`] →
 `Consumer.try_consume_file` [`consumer.py:L213`] → `pre_check_duplicate` [`consumer.py:L110`] →
-`_fail` [`consumer.py:L81`] → `raise ConsumerError`. The duplicate check compares the SHA-256
+`_fail` [`consumer.py:L81`] → `raise ConsumerError`. The duplicate check compares the MD5
 checksum of the incoming file against existing `documents_document.checksum` values; the three
 `probe_dup.txt` rows in `django_q_task` all carry `success = 0` (§6.2), and — critically — **no new
 `documents_document` row was created** for any of them (the table has exactly 10 rows, §6.1), which
