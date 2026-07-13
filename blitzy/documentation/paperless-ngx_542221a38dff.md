@@ -83,9 +83,14 @@ $ docker exec paperless-redis redis-server --version
 Redis server v=7.4.9 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=b4acab9aea09546d
 ```
 
-**Runtime commit matches the deliverable's citation commit [observed]:**
+**Runtime commit matches the deliverable's citation commit [observed].** `docker exec` runs as
+`root` (the image's default user), while `/app` is owned by `testuser`, so git first needs `/app`
+marked as a safe directory; otherwise it aborts with `fatal: detected dubious ownership in
+repository at '/app'` (exit 128). This one-time global setting also satisfies the
+`git -C /app status --porcelain` check in *Cleanup & Security Teardown*:
 
 ```
+$ docker exec paperless-app git config --global --add safe.directory /app
 $ docker exec paperless-app git -C /app rev-parse HEAD
 542221a38dff06361e07976452f9aea24d210542
 ```
@@ -107,20 +112,43 @@ docker run -d --name paperless-redis --network paperless-net redis:7-alpine
 
 # 2. Application container, port published, on the same network.
 #    PAPERLESS_ADMIN_PASSWORD is a secret and is intentionally not printed here; supply your own.
+#    NOTE: the image ENTRYPOINT is ["/bin/bash"], so `--entrypoint bash` is REQUIRED. Without it the
+#    effective command becomes `/bin/bash bash -c "sleep infinity"` and the container immediately
+#    exits 126 ("/bin/bash: /bin/bash: cannot execute binary file"). With `--entrypoint bash` the
+#    running COMMAND is `bash -c 'sleep infi…'`, exactly as shown by the `docker ps` capture above.
 docker run -d --name paperless-app --network paperless-net -p 8000:8000 \
+  --entrypoint bash \
   -e PAPERLESS_REDIS=redis://paperless-redis:6379 \
   -e PAPERLESS_ADMIN_USER=admin \
   -e PAPERLESS_ADMIN_PASSWORD="$PAPERLESS_ADMIN_PASSWORD" \
   -e PAPERLESS_ADMIN_MAIL=admin@example.com \
   -e PAPERLESS_TIME_ZONE=UTC \
-  "$IMAGE" bash -c "sleep infinity"
+  "$IMAGE" -c "sleep infinity"
 
-# 3. Prepare data dirs, apply migrations, create the superuser (run inside the container)
+# 2b. Runtime prerequisites the raw image lacks — run as root inside the container (docker exec's
+#     default user is root).
+#     * libzbar0 is REQUIRED: `src/documents/tasks.py:25` does `from pyzbar import pyzbar` at module
+#       load, and the qcluster worker imports `documents.tasks`; without libzbar0 that import fails
+#       with "ImportError: Unable to find zbar shared library", so `consume_file` can never run.
+#       poppler-utils and pngquant back the PDF/image consume path.
+#     * The bundled ImageMagick policy replaces the distro default, whose
+#       `<policy domain="coder" rights="none" pattern="PDF" />` blocks the PDF coder that the
+#       generating_thumbnail (progress 70) and archive stages need; the bundled file grants
+#       `rights="read|write" pattern="PDF"`.
+docker exec paperless-app bash -c 'apt-get update && apt-get install -y libzbar0 poppler-utils pngquant'
+docker exec paperless-app bash -c 'cp /app/docker/imagemagick-policy.xml /etc/ImageMagick-6/policy.xml'
+
+# 3. Prepare data dirs, apply migrations, create the superuser (run inside the container).
+#    The data/media/consume dirs must exist first, or Django's system check aborts migrate with
+#    "PAPERLESS_CONSUMPTION_DIR is set but doesn't exist." / "PAPERLESS_MEDIA_ROOT is set but doesn't exist."
+docker exec paperless-app bash -c 'mkdir -p /app/data /app/media /app/consume /app/data/index'
 docker exec paperless-app bash -c 'cd /app/src && python3 manage.py migrate'
 docker exec paperless-app bash -c 'cd /app/src && python3 manage.py manage_superuser'
 
-# 4. Start the ASGI web/WebSocket server and the django-q worker (both inside the container)
-docker exec -d paperless-app bash -c 'cd /app/src && gunicorn -c /app/gunicorn.conf.py paperless.asgi:application'
+# 4. Start the ASGI web/WebSocket server and the django-q worker (both inside the container).
+#    gunicorn's stdout/stderr is redirected to /tmp/gunicorn.log so the "Listening at" / "Using
+#    worker" lines can be read back with the verification command shown below.
+docker exec -d paperless-app bash -c 'cd /app/src && gunicorn -c /app/gunicorn.conf.py paperless.asgi:application > /tmp/gunicorn.log 2>&1'
 docker exec -d paperless-app bash -c 'cd /app/src && python3 manage.py qcluster'
 ```
 
