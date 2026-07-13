@@ -92,7 +92,7 @@ Every code citation uses a full `src/...:line` path so a reader can reproduce it
 
 ### 1.4 Documented deviations from the literal runbook (canonical-equivalent)
 
-1. **ASGI server = daphne, not `runserver`.** `python manage.py runserver` in this image does not upgrade the `ws/status/` handshake (it answers HTTP `200` instead of a `101` switch), so the authenticated WebSocket capture uses **daphne 3.0.2** (`daphne -b 127.0.0.1 -p 8000 paperless.asgi:application`). daphne loads the same `paperless.asgi:application` and the same `ws/status/` route (`src/paperless/urls.py:137`), so the observed frames are canonical. The unauthenticated negative control (§O3) was captured against the `runserver` transport **before** the switch and is labeled accordingly.
+1. **ASGI server = daphne, not `runserver`.** `python manage.py runserver` in this image starts a plain `WSGIServer` (the Channels ASGI runserver override is not active) that does **not** upgrade the `ws/status/` handshake — a raw upgrade request is answered with `302 → /accounts/login/?next=/ws/status/` (a redirect-following client then lands on the login page, HTTP `200`), never a `101` switch. The authenticated WebSocket capture therefore uses **daphne 3.0.2** (`daphne -b 127.0.0.1 -p 8000 paperless.asgi:application`), which loads the same `paperless.asgi:application` and the same `ws/status/` route (`src/paperless/urls.py:137`), so the observed frames — and the unauthenticated negative control (§O3) — are canonical. On daphne the unauthenticated handshake is refused with HTTP `403` (daphne logs `WSREJECT`); the `runserver` `302 → login → 200` chain is retained in §O3 only as an explicitly-labeled non-canonical contrast.
 2. **`curl` is absent** in the image; HTTP readiness is polled with a short Python `urllib` probe instead.
 3. **Directories are `/paperless/*`** via warmed-image `PAPERLESS_*` env overrides; the source defaults are `/app/{data,media,consume}` (§1.1). This changes only paths, not behavior.
 
@@ -316,13 +316,24 @@ AUTH_OK authenticated=True
 
 > **observed.** `LOGIN_GET … 200`, `LOGIN_POST … 302 authenticated=True`, `ADMIN_CHECK /admin/ 200`, then `WS_CONNECTED` at `18:40:42` — matching the frame timestamps below. No cookie or password value is printed.
 
-**Negative control (observed, separately).** An unauthenticated probe does not receive frames:
+**Negative control (observed on canonical daphne).** An unauthenticated probe is refused the handshake and receives no frames:
 
 ```text
-UNAUTH_RESULT rejected_http_status=200
+UNAUTH_RESULT rejected_http_status=403
 ```
 
-> **observed + inferred.** This probe was captured against the `runserver` dev transport (before the switch to daphne, §1.4), which answers the handshake with HTTP `200` rather than upgrading, so no frames are served without a session. The authoritative server-side rejection for an unauthenticated Channels connection is `raise DenyConnection()` at `src/paperless/consumers.py:15` (**inferred** — the connection guard in `def connect` at `:13`); the `200` here is the dev-transport artifact, not a `101` upgrade.
+daphne records the rejection on its own console as it happens (one `WSCONNECTING → WSREJECT → WSDISCONNECT` cycle per attempt):
+
+```text
+[2026-07-13 21:15:01,727] [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8000
+127.0.0.1:49006 - - [13/Jul/2026:21:15:13] "WSCONNECTING /ws/status/" - -
+127.0.0.1:49006 - - [13/Jul/2026:21:15:13] "WSREJECT /ws/status/" - -
+127.0.0.1:49006 - - [13/Jul/2026:21:15:13] "WSDISCONNECT /ws/status/" - -
+```
+
+> **observed.** On the canonical **daphne** ASGI transport an unauthenticated `ws/status/` handshake is refused with HTTP `403` (stable across three consecutive probes), and daphne's console records the `WSCONNECTING → WSREJECT → WSDISCONNECT` cycle for each attempt. This is the runtime manifestation of the server-side guard `raise DenyConnection()` at `src/paperless/consumers.py:15` — reached inside `def connect` at `:13` because `_authenticated()` (`consumers.py:10-11`) is `False` for an anonymous scope. The rejection is **observed** (the `403` and `WSREJECT` are captured directly from the running server), not merely inferred, and no `status_updates` frame is ever delivered without an authenticated session.
+>
+> **Non-canonical contrast (labeled).** The Django `runserver` dev transport in this image is a plain `WSGIServer` (banner `Starting development server …`, Django 4.0.4) that does **not** upgrade `ws/status/`: a raw handshake returns `302 Found` with `Location: /accounts/login/?next=/ws/status/`, which a redirect-following client resolves to the login page (`200`). An earlier draft reported `rejected_http_status=200`; that value is the `runserver` `302 → login → 200` redirect-chain artifact — a dev-transport quirk, **not** a `101` upgrade and **not** the canonical rejection. The canonical negative-control value is daphne's `403` above.
 
 **Observed per-stage frames — happy path (`sample_run1.txt` → document id 1):**
 
