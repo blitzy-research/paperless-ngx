@@ -281,7 +281,7 @@ documents/tests/test_classifier.py::TestClassifier::testNoTrainingData PASSED [1
 ======================== 4 passed, 6 warnings in 2.18s =========================
 ```
 
-`test_train_classifier` (`src/documents/tests/test_tasks.py:75-89`) asserts the exact mtime reuse/retrain behavior observed above; `testVersionIncreased` and `testNoTrainingData` cover the version-guard and empty-corpus paths. All pass.
+`test_train_classifier` (`src/documents/tests/test_tasks.py:75-94`) asserts the exact mtime reuse/retrain behavior observed above; `testVersionIncreased` and `testNoTrainingData` cover the version-guard and empty-corpus paths. All pass.
 
 ### 2.4 Cross-test isolation — model file, DB identity, and factory usage
 
@@ -724,7 +724,7 @@ separate_pages(several-patcht-codes.pdf     splits=[2, 5] ) -> 3 fragment(s): ['
 
 ```
 
-`[]`→0 fragments (with `No pages to split on!`, `src/documents/tasks.py:129`); `[1]` on the 3-page `patch-code-t-middle.pdf`→**2** fragments (1 page each; the separator page 1 is skipped by `range(page_number+1, next_page)`, `src/documents/tasks.py:149`); `[2, 5]` on the 7-page `several-patcht-codes.pdf`→**3** fragments (2, 2, 1 pages). Fragments are written to a `tempfile.mkdtemp(prefix="paperless-", dir=SCRATCH_DIR)` (`src/documents/tasks.py:118`), i.e. `/tmp/paperless/…`, **not** `/app/consume`.
+`[]`→0 fragments (with `No pages to split on!`, `src/documents/tasks.py:127`); `[1]` on the 3-page `patch-code-t-middle.pdf`→**2** fragments (1 page each; the separator page 1 is skipped by `range(page_number+1, next_page)`, `src/documents/tasks.py:149`); `[2, 5]` on the 7-page `several-patcht-codes.pdf`→**3** fragments (2, 2, 1 pages). Fragments are written to a `tempfile.mkdtemp(prefix="paperless-", dir=SCRATCH_DIR)` (`src/documents/tasks.py:121`), i.e. `/tmp/paperless/…`, **not** `/app/consume`.
 
 ### 5.5 Observed — (d) the split path creates 0 rows; consuming fragments enlarges the corpus
 
