@@ -162,7 +162,7 @@ $ cd /app/src && PYTHONPATH=/tmp/harness:/app/src DJANGO_SETTINGS_MODULE=harness
 harness SECRET_KEY == paperless SECRET_KEY: True
 ```
 
-> **Why `workers: 11`?** `Q_CLUSTER["workers"]` comes from paperless's `default_task_workers()` (`src/paperless/settings.py:427-435`): for a host with >= 4 cores it returns `floor(sqrt(cores))`. This container's Python sees `multiprocessing.cpu_count() == 128`, so `floor(sqrt(128)) == 11`. This is the canonical default *for this machine*, reported as observed. It is environment-overridable via `PAPERLESS_TASK_WORKERS` (`settings.py:437`).
+> **Why `workers: 11`?** `Q_CLUSTER["workers"]` comes from paperless's `default_task_workers()` (`src/paperless/settings.py:427-435`): for a host with >= 4 cores it returns `floor(sqrt(cores))`. This container's Python sees `multiprocessing.cpu_count() == 128`, so `floor(sqrt(128)) == 11`. This is the canonical default *for this machine*, reported as observed. It is environment-overridable via `PAPERLESS_TASK_WORKERS` (`settings.py:438`).
 
 > **Why isolate at all? (an honest failure note — Finding-driven.)** An **earlier, non-isolated** attempt ran the harness against the **same** Redis DB 0 the real paperless `qcluster` was draining, but signed packages with a **different** `SECRET_KEY`. The real cluster's `pusher()` then rejected them. That failure is real and was captured in the leftover cluster log:
 
@@ -280,7 +280,7 @@ ROOT_URLCONF = "harness_urls"
 urlpatterns = []
 ```
 
-The per-experiment helper scripts (`enq.py`, `measure.py`, `inspect_pkg.py`, `dump_config.py`, `show_tables.py`, and the Q3/Q4/Q5 helpers `burst.py`, `poll.py`, `read_task.py`, `raw_sql.py`, `save_limit.py`, `channels_probe.py`) are listed verbatim in **Appendix G**. Every command in this document names the exact script it runs.
+The per-experiment helper scripts (`enq.py`, `measure.py`, `inspect_pkg.py`, `dump_config.py`, `show_tables.py`, and the Q3/Q4/Q5 helpers `burst.py`, `poll.py`, `read_task.py`, `raw_sql.py`, `save_limit.py`, `channels_probe.py`) are listed verbatim in **Appendix G**. Every per-experiment command in this document names the exact script it runs; the only inline exceptions are a few short `python3 -c` one-liners (used for row counts and a version print) that show their complete output inline — the row-count logic they use is reproduced verbatim in Appendix G's `read_task.py`.
 
 ### 1.4 Migrations create the Django-Q tables
 
@@ -1764,7 +1764,7 @@ $ git ls-files "tmp/*" "**/qa_evidence/*" "**/harness/*"   (must be empty — no
 # Point-in-time commit/size snapshots (labeled; each necessarily precedes its own commit):
 #   draft   commit 22d3c2db92eded84908efcf2a92208238dd7c14c -> 56053 bytes  (Jul 13 17:52)
 #   rewrite commit b719635e74f8ac7efd5cd6fe7d389c3632b1e8d9 -> 166384 bytes (Jul 13 20:17)
-#   this evidence-fidelity correction adds one further commit, re-growing the file; the NET
+#   subsequent evidence-fidelity corrections each add a further commit, re-growing the file; the NET
 #   name-status claim above (exactly one added file) is unchanged by any of these commits.
 ```
 
@@ -1789,7 +1789,7 @@ unchanged. Any bare `git rev-parse HEAD` value or `ls -l` byte count captured *i
 document is inherently self-referential: it is recorded *before* the commit that stores the
 document's own current text, so it necessarily names an earlier draft. The point-in-time
 snapshots in the transcript are labeled accordingly (draft `22d3c2db9`, 56053 bytes; rewrite
-`b719635e7`, 166384 bytes; and this evidence-fidelity correction adds one further commit). The
+`b719635e7`, 166384 bytes; and subsequent evidence-fidelity corrections each add a further commit). The
 net name-status claim is invariant under every one of those commits, which is why it — not any
 single HEAD hash — is the guarantee that *this* document is the sole modification to the
 repository, shown in the final commit step.
