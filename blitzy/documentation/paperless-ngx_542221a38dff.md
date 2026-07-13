@@ -81,7 +81,11 @@ $ docker pull ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-n
 
 $ docker run -d --name paperless_fresh \
       ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01 \
-      bash -c "sleep infinity"
+      -c "sleep infinity"
+122e7758b9c98cb4d402ce8582fca672dbfe398a79d3e6e40d8406e847dd4746
+
+$ docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' paperless_fresh
+true 0
 
 $ docker inspect --format '{{.Config.Image}}
 {{.Image}}' paperless_fresh
@@ -91,6 +95,15 @@ sha256:6e699f225ced49182033cf995daf2a07d3628fe29bb573f5aa4c4188c253969f
 $ docker image inspect sha256:6e699f225ced --format '{{.RepoDigests}}'
 [ghcr.io/scaleapi/swe-atlas@sha256:d4abe56dd5d1cb2632353baf06e9d80a704f147a70ac2ec15c2b78fc5fddfe15]
 ```
+
+> **The launch uses `-c "sleep infinity"`, not `bash -c "sleep infinity"`.** The image's `ENTRYPOINT`
+> is `["/bin/bash"]` with an empty `Cmd` (`docker image inspect … --format '{{json .Config.Entrypoint}}'`
+> ⇒ `["/bin/bash"]`; `{{json .Config.Cmd}}` ⇒ `null`), so whatever is passed after the image name
+> becomes *arguments to bash*. Passing `-c "sleep infinity"` therefore executes
+> `/bin/bash -c "sleep infinity"`, and the container stays up (`State.Running=true`, `ExitCode=0`,
+> shown above) so every later `docker exec` works. A leading `bash` token would instead make the
+> entrypoint try to run the `bash` binary itself as a script — the container dies immediately with
+> `/bin/bash: /bin/bash: cannot execute binary file` (exit code `126`).
 
 All subsequent commands are run inside that container as the code owner `testuser`, e.g.
 `docker exec -u testuser paperless_fresh bash -lc '<command>'`. The image identity, OS, commit, and
@@ -108,8 +121,36 @@ Python 3.9.23
 
 > The image ships all `requirements.txt` runtime deps but omits a few OS packages the pipeline needs
 > at runtime; these were installed as root once, before any probe: `redis-server` (the broker),
-> `libzbar0` (pyzbar barcode support — an import-time dependency), `poppler-utils`, and `procps`.
-> These are system packages inside the ephemeral container, not repository changes (§10.2).
+> `libzbar0` (pyzbar barcode support — an import-time dependency), `poppler-utils`, `procps`, and
+> `curl` (used by the §1.4 HTTP health checks). These are system packages inside the ephemeral
+> container, not repository changes (§10.2).
+
+The pristine image has no `curl` (and the other four packages are absent too), so the install pulls
+them — plus their dependencies, e.g. `redis-tools`, which provides `redis-cli` — as **new** packages.
+The exact command and its result (the non-deterministic `Get:`/`Unpacking` progress and the
+per-package `Setting up …` lines are elided and marked `[…]`; everything shown is verbatim):
+
+```text
+$ command -v curl || echo "curl NOT FOUND"        # pristine image — before install
+curl NOT FOUND
+$ apt-get update > /dev/null                        # refresh Debian bullseye package lists (exit 0)
+$ DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      redis-server libzbar0 poppler-utils procps curl
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following NEW packages will be installed:
+  curl libcurl4 libgpm2 libjemalloc2 liblua5.1-0 liblzf1 libncurses6 libnspr4
+  libnss3 libpoppler102 libprocps8 libv4l-0 libv4lconvert0 libzbar0 lua-bitop
+  lua-cjson poppler-utils procps psmisc redis-server redis-tools
+0 upgraded, 21 newly installed, 0 to remove and 50 not upgraded.
+[… download, unpack, and the 21 per-package "Setting up …" lines elided; exit status 0 …]
+$ command -v curl && curl --version | head -1       # after install — now present
+/usr/bin/curl
+curl 7.74.0 (x86_64-pc-linux-gnu) libcurl/7.74.0 OpenSSL/1.1.1w zlib/1.2.11 brotli/1.0.9 libidn2/2.3.0 libpsl/0.21.0 (+libidn2/2.3.0) libssh2/1.9.0 nghttp2/1.43.0 librtmp/2.3
+$ command -v redis-cli                              # provided by redis-tools, pulled in above
+/usr/bin/redis-cli
+```
 
 Package versions (read from the installed distributions; these match the pins in `requirements.txt`):
 
@@ -164,7 +205,31 @@ $ redis-cli ping
 PONG
 ```
 
-Database migrations onto a fresh SQLite database (`manage.py migrate`, complete verbatim output):
+**Runtime directories must be created first.** The fresh image ships **no** runtime directories, and
+Paperless's Django system check aborts `migrate` until `CONSUMPTION_DIR` and `MEDIA_ROOT` exist.
+Running `migrate` before creating them shows the gate; the directories are then created explicitly.
+(The container entrypoint creates the data/media directories
+[`docker/docker-entrypoint.sh:L21-L29`] but **not** `consume`, so the consumption directory must be
+made by hand regardless of how the stack is brought up.)
+
+```text
+$ python3 manage.py migrate                          # attempted BEFORE the directories exist
+SystemCheckError: System check identified some issues:
+
+ERRORS:
+?: PAPERLESS_CONSUMPTION_DIR is set but doesn't exist.
+	HINT: Create a directory at /app/src/../consume
+?: PAPERLESS_MEDIA_ROOT is set but doesn't exist.
+	HINT: Create a directory at /app/src/../media
+                                                     # (exit status 1)
+
+$ mkdir -p /app/consume /app/data/index /app/data/log \
+           /app/media/documents/originals /app/media/documents/thumbnails /app/static
+$ mkdir -p /tmp/paperless && chown testuser:testuser /tmp/paperless   # consumer scratch dir (run as root)
+```
+
+With the directories in place, `manage.py migrate` runs onto a fresh SQLite database (complete
+verbatim output):
 
 ```text
 $ python3 manage.py migrate
@@ -877,11 +942,15 @@ while time.monotonic() < deadline:
         break
 ```
 
-Running it under `timeout` and then dropping `probe_final.txt` produced exactly six transitions
-(verbatim `/tmp/obs/progress_final.log`):
+The literal invocation — one shell subscribes under a hard `timeout` guard (the helper self-exits at
+its own ~40 s deadline, so `timeout 45` is only a backstop), and a second shell drops
+`probe_final.txt` into the consumption directory using the canonical `printf` form of §2 — produced
+exactly six transitions (verbatim `/tmp/obs/progress_final.log`):
 
 ```text
+$ timeout 45 python3 /tmp/obs/progress_listener.py | tee /tmp/obs/progress_final.log   # shell A
 LISTENING
+#   ← now, in shell B: printf '...' > /app/consume/probe_final.txt   (canonical drop, §2)
 PROGRESS {"filename": "probe_final.txt", "task_id": "492bfc9b-1986-47d9-8a42-fffecf8c36ff", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
 PROGRESS {"filename": "probe_final.txt", "task_id": "492bfc9b-1986-47d9-8a42-fffecf8c36ff", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}
 PROGRESS {"filename": "probe_final.txt", "task_id": "492bfc9b-1986-47d9-8a42-fffecf8c36ff", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}
@@ -1566,10 +1635,15 @@ The pin is declared in the dependency manifest and confirmed at runtime in the c
 (§1.2). From `requirements.txt`:
 
 ```text
-$ grep -i 'django-q\|redis' requirements.txt
+$ grep -E '^(django-q|redis)==' requirements.txt
 django-q==1.3.9
 redis==3.5.3
 ```
+
+The pattern is anchored (`^…==`) deliberately: a loose `grep -i 'django-q\|redis'` also matches the
+`redis` substring in `aioredis==1.3.1`, `channels-redis==3.4.0`, and `hiredis==2.0.0` — five lines in
+total — none of which is the task-queue framework or its direct client. Anchoring to line start and
+`==` isolates the two exact pins that matter here.
 
 Runtime confirmation (captured in §1.2 from the live interpreter):
 
