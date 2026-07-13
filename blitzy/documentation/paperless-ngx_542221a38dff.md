@@ -1220,7 +1220,7 @@ Sources:
 
 The investigation created only ephemeral, throwaway state: a container from the canonical image (`blitzy_inv`), a local Redis broker (an observation aid), a throwaway SQLite database and staged media/consume files under the gitignored runtime directories, and temporary observation scripts. **All of it was removed.** No source file was modified; the only tracked change is this document.
 
-**Observed — BEFORE teardown** (the residual state a review would see): the gitignored runtime directories held leftover files and a Redis process was still running.
+**Observed — BEFORE teardown** (the residual state a review would see): the gitignored runtime directories held leftover files, a Redis process was still running, and the temporary observation scripts and their captured outputs remained under `/tmp/blitzy_investigation`.
 
 ```bash
 # host$ (cwd=<repo>)
@@ -1228,6 +1228,7 @@ find data media consume -type f ; ls -la data/db.sqlite3
 ps aux | grep '[r]edis-server' | awk '{print "PID="$2, $11, $12}'
 redis-cli ping
 docker ps -a --filter name=blitzy_inv --format '{{.Names}} {{.Status}}'
+find /tmp/blitzy_investigation -type f | wc -l   # temporary observation scripts + captured outputs
 ```
 ```text
 data/log/.__paperless.lock
@@ -1239,6 +1240,7 @@ consume/patch-code-t-middle_document_1.pdf
 PID=8311 redis-server *:6379
 PONG
 blitzy_inv Up About an hour
+31
 ```
 
 **Observed — teardown commands** (each residual file is gitignored, so removing it changes no tracked file; the runtime directories themselves are kept, empty):
@@ -1253,8 +1255,8 @@ find data/index -mindepth 1 -delete
 kill 8311
 # 3) remove the investigation container
 docker rm -f blitzy_inv
-# 4) remove temporary observation scripts and throwaway DBs
-rm -rf /tmp/blitzy_investigation/out/scripts /tmp/pdata /tmp/sdata /tmp/qhist
+# 4) remove the investigation working directory (observation scripts + captured outputs) and throwaway DBs
+rm -rf /tmp/blitzy_investigation /tmp/pdata /tmp/sdata /tmp/qhist
 ```
 
 **Observed — AFTER teardown** (the workspace is pristine; only this document is changed; no Redis process, no container, no residual files, no scripts):
@@ -1267,7 +1269,7 @@ find data media consume export -type f          # expect: (nothing)
 ps aux | grep '[r]edis-server' || echo '(no redis-server process)'
 redis-cli ping
 docker ps -a --filter name=blitzy_inv --format '{{.Names}} {{.Status}}'   # expect: (nothing)
-ls /tmp/blitzy_investigation/out/scripts 2>&1
+ls -d /tmp/blitzy_investigation 2>&1
 ```
 ```text
  M blitzy/documentation/paperless-ngx_542221a38dff.md
@@ -1277,7 +1279,7 @@ ls /tmp/blitzy_investigation/out/scripts 2>&1
 (no redis-server process)
 Could not connect to Redis at 127.0.0.1:6379: Connection refused
 (no blitzy_inv container)
-ls: cannot access '/tmp/blitzy_investigation/out/scripts': No such file or directory
+ls: cannot access '/tmp/blitzy_investigation': No such file or directory
 ```
 
 The gitignored runtime directories (`data/`, `data/log/`, `data/index/`, `media/`, `consume/`, `export/`, `static/`) remain present but empty (0 files each), matching the pristine post-setup state. `git status --porcelain` reports **only** this single documentation file, and every one of the 21 authoritative source/config/manifest files cited above is byte-for-byte unchanged.
