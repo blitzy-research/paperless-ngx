@@ -72,7 +72,7 @@ drf 3.13.1
 django_filter (21, 1)
 ```
 
-These match the pinned dependencies in `src/requirements.txt` (django 4.0.4, djangorestframework 3.13.1, django-filter 21.1). The repository root is bind-mounted into the container as its working directory, so every command below uses **repository-relative paths** (e.g. `cd src`, `data/db.sqlite3`); no absolute container path is relied upon.
+These match the pinned dependencies in `requirements.txt` (django 4.0.4, djangorestframework 3.13.1, django-filter 21.1). The repository root is bind-mounted into the container as its working directory, so every command below uses **repository-relative paths** (e.g. `cd src`, `data/db.sqlite3`); no absolute container path is relied upon.
 
 ### 3.2 Default database is SQLite [STATICALLY VERIFIED + OBSERVED — runtime]
 
@@ -525,7 +525,7 @@ The Angular client models a page **number**, not a cursor, and assumes a single 
 
 - `src-ui/src/app/data/results.ts:L1-5` declares `interface Results<T> { count: number; results: T[] }` — **no `next`/`previous`**. The client does not follow cursor links; it navigates by page number. (The DRF JSON does include `next`/`previous`, per `docs/api.rst`, but the Angular type ignores them.)
 - `src-ui/src/app/services/rest/abstract-paperless-service.ts` `list()` sets the query params `page` (`L41`), `page_size` (`L44`), and `ordering` (`L48`).
-- `src-ui/src/app/services/document-list-view.service.ts` defaults the documents list to `sortField: 'created'` (`L93`) and `sortReverse: true` (`L94`) → effective `ordering=-created`, the **same non-unique key** as the model default; page size comes from user settings (`currentPageSize`, `L73`); `reload()` calls `list(currentPage, currentPageSize, sortField, sortReverse, …)` (`L140-143`) and stores `collectionSize = result.count` (`L149`).
+- `src-ui/src/app/services/document-list-view.service.ts` defaults the documents list to `sortField: 'created'` (`L93`) and `sortReverse: true` (`L94`) → effective `ordering=-created`, the **same non-unique key** as the model default; page size comes from user settings (`currentPageSize`, `L73`); `reload()` calls `listFiltered(currentPage, currentPageSize, sortField, sortReverse, filterRules)` (`L138-145`), which delegates to `list(...)` (`document.service.ts:L104`), and stores `collectionSize = result.count` (`L149`).
 - The UI's **total-page calculation** is explicit: `getLastPage(): number { return Math.ceil(this.collectionSize / this.currentPageSize) }` (`src-ui/src/app/services/document-list-view.service.ts:L276-277`) — i.e. `ceil(count / page_size)`. The template binds this model to the pager: `<ngb-pagination [pageSize]="list.currentPageSize" [collectionSize]="list.collectionSize" [(page)]="list.currentPage" [maxSize]="5" [rotate]="true">` (`src-ui/src/app/components/document-list/document-list.component.html:L95-96`), which independently computes the page count from `collectionSize`/`pageSize`.
 - On any page beyond the first, a `404` triggers a **reset to page 1**: `if (activeListViewState.currentPage != 1 && error.status == 404)` (`L158`) → `currentPage = 1` (`L160`) → `this.reload()` (`L161`).
 
