@@ -642,10 +642,12 @@ grep -n 'os_error_retry_count\|os_error_retry_wait\|while (read_try_count\|CONSU
 59:    os_error_retry_count: Final[int] = 50
 60:    os_error_retry_wait: Final[float] = 0.01
 65:    while (read_try_count < os_error_retry_count) and not file_open_ok:
+71:            sleep(os_error_retry_wait)
+73:    if read_try_count >= os_error_retry_count:
 107:    while current_try < settings.CONSUMER_POLLING_RETRY_COUNT:
 ```
 
-1. **File-open readiness retry** — `os_error_retry_count = 50` `[src/documents/management/commands/document_consumer.py:59]` bounds retries of *opening a newly-arrived file that is not yet fully written*, each spaced by `os_error_retry_wait = 0.01`s `[src/documents/management/commands/document_consumer.py:60]`, in the loop at `[src/documents/management/commands/document_consumer.py:65]`.
+1. **File-open readiness retry** — `os_error_retry_count = 50` `[src/documents/management/commands/document_consumer.py:59]` bounds retries of *opening a newly-arrived file that is not yet fully written*, each spaced by a `sleep(os_error_retry_wait)` of `0.01`s `[src/documents/management/commands/document_consumer.py:60,71]`, in the loop at `[src/documents/management/commands/document_consumer.py:65]`; once the bound is reached the consumer stops trying and logs a busy-file warning `[src/documents/management/commands/document_consumer.py:73]`.
 2. **Polling stability retry** — a second loop `while current_try < settings.CONSUMER_POLLING_RETRY_COUNT` `[src/documents/management/commands/document_consumer.py:107]` waits for a file's size to stabilize when polling is enabled (`PAPERLESS_CONSUMER_POLLING`), bounded by `CONSUMER_POLLING_RETRY_COUNT` (default 5, `[src/paperless/settings.py:482-483]`).
 
 Both govern *newly-arriving files in the consume directory*; they are unrelated to Django Q scheduled-task failures. There is no mechanism that re-runs a failed `django_q_task` (Section 7.2).
@@ -1149,7 +1151,25 @@ grep -n '"root"\|"paperless":\|"paperless_mail":\|paperless.log\|mail.log\|maxBy
 410:        "paperless_mail": {"handlers": ["file_mail"], "level": "DEBUG"},
 ```
 
-The maintenance loggers — `paperless.tasks` `[src/documents/tasks.py:29]`, `paperless.sanity_checker` `[src/documents/sanity_checker.py:24]`, and `paperless.mail.tasks` `[src/paperless_mail/tasks.py:8]` — are children of `paperless` / `paperless_mail`, so their output lands in `paperless.log` / `mail.log` respectively (and, when run under `qcluster`, on the console as seen throughout this document).
+All three maintenance loggers — `paperless.tasks` `[src/documents/tasks.py:29]`, `paperless.sanity_checker` `[src/documents/sanity_checker.py:24]`, and `paperless.mail.tasks` `[src/paperless_mail/tasks.py:8]` — are children of the **`paperless`** logger. Python's logging hierarchy splits logger names on dots, so the dotted name `paperless.mail.tasks` descends from `paperless` (via `paperless.mail`) — **not** from the underscore logger `paperless_mail` — and all three therefore propagate to the `paperless` logger's `file_paperless` handler and land in **`paperless.log`** (and, when run under `qcluster`, on the console as seen throughout this document). Only the separate top-level **`paperless_mail`** logger `[src/paperless/settings.py:410]` is routed to **`mail.log`**; at runtime its real user is `mail.py`'s `MailAccountHandler`, which logs via `LoggingMixin` with `logging_name = "paperless_mail"` `[src/paperless_mail/mail.py:106]` `[src/documents/loggers.py:14-21]`. Consequently `process_mail_accounts()`'s own output (logger `paperless.mail.tasks`) lands in `paperless.log`, while `mail.log` receives the per-account handling records emitted by `mail.py`. This is exactly what the routing config above dictates and matches the observation that these three maintenance loggers are children of `paperless` and land in `paperless.log`.
+
+**Observed** — a 4-logger routing probe run in the canonical image confirms the split; each logger emits one `ERROR` record and `grep -H` (which prints the matching filename) reports which log file received it:
+
+```bash
+# cont$ (cwd=/app/src)  — DJANGO_SETTINGS_MODULE=paperless.settings so a bare `python -c` loads the project settings
+mkdir -p /tmp/logtest
+DJANGO_SETTINGS_MODULE=paperless.settings PAPERLESS_LOGGING_DIR=/tmp/logtest \
+  python -c "import django, logging; django.setup(); [logging.getLogger(n).error('probe-'+n) for n in ('paperless.tasks','paperless.sanity_checker','paperless.mail.tasks','paperless_mail')]; logging.shutdown()"
+grep -H 'probe-' /tmp/logtest/paperless.log /tmp/logtest/mail.log
+```
+```text
+/tmp/logtest/paperless.log:[2026-07-13 22:03:33,580] [ERROR] [paperless.tasks] probe-paperless.tasks
+/tmp/logtest/paperless.log:[2026-07-13 22:03:33,580] [ERROR] [paperless.sanity_checker] probe-paperless.sanity_checker
+/tmp/logtest/paperless.log:[2026-07-13 22:03:33,581] [ERROR] [paperless.mail.tasks] probe-paperless.mail.tasks
+/tmp/logtest/mail.log:[2026-07-13 22:03:33,581] [ERROR] [paperless_mail] probe-paperless_mail
+```
+
+Three of the four probes (`paperless.tasks`, `paperless.sanity_checker`, and `paperless.mail.tasks`) landed in `paperless.log`; only `paperless_mail` landed in `mail.log` — exactly as the routing config dictates `[src/paperless/settings.py:409-410]`.
 
 ---
 
