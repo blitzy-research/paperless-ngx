@@ -531,7 +531,7 @@ The live schedule registry (read from `django_q.models.Schedule`):
 ```
 
 These map to task functions in `src/documents/tasks.py`: `index_optimize()` [L32],
-`train_classifier()` [L48], `sanity_check()` [L253]. They are registered by:
+`train_classifier()` [L48], `sanity_check()` [L255]. They are registered by:
 
 - `src/documents/migrations/1001_auto_20201109_1636.py` — `train_classifier` as **HOURLY** (`H`),
   name `"Train the classifier"` [L11-L13]; `index_optimize` as **DAILY** (`D`), name `"Optimize the
@@ -961,7 +961,7 @@ PROGRESS {"filename": "probe_final.txt", "task_id": "492bfc9b-1986-47d9-8a42-fff
 
 The transitions map to `_send_progress` calls in `consumer.py`: `STARTING/new_file` at 0%
 [`consumer.py:L202`], `parsing_document` at 20% [`consumer.py:L259`], `generating_thumbnail` at 70%
-[`consumer.py:L264`], `parse_date` at 90% [`consumer.py:L273`], `save_document` at 95%
+[`consumer.py:L264`], `parse_date` at 90% [`consumer.py:L274`], `save_document` at 95%
 [`consumer.py:L294`], and `SUCCESS/finished` at 100% [`consumer.py:L375`].
 
 **The progress `task_id` is a separate UUID (F10).** Here it is
@@ -1233,6 +1233,7 @@ helper prints the breakdown. Full source:
 
 ```python
 #!/usr/bin/env python3
+# fail.py — Success/Failure task-history breakdown counter (see §10.2 cleanup)
 """
 Temporary observation helper (READ-ONLY): print the Django-Q task-history
 breakdown by success flag using the framework's own Success/Failure proxy
