@@ -194,6 +194,8 @@ All commands were run inside the canonical container. For each scenario a **fres
 Each scenario: populate a throwaway corpus (N docs, chosen `content` size, tiny ~14-byte physical files) in a separate process, then run the **real** management command under `/usr/bin/time -v` in a fresh process. `cwd=/app/src`; environment for every run is
 `PAPERLESS_DATA_DIR=/tmp/<scratch>/data PAPERLESS_MEDIA_ROOT=/tmp/<scratch>/media PAPERLESS_STATICDIR=/tmp/<scratch>/static PAPERLESS_CONSUMPTION_DIR=/tmp/<scratch>/consume` (the exact scratch root is printed in each block).
 
+**Export-target prerequisite (one-line `mkdir -p` before every run).** `document_exporter` requires its positional target directory to already exist — `src/documents/management/commands/document_exporter.py:98-99` raises `CommandError("That path doesn't exist")` and the command never creates the directory itself. Each run's target (`/tmp/exp_<scenario>_run<n>`) is therefore created with `mkdir -p` immediately before the command; this one-line step is shown explicitly in the run harness in §13.1 and applies identically to every scenario below (zero / meta5000 / text200 / text1000 / text5000 / uni5000, run1 and run2). The `$ /usr/bin/time -v ... document_exporter ...` transcripts that follow therefore presuppose that preceding `mkdir -p`; the `Exit status: 0` they show is what the exporter returns once its target directory exists.
+
 **True zero-document baseline (empty migrated DB — no documents at all).** This is the real startup cost of the command; it is *not* ~86 MB. Complete `/usr/bin/time -v`, run 1:
 
 ```text
@@ -779,7 +781,7 @@ Reading (stable across both runs): the **first** `parse_date` call triggers a on
 The classifier's memory lives on the **instance**, not at module scope. `DocumentClassifier.__init__` sets `self.data_vectorizer = None` (`src/documents/classifier.py:70`); `load()` restores it (and the other models) from the pickle. Runtime introspection confirms this and the pickle count:
 
 ```text
-$ python -c "(introspect DocumentClassifier)"   # cwd=/app/src, canonical image
+$ python -c "import os,inspect,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','paperless.settings'); django.setup(); import documents.classifier as m; from documents.classifier import DocumentClassifier as C; c=C(); print('FORMAT_VERSION =', C.FORMAT_VERSION); print('data_vectorizer in instance __dict__ =', 'data_vectorizer' in c.__dict__); print('data_vectorizer is a module global   =', hasattr(m,'data_vectorizer')); print('pickle.load occurrences in load() =', inspect.getsource(c.load).count('pickle.load'))"   # cwd=/app/src, canonical image
 FORMAT_VERSION = 7
 data_vectorizer in instance __dict__ = True
 data_vectorizer is a module global   = False
@@ -945,8 +947,13 @@ docker exec "$CNAME" bash -lc '
   # populate a throwaway corpus in its own scratch instance
   mkscratch /tmp/s_text5000
   python /tmp/scripts/populate.py --scratch /tmp/s_text5000 --n 5000 --content-bytes 50000
-  # EXPORT under GNU time, fresh process, canonical entry point
+  # EXPORT under GNU time, fresh process, canonical entry point.
+  # NOTE: document_exporter REQUIRES its target directory to pre-exist
+  # (src/documents/management/commands/document_exporter.py:98-99 raises
+  #  CommandError("That path doesn't exist")); the command never creates it.
+  # Create the export target first, then run the exporter into it:
   cd /app/src && scenv /tmp/s_text5000
+  mkdir -p /tmp/exp_text5000_run1
   /usr/bin/time -v python manage.py document_exporter /tmp/exp_text5000_run1 --no-progress-bar
   # IMPORT into a SEPARATE fresh empty DB, canonical entry point
   mkscratch /tmp/imp_text5000_run1 && scenv /tmp/imp_text5000_run1
