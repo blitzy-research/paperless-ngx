@@ -3,14 +3,14 @@
 This document answers five questions about how **token-based authentication** works in the
 paperless-ngx REST API, so an external tool can be integrated against it. Every answer is
 **written from observed runtime output** of a locally running, default-configured instance
-(the governing rule is *run first, then write*), and every behavioral claim is grounded with a
+(the governing rule is _run first, then write_), and every behavioral claim is grounded with a
 `file:line` reference into the repository source. The source tree was treated as **read-only
 evidence**; nothing in it was modified. The test user, API token, seeded documents, local
 SQLite database, temporary scripts, and the throwaway investigation container used here were all
 removed afterward, and the removal is verified below — only this document remains.
 
 Every command block below is **copy-paste reproducible from a clean checkout**: each block shows
-the *exact* command that produced the output immediately beneath it, and the one-time setup
+the _exact_ command that produced the output immediately beneath it, and the one-time setup
 (container start, environment file, and helper scripts) is shown in full before it is used.
 
 ### Provenance (what was investigated vs. where this file lives)
@@ -22,7 +22,7 @@ the *exact* command that produced the output immediately beneath it, and the one
 - **Destination repository (where this document is added):** the Blitzy working branch
   `blitzy-03b19d89-b665-4750-904b-b3b5d93c0c5f`. The **only** change added to the destination is
   this one markdown file, placed on top of the source baseline; no source file is changed
-  (verified in *Cleanup and verification*).
+  (verified in _Cleanup and verification_).
 - **Framework pins (version grounding):** `django==4.0.4` (`requirements.txt:L38`),
   `djangorestframework==3.13.1` (`requirements.txt:L39`).
 - **Runtime pin:** Python 3.9 — repo-root `Dockerfile:L18` -> `FROM python:3.9-slim-bullseye`.
@@ -494,7 +494,7 @@ The `HTTP/1.1 200 OK` status line is emitted by the helper (the server returns s
 line is not part of the JSON body). The returned `token` value
 `1f350e2500056d57d92f7aabeeef0665c46d91bc` is exactly **40 characters** long — the shape the `Authorization` header must
 carry below. This token belongs to a disposable test user and is **provably invalidated** in the
-*Cleanup and verification* section at the end.
+_Cleanup and verification_ section at the end.
 
 ---
 
@@ -576,7 +576,7 @@ default. (The bind address/port `127.0.0.1:8123` is only a local capture conveni
 ## Q3 — response shape: top-level fields and pagination
 
 **Direct answer:** the response is a **paginated JSON envelope** whose top-level fields are
-**`count`, `next`, `previous`, `results`**. **Pagination *is* involved** — the endpoint does
+**`count`, `next`, `previous`, `results`**. **Pagination _is_ involved** — the endpoint does
 **not** dump everything at once. It uses DRF `PageNumberPagination` via the project-wide
 `StandardPagination` with a **default `page_size` of 25** (client-overridable via the `page_size`
 query parameter, up to a **maximum of `max_page_size=100000`**).
@@ -1068,7 +1068,7 @@ no `query`/`more_like_id` query parameter is present:
 
 **Cause -> effect:** with 30 documents, the default page returns the first 25 items plus a `next`
 link and `previous=null`; `?page=2` returns the remaining 5 items with a `previous` link and
-`next=null`; `?page_size=5` proves the page size is client-overridable. **25 is the *default*
+`next=null`; `?page_size=5` proves the page size is client-overridable. **25 is the _default_
 page size, not a hard cap** — a client may request up to `max_page_size=100000`. The endpoint
 pages its results and does **not** dump everything at once.
 
