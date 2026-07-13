@@ -153,12 +153,15 @@ Ordered stages, each with its source citation:
 
 1. **`STARTING` / `new_file` at 0%** — `:L202` (`MESSAGE_NEW_FILE` `:L43`).
 2. **Pre-checks** (no progress payload), in this real call order — `pre_check_file_exists()` `:L211` (`def` `:L95`; raises if the file is missing), then `pre_check_directories()` `:L212` (`def` `:L115`; creates scratch/thumbnail dirs), then `pre_check_duplicate()` `:L213` (`def` `:L102`; rejects when the md5 `checksum` — or `archive_checksum`, `:L106` — already exists). The order is **file-exists → directories → duplicate**, not duplicate-first.
-3. **`document_consumption_started` signal** fires — `:L229`.
-4. **`WORKING` / `parsing_document` at 20%** — `:L259` (`MESSAGE_PARSING_DOCUMENT` `:L45`); the MIME-selected parser's `parse()` runs at `:L261` (unsupported types raise here). During parsing the parser may call `progress_callback` (`def` `:L237`), which maps parser progress into the band via `p = int((current_progress / max_progress) * 50 + 20)` (`:L239`) — so parser progress spans **20%–70%**. NOTE: the code *comment* at `:L238` says "within 20 and 80", but the arithmetic (`* 50 + 20`) tops out at **70**, and the next fixed payload is 70% for thumbnailing — so the observed parse band is **20–70%**, not 20–80%.
-5. **`WORKING` / `generating_thumbnail` at 70%** — `:L264` (`MESSAGE_GENERATING_THUMBNAIL` `:L46`).
-6. **`WORKING` / `parse_date` at 90%** — `:L274` (`MESSAGE_PARSE_DATE` `:L47`) — emitted **only when the parser did not already return a date** (`parse_date()` called at `:L275`). This edge branch was exercised in the observed run (the text parser returns no date), which is why `parse_date` appears.
-7. **`WORKING` / `save_document` at 95%** — `:L294` (`MESSAGE_SAVE_DOCUMENT` `:L48`), inside `transaction.atomic()` (`:L298`). `_store()` (`:L379`) creates the `Document`; the **`document_consumption_finished` signal fires** (`:L306`) — this triggers organization (Q6/Q7). Under `FileLock` (`:L315`) the original, thumbnail, and optional archive are written; `generate_unique_filename()` (`:L316`, from `file_handling.py:L19`) computes the storage name; when an archive is produced, `archive_filename` is set (`:L328`) and `archive_checksum` is computed as an md5 over the archive bytes (`:L339-L342`).
-8. **`SUCCESS` / `finished` at 100%** — `:L375` (`MESSAGE_FINISHED` `:L49`), carrying the new `document.id`.
+3. **MIME detection & parser selection** (no progress payload) — the MIME type is detected with `magic.from_file(self.path, mime=True)` (`:L219`), then the parser class is chosen by `get_parser_class_for_mime_type()` (defined in `src/documents/parsers.py:L81`, imported at `consumer.py:L26`, called at `:L223`). If no parser matches the MIME type, the file is **rejected as unsupported here** — `if not parser_class:` (`:L224`) calls `self._fail(MESSAGE_UNSUPPORTED_TYPE, ...)` (`:L225`; `MESSAGE_UNSUPPORTED_TYPE` `:L44`) — **before** the `document_consumption_started` signal in the next step. MIME detection and parser selection are **[observed]** (the observed text/plain run detected the type at `:L219` and selected the text parser at `:L223`); the unsupported-type rejection branch is **[inferred]** — it was not taken on that supported-type run.
+4. **`document_consumption_started` signal** fires — `:L229`.
+5. **`WORKING` / `parsing_document` at 20%** — `:L259` (`MESSAGE_PARSING_DOCUMENT` `:L45`); the selected parser's `parse()` is **invoked** at `:L261` (reached only for supported types — the unsupported-type check already happened in step 3). During parsing the parser may call `progress_callback` (`def` `:L237`), which maps parser progress into the band via `p = int((current_progress / max_progress) * 50 + 20)` (`:L239`) — so parser progress spans **20%–70%**. NOTE: the code *comment* at `:L238` says "within 20 and 80", but the arithmetic (`* 50 + 20`) tops out at **70**, and the next fixed payload is 70% for thumbnailing — so the observed parse band is **20–70%**, not 20–80%.
+6. **`WORKING` / `generating_thumbnail` at 70%** — `:L264` (`MESSAGE_GENERATING_THUMBNAIL` `:L46`).
+7. **`WORKING` / `parse_date` at 90%** — `:L274` (`MESSAGE_PARSE_DATE` `:L47`) — emitted **only when the parser did not already return a date** (`parse_date()` called at `:L275`). This edge branch was exercised in the observed run (the text parser returns no date), which is why `parse_date` appears.
+8. **`WORKING` / `save_document` at 95%** — `:L294` (`MESSAGE_SAVE_DOCUMENT` `:L48`), inside `transaction.atomic()` (`:L298`). `_store()` (`:L379`) creates the `Document`; the **`document_consumption_finished` signal fires** (`:L306`) — this triggers organization (Q6/Q7). Under `FileLock` (`:L315`) the original, thumbnail, and optional archive are written; `generate_unique_filename()` (`:L316`, defined in `file_handling.py:L81`) computes the storage name; when an archive is produced, `archive_filename` is set (`:L328`) and `archive_checksum` is computed as an md5 over the archive bytes (`:L339-L342`).
+9. **`SUCCESS` / `finished` at 100%** — `:L375` (`MESSAGE_FINISHED` `:L49`), carrying the new `document.id`.
+
+**Failure path (unified).** Every pre-check and parser failure funnels through `_fail()` (`def` `:L78`), which first broadcasts a terminal **`FAILED`** payload at 100% — `self._send_progress(100, 100, "FAILED", message)` (`:L79`) — and then raises `ConsumerError` (`:L81`). This unified failure path is **[inferred]**: no failure branch was triggered on the observed successful run, so the `FAILED` payload was not emitted during the capture.
 
 Optional `PRE_CONSUME_SCRIPT` (`run_pre_consume_script` `:L121`) and `POST_CONSUME_SCRIPT` (`run_post_consume_script` `:L143`) run before/after when configured.
 
@@ -231,7 +234,7 @@ stderr (the application's own INFO log, corroborating start and finish):
 [2026-07-13 18:05:37,910] [INFO] [paperless.consumer] Document 2026-07-13 sample consumption finished
 ```
 
-The full pipeline for a real scanned PDF (Tesseract OCR via `paperless_tesseract`) is **[inferred]** from the parser selection at `consumer.py:L261`; the stage **order** and the progress/message codes are **[observed]** via the text/plain parser path, which exercises the identical `Consumer.try_consume_file` code.
+The full pipeline for a real scanned PDF (Tesseract OCR via `paperless_tesseract`) is **[inferred]** from the parser selection at `consumer.py:L223` (`get_parser_class_for_mime_type`, `src/documents/parsers.py:L81`) and the `parse()` invocation at `consumer.py:L261`; the stage **order** and the progress/message codes are **[observed]** via the text/plain parser path, which exercises the identical `Consumer.try_consume_file` code.
 
 ---
 
@@ -467,7 +470,7 @@ Field-by-field source citations (`src/documents/models.py`): `id` — the implic
 - `'20221101123045Z - Fourteen Digit.pdf'` → 14-digit date → `created=2022-11-01 12:30:45`, `title='Fourteen Digit'`.
 - `'just a scan.pdf'` → `title='just a scan'`, `created=None`.
 
-(The 8-digit form is zero-padded to 14 by `_get_created`'s `"{:0<14}Z".format(...)` at `:L418`.)
+(The 8-digit form is zero-padded to 14 in `_get_created` (`def` `:L418`) by the expression `"{:0<14}Z".format(...)` at `:L420`.)
 
 ---
 
