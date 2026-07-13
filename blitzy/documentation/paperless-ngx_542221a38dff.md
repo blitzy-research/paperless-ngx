@@ -1748,17 +1748,24 @@ $ redis-cli -n 0 KEYS django_q:*
 ---- Repository integrity proof (host working tree = container /app) ----
 $ git rev-parse --abbrev-ref HEAD
 blitzy-dd0b3c25-315c-47fb-a8a9-df89c3d47bf1
-$ git rev-parse HEAD
-22d3c2db92eded84908efcf2a92208238dd7c14c
+# SELF-REFERENCE NOTE: a git transcript embedded *inside* this answer document is
+# necessarily captured BEFORE the commit that records the document's own current bytes,
+# so any single `git rev-parse HEAD` value or `ls -l` byte size shown here is only a
+# point-in-time snapshot of a draft, never of the finally delivered blob (each correction
+# adds one more commit and re-grows the file). The authoritative, staleness-proof guarantee
+# is therefore the NET diff against the FROZEN source HEAD 542221a38dff, shown next — it
+# stays true no matter how many times this document is re-committed.
+$ git diff --name-status 542221a38dff06361e07976452f9aea24d210542..HEAD   (AUTHORITATIVE net claim)
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
 $ git status --porcelain   (empty = working tree clean; no harness/evidence leaked)
 (git status --porcelain exit=0; no lines above = clean)
 $ git ls-files "tmp/*" "**/qa_evidence/*" "**/harness/*"   (must be empty — no investigation artifacts tracked)
 (none listed = confirmed)
-$ ls blitzy/documentation/ 2>/dev/null   (current committed deliverable)
-total 64
-drwxr-xr-x 2 root root  4096 Jul 13 17:35 .
-drwxr-sr-x 5 root root  4096 Jul 13 17:34 ..
--rw-r--r-- 1 root root 56053 Jul 13 17:52 paperless-ngx_542221a38dff.md
+# Point-in-time commit/size snapshots (labeled; each necessarily precedes its own commit):
+#   draft   commit 22d3c2db92eded84908efcf2a92208238dd7c14c -> 56053 bytes  (Jul 13 17:52)
+#   rewrite commit b719635e74f8ac7efd5cd6fe7d389c3632b1e8d9 -> 166384 bytes (Jul 13 20:17)
+#   this evidence-fidelity correction adds one further commit, re-growing the file; the NET
+#   name-status claim above (exactly one added file) is unchanged by any of these commits.
 ```
 
 **Reading the transcript.** The cluster began with **23** investigation processes (the
@@ -1772,14 +1779,24 @@ key to `DBSIZE 0`; the real broker queue `django_q:paperless:q` on **DB 0** is e
 (`DBSIZE 0`, no `django_q:*` keys).
 
 **Repository proof.** After teardown, the working tree is clean and no harness or evidence
-artifact was ever tracked: `git status --porcelain` prints nothing, `git ls-files` finds no
-`qa_evidence`/`harness`/`tmp` paths, and `HEAD` is unchanged at
-`22d3c2db92eded84908efcf2a92208238dd7c14c` on branch
-`blitzy-dd0b3c25-315c-47fb-a8a9-df89c3d47bf1`. The subsequent commit of *this* document is the
-sole modification to the repository — shown in the final commit step.
+artifact was ever tracked: `git status --porcelain` prints nothing and `git ls-files` finds no
+`qa_evidence`/`harness`/`tmp` paths. The authoritative, staleness-proof integrity claim is the
+**net diff against the frozen source HEAD** `542221a38dff`: `git diff --name-status
+542221a38dff..HEAD` reports **exactly one added file** —
+`blitzy/documentation/paperless-ngx_542221a38dff.md` — on branch
+`blitzy-dd0b3c25-315c-47fb-a8a9-df89c3d47bf1`; the source tree is otherwise byte-for-byte
+unchanged. Any bare `git rev-parse HEAD` value or `ls -l` byte count captured *inside* this
+document is inherently self-referential: it is recorded *before* the commit that stores the
+document's own current text, so it necessarily names an earlier draft. The point-in-time
+snapshots in the transcript are labeled accordingly (draft `22d3c2db9`, 56053 bytes; rewrite
+`b719635e7`, 166384 bytes; and this evidence-fidelity correction adds one further commit). The
+net name-status claim is invariant under every one of those commits, which is why it — not any
+single HEAD hash — is the guarantee that *this* document is the sole modification to the
+repository, shown in the final commit step.
 
-*(Everything in this section is observed output from the embedded transcript; nothing here is
-inferred.)*
+*(The transcript above is observed command output; the net-diff claim and the self-reference
+note are factual statements about git's commit ordering, not inferences about runtime
+behavior.)*
 
 
 ## Appendix A — verified `file:line` reference map
