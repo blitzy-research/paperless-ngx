@@ -3745,13 +3745,13 @@ Run 1:
 
 ```text
 ================ Q4-MATRIX RUN 1 ================
-[1m
+\x1b[1m
 
   This is a one-time only migration to generate thumbnails for all of your
   documents so that future UIs will have something to work with.  If you have
   a lot of documents though, this may take a while, so a coffee break may be
   in order.
-[0m
+\x1b[0m
 
 --- (M) CONSUMER_BARCODE_STRING value matrix -> scan() separators (case/whitespace/empty/custom/nonmatching) ---
 fixtures: patch-code-t.pdf (decodes 'PATCHT', CODE39); barcode-128-custom.pdf (decodes 'CUSTOM BARCODE', CODE128)
@@ -3890,13 +3890,13 @@ Run 2 (matrix and staged counts identical to run 1; only fragment md5 values dif
 
 ```text
 ================ Q4-MATRIX RUN 2 ================
-[1m
+\x1b[1m
 
   This is a one-time only migration to generate thumbnails for all of your
   documents so that future UIs will have something to work with.  If you have
   a lot of documents though, this may take a while, so a coffee break may be
   in order.
-[0m
+\x1b[0m
 
 --- (M) CONSUMER_BARCODE_STRING value matrix -> scan() separators (case/whitespace/empty/custom/nonmatching) ---
 fixtures: patch-code-t.pdf (decodes 'PATCHT', CODE39); barcode-128-custom.pdf (decodes 'CUSTOM BARCODE', CODE128)
@@ -4037,13 +4037,13 @@ Run 1 (`exit=124` — the non-daemon-thread hang):
 
 ```text
 ================ Q4-PAGE0 ================
-[1m
+\x1b[1m
 
   This is a one-time only migration to generate thumbnails for all of your
   documents so that future UIs will have something to work with.  If you have
   a lot of documents though, this may take a while, so a coffee break may be
   in order.
-[0m
+\x1b[0m
 input patch-code-t.pdf pages=1 size=40893
 
 --- (1) scan_file_for_separating_barcodes(patch-code-t.pdf) ---
@@ -4163,13 +4163,13 @@ Run 2 (`exit=124`; all invariants identical to run 1; only the empty-PDF digests
 
 ```text
 ================ Q4-PAGE0 ================
-[1m
+\x1b[1m
 
   This is a one-time only migration to generate thumbnails for all of your
   documents so that future UIs will have something to work with.  If you have
   a lot of documents though, this may take a while, so a coffee break may be
   in order.
-[0m
+\x1b[0m
 input patch-code-t.pdf pages=1 size=40893
 
 --- (1) scan_file_for_separating_barcodes(patch-code-t.pdf) ---
