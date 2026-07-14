@@ -215,7 +215,9 @@ Q_CLUSTER= {"catch_up": false, "name": "paperless", "recycle": 1, "redis": "redi
 
 ### Topology of the background workers
 
-`ps` is **not installed** in this image, so the process list was enumerated from `/proc`. The actual
+`ps` is **not installed** in this image, so the process list was enumerated from `/proc`. The scan
+skips its own PID (`self=$$`) and reads each `cmdline` defensively (`cat … 2>/dev/null | tr`), so the
+enumerating shell itself and any PID that vanishes mid-scan do not appear in the output. The actual
 topology is: PID 1 = `sleep infinity`; a gunicorn master + workers running the ASGI app; and a
 django-q `qcluster` sentinel + worker pool. **There is no `document_consumer` process** — uploads in
 this investigation used the REST entry point exclusively.
@@ -223,7 +225,7 @@ this investigation used the REST entry point exclusively.
 **Command [observed]:**
 
 ```
-$ docker exec paperless-app bash -c 'for p in $(ls /proc | grep -E "^[0-9]+$"); do cmd=$(tr "\0" " " </proc/$p/cmdline 2>/dev/null); [ -n "$cmd" ] && echo "PID $p: $cmd"; done'
+$ docker exec paperless-app bash -c 'self=$$; for p in $(ls /proc | grep -E "^[0-9]+$"); do [ "$p" = "$self" ] && continue; cmd=$(cat /proc/$p/cmdline 2>/dev/null | tr "\0" " "); [ -n "$cmd" ] && echo "PID $p: $cmd"; done'
 PID 1: sleep infinity
 PID 527: python3 manage.py qcluster
 PID 535: /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
@@ -256,13 +258,14 @@ itself [observed]:
 $ docker exec paperless-app bash -c 'self=$$; dc=0;
 for p in $(ls /proc | grep -E "^[0-9]+$"); do
   [ "$p" = "$self" ] && continue
-  cmd=$(tr "\0" " " </proc/$p/cmdline 2>/dev/null)
+  cmd=$(cat /proc/$p/cmdline 2>/dev/null | tr "\0" " ")
   case "$cmd" in *"manage.py document_consumer"*) dc=$((dc+1));; esac
 done
 [ "$dc" -eq 0 ] && echo "RESULT: no manage.py document_consumer process is running";
 g=0; q=0;
 for p in $(ls /proc | grep -E "^[0-9]+$"); do
-  cmd=$(tr "\0" " " </proc/$p/cmdline 2>/dev/null)
+  [ "$p" = "$self" ] && continue
+  cmd=$(cat /proc/$p/cmdline 2>/dev/null | tr "\0" " ")
   case "$cmd" in
     *gunicorn*paperless.asgi*) g=$((g+1));;
     *"manage.py qcluster"*) q=$((q+1));;
@@ -442,14 +445,31 @@ Mapping each frame to code: `STARTING/new_file/0` = `src/documents/consumer.py:2
 `WORKING/parse_date/90` = `:274`; `WORKING/save_document/95` = `:294`; `SUCCESS/finished/100` with
 the new `document_id` = `:375`.
 
+> **The `parse_date/90` frame is conditional.** It is emitted only inside the `if not date:` guard at `src/documents/consumer.py:273` — i.e. only when the parser did **not** already return a date for the document. Every input used in this investigation yields no parser date, so the frame is present in all runs shown above **[observed]**; a document whose parser returns a date skips this frame and transitions `generating_thumbnail/70 → save_document/95` directly **[inferred from `:273`]**.
+
 ### DURING — OCR starts, and the start signal in the logs (Run 1) [observed]
 
 The definitive **start-of-OCR** signal is the `paperless.parsing.tesseract` line
 `Calling OCRmyPDF with args:` (`src/paperless_tesseract/parsers.py:260`). The producing command
-selects run 1's log window (17:52–17:53; run 2 is at 17:55, so the windows do not overlap):
+selects run 1's log window (17:52–17:53; run 2 is at 17:55, so the windows do not overlap) and then
+distills it to the milestone lines via a four-stage pipeline, so that the block below is the
+**complete, verbatim output of the command as written** (not a hand-trimmed excerpt): **(1)** `grep`
+the run-1 window; **(2)** keep only the `paperless.consumer` and `paperless.parsing.tesseract`
+loggers — this drops the `convert` thumbnail line (logged under `paperless.parsing`) and the
+`paperless.classifier` check; **(3)** `grep -v` the thumbnail subprocess `Execute:` lines (the
+`optipng` invocation *is* logged under `paperless.parsing.tesseract`, so the logger filter alone
+would keep it) and the temp-directory `Deleting directory` cleanup line; and **(4)** collapse the
+byte-identical lines the force-OCR fallback re-emits — because `construct_ocrmypdf_parameters` re-runs
+the same per-image DPI probe on the safe-fallback retry (`src/paperless_tesseract/parsers.py:188-189`,
+reached again via the fallback call at `:288`), the second `Error while getting DPI`/`Estimated DPI 35` pair (and, on some
+runs, a second `Using text from sidecar file`) are exact duplicates of lines already shown. The
+dropped thumbnail/classifier lines are what fill the ~7.6 s `generating_thumbnail → parse_date` gap.
 
 ```
-$ docker exec paperless-app bash -c "grep -E '2026-07-13 17:5[23]:' /app/data/log/paperless.log"
+$ docker exec paperless-app bash -c 'grep -E "2026-07-13 17:5[23]:" /app/data/log/paperless.log \
+| grep -E "\[paperless\.(consumer|parsing\.tesseract)\]" \
+| grep -vE "\] Execute:|Deleting directory" \
+| awk "{ line=\$0; sub(/^\[[^]]*\] /, \"\", line) } !seen[line]++"'
 [2026-07-13 17:52:51,417] [INFO] [paperless.consumer] Consuming no-text-alpha.png
 [2026-07-13 17:52:51,418] [DEBUG] [paperless.consumer] Detected mime type: image/png
 [2026-07-13 17:52:51,420] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
@@ -481,7 +501,7 @@ Key facts from this trace **[observed]**:
 - Because this particular image yields no text, the first pass produces an empty sidecar, which
   raises `NoTextFoundException` (`src/paperless_tesseract/parsers.py:267`) and triggers the
   `force_ocr` safe-fallback second invocation (`:297`). That is a Q4 concern; it is noted here only
-  because it is part of the honest, unedited trace.
+  because it appears in this trace.
 
 ### The background worker that executed it [observed]
 
@@ -913,8 +933,8 @@ while doc 23 still existed failed **immediately after `STARTING`**, before any p
 
 ```
 LISTENER_START 18:06:00.343 connected=ws://localhost:8000/ws/status/
-[18:06:00.674] {"filename": "blank_white.png", "task_id": "cc09deee-d9e3-40bc-a29c-ed59d6945cc6", "current_progress": 0,   "status": "STARTING", "message": "new_file",              "document_id": null}
-[18:06:00.697] {"filename": "blank_white.png", "task_id": "cc09deee-d9e3-40bc-a29c-ed59d6945cc6", "current_progress": 100, "status": "FAILED",   "message": "document_already_exists","document_id": null}
+[18:06:00.674] {"filename": "blank_white.png", "task_id": "cc09deee-d9e3-40bc-a29c-ed59d6945cc6", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}
+[18:06:00.697] {"filename": "blank_white.png", "task_id": "cc09deee-d9e3-40bc-a29c-ed59d6945cc6", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "document_already_exists", "document_id": null}
 ```
 
 **(2) LATE — a database `IntegrityError` at store time.** An **alpha** image (`no-text-alpha.png`)
