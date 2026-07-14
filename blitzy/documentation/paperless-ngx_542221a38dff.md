@@ -953,7 +953,7 @@ qcluster_stop                               # kill -TERM/-KILL on the NEGATIVE P
 
 With `PAPERLESS_TASK_WORKERS=1` the cluster runs exactly three helper processes — one **worker** (`Process-1:1`, PID `49994`), one result **monitor** (`Process-1:2`, PID `49995`), and one task **pusher** (`Process-1:3`, PID `49996`) — under the guardian `Process-1`. The `... stopping.` / `... has stopped.` lines are the direct evidence that `qcluster_stop` tore the **entire** process group down cleanly (a plain parent-only kill would orphan `Process-1:1..3`); the cluster name and the three helper PIDs are the only run-to-run variance in this block.
 
-Cause → effect: the cluster `island-tennessee-minnesota-oven` started 13 processes, `Process-1:1` picked up `[probe-consume]`, ran the real consumer (`Consuming upload.txt` → `consumption finished`), reported `Processed [probe-consume]`, and stopped cleanly. (The cluster name and the per-process PIDs are generated fresh per start; together with the log timestamps and dates they are the values that vary between runs here.)
+Cause → effect: the cluster `bakerloo-item-lithium-two` started a guardian (`Process-1`) plus three helper processes (worker `Process-1:1`, monitor `Process-1:2`, pusher `Process-1:3`); the worker `Process-1:1` then picked up `[probe-consume]`, ran the real consumer (`Consuming upload.txt` → `consumption finished`), reported `Processed [probe-consume]`, and stopped cleanly. (The cluster name and the per-process PIDs are generated fresh per start; together with the log timestamps and dates they are the values that vary between runs here.)
 
 ---
 
