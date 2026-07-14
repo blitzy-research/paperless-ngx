@@ -36,8 +36,9 @@ observed at runtime are explicitly labeled **(inferred)**.
 
 ## 1. How the environment was built and run
 
-The stack was run from the canonical Docker image specified in the setup instructions
-(`ghcr.io/scaleapi/swe-atlas:...paperless-ngx...542221a38dff...`), whose main application stage is
+The stack was run from the canonical Docker image specified in the setup instructions —
+`ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01`
+(the runtime environment pinned to source commit `542221a38dff`) — whose main application stage is
 built `FROM python:3.9-slim-bullseye` (`Dockerfile:18`). Two containers were used: the paperless-ngx
 application container (`pngx`) and a **Redis 6.0** broker container (`pngx-redis`), mirroring
 `docker/compose/docker-compose.sqlite.yml:28-29` (`broker: image: redis:6.0`). The three long-running
@@ -145,8 +146,8 @@ so each line below is attributed to a service by its `[name]` (logger namespace)
 
 ```text
 $ docker ps --format '{{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}'
-pngx        ghcr.io/scaleapi/swe-atlas:...paperless-ngx...qna_1.01  Up 8 minutes  127.0.0.1:8000->8000/tcp
-pngx-redis  redis:6.0                                               Up 8 minutes  6379/tcp
+pngx  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01  Up 2 minutes  127.0.0.1:8000->8000/tcp
+pngx-redis  redis:6.0  Up 2 minutes  6379/tcp
 ```
 
 **All three services live, running as the non-root service user (UID 1000).** The image ships no `ps`,
@@ -670,15 +671,28 @@ inlined in §3.2) and its complete, unedited output:
 $ TOKEN=$(cat /tmp/pngx-investigation/evidence/.drf_token)
 $ PLOG=/app/data/log/paperless.log ; MODEL=/app/data/classification_model.pickle
 $ for n in 2 3 4; do
+>   echo "########## UPLOAD #${n} ##########"
 >   docker exec -u 1000:1000 pngx bash -lc "python3 /tmp/make_pdf.py /tmp/pngx-test/q2_doc_${n}.pdf 'Q2 Multi-Upload Doc ${n}'"
->   docker cp pngx:/tmp/pngx-test/q2_doc_${n}.pdf /tmp/pngx-investigation/q2_doc_${n}.pdf
+>   docker cp pngx:/tmp/pngx-test/q2_doc_${n}.pdf /tmp/pngx-investigation/q2_doc_${n}.pdf >/dev/null 2>&1
 >   POFF=$(docker exec pngx bash -lc "wc -c < $PLOG")                          # byte offset BEFORE
->   curl -s -w " [HTTP %{http_code}]" -H "Authorization: Token $TOKEN" \
+>   printf 'REST response: '
+>   curl -s -w ' [HTTP %{http_code}]\n' -H "Authorization: Token $TOKEN" \
 >        -F "document=@/tmp/pngx-investigation/q2_doc_${n}.pdf" \
 >        http://127.0.0.1:8000/api/documents/post_document/                    # REAL entry point
->   # (wait until "consumption finished" appears in the delta, then:)
->   docker exec pngx bash -lc "tail -c +$((POFF+1)) $PLOG" \
->        | grep -E "paperless.tasks|Saving updated classifier|Training data unchanged|Gathering data"
+>   # block until THIS upload's consumption finishes (bounded ~90s), then read only its delta:
+>   for _ in $(seq 90); do
+>     docker exec pngx bash -lc "tail -c +$((POFF+1)) $PLOG" | grep -q 'consumption finished' && break
+>     sleep 1
+>   done
+>   echo "--- paperless.log delta grep for training/tasks (expect NONE) ---"
+>   HITS=$(docker exec pngx bash -lc "tail -c +$((POFF+1)) $PLOG" \
+>          | grep -E 'paperless.tasks|Saving updated classifier|Training data unchanged|Gathering data' || true)
+>   if [ -n "$HITS" ]; then
+>     echo "$HITS" | sed 's/^/    /'
+>   else
+>     echo "    (NONE — no training/classifier-task line in this upload's delta)"
+>   fi
+>   printf -- '--- model file after upload #%s: ' "$n"
 >   docker exec pngx bash -lc "test -f $MODEL && echo EXISTS || echo ABSENT"
 > done
 
@@ -687,13 +701,11 @@ REST response: "OK" [HTTP 200]
 --- paperless.log delta grep for training/tasks (expect NONE) ---
     (NONE — no training/classifier-task line in this upload's delta)
 --- model file after upload #2: ABSENT
-
 ########## UPLOAD #3 ##########
 REST response: "OK" [HTTP 200]
 --- paperless.log delta grep for training/tasks (expect NONE) ---
     (NONE — no training/classifier-task line in this upload's delta)
 --- model file after upload #3: ABSENT
-
 ########## UPLOAD #4 ##########
 REST response: "OK" [HTTP 200]
 --- paperless.log delta grep for training/tasks (expect NONE) ---
@@ -701,7 +713,7 @@ REST response: "OK" [HTTP 200]
 --- model file after upload #4: ABSENT
 ```
 
-*(The `##########`, `---`, and `(NONE …)` lines are the harness's own `echo`/`tee` annotations; the
+*(The `##########`, `---`, and `(NONE …)` lines are the harness's own `echo`/`printf` annotations; the
 `"OK" [HTTP 200]` and `ABSENT` tokens are the live REST response and file-test result.)* Across three
 additional uploads (documents `pk=2,3,4`, on top of the `pk=1` document from §3), **not one** produced
 a `paperless.tasks` or `Gathering data` line, and the model file remained **ABSENT** after every one.
@@ -1584,22 +1596,26 @@ no
 ```console
 # --- container-internal scratch (test PDFs, helper scripts, the start-services copy,
 #     and the consumer's residual upload temp) ---
-$ docker exec pngx sh -c 'rm -rf /tmp/pngx-test; \
-      rm -f /tmp/db_rowcounts.py /tmp/make_pdf.py /tmp/proc_snapshot.py /tmp/start-services.sh; \
-      rm -rf /tmp/paperless'
-# absence checks inside the container:
-/tmp/pngx-test                        -> ABSENT
-/tmp/*.py  (helper scripts)           -> ABSENT
-/tmp/start-services.sh                -> ABSENT
-/tmp/paperless  (paperless-upload-*)  -> ABSENT
-find /tmp -name '*.pdf'               -> NONE
-find /tmp -name 'paperless-upload-*'  -> NONE
+$ docker exec pngx sh -c 'rm -rf /tmp/pngx-test; rm -f /tmp/db_rowcounts.py /tmp/make_pdf.py /tmp/proc_snapshot.py /tmp/start-services.sh; rm -rf /tmp/paperless'
+# absence checks inside the container (real test -e per path):
+$ docker exec pngx sh -c 'for p in /tmp/pngx-test /tmp/make_pdf.py /tmp/db_rowcounts.py /tmp/proc_snapshot.py /tmp/start-services.sh /tmp/paperless; do [ -e "$p" ] && echo "PRESENT  $p" || echo "ABSENT   $p"; done'
+ABSENT   /tmp/pngx-test
+ABSENT   /tmp/make_pdf.py
+ABSENT   /tmp/db_rowcounts.py
+ABSENT   /tmp/proc_snapshot.py
+ABSENT   /tmp/start-services.sh
+ABSENT   /tmp/paperless
+$ docker exec pngx sh -c "find /tmp -name '*.pdf'; echo exit=$?"
+exit=0
+$ docker exec pngx sh -c "find /tmp -name 'paperless-upload-*'; echo exit=$?"
+exit=0
 
 # --- host-side scratch (scripts, evidence captures, test PDFs, section backups) ---
 $ rm -rf /tmp/pngx-investigation
-$ ls -la /tmp/pngx-investigation   -> ABSENT
-$ ls -la /tmp/paperless            -> ABSENT
-$ ls -la /tmp/pngx-run             -> ABSENT
+$ for p in /tmp/pngx-investigation /tmp/paperless /tmp/pngx-run; do [ -e "$p" ] && echo "PRESENT  $p" || echo "ABSENT   $p"; done
+ABSENT   /tmp/pngx-investigation
+ABSENT   /tmp/paperless
+ABSENT   /tmp/pngx-run
 ```
 
 The `/root/pngx-run/{bring-up.sh,start-services.sh}` scripts are the environment's own provisioning
@@ -1614,9 +1630,12 @@ pngx
 pngx-redis
 $ docker network rm pngx-net
 pngx-net
-$ docker ps -a --format '{{.Names}}' | grep -iE 'pngx|paperless|redis'   -> NONE (all removed)
-$ docker network ls --format '{{.Name}}' | grep -E 'pngx-net'            -> NONE (removed)
-$ docker volume ls | grep -iE 'pngx|paperless'                           -> NONE (no residual volumes)
+$ docker ps -a --format '{{.Names}}' | grep -iE 'pngx|paperless|redis'; echo exit=$?
+exit=1
+$ docker network ls --format '{{.Name}}' | grep -E 'pngx-net'; echo exit=$?
+exit=1
+$ docker volume ls | grep -iE 'pngx|paperless'; echo exit=$?
+exit=1
 ```
 
 Because the container held no volumes, its removal wiped the database, media tree, and any generated
@@ -1652,7 +1671,12 @@ $ find . -not -path './.git/*' \( -name 'classification_model*' -o -name 'db.sql
 (no output — none found)
 
 # runtime dirs are container-only and never existed in the repo tree:
-media, data, documents/originals, src/media, src/data   -> all absent
+$ for p in media data documents/originals src/media src/data; do [ -e "$p" ] && echo "PRESENT  $p" || echo "ABSENT   $p"; done
+ABSENT   media
+ABSENT   data
+ABSENT   documents/originals
+ABSENT   src/media
+ABSENT   src/data
 ```
 
 A repository-wide search for `*.pickle` matches exactly one path —
