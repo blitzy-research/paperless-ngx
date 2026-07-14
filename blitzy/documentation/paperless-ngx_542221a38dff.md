@@ -53,7 +53,7 @@ The measurements in §3 confirm this quantitatively with the **real `manage.py d
 
 The "not released promptly" symptom (§8, O6) is **normal CPython/glibc allocator arena retention amplified by scale**, observed directly: after `del` + `gc.collect()` the Python heap is fully freed (`tracemalloc` current drops to ≈1.4 MB) but process RSS stays at its high-water mark; a subsequent `malloc_trim(0)` then returns ≈485 MB to the OS, and re-running the same input **reuses** the retained arenas instead of growing (peak stdev 0.52 MB across 6 identical runs, §7). It is **not** an unbounded leak. Because the exporter/importer are **standalone `manage.py` CLI processes that exit**, the OS reclaims everything on exit (a fresh process restarts at ≈48.7 MB, §8); the delayed release is only visible *within* a single long-running process.
 
-The user's "caching behavior that's accumulating data unexpectedly" (§9, O3) resolves to **two module/instance-scoped accumulators**, not a dedicated caching layer: there is **no `src/documents/caching.py`** in this revision (shown in §9.1), so the candidates are the `dateparser` module-level locale cache invoked by `parse_date()` (`src/documents/parsers.py:212`) and the whole-corpus `CountVectorizer` vocabulary built by `classifier.train()` (`src/documents/classifier.py:194-199`). Measured, the `dateparser` locale cache is a **bounded one-time ≈15.5 MB warm-up that then plateaus** (§9.2), not unbounded growth.
+The user's "caching behavior that's accumulating data unexpectedly" (§9, O3) resolves to **two module/instance-scoped accumulators**, not a dedicated caching layer: there is **no `src/documents/caching.py`** in this revision (shown in §9.1), so the candidates are the `dateparser` module-level locale cache invoked by `parse_date()` (`src/documents/parsers.py:212`) and the whole-corpus `CountVectorizer` vocabulary built by `classifier.train()` (`src/documents/classifier.py:194-199`). Measured, the `dateparser` locale cache is a **bounded one-time warm-up that then plateaus** (§9.2), not unbounded growth — but its warm-up size is **input- and locale-dependent**: when the matched date substring parses cleanly in the configured language only English data loads (≈15.7 MB RSS / 5.5 MB retained heap); when the substring is *not* cleanly parseable (a common default-configuration case shown in §9.2), `dateparser` tries **all 205 bundled languages**, loading every locale's translation data (a larger ≈62 MB one-time RSS warm-up, ≈23.4 MB of it retained Python heap) — still bounded (it cannot exceed all 205 locales) and still dwarfed by the manifest path (§3).
 
 ---
 
@@ -106,9 +106,9 @@ $ docker exec pngx-mem bash -lc 'cd /app/src && python manage.py check'
 System check identified no issues (0 silenced).
 ```
 
-Inside this image I exercised the **real `manage.py document_exporter` and `manage.py document_importer` entry points** (§3.1, §3.3) and the **real `documents.models.Document` model / real `documents.parsers.parse_date`** (§3.2, §3.4, §7, §9), so all evidence is **CANONICAL**.
+Inside this image I exercised, on the pinned Python 3.9.23 stack: the **real `manage.py document_exporter` and `manage.py document_importer` entry points** under `/usr/bin/time -v` (§3.1, §3.3 — these **carry the export/import magnitude claims**); the **real `documents.parsers.parse_date`** function (§9.2) and the **real `DocumentClassifier`** (§9.3); and the **real canonical consume and concurrency paths** — `documents.tasks.consume_file` on a scanned PDF/PNG and the real `qcluster` + `document_consumer` (§2.5, §5.1). Separately, three **labeled partial in-process stand-ins** — `export_probe` (§3.2), `import_probe` (§3.4), and `stability_probe` (§7) — run only the *memory-relevant subset* of those same commands against the **real `documents.models.Document`** on the same stack; their sole purpose is to expose the phase-by-phase Python allocation and allocator-retention behavior that `/usr/bin/time` cannot show, so each enumerates its omissions and defers its **whole-command magnitude to the canonical §3.1/§3.3** and carries **no magnitude claim of its own**. In other words, the headline numbers are all **CANONICAL**; the stand-ins are explicitly **labeled partial** and corroborate mechanism only. §10 states the exact canonical / partial-stand-in / non-canonical / infeasible classification for every section.
 
-**The host interpreter cannot run the pinned stack (it is not used for any number).** The Blitzy host is Python 3.13.7. Installing `django==4.0.4` there succeeds, but `django.setup()` fails because Django 4.0.4 imports the standard-library `cgi` module, which Python 3.13 removed (PEP 594). Exact command and **complete, unedited** traceback:
+**The host interpreter cannot run the pinned stack (it is not used for any number).** The Blitzy host is Python 3.13.7. Installing `django==4.0.4` there succeeds, but `django.setup()` fails because Django 4.0.4 imports the standard-library `cgi` module, which Python 3.13 removed (PEP 594). Exact command and traceback, captured **verbatim** and reproduced identically across three consecutive runs. The `...<11 lines>...` and `...<4 lines>...` tokens inside the trace are **emitted by CPython 3.13's own traceback formatter**, which collapses multi-line `from … import ( … )` statements to their first and last physical line; they are the interpreter's literal output, **not** a manual elision. The names each token collapses are enumerated immediately after the trace (§2.2.1), so no frame or import name is withheld:
 
 ```text
 $ python3 --version
@@ -140,6 +140,36 @@ Traceback (most recent call last):
 ModuleNotFoundError: No module named 'cgi'
 ```
 
+#### 2.2.1 What CPython 3.13 collapsed in the trace (full transparency)
+
+Python 3.13's traceback formatter renders a statement that spans several physical lines as its first line, a `...<N lines>...` token, and its closing line. Both tokens above are exactly this behavior applied to two multi-line `import` statements; reading the corresponding lines out of the installed files shows there is nothing hidden:
+
+```text
+$ sed -n '1,13p' /tmp/hosttest_libs/django/urls/__init__.py     # the '...<11 lines>...' token
+from .base import (
+    clear_script_prefix,
+    clear_url_caches,
+    get_script_prefix,
+    get_urlconf,
+    is_valid_path,
+    resolve,
+    reverse,
+    reverse_lazy,
+    set_script_prefix,
+    set_urlconf,
+    translate_url,
+)
+$ sed -n '2,7p' /tmp/hosttest_libs/django/http/__init__.py       # the '...<4 lines>...' token
+from django.http.request import (
+    HttpRequest,
+    QueryDict,
+    RawPostDataException,
+    UnreadablePostError,
+)
+```
+
+`...<11 lines>...` is the 11 imported names on lines 2–12 of `django/urls/__init__.py` (between the `from .base import (` on line 1 and the `)` on line 13); `...<4 lines>...` is the 4 imported names on lines 3–6 of `django/http/__init__.py` (between the `from django.http.request import (` on line 2 and the `)` on line 7). Neither collapse omits any *frame* of the failing import chain, which proceeds in full: `django/__init__.py:16 → django/urls/__init__.py:1 → django/urls/base.py:8 → django/urls/exceptions.py:1 → django/http/__init__.py:2 → django/http/request.py:1: import cgi`.
+
 The very first line of `django.setup()` (`from django.urls import set_script_prefix`, `django/__init__.py:16`) triggers the import chain that reaches `django/http/request.py:1: import cgi`, so the failure occurs before any settings are consulted. This is why the canonical Python 3.9 container is used throughout; **no measurement in this document comes from the host.**
 
 ### 2.3 Controlled corpus (stated plainly, and its limits)
@@ -164,9 +194,9 @@ $ docker exec pngx-mem bash -lc '/usr/bin/time -v python3 -c "a=bytearray(300*10
 - **Python-heap allocation** is captured with `tracemalloc.get_traced_memory()` (current and peak). Crucially, tracemalloc is kept **active through `del` + `gc.collect()`** so the post-GC current bytes are recorded (§7, §8). **RSS (MB) and tracemalloc (MB) are always reported on their own metric and never subtracted from each other** (see §3.2/§3.4 for how transient copies are quantified on a single metric).
 - **Concurrent peak during `loaddata`** is captured by a background sampler thread (§3.4), not by a single post-return sample.
 
-### 2.5 Scope limitation (full OCR consume path)
+### 2.5 Consume path: OCR **is** reproducible on this image; the bounded limitation is Office/DOCX (external Tika + Java)
 
-The full end-to-end **OCR consume** path (actual ingestion of scanned PDFs) depends on native binaries pinned in `.build-config.json`:
+The `.build-config.json` pins native binaries for the reference build, and the canonical image carries **qpdf 10.1.0 and lacks the `jbig2` binary** (shown in §2.2):
 
 ```text
 $ cat .build-config.json
@@ -179,9 +209,48 @@ $ cat .build-config.json
       "git_tag": "0.29"
     }
 }
+$ command -v jbig2 || echo 'jbig2: NOT FOUND'
+jbig2: NOT FOUND
 ```
 
-The canonical image carries **qpdf 10.1.0 and lacks the `jbig2` binary** (shown in §2.2), so a *complete OCR ingest* of scanned PDFs is not reproduced here. This does **not** affect the investigation: the memory question is about **import / metadata handling** — the export/import manifest path — which is reproduced canonically through its real entry points (§3.1, §3.3). The per-document consume path is analyzed from code with `file:line` grounding and contrasted with the corpus-proportional manifest path (§5, §9) to explain the "varies by source/stage" observation.
+**Correction (F-04, runtime-verified).** An earlier revision of this document claimed the full OCR consume path was *infeasible* on this image because `jbig2` is absent. That claim is **wrong**, and it is corrected here from direct runtime observation: `jbig2enc` is only an *optional output-PDF compression optimizer* for OCRmyPDF, **not** a prerequisite for OCR. Exercised through the **real canonical consume task** `documents.tasks.consume_file(path)` (`src/documents/tasks.py:184` → `Consumer().try_consume_file` at `tasks.py:236` — the exact function a Django-Q worker runs), a synthetic **image-only scanned PDF** and a **PNG** both consume **successfully without `jbig2`**, each producing a `Document` with OCR-extracted content, an archive PDF, and a thumbnail. Complete, unedited output (`cwd=/app/src`; scratch DB migrated under `/tmp/s_ocr2`):
+
+```text
+### the scanned PDF is image-only (no text layer): pdftotext yields 0 characters -> OCR is required
+$ pdftotext /tmp/ocr_inputs/scanned_probe.pdf - | tr -d '[:space:]' | wc -c
+0
+
+### consume the scanned PDF via the canonical task (jbig2 absent):
+$ python /tmp/scripts/consume_probe.py --scratch /tmp/s_ocr2 --file /tmp/ocr_inputs/scanned_probe.pdf --label ocr_pdf
+{"label": "ocr_pdf", "input_file": "/tmp/ocr_inputs/scanned_probe.pdf", "input_bytes": 16435, "consume_result_msg": "Success. New document id 1 created", "documents_before": 0, "documents_after": 1, "doc_pk": 1, "doc_mime_type": "application/pdf", "content_len": 307, "content_snippet": "PRPERLESS OCR MEMORY PROBE ALPHA ERAVO CHARLIE 2018\n\nquick brom\n\nquick brom\n\nquick brom\n\nquick brom\n\nquick brom\n\nquick b", "content_has_MEMORY": true, "content_has_PROBE": true, "has_archive_version": true, "archive_exists_on_disk": true, "original_exists_on_disk": true, "thumbnail_exists_on_disk": true, "checksum": "59929d21d8d6c16f09afda15fee694a8", "base_rss_mb": 68.1, "peak_rss_mb": 219.9, "consume_rss_delta_mb": 151.8, "tm_peak_mb": 39.8}
+
+### consume the PNG via the canonical task:
+$ python /tmp/scripts/consume_probe.py --scratch /tmp/s_ocr2 --file /tmp/ocr_inputs/scanned_probe.png --label ocr_png
+{"label": "ocr_png", "input_file": "/tmp/ocr_inputs/scanned_probe.png", "input_bytes": 15000, "consume_result_msg": "Success. New document id 2 created", "documents_before": 1, "documents_after": 2, "doc_pk": 2, "doc_mime_type": "image/png", "content_len": 307, "content_snippet": "PRPERLESS OCR MEMORY PROBE ALPHA ERAVO CHARLIE 2018\n\nquick brom\n\nquick brom\n\nquick brom\n\nquick brom\n\nquick brom\n\nquick b", "content_has_MEMORY": true, "content_has_PROBE": true, "has_archive_version": true, "archive_exists_on_disk": true, "original_exists_on_disk": true, "thumbnail_exists_on_disk": true, "checksum": "c19a7c811edd51c73c26513dacde9e6a", "base_rss_mb": 68.5, "peak_rss_mb": 218.9, "consume_rss_delta_mb": 150.4, "tm_peak_mb": 39.5}
+```
+
+Both consumes return `"Success. New document id N created"`; both create a `Document` with non-empty OCR `content` (307 chars; the distinctive tokens `MEMORY` and `PROBE` survive OCR), `has_archive_version=true` with the archive on disk, the original on disk, and a thumbnail on disk. The OCR text is imperfect (`PRPERLESS`/`ERAVO` — tesseract 4.1.1 on a bold synthetic scan) but that is immaterial to feasibility. *(One benign log note: ImageMagick's `policy.xml` blocks its PDF coder, so thumbnailing falls back to ghostscript, which succeeds — `thumbnail_exists_on_disk=true`.)*
+
+**The real bounded limitation is Office/DOCX, not scanned OCR.** Office formats are handled by the Tika parser, which is **disabled by default** (`PAPERLESS_TIKA_ENABLED` defaults to `"NO"`, `settings.py:592`) — so `.docx` is not even a supported extension out of the box — and which, when enabled, delegates to an **external Tika/Gotenberg server backed by Java**. The image has **no Java**, so the real `TikaDocumentParser.parse()` (`src/paperless_tika/parsers.py:55`, `parser.from_file(document_path, PAPERLESS_TIKA_ENDPOINT)`) cannot start a server and raises `ParseError`. Complete, unedited output:
+
+```text
+$ command -v java || echo 'java: NOT FOUND'
+java: NOT FOUND
+
+### default config: .docx is unsupported because Tika is off:
+PAPERLESS_TIKA_ENABLED(default)= False | .docx supported= False
+
+### with Tika enabled, the real parser on a genuine .docx (no server; Java absent):
+$ PAPERLESS_TIKA_ENABLED=1 python /tmp/scripts/tika_docx_probe.py
+PAPERLESS_TIKA_ENABLED: True
+PAPERLESS_TIKA_ENDPOINT: http://localhost:9998
+docx bytes: 927
+2026-07-14 02:16:20,688 [MainThread  ] [ERROR]  Unable to run java; is it installed?
+2026-07-14 02:16:20,688 [MainThread  ] [ERROR]  Failed to receive startup confirmation from startServer.
+ParseError (expected): Could not parse /tmp/ocr_inputs/office_probe.docx with tika server at http://localhost:9998: Unable to start Tika server.
+```
+
+This does **not** affect the core investigation: the memory question is about **import / metadata handling** — the export/import manifest path — which is reproduced canonically through its real entry points (§3.1, §3.3). The consume path is now also exercised canonically here (and its concurrency behavior measured in §5), and contrasted with the corpus-proportional manifest path (§5, §9) to explain the "varies by source/stage" observation. The probe sources (`consume_probe.py`, `tika_docx_probe.py`, and the synthetic-input generators) are listed in Appendix §13.2.
 
 ---
 
@@ -600,13 +669,32 @@ Same command, same entry point, same file count, same ~14-byte files → **≈9.
 | Source / stage | Where the work (and memory) lives | `file:line` |
 |---|---|---|
 | **Export / import manifest** | In the Paperless process, **corpus-proportional**: the whole corpus's `content` is materialized at once. This is the spike path. | `document_exporter.py:127-130`; `document_importer.py:73,87` |
-| **Consume (per-document)** | In the Paperless process, **per-document**: `try_consume_file` processes one document at a time — parse, `parse_date`, `load_classifier`, `_store`. Footprint does **not** scale with corpus size. | `consumer.py:180` (`try_consume_file`), `:261` (`parser.parse`), `:275` (`parse_date`), `:292` (`load_classifier`), `:379` (`_store`) |
+| **Consume (per-document, per-worker)** | In the Paperless process, **per in-flight document**: `try_consume_file` processes one document at a time — parse, `parse_date`, `load_classifier`, `_store`. The *per-task* footprint is bounded by a single document and does **not** grow with the total corpus size. **However (F-05, runtime-measured in §5.1), the total process-tree memory of the Django-Q cluster scales with the number of documents consumed *concurrently*, up to the configured worker count** — 1 PDF ≈1.02 GiB / 16 PIDs vs. 4 concurrent PDFs ≈1.48 GiB / 19 PIDs (+44.7%). | `consumer.py:180` (`try_consume_file`), `:261` (`parser.parse`), `:275` (`parse_date`), `:292` (`load_classifier`), `:379` (`_store`); `settings.py:449-457` (`Q_CLUSTER`, 11 workers) |
 | **Plain-text parser** | In the Paperless process: reads the **whole file into memory** (`self.text = f.read()`). Per-document, bounded by one file. | `paperless_text/parsers.py:40-42` |
 | **Office docs (Tika)** | In an **external Tika JVM server**, not the Paperless process: the document is sent via `requests`/`parser.from_file(document_path, tika_server)` and only the returned `content` string is held by Paperless. | `paperless_tika/parsers.py:4` (`import requests`), `:9` (`from tika import parser`), `:32`,`:55` (`parser.from_file(..., tika_server)`) |
-| **Scanned PDF/image (Tesseract/OCR)** | In **native subprocesses** (ocrmypdf/tesseract/qpdf), not the Python heap; Paperless holds the resulting text. Not fully reproducible here (no `jbig2`; §2.5). | `paperless_tesseract/parsers.py` (native OCR boundary) |
+| **Scanned PDF/image (Tesseract/OCR)** | In **native subprocesses** (ocrmypdf/tesseract/qpdf), not the Python heap; Paperless holds the resulting text. **Reproduced canonically here (F-04, §2.5): scanned-PDF and PNG OCR consume succeed WITHOUT `jbig2`**, each producing OCR content + archive + thumbnail (single-document consume peak ≈219 MB RSS). | `paperless_tesseract/parsers.py` (native OCR boundary); runtime §2.5 / §5.1 |
 | **Email (IMAP)** | Mail is fetched over IMAP and queued for consume; per-message footprint. | `paperless_mail/mail.py` |
 
-So two different "stages" have fundamentally different memory profiles for the *same* documents: the export/import manifest stage is corpus-proportional (spikes with aggregate `content`), while the consume stage and the external/native parser stages are per-document or out-of-process (do not spike with corpus size). This is the precise mechanism behind the user's "seems to vary based on the document source or processing stage."
+So two different "stages" have fundamentally different memory profiles for the *same* documents: the export/import manifest stage is corpus-proportional (its single-process peak spikes with the aggregate `content` of the whole corpus), while the consume stage is **per in-flight document** — each task's footprint is bounded by one document regardless of corpus size. The two are distinct axes: the manifest peak grows with *total corpus content in one process*, whereas the consume subsystem's peak grows with *how many documents are processed at once* across the Django-Q worker pool (§5.1, F-05: +44.7% from 1 to 4 concurrent OCR consumes), not with the total number of documents ever stored. This dual behavior is the precise mechanism behind the user's "seems to vary based on the document source or processing stage."
+
+### 5.1 Consume concurrency: total process-tree memory scales with in-flight document count (F-05, runtime-measured)
+
+The per-task consume footprint is bounded by one document, but Paperless consumes documents through a **Django-Q worker pool** whose default size is **11 workers** (`TASK_WORKERS`, resolved at runtime; `settings.py:438,449-457` — `Q_CLUSTER["workers"] = TASK_WORKERS`). The memory that matters operationally is therefore the **total process tree** (the `qcluster` master + its workers + the transient native OCR subprocesses `ocrmypdf`/`tesseract`/`gs` each consume spawns), and that total scales with how many documents are in flight at once.
+
+This was measured canonically by starting the real cluster (`python manage.py qcluster`, 11 workers) and enqueuing work through the real `python manage.py document_consumer --oneshot` path (which `async_task`s `documents.tasks.consume_file`, `document_consumer.py:86-87`), while an external sampler walked the full process tree rooted at the `qcluster` PID and recorded peak summed-RSS and peak PID count. Four **distinct** scanned PDFs were used (distinct checksums, so none are rejected as duplicates). Two fresh runs per level (complete, unedited output; `cwd=/app/src`):
+
+```text
+$ bash /tmp/scripts/concurrency_probe.sh /tmp/s_conc1  1 conc_1pdf    /tmp/conc_pdfs
+{"label":"conc_1pdf","n_queued":1,"docs_created":1,"peak_tree_rss_kib":1077936,"peak_pids":16,"samples":77,"q_workers":11}
+$ bash /tmp/scripts/concurrency_probe.sh /tmp/s_conc1b 1 conc_1pdf_r2 /tmp/conc_pdfs
+{"label":"conc_1pdf_r2","n_queued":1,"docs_created":1,"peak_tree_rss_kib":1063536,"peak_pids":16,"samples":78,"q_workers":11}
+$ bash /tmp/scripts/concurrency_probe.sh /tmp/s_conc4  4 conc_4pdf    /tmp/conc_pdfs
+{"label":"conc_4pdf","n_queued":4,"docs_created":4,"peak_tree_rss_kib":1548732,"peak_pids":19,"samples":77,"q_workers":11}
+$ bash /tmp/scripts/concurrency_probe.sh /tmp/s_conc4b 4 conc_4pdf_r2 /tmp/conc_pdfs
+{"label":"conc_4pdf_r2","n_queued":4,"docs_created":4,"peak_tree_rss_kib":1550784,"peak_pids":19,"samples":80,"q_workers":11}
+```
+
+Reading (stable across both runs): consuming **1** PDF peaks at **≈1,070,736 KiB (≈1.02 GiB) mean across 16 PIDs**; consuming **4** concurrently peaks at **≈1,549,758 KiB (≈1.48 GiB) mean across 19 PIDs** — a mean increase of **+479,022 KiB (+467.8 MiB), ratio 1.4474 = +44.7%** (per-run +43.7% / +45.8%), with **all four documents consumed successfully**. The peak PID count rises from 16 to 19 because more native OCR subprocesses are co-resident. This independently reproduces the reviewer's concurrency-scaling observation (their runs measured +37.151% / +37.585%); the exact percentage is environment- and timing-dependent (it hinges on how many native OCR subprocesses are co-resident at the sampled instant), but the **direction and order of magnitude are stable and reproducible**. *Labeled inferred:* the precise +% is not a fixed constant — the robust, observed claim is that **total cluster memory scales materially with in-flight concurrency up to the worker count**, whereas the *per-document* work does not scale with corpus size. The probe (`concurrency_probe.sh`, `tree_sampler.py`, `make_n_pdfs.py`) is listed in Appendix §13.2.
 
 ---
 
@@ -743,7 +831,7 @@ $        # (no output, exit status 0 — no file named caching.py anywhere under
 
 So "caching" resolves to two accumulators that outlive a single document, not a purpose-built cache: the `dateparser` module-scoped locale cache (§9.2) and the classifier's `CountVectorizer` vocabulary / unpickled model (§9.3).
 
-### 9.2 `dateparser` module-scoped locale cache — bounded one-time warm-up, then plateau
+### 9.2 `dateparser` module-scoped locale cache — bounded, but input/locale-dependent (≈15.7 MB for clean English vs. ≈62 MB / all 205 locales for a word-year false positive)
 
 `parse_date()` (`src/documents/parsers.py:212`) imports `dateparser` inside its inner `__parser` and calls `dateparser.parse` per regex date match (`parsers.py:221-231`):
 
@@ -762,19 +850,58 @@ So "caching" resolves to two accumulators that outlive a single document, not a 
         )
 ```
 
-The probe exercises the **real repository function `documents.parsers.parse_date(filename, text)`** (not a bare `dateparser.parse` call). The crafted `text` contains four **future** dates that parse successfully but fail the inner `__filter` (`date <= timezone.now()` at `parsers.py:237`; `__filter` body `parsers.py:233-241`), forcing the `re.finditer` loop (`parsers.py:261`) to iterate, followed by one valid **past** date (`15/06/2018`) that returns. It is run **2,000 iterations × 2 independent fresh processes**, inspecting the `dateparser` module-scoped locale cache before and after. Complete, unedited output (`cwd=/app/src`):
+The probe exercises the **real repository function `documents.parsers.parse_date(filename, text)`** (not a bare `dateparser.parse` call) under the **canonical default `PAPERLESS_DATE_ORDER=DMY`** (`settings.py:574`). It is run **2,000 iterations × 2 independent fresh processes per case**, inspecting the `dateparser` module-scoped locale cache before and after. Two canonical cases are exercised because — as the runtime evidence below shows — **the size of the warm-up depends on the input text, not on the code alone**:
+
+- **Case A — realistic prose (`"Valid 2018-06-15"`).** This is the far more representative real-world input (an ISO date embedded in ordinary text). What `parse_date` actually feeds to `dateparser` is **not** the ISO date: the `DATE_REGEX` `re.finditer` loop (`parsers.py:261`) matches the **word-year alternative** `([^\W\d_]{3,9} [0-9]{4})` (the 5th alternative, `parsers.py:35`), which captures **`"Valid 2018"`** — consuming the `2018`, so the real ISO date `2018-06-15` never matches. `dateparser` is then handed the token `"Valid 2018"`; because `"Valid"` is **not** an English date keyword, `dateparser` consults **every bundled language locale** to see whether it is a date word in some other language, loading **all 205 locales**.
+- **Case B — clean numeric `DD/MM/YYYY`.** Four **future** dates that parse successfully but fail the inner `__filter` (`date <= timezone.now()` at `parsers.py:237`; `__filter` body `parsers.py:233-241`), forcing the loop to iterate, followed by one valid **past** date (`15/06/2018`) that returns. All matches are numeric and parse as **English only**, so only the `en` locale loads.
+
+The `DATE_REGEX` token extraction that distinguishes the two cases is itself observed (complete, unedited output; `cwd=/app/src`):
 
 ```text
-### parse_date run1 (fresh process):
-$ python /tmp/scripts/parse_date_probe.py --scratch /tmp/s_modcheck --iters 2000 --label pd_r1
-{"label": "pd_r1", "iters": 2000, "parse_ok": 2000, "parsed_date": "2018-06-15T00:00:00+00:00", "base_rss": 48.8, "after_first_parse_rss": 64.4, "after_all_parses_rss": 64.4, "after_gc_rss": 64.4, "warmup_delta_mb": 15.6, "plateau_delta_over_iters_mb": 0.0, "released_after_gc_mb": 0.0, "tm_peak": 6.3, "tm_current_after_gc": 5.5, "cache_after_first": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded": ["en"], "locale_translation_data_count": 1}, "cache_after_many": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded": ["en"], "locale_translation_data_count": 1}}
-
-### parse_date run2 (fresh process):
-$ python /tmp/scripts/parse_date_probe.py --scratch /tmp/s_modcheck --iters 2000 --label pd_r2
-{"label": "pd_r2", "iters": 2000, "parse_ok": 2000, "parsed_date": "2018-06-15T00:00:00+00:00", "base_rss": 49.0, "after_first_parse_rss": 64.5, "after_all_parses_rss": 64.5, "after_gc_rss": 64.5, "warmup_delta_mb": 15.5, "plateau_delta_over_iters_mb": 0.0, "released_after_gc_mb": 0.0, "tm_peak": 6.3, "tm_current_after_gc": 5.5, "cache_after_first": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded": ["en"], "locale_translation_data_count": 1}, "cache_after_many": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded": ["en"], "locale_translation_data_count": 1}}
+$ python - <<'PY'   # DJANGO_SETTINGS_MODULE=paperless.settings + scratch PAPERLESS_* env
+import django; django.setup()
+from documents.parsers import DATE_REGEX
+import re
+for t in ["Valid 2018-06-15",
+          "Report dated 01/02/2090 revised 03/04/2091 and 05/06/2092 superseded 07/08/2093 final valid 15/06/2018 end of file."]:
+    print(repr(t), "->", [m.group(0) for m in re.finditer(DATE_REGEX, t)])
+PY
+'Valid 2018-06-15' -> ['Valid 2018']
+'Report dated 01/02/2090 revised 03/04/2091 and 05/06/2092 superseded 07/08/2093 final valid 15/06/2018 end of file.' -> ['01/02/2090', '03/04/2091', '05/06/2092', '07/08/2093', '15/06/2018']
 ```
 
-Reading (stable across both runs): the **first** `parse_date` call triggers a one-time lazy load of `dateparser`'s locale/language machinery — a **`warmup_delta` of +15.6 / +15.5 MB**. The following **2,000** calls add **`plateau_delta_over_iters` of +0.0 MB** — the cache does **not** grow with more same-language parses. Cache-state inspection confirms why: `locale_translation_data_loaded` is `["en"]` (count 1) both `after_first` and `after_many` — only English locale data is loaded, and it is loaded **once** and held at module scope (`dateparser_modules_loaded` = 20, unchanged). Every call returns the expected `2018-06-15` (`parse_ok` 2000/2000), so the loop genuinely exercised the function. So this is **bounded accumulation, not a leak or unbounded cache**: a one-time ≈15.5 MB locale warm-up that persists for the process/worker lifetime because it is module-scoped. It contributes to the *date-extraction metadata stage* footprint (`consumer.py:275`) but is fixed, not corpus-proportional, and it is dwarfed by the manifest path (§3). *Labeled inferred:* that the ≈15.5 MB lives largely in C-extension/locale structures (only 6.3 MB shows in `tm_peak`) is a mechanism explanation; the observed facts are the +15.5 MB warm-up, the +0.0 MB plateau, and the `["en"]` cache state.
+**Case A — complete, unedited output (`cwd=/app/src`):**
+
+```text
+### parse_date Case A run1 (fresh process):
+$ python /tmp/scripts/parse_date_probe.py --scratch /tmp/s_pd --iters 2000 --label pd_dmy_realistic_r1 --text 'Valid 2018-06-15'
+{"label": "pd_dmy_realistic_r1", "date_order": "DMY", "text": "Valid 2018-06-15", "iters": 2000, "calls_returning_a_date": 0, "parsed_date": null, "base_rss": 48.9, "after_first_parse_rss": 111.4, "after_all_parses_rss": 111.5, "after_gc_rss": 111.5, "warmup_delta_mb": 62.5, "plateau_delta_over_iters_mb": 0.0, "released_after_gc_mb": 0.0, "tm_peak": 25.9, "tm_current_after_gc": 23.4, "cache_after_first": {"dateparser_modules_loaded": 224, "locale_translation_data_loaded_count": 205, "locale_translation_data_sample": ["af", "agq", "ak", "am", "ar", "as", "asa", "ast"]}, "cache_after_many": {"dateparser_modules_loaded": 224, "locale_translation_data_loaded_count": 205, "locale_translation_data_sample": ["af", "agq", "ak", "am", "ar", "as", "asa", "ast"]}}
+
+### parse_date Case A run2 (fresh process):
+$ python /tmp/scripts/parse_date_probe.py --scratch /tmp/s_pd --iters 2000 --label pd_dmy_realistic_r2 --text 'Valid 2018-06-15'
+{"label": "pd_dmy_realistic_r2", "date_order": "DMY", "text": "Valid 2018-06-15", "iters": 2000, "calls_returning_a_date": 0, "parsed_date": null, "base_rss": 48.8, "after_first_parse_rss": 110.5, "after_all_parses_rss": 110.6, "after_gc_rss": 110.6, "warmup_delta_mb": 61.7, "plateau_delta_over_iters_mb": 0.1, "released_after_gc_mb": 0.0, "tm_peak": 25.5, "tm_current_after_gc": 23.4, "cache_after_first": {"dateparser_modules_loaded": 224, "locale_translation_data_loaded_count": 205, "locale_translation_data_sample": ["af", "agq", "ak", "am", "ar", "as", "asa", "ast"]}, "cache_after_many": {"dateparser_modules_loaded": 224, "locale_translation_data_loaded_count": 205, "locale_translation_data_sample": ["af", "agq", "ak", "am", "ar", "as", "asa", "ast"]}}
+```
+
+**Case B — complete, unedited output (`cwd=/app/src`):**
+
+```text
+### parse_date Case B run1 (fresh process):
+$ python /tmp/scripts/parse_date_probe.py --scratch /tmp/s_pd --iters 2000 --label pd_clean_r1
+{"label": "pd_clean_r1", "date_order": "DMY", "text": "Report dated 01/02/2090 revised 03/04/2091 and 05/06/2092 superseded 07/08/2093 final valid 15/06/2018 end of file.", "iters": 2000, "calls_returning_a_date": 2000, "parsed_date": "2018-06-15T00:00:00+00:00", "base_rss": 48.9, "after_first_parse_rss": 64.6, "after_all_parses_rss": 64.7, "after_gc_rss": 64.7, "warmup_delta_mb": 15.7, "plateau_delta_over_iters_mb": 0.0, "released_after_gc_mb": 0.0, "tm_peak": 6.3, "tm_current_after_gc": 5.5, "cache_after_first": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded_count": 1, "locale_translation_data_sample": ["en"]}, "cache_after_many": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded_count": 1, "locale_translation_data_sample": ["en"]}}
+
+### parse_date Case B run2 (fresh process):
+$ python /tmp/scripts/parse_date_probe.py --scratch /tmp/s_pd --iters 2000 --label pd_clean_r2
+{"label": "pd_clean_r2", "date_order": "DMY", "text": "Report dated 01/02/2090 revised 03/04/2091 and 05/06/2092 superseded 07/08/2093 final valid 15/06/2018 end of file.", "iters": 2000, "calls_returning_a_date": 2000, "parsed_date": "2018-06-15T00:00:00+00:00", "base_rss": 48.6, "after_first_parse_rss": 64.3, "after_all_parses_rss": 64.4, "after_gc_rss": 64.4, "warmup_delta_mb": 15.7, "plateau_delta_over_iters_mb": 0.0, "released_after_gc_mb": 0.0, "tm_peak": 6.3, "tm_current_after_gc": 5.5, "cache_after_first": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded_count": 1, "locale_translation_data_sample": ["en"]}, "cache_after_many": {"dateparser_modules_loaded": 20, "locale_translation_data_loaded_count": 1, "locale_translation_data_sample": ["en"]}}
+```
+
+**Reading (stable across both runs of each case).** The **first** `parse_date` call triggers a one-time lazy load of `dateparser`'s locale/language machinery; the following **2,000** calls add a `plateau_delta_over_iters` of **+0.0 / +0.1 MB** in *both* cases — the cache does **not** grow with repeated same-input parses. The magnitude of that one-time warm-up, however, is **input- and locale-dependent**, and this is the key correction to any single-number claim:
+
+- **Case A (realistic prose):** the warm-up is **+62.5 / +61.7 MB RSS**, of which **`tm_current_after_gc` = 23.4 MB** is retained Python heap that survives `gc.collect()` (exactly stable across both runs). Cache inspection shows **all 205 bundled locales** loaded (`locale_translation_data_loaded_count` 205; `dateparser_modules_loaded` 224) both `after_first` and `after_many`. No date is returned (`calls_returning_a_date` 0, `parsed_date` null) — the word-year token `"Valid 2018"` is not a real date, which is exactly why the full multilingual locale sweep is triggered.
+- **Case B (clean numeric):** the warm-up is **+15.7 MB RSS**, of which **`tm_current_after_gc` = 5.5 MB** is retained heap. Only the **`en`** locale loads (`locale_translation_data_loaded_count` 1; `dateparser_modules_loaded` 20). Every call returns the expected `2018-06-15` (`calls_returning_a_date` 2000/2000).
+
+**Classification.** In both cases the accumulation is **bounded, not a leak and not unbounded**: the per-input plateau is ≈0 MB, and the locale cache **cannot exceed the number of bundled locales** (205 is the ceiling, already reached in Case A). It is **module-scoped**, so whatever is loaded persists for the worker/process lifetime — which is why, in a long-lived Django-Q worker, the first document containing a word-year token permanently raises the worker's baseline by ≈23 MB of retained heap (≈60 MB RSS). This matches the reviewer's independently-observed ≈23.5 MiB retained-heap figure (our `tm_current_after_gc` = 23.4 MB, Case A). Relative to the manifest path (§3), even the 205-locale case is small and **fixed** (it does not scale with corpus count or `Document.content` size); it contributes to the *date-extraction metadata stage* footprint (`consumer.py:275`).
+
+*Two labeled-inferred points, distinguished from the observations:* (1) the `warmup_delta_mb` RSS figure carries ≈±1 MB run-to-run variation (62.5 vs. 61.7; 15.7 vs. 15.7) because RSS reflects glibc-arena granularity, whereas the retained-heap `tm_current_after_gc` (23.4 / 5.5 MB) and the locale counts (205 / 1) are **exactly** reproducible — the stable figures are the ones relied upon; (2) that the majority of the warm-up lives in C-extension/locale data structures (only 25.9 / 6.3 MB of it shows in `tm_peak`, the Python-object peak) is a mechanism explanation. The **observed** facts are the warm-up deltas, the +0.0 MB plateau, the retained-heap figures, and the 205-vs-1 locale cache states above.
 
 ### 9.3 `classifier` — instance-held vectorizer/model and whole-corpus training (grounded in code + runtime)
 
@@ -816,6 +943,8 @@ Per the canonical-observation rule, this section states exactly which evidence i
 - **§8.3** — `Q_CLUSTER` config read verbatim from the image, and the CLI-exit lifecycle demo (real `Document` + `serializers`).
 - **§9.2** — the **real** `documents.parsers.parse_date(filename, text)` function.
 - **§9.3** — runtime introspection of the real `DocumentClassifier` class on the pinned stack.
+- **§2.5** — the **real** canonical consume task `documents.tasks.consume_file` on a scanned PDF and a PNG (OCR feasibility, F-04), and the real `TikaDocumentParser.parse()` failure on `.docx` (the Tika/Java limitation).
+- **§5.1** — the **real** `python manage.py qcluster` (11 workers) + `python manage.py document_consumer --oneshot` path, measuring process-tree memory vs. concurrency (F-05, ≥2 runs per level).
 
 **LABELED PARTIAL STAND-INS** — real pinned stack and real `documents.models.Document`/real Django APIs, but only a *subset* of the full command (each section enumerates its omissions). Used only for phase-by-phase Python allocation and allocator behavior that `/usr/bin/time` cannot show; the whole-command magnitude is always carried by the canonical §3.1/§3.3:
 
@@ -829,7 +958,8 @@ Per the canonical-observation rule, this section states exactly which evidence i
 
 **INFEASIBLE ON THIS IMAGE** — stated, not worked around:
 
-- The **full end-to-end OCR consume** of scanned PDFs (Tesseract/`ocrmypdf`) requires the `jbig2` binary (absent — §2.2) and qpdf 10.6.3 (the image ships 10.1.0). The per-document nature of the consume path is therefore established from code (`file:line`, §5) and from the real per-document date stage (§9.2), not from a full OCR run (§2.5).
+- **Office/DOCX consume via Tika.** The Tika parser is disabled by default (`PAPERLESS_TIKA_ENABLED="NO"`, `settings.py:592`); when enabled it delegates to an **external Tika/Gotenberg server backed by Java**, and the image ships **no Java** (`java: NOT FOUND`), so `TikaDocumentParser.parse()` raises `ParseError: … Unable to start Tika server` (§2.5, runtime-shown). This is the **only** consume path that cannot be exercised on this image.
+- *(Corrected)* The **full end-to-end OCR consume of scanned PDFs/PNGs is NOT infeasible** — it is reproduced canonically in §2.5 and §5.1 and succeeds **without** `jbig2` (which is only an optional output-compression optimizer, not an OCR prerequisite). An earlier revision incorrectly listed OCR consume here; that claim is retracted and superseded by the F-04 runtime evidence in §2.5.
 
 ---
 
@@ -855,14 +985,16 @@ Every key statement in this document is classified as **S** = source-grounded (`
 | 14 | CLI processes exit → OS reclaims all; `Q_CLUSTER['recycle']=1` recycles workers per task | **O**+**S** | §8.3 (lifecycle demo) → `settings.py:110,449-457` |
 | 15 | The un-returned bytes live in CPython `pymalloc`/glibc **arenas** | **I** | §8.3 (labeled inferred; observed facts are tm_current≈0, trim-reclaim, exit-reclaim) |
 | 16 | **No** dedicated `caching.py` module exists in this revision | **S**+**O** | §9.1 (`ls`/`find` output) |
-| 17 | `dateparser` locale cache: one-time ≈15.5 MB warm-up, then **+0.0 MB plateau**; cache = `["en"]` | **O** | §9.2 (real `parse_date`, 2 runs, cache-state introspection) |
-| 18 | The ≈15.5 MB warm-up lives largely in C-extension/locale structures | **I** | §9.2 (labeled inferred; observed = +15.5 MB warm-up, +0.0 plateau, tm_peak 6.3) |
+| 17 | `dateparser` locale cache warm-up is **input/locale-dependent but bounded**: clean numeric text → ≈15.7 MB RSS / 5.5 MB retained heap / `["en"]` only; realistic prose word-year token → ≈62 MB RSS / **23.4 MB retained heap** / **all 205 locales**. Both **plateau at +0.0 MB** over 2000 iters and cannot exceed the 205 bundled locales | **O** | §9.2 (real `parse_date`, default DMY, 2 runs × 2 cases, cache-state introspection) |
+| 18 | The warm-up lives largely in C-extension/locale structures (only 25.9 / 6.3 MB of it appears in `tm_peak`) | **I** | §9.2 (labeled inferred; observed = warm-up deltas, +0.0 plateau, retained heap 23.4 / 5.5 MB, 205 / 1 locales) |
 | 19 | Classifier `data_vectorizer` is an **instance field**; `load()` has **7** `pickle.load` calls | **S**+**O** | §9.3 → `classifier.py:63,70,78,86-92`; runtime introspection |
 | 20 | `train()` builds a **whole-corpus** CountVectorizer (unigram+bigram) | **S** | §9.3 → `classifier.py:194-199` |
 | 21 | Unicode manifest ≈ **2.2×** the ASCII manifest at equal doc count/size | **O** | §6 (uni5000 533.32 MB vs text5000 241.91 MB manifest) |
 | 22 | 1000→5000 content-driven growth is ≈ **5.01× (linear)** over the true baseline | **D** | §6 ((805.6−65.3)/(213.1−65.3)) |
-| 23 | Host interpreter (Py 3.13) **cannot** host the stack (`cgi` removed, PEP 594) | **O** | §2.2 (complete traceback) |
-| 24 | Full OCR consume is **infeasible** on this image (no `jbig2`, qpdf 10.1.0) | **S**+**O** | §2.5, §2.2 |
+| 23 | Host interpreter (Py 3.13) **cannot** host the stack (`cgi` removed, PEP 594) | **O** | §2.2 + §2.2.1 (verbatim traceback; CPython-3.13 collapse tokens expanded) |
+| 24 | Full OCR consume of a scanned PDF and a PNG **succeeds** on this image **without `jbig2`** (canonical `consume_file`), producing OCR content + archive + thumbnail; single-doc consume peak ≈219 MB RSS | **O** | §2.5 (F-04) |
+| 24a | The **only** infeasible consume path is Office/DOCX via Tika: disabled by default (`settings.py:592`) and requires an external Java-backed Tika server (Java absent) → `ParseError: Unable to start Tika server` | **S**+**O** | §2.5 (F-04) |
+| 24b | Consume **total process-tree** memory scales with in-flight concurrency up to the worker count: 1 PDF ≈1.02 GiB / 16 PIDs vs. 4 concurrent ≈1.48 GiB / 19 PIDs (+44.7% mean, 2 runs) | **O** | §5.1 (F-05) |
 
 ---
 
@@ -873,10 +1005,10 @@ Decomposing the original question into the six objectives and the user's named s
 | Objective / sub-question (from the prompt) | Answered in | One-line answer |
 |--------------------------------------------|-------------|-----------------|
 | **O1** — Root cause of the spike | §1, §3.1, §3.3, §4 | Whole-corpus manifest materialization in `document_exporter.dump()` / `document_importer.handle()`; peak = corpus_count × `Document.content`. |
-| **O2** — "unnecessary copies or holding references longer than needed" | §1, §3.2, §3.4, §4 | Yes — a transient ≈240.7 MB JSON-string/list duplicate at export peak, and `json.load` manifest co-resident with `loaddata` re-materialization at import (≈811 MB concurrent). `manifest_documents` is *not* an extra copy (§7-#7). |
-| **O3** — "caching behavior accumulating data unexpectedly" | §9 | No dedicated cache module; `dateparser` locale cache is a bounded one-time ≈15.5 MB warm-up (plateaus); classifier vectorizer is instance-scoped/train-time. None causes the import spike. |
+| **O2** — "unnecessary copies or holding references longer than needed" | §1, §3.2, §3.4, §4 | Yes — a transient ≈240.7 MB JSON-string/list duplicate at export peak, and `json.load` manifest co-resident with `loaddata` re-materialization at import (≈811 MB concurrent). `manifest_documents` is *not* an extra copy (claim #7, §3.4 — `manifest_documents_extra_delta` 0.0). |
+| **O3** — "caching behavior accumulating data unexpectedly" | §9 | No dedicated cache module; the `dateparser` locale cache is a **bounded, module-scoped one-time warm-up** whose size is input/locale-dependent (≈15.7 MB / `["en"]` for clean numeric dates vs. ≈62 MB RSS / 23.4 MB retained heap / all 205 locales for a realistic word-year token), but it **plateaus at +0.0 MB** and cannot exceed the 205 bundled locales; the classifier vectorizer is instance-scoped/train-time. None causes the import spike. |
 | **O4** — "what's different between spike and non-spike" | §5, §6, §3 | The single variable is aggregate `Document.content`: at equal doc count (5000) text-heavy vs metadata-only differs ≈9.5× (export) / ≈5.8× (import). Source/stage boundaries in §5. |
-| **O5** — "how behavior changes with document types / batch sizes" | §6 | Batch size (200/1000/5000) scales linearly (≈5.01×); document type (proxied by content size; ASCII vs Unicode 2.2×) scales with per-doc `content`, not file count. |
+| **O5** — "how behavior changes with document types / batch sizes" | §6, §5.1 | **Manifest (import/export) path:** batch size (200/1000/5000) scales linearly (≈5.01×); document type (proxied by content size; ASCII vs Unicode 2.2×) scales with per-doc `content`, not file count. **Consume path:** per-task footprint is document-bounded, but the Django-Q cluster's total process-tree memory scales with *concurrent* in-flight documents up to the 11-worker count (1→4 PDFs: +44.7%, §5.1, F-05). |
 | **O6** — runtime measurements, responsible methods, normal-GC-vs-problematic | §3 (before/during/after), §4, §7, §8 | Full tracemalloc+RSS series; named methods in §4; classified as **normal allocator retention, not a leak** (§8). |
 | "actual runtime memory measurements" | §3.1–§3.4, §7, §8, §9 | Complete `/usr/bin/time -v` + tracemalloc/RSS output for every condition, ≥2 runs. |
 | "which components/methods are responsible" | §4 | `dump()` L127-130 map/manifest; `handle()` L73/L87 manifest+loaddata; `Document.content`. |
@@ -884,6 +1016,128 @@ Decomposing the original question into the six objectives and the user's named s
 | "where the memory is actually going" | §3.2, §3.4, §4, §8.2 | Into the corpus-sized serialized string + parsed Python list (export) and manifest + `loaddata` structures (import), then held in reclaimable arenas until trim/exit. |
 
 Every named item in the prompt is addressed above; no sub-question is left unanswered.
+
+
+---
+
+## 12A. Out-of-scope observations & pre-existing conditions (noted for completeness; not remediated — read-only mandate)
+
+The investigation above answers the memory question in full. During the runtime work, four conditions surfaced that fall **outside the scope of this memory investigation**. Per the task's read-only mandate — no source or dependency file may be modified; the only repository change is this document (§2.1, §13.3) — they are **documented here for completeness rather than remediated**. Each is pre-existing in the canonical baseline and is **not** introduced by this documentation task; none of them is reachable through, or affects, the synthetic management-command measurement path used for the memory numbers above. Each maps to a QA finding and is grounded in `file:line` or complete observed output.
+
+### 12A.1 The importer is non-atomic across `loaddata` + file-copy: a missing thumbnail leaves partial state (data-integrity edge — F-14)
+
+`document_importer.handle()` runs a pre-flight `_check_manifest()` **before** any database write, but that check validates only the original document file and (conditionally) the archive file — it does **not** validate the thumbnail:
+
+```
+# src/documents/management/commands/document_importer.py:101-127  (_check_manifest)
+#   L108  if EXPORTER_FILE_NAME not in record:  raise CommandError(...)             # key present?
+#   L114  doc_file = record[EXPORTER_FILE_NAME]
+#   L115  if not os.path.exists(os.path.join(self.source, doc_file)): raise ...     # ORIGINAL validated
+#   L121  if EXPORTER_ARCHIVE_NAME in record:                                       # ARCHIVE validated (conditional)
+#   L122      archive_file = record[EXPORTER_ARCHIVE_NAME]
+#   L123      if not os.path.exists(os.path.join(self.source, archive_file)): raise ...
+#   (there is NO EXPORTER_THUMBNAIL_NAME existence check)
+```
+
+Because the thumbnail is never pre-validated, a manifest whose referenced thumbnail is missing passes `_check_manifest()`; `loaddata` then commits the rows (`document_importer.py:87`), and only afterward does the physical copy loop raise — the original is copied first (`:165`), then the thumbnail copy (`:166`) fails:
+
+```
+# src/documents/management/commands/document_importer.py
+#   :87   call_command("loaddata", manifest_path)          # rows COMMITTED here
+#   :89   self._import_files_from_manifest(...)             # called AFTER loaddata
+#   :165  shutil.copy2(document_path,  document.source_path)      # original copied OK
+#   :166  shutil.copy2(thumbnail_path, document.thumbnail_path)   # raises FileNotFoundError
+```
+
+There is no transaction wrapping `loaddata` + the file copies, so the committed rows are **not** rolled back on the copy failure. Reproduced end-to-end through the **real** management command (originals were destroyed in a prior control attempt, so a fresh 2-doc corpus is re-exported here; `mkscratch`/`scenv`/`populate.py` are the Appendix §13.2 helpers):
+
+```bash
+source lib.sh
+# 1. populate a 2-doc corpus and export it
+mkscratch /tmp/s_f14_src3 ; cd /app/src ; scenv /tmp/s_f14_src3
+python populate.py --scratch /tmp/s_f14_src3 --n 2 --content-bytes 1000
+mkdir -p /tmp/exp_f14c ; python manage.py document_exporter /tmp/exp_f14c --no-progress-bar
+# 2. remove ONLY the first thumbnail (manifest / original / archive left valid)
+rm -f "/tmp/exp_f14c/2026-07-14 doc-0.txt-thumbnail.png"
+# 3. import into a FRESH migrated DB via the REAL management command; read back state
+mkscratch /tmp/s_f14_dst3 ; scenv /tmp/s_f14_dst3
+python -c 'import django;django.setup();from documents.models import Document;print("docs_before=",Document.objects.count())'
+python manage.py document_importer /tmp/exp_f14c --no-progress-bar ; echo "IMPORTER_EXIT=$?"
+# read back rows + ORIGINALS/THUMBNAILS/ARCHIVE dir contents (settings.*_DIR)
+```
+
+Complete, unedited output (`/tmp/mem_probe/evidence/f14_partial_state.txt`):
+
+```
+docs_before=0
+----- python manage.py document_importer /tmp/exp_f14c --no-progress-bar -----
+Installed 3 object(s) from 1 fixture(s)
+Copy files into paperless...
+Traceback (most recent call last):
+  File "/app/src/manage.py", line 11, in <module>
+    execute_from_command_line(sys.argv)
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/__init__.py", line 446, in execute_from_command_line
+    utility.execute()
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/__init__.py", line 440, in execute
+    self.fetch_command(subcommand).run_from_argv(self.argv)
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/base.py", line 414, in run_from_argv
+    self.execute(*args, **cmd_options)
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/base.py", line 460, in execute
+    output = self.handle(*args, **options)
+  File "/app/src/documents/management/commands/document_importer.py", line 89, in handle
+    self._import_files_from_manifest(options["no_progress_bar"])
+  File "/app/src/documents/management/commands/document_importer.py", line 166, in _import_files_from_manifest
+    shutil.copy2(thumbnail_path, document.thumbnail_path)
+  File "/usr/local/lib/python3.9/shutil.py", line 444, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/usr/local/lib/python3.9/shutil.py", line 264, in copyfile
+    with open(src, 'rb') as fsrc:
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/exp_f14c/2026-07-14 doc-0.txt-thumbnail.png'
+IMPORTER_EXIT=1
+----- partial state after failure -----
+docs_after= 2
+ORIGINALS_DIR(1)= ['doc-0000000.txt']
+THUMBNAILS_DIR(0)= []
+ARCHIVE_DIR(0)= []
+```
+
+Observed: `loaddata` installs the fixture objects (`Installed 3 object(s)` for this minimal 2-document fixture); the thumbnail copy raises `FileNotFoundError` at `document_importer.py:166`; the importer exits 1; the two document rows **remain** (`docs_after= 2`), the first original **has** been copied (`ORIGINALS_DIR(1)= ['doc-0000000.txt']`), and thumbnails are absent (`THUMBNAILS_DIR(0)= []`). (Removing an *original* instead is caught cleanly by `_check_manifest` at `:115` with `CommandError: … does not appear to be in the source directory` before any `loaddata`, so it does **not** leave partial state — the thumbnail is the only referenced file with no pre-flight check.) This is a pre-existing data-integrity edge in `document_importer.py`, unrelated to the memory question and **not** modified here (read-only). A fix would validate all referenced files before `loaddata` or wrap the DB + file changes in explicit rollback/cleanup. *[QA finding F-14, INFO — pre-existing source behavior.]*
+
+### 12A.2 The pinned canonical baseline carries pre-existing security advisories (dependency posture — F-08)
+
+The canonical image pins the exact versions in `Pipfile.lock`; several carry published security advisories. A read-only cross-check against the OSV.dev API — issued from **inside** the canonical container, installing nothing and touching no manifest — returned the following per pinned version. Exact command and complete output (`/tmp/mem_probe/evidence/f08_f15_osv.txt`; the probe is a zero-install `urllib` POST to `https://api.osv.dev/v1/query`):
+
+```
+### exact command: python /tmp/osv_query.py (OSV.dev /v1/query per pinned version) ###
+django@4.0.4: 20 advisory(ies): GHSA-2hrw-hx67-34x6(BIT-django-2023-24580,CVE-2023-24580,PYSEC-2023-13); GHSA-6w2r-r2m5-xq5w(BIT-django-2025-57833,CVE-2025-57833,PYSEC-2025-105); GHSA-7xr5-9hcq-chf9(BIT-django-2025-48432,CVE-2025-48432,PYSEC-2025-47); GHSA-8x94-hmjh-97hq(BIT-django-2022-36359,CVE-2022-36359,PYSEC-2022-245); GHSA-frmv-pr5f-9mcr(BIT-django-2025-64459,CVE-2025-64459,PYSEC-2025-108); GHSA-jh3w-4vvf-mjgr(BIT-django-2023-36053,CVE-2023-36053,PYSEC-2023-100); GHSA-p64x-8rxx-wf6q(BIT-django-2022-34265,CVE-2022-34265,PYSEC-2022-213); GHSA-q2jf-h9jm-m7p4(BIT-django-2023-23969,CVE-2023-23969,PYSEC-2023-12); GHSA-qrw5-5h28-6cmg(BIT-django-2022-41323,CVE-2022-41323,PYSEC-2022-304); GHSA-qw25-v68c-qjf3(BIT-django-2025-64458,CVE-2025-64458,PYSEC-2025-107); GHSA-r3xc-prgr-mg9p(BIT-django-2023-31047,CVE-2023-31047,PYSEC-2023-61); GHSA-rrqc-c2jx-6jgv(BIT-django-2024-45231,CVE-2024-45231,PYSEC-2026-1297); PYSEC-2022-213(BIT-django-2022-34265,CVE-2022-34265,GHSA-p64x-8rxx-wf6q); PYSEC-2022-245(BIT-django-2022-36359,CVE-2022-36359,GHSA-8x94-hmjh-97hq); PYSEC-2022-304(BIT-django-2022-41323,CVE-2022-41323,GHSA-qrw5-5h28-6cmg); PYSEC-2023-100(BIT-django-2023-36053,CVE-2023-36053,GHSA-jh3w-4vvf-mjgr); PYSEC-2023-12(BIT-django-2023-23969,CVE-2023-23969,GHSA-q2jf-h9jm-m7p4); PYSEC-2023-13(BIT-django-2023-24580,CVE-2023-24580,GHSA-2hrw-hx67-34x6); PYSEC-2023-61(BIT-django-2023-31047,CVE-2023-31047,GHSA-r3xc-prgr-mg9p); PYSEC-2026-1297(BIT-django-2024-45231,CVE-2024-45231,GHSA-rrqc-c2jx-6jgv)
+scikit-learn@1.0.2: 2 advisory(ies): GHSA-jw8x-6495-233v(CVE-2024-5206,PYSEC-2024-110); PYSEC-2024-110(CVE-2024-5206,GHSA-jw8x-6495-233v)
+scipy@1.8.0: 1 advisory(ies): PYSEC-2023-102(CVE-2023-25399,GHSA-9jx5-6pgf-crrp)
+numpy@1.22.3: (no advisories)
+dateparser@1.1.1: (no advisories)
+django-q@1.3.9: (no advisories)
+pikepdf@5.1.1: (no advisories)
+ocrmypdf@13.4.3: (no advisories)
+redis@3.5.3: (no advisories)
+```
+
+OSV returns each advisory once per identifier namespace, so the GHSA and PYSEC rows are alias pairs of the same underlying CVE. **Deduplicating by CVE**, the 20 Django rows collapse to **12 unique Django CVEs** (each present as one GHSA + one PYSEC record) and the 2 scikit-learn rows collapse to **1 CVE (CVE-2024-5206)**; the single SciPy record is **withdrawn** (§12A.3). The active baseline count is therefore **12 Django + 1 scikit-learn = 13**; `numpy`, `dateparser`, `django-q`, `pikepdf`, `ocrmypdf`, and `redis` returned no advisories. These are **pre-existing in the pinned baseline and not introduced by this task**; they cannot be remediated here because the read-only mandate forbids any change to `Pipfile.lock` or the pins. They are also **not reachable through the memory-measurement path**, which drives the exporter/importer/parser/classifier/consume code via management commands and never serves the Django HTTP request surfaces to which most of these advisories apply. `Pipfile.lock` remains byte-identical to HEAD (§13.3 confirms `git` reports only the deliverable changed). Remediation would be a separate dependency-upgrade effort with regression testing — explicitly not this read-only documentation task. *[QA finding F-08, MAJOR — pre-existing baseline.]*
+
+### 12A.3 One reported SciPy advisory is withdrawn (audit-tooling caveat — F-15)
+
+A version-based scan of SciPy 1.8.0 surfaces `PYSEC-2023-102` / `CVE-2023-25399`, but the authoritative GitHub-Advisory record for it is **withdrawn**. Exact command and complete output (same evidence file; `urllib` GET to `https://api.osv.dev/v1/vulns/<id>`):
+
+```
+### exact command: python /tmp/osv_withdrawn.py (OSV.dev /v1/vulns/<id>) ###
+GHSA-9jx5-6pgf-crrp: withdrawn=2024-05-14T20:15:44Z | aliases=CVE-2023-25399,PYSEC-2023-102 | summary=Withdrawn: scipy memory leak vulnerability
+PYSEC-2023-102: withdrawn=(none) | aliases=CVE-2023-25399,GHSA-9jx5-6pgf-crrp | summary=
+CVE-2023-25399: withdrawn=(none) | aliases=GHSA-9jx5-6pgf-crrp,PYSEC-2023-102 | summary=
+```
+
+`GHSA-9jx5-6pgf-crrp` carries `withdrawn=2024-05-14T20:15:44Z` and the summary "Withdrawn: scipy memory leak vulnerability", whereas its `PYSEC-2023-102` / `CVE-2023-25399` alias records carry no `withdrawn` field — which is exactly why a version-only scan still reports it. It is therefore **excluded from the active advisory count in §12A.2** and should be annotated as withdrawn rather than treated as active. (Of note for this investigation specifically: the withdrawn record was itself a *scipy memory-leak* report; it is withdrawn and does not apply to the pinned SciPy, so it is not evidence of any memory issue in this codebase.) *[QA finding F-15, INFO — audit-tooling discrepancy.]*
+
+### 12A.4 Prior standalone QA reports were not available as artifacts (process note — F-01)
+
+This deliverable's content — the memory root-cause analysis (§1), runtime measurements (§3), component attribution (§4), sensitivity analysis (§5–§6), stability/inconsistency (§7), and the normal-GC-vs-leak classification (§8) — is complete and self-contained against the six objectives (§12). Separately, earlier per-checkpoint QA reports were not persisted as standalone, independently retrievable artifacts, so completeness against any *unrecorded* earlier finding cannot be proven from this document alone. This is a QA-process / artifact-persistence matter — checkpoint reports should be stored as immutable artifacts with their IDs supplied to final acceptance — **not a defect in this document's content**, and it cannot be addressed by editing this Markdown deliverable. It is recorded here only so the limitation is explicit. *[QA finding F-01, MAJOR — process/evidence.]*
 
 
 ---
@@ -896,6 +1150,7 @@ Everything here is copy-pasteable. The investigation used the unique container n
 
 ```bash
 set -euo pipefail
+umask 077   # F-12: temporary scripts, evidence files, and scratch dirs are created private (0700/0600)
 
 # 1. Canonical image (already pulled; do NOT rebuild)
 IMG="ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01"
@@ -934,8 +1189,16 @@ for s in populate.py export_probe.py import_probe.py parse_date_probe.py stabili
   docker cp "/tmp/mem_probe/scripts/$s" "$CNAME:/tmp/scripts/$s"
 done
 
-# 9. (After runs) copy an evidence file OUT — explicit source and destination, no wildcards:
+# 9. (After runs) copy an evidence file OUT — explicit source and destination, no wildcards.
+#    The source /tmp/evidence/export_text5000.txt is written by the per-scenario run block
+#    below (the `... | tee /tmp/evidence/export_text5000.txt` step). The host destination
+#    parent directory must exist before `docker cp`, so create it first, then verify the
+#    copy is byte-identical to the in-container file via a sha256 checksum.
+mkdir -p /tmp/mem_probe/evidence_container
 docker cp "$CNAME:/tmp/evidence/export_text5000.txt" "/tmp/mem_probe/evidence_container/export_text5000.txt"
+IN_SUM="$(docker exec "$CNAME" sha256sum /tmp/evidence/export_text5000.txt | awk '{print $1}')"
+OUT_SUM="$(sha256sum /tmp/mem_probe/evidence_container/export_text5000.txt | awk '{print $1}')"
+[ "$IN_SUM" = "$OUT_SUM" ] && echo "copy verified: $OUT_SUM" || { echo "CHECKSUM MISMATCH"; exit 1; }
 ```
 
 Per-scenario run pattern (example: text5000). `lib.sh` provides `mkscratch` (a fresh migrated instance) and `scenv` (exports the scratch env). Every scenario populates in its own process, exports in a fresh process, and imports into a **separate empty** DB:
@@ -953,8 +1216,11 @@ docker exec "$CNAME" bash -lc '
   #  CommandError("That path doesn't exist")); the command never creates it.
   # Create the export target first, then run the exporter into it:
   cd /app/src && scenv /tmp/s_text5000
-  mkdir -p /tmp/exp_text5000_run1
-  /usr/bin/time -v python manage.py document_exporter /tmp/exp_text5000_run1 --no-progress-bar
+  mkdir -p /tmp/exp_text5000_run1 /tmp/evidence
+  # Capture the full export transcript (stdout + the /usr/bin/time -v report on stderr)
+  # to the evidence file that step 9 of §13.1 copies out. `tee` preserves the on-screen
+  # output while writing the file; `set -o pipefail` keeps a non-zero exporter exit fatal.
+  /usr/bin/time -v python manage.py document_exporter /tmp/exp_text5000_run1 --no-progress-bar 2>&1 | tee /tmp/evidence/export_text5000.txt
   # IMPORT into a SEPARATE fresh empty DB, canonical entry point
   mkscratch /tmp/imp_text5000_run1 && scenv /tmp/imp_text5000_run1
   /usr/bin/time -v python manage.py document_importer /tmp/exp_text5000_run1 --no-progress-bar
@@ -963,7 +1229,7 @@ docker exec "$CNAME" bash -lc '
 
 ### 13.2 Probe script sources (verbatim, unedited)
 
-All probes **force** a unique scratch env (assignment, never `setdefault`), **assert** the resolved DB/MEDIA/ORIGINALS paths are under that `/tmp` scratch root before touching a row (finding 14), **refuse** to run against a non-empty DB where relevant, and carry **falsifiable assertions** on row/manifest counts (finding 18).
+All probes **force** a unique scratch env (assignment, never `setdefault`); **resolve** the scratch root with `os.path.realpath` and abort unless it lives strictly under `/tmp/`, so a symlinked path component cannot redirect a destructive operation outside `/tmp` (F-07); set `umask 077` so every scratch dir/file they create is private (0700/0600, F-12); **validate** numeric arguments (`--n`/`--content-bytes` ≥ 0, `--repeat`/`--iters` ≥ 1) with a concise nonzero-exit error, treating each argument value literally (F-13); **assert** the resolved DB/MEDIA/ORIGINALS paths are under that `/tmp` scratch root before touching a row (finding 14); **refuse** to run against a non-empty DB where relevant; and carry **falsifiable assertions** on row/manifest counts (finding 18). The companion `lib.sh` `mkscratch`/`scenv` and the F-05 `concurrency_probe.sh` apply the same `readlink -f` realpath guard (rejecting anything not strictly under `/tmp/`) before any `rm -rf`, and set `umask 077`.
 
 **`populate.py`**
 
@@ -989,8 +1255,13 @@ import sys
 
 
 def force_scratch_env(scratch_root):
-    if not scratch_root or not scratch_root.startswith("/tmp/"):
-        sys.exit("SAFETY ABORT: scratch root must be an explicit path under /tmp/, got: %r" % scratch_root)
+    # F-07: resolve symlinks/'..' so a crafted argument cannot escape /tmp via a symlinked
+    # path component; require the RESOLVED path to live strictly under /tmp/.
+    # F-12: umask 077 so scratch dirs/files created afterwards are private (0700/0600).
+    scratch_root = os.path.realpath(scratch_root) if scratch_root else ""
+    if not scratch_root.startswith("/tmp/"):
+        sys.exit("SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: %r" % scratch_root)
+    os.umask(0o077)
     os.environ["PAPERLESS_DATA_DIR"] = scratch_root + "/data"
     os.environ["PAPERLESS_MEDIA_ROOT"] = scratch_root + "/media"
     os.environ["PAPERLESS_STATICDIR"] = scratch_root + "/static"
@@ -1021,6 +1292,12 @@ def main():
     ap.add_argument("--unicode", action="store_true",
                     help="fill content with a multi-byte Unicode pattern instead of ASCII 'x'")
     args = ap.parse_args()
+
+    # F-13: validate numeric inputs with a concise nonzero-exit error.
+    if args.n < 0:
+        sys.exit("ABORT: --n must be >= 0, got %d" % args.n)
+    if args.content_bytes < 0:
+        sys.exit("ABORT: --content-bytes must be >= 0, got %d" % args.content_bytes)
 
     force_scratch_env(args.scratch)
     import django
@@ -1124,8 +1401,13 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
 def force_scratch_env(scratch_root):
-    if not scratch_root or not scratch_root.startswith("/tmp/"):
-        sys.exit("SAFETY ABORT: scratch root must be under /tmp/, got: %r" % scratch_root)
+    # F-07: resolve symlinks/'..' so a crafted argument cannot escape /tmp via a symlinked
+    # path component; require the RESOLVED path to live strictly under /tmp/.
+    # F-12: umask 077 so scratch dirs/files created afterwards are private (0700/0600).
+    scratch_root = os.path.realpath(scratch_root) if scratch_root else ""
+    if not scratch_root.startswith("/tmp/"):
+        sys.exit("SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: %r" % scratch_root)
+    os.umask(0o077)
     os.environ["PAPERLESS_DATA_DIR"] = scratch_root + "/data"
     os.environ["PAPERLESS_MEDIA_ROOT"] = scratch_root + "/media"
     os.environ["PAPERLESS_STATICDIR"] = scratch_root + "/static"
@@ -1222,6 +1504,12 @@ def main():
                     help="in-process repeats (demonstrates arena retention/reuse across iterations)")
     args = ap.parse_args()
 
+    # F-13: validate numeric inputs with a concise nonzero-exit error.
+    if args.n < 0:
+        sys.exit("ABORT: --n must be >= 0, got %d" % args.n)
+    if args.repeat < 1:
+        sys.exit("ABORT: --repeat must be >= 1, got %d" % args.repeat)
+
     force_scratch_env(args.scratch)
     import django
     django.setup()
@@ -1294,8 +1582,13 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
 def force_scratch_env(scratch_root):
-    if not scratch_root or not scratch_root.startswith("/tmp/"):
-        sys.exit("SAFETY ABORT: scratch root must be under /tmp/, got: %r" % scratch_root)
+    # F-07: resolve symlinks/'..' so a crafted argument cannot escape /tmp via a symlinked
+    # path component; require the RESOLVED path to live strictly under /tmp/.
+    # F-12: umask 077 so scratch dirs/files created afterwards are private (0700/0600).
+    scratch_root = os.path.realpath(scratch_root) if scratch_root else ""
+    if not scratch_root.startswith("/tmp/"):
+        sys.exit("SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: %r" % scratch_root)
+    os.umask(0o077)
     os.environ["PAPERLESS_DATA_DIR"] = scratch_root + "/data"
     os.environ["PAPERLESS_MEDIA_ROOT"] = scratch_root + "/media"
     os.environ["PAPERLESS_STATICDIR"] = scratch_root + "/static"
@@ -1457,17 +1750,23 @@ if __name__ == "__main__":
 """
 parse_date_probe.py - exercises the REAL repository function
 documents.parsers.parse_date(filename, text) (src/documents/parsers.py:212), NOT a direct
-dateparser.parse() call. Each invocation runs several dateparser.parse() calls internally
-because the crafted text contains multiple FUTURE dates that parse successfully but fail the
-inner __filter (date <= timezone.now(); parsers.py:234-242), forcing the finditer loop to
-continue, followed by one valid PAST date that returns (parsers.py:261-273).
+dateparser.parse() call. Each invocation runs one or more dateparser.parse() calls internally
+via the DATE_REGEX finditer loop (parsers.py:261-272) with the inner __filter that rejects
+future dates (date <= timezone.now(); parsers.py:233-241).
 
-GOAL (review finding 9): show the dateparser module-scoped locale cache warm-up on the first
-call and the PLATEAU afterwards (matching the reviewer's observation), inspect cache state,
-and repeat >=2 times via fresh processes (shell) plus an in-process second pass.
+GOAL (review finding 9 / F-06): show that the dateparser module-scoped locale cache warm-up
+is INPUT- and LOCALE-dependent. Two canonical cases under the DEFAULT PAPERLESS_DATE_ORDER=DMY
+(settings.py:574):
+  (A) realistic prose text whose DATE_REGEX match is a WORD+YEAR token that is not an English
+      date keyword -> dateparser consults ALL bundled language locales -> large warm-up.
+  (B) clean numeric DD/MM/YYYY text that parses as English -> only the 'en' locale loads ->
+      small warm-up.
+In BOTH cases the accumulation is BOUNDED (plateaus over N iterations; cannot exceed the
+number of bundled locales) and module-scoped (held for the worker lifetime).
 
-SAFETY (finding 14): forced scratch env + assertions. FALSIFIABILITY (finding 18): asserts
-parse_date returns the expected 2018-06-15 date on every call.
+SAFETY (finding 14 / F-07): forced scratch env + assertions.
+FALSIFIABILITY (finding 18 / F-13): asserts run-to-run determinism (same input -> same result
+on the warm-up call and across the whole iteration loop).
 """
 import argparse
 import gc
@@ -1480,8 +1779,13 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
 def force_scratch_env(scratch_root):
-    if not scratch_root or not scratch_root.startswith("/tmp/"):
-        sys.exit("SAFETY ABORT: scratch root must be under /tmp/, got: %r" % scratch_root)
+    # F-07: resolve symlinks/'..' so a crafted argument cannot escape /tmp via a symlinked
+    # path component; require the RESOLVED path to live strictly under /tmp/.
+    # F-12: umask 077 so scratch dirs/files created afterwards are private (0700/0600).
+    scratch_root = os.path.realpath(scratch_root) if scratch_root else ""
+    if not scratch_root.startswith("/tmp/"):
+        sys.exit("SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: %r" % scratch_root)
+    os.umask(0o077)
     os.environ["PAPERLESS_DATA_DIR"] = scratch_root + "/data"
     os.environ["PAPERLESS_MEDIA_ROOT"] = scratch_root + "/media"
     os.environ["PAPERLESS_STATICDIR"] = scratch_root + "/static"
@@ -1512,8 +1816,8 @@ def dateparser_cache_state():
         m[len(prefix):] for m in sys.modules
         if m.startswith(prefix) and "." not in m[len(prefix):]
     )
-    state["locale_translation_data_loaded"] = langs
-    state["locale_translation_data_count"] = len(langs)
+    state["locale_translation_data_loaded_count"] = len(langs)
+    state["locale_translation_data_sample"] = langs[:8]
     return state
 
 
@@ -1522,18 +1826,28 @@ def main():
     ap.add_argument("--scratch", required=True)
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--label", default="parsedate")
+    ap.add_argument("--text", default=None,
+                    help="text to parse; default = clean DD/MM/YYYY case (B)")
+    ap.add_argument("--date-order", default="DMY",
+                    help="PAPERLESS_DATE_ORDER; canonical default is DMY (settings.py:574)")
     args = ap.parse_args()
 
+    if args.iters < 1:
+        sys.exit("ABORT: --iters must be >= 1, got %d" % args.iters)
+
+    os.environ["PAPERLESS_DATE_ORDER"] = args.date_order
     force_scratch_env(args.scratch)
     import django
     django.setup()
 
     from documents.parsers import parse_date
 
-    filename = "doc.txt"  # FILENAME_DATE_ORDER is empty by default -> filename loop skipped
-    # Multiple FUTURE dates (fail __filter, force iteration) then one valid PAST date.
-    text = ("Report dated 01/02/2090 revised 03/04/2091 and 05/06/2092 "
-            "superseded 07/08/2093 final valid 15/06/2018 end of file.")
+    filename = "doc.txt"  # FILENAME_DATE_ORDER empty by default -> filename loop skipped
+    # Case (B) default: multiple FUTURE dates (fail __filter, force iteration) then one valid
+    # PAST date that returns. Case (A) is supplied via --text.
+    default_text = ("Report dated 01/02/2090 revised 03/04/2091 and 05/06/2092 "
+                    "superseded 07/08/2093 final valid 15/06/2018 end of file.")
+    text = args.text if args.text is not None else default_text
 
     gc.collect()
     base = rss_mb()
@@ -1543,11 +1857,13 @@ def main():
     after_first = rss_mb()
     cache_after_first = dateparser_cache_state()
 
-    ok = 0
+    returned = 0
+    last = "UNSET"
     for _ in range(args.iters):
         d = parse_date(filename, text)
-        if d is not None and d.year == 2018 and d.month == 6 and d.day == 15:
-            ok += 1
+        last = d
+        if d is not None:
+            returned += 1
     after_many = rss_mb()
     cur, peak = tracemalloc.get_traced_memory()
     cache_after_many = dateparser_cache_state()
@@ -1557,16 +1873,23 @@ def main():
     cur_after_gc, _ = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    # FALSIFIABLE assertions: the real function actually parsed the expected date every time.
-    assert d0 is not None and d0.year == 2018 and d0.month == 6 and d0.day == 15, \
-        "warm-up parse_date returned unexpected: %r" % (d0,)
-    assert ok == args.iters, "only %d/%d parse_date calls returned 2018-06-15" % (ok, args.iters)
+    # FALSIFIABLE determinism: same input -> identical result on warm-up and across the loop.
+    assert (d0 is None) == (last is None), \
+        "nondeterministic presence: warm-up %r vs loop %r" % (d0, last)
+    if d0 is not None:
+        assert d0 == last, "nondeterministic date: warm-up %r vs loop %r" % (d0, last)
+        assert returned == args.iters, \
+            "expected %d dates, got %d" % (args.iters, returned)
+    else:
+        assert returned == 0, "expected 0 dates, got %d" % returned
 
     print(json.dumps({
         "label": args.label,
+        "date_order": args.date_order,
+        "text": text,
         "iters": args.iters,
-        "parse_ok": ok,
-        "parsed_date": d0.isoformat(),
+        "calls_returning_a_date": returned,
+        "parsed_date": d0.isoformat() if d0 is not None else None,
         "base_rss": round(base, 1),
         "after_first_parse_rss": round(after_first, 1),
         "after_all_parses_rss": round(after_many, 1),
@@ -1622,8 +1945,13 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
 def force_scratch_env(scratch_root):
-    if not scratch_root or not scratch_root.startswith("/tmp/"):
-        sys.exit("SAFETY ABORT: scratch root must be under /tmp/, got: %r" % scratch_root)
+    # F-07: resolve symlinks/'..' so a crafted argument cannot escape /tmp via a symlinked
+    # path component; require the RESOLVED path to live strictly under /tmp/.
+    # F-12: umask 077 so scratch dirs/files created afterwards are private (0700/0600).
+    scratch_root = os.path.realpath(scratch_root) if scratch_root else ""
+    if not scratch_root.startswith("/tmp/"):
+        sys.exit("SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: %r" % scratch_root)
+    os.umask(0o077)
     os.environ["PAPERLESS_DATA_DIR"] = scratch_root + "/data"
     os.environ["PAPERLESS_MEDIA_ROOT"] = scratch_root + "/media"
     os.environ["PAPERLESS_STATICDIR"] = scratch_root + "/static"
@@ -1652,6 +1980,12 @@ def main():
     ap.add_argument("--repeat", type=int, default=6)
     ap.add_argument("--label", default="stab")
     args = ap.parse_args()
+
+    # F-13: validate numeric inputs with a concise nonzero-exit error.
+    if args.n < 0:
+        sys.exit("ABORT: --n must be >= 0, got %d" % args.n)
+    if args.repeat < 1:
+        sys.exit("ABORT: --repeat must be >= 1, got %d" % args.repeat)
 
     force_scratch_env(args.scratch)
     import django
@@ -1711,7 +2045,11 @@ and (b) full OS reclaim when the process EXITS (next fresh process starts at bas
 Exercises the real documents.models.Document + serializers (export mechanism, dump() L127-130)."""
 import os, sys, json, gc, argparse
 def _force_scratch_env(scratch):
-    assert scratch.startswith("/tmp/"), f"SAFETY ABORT: scratch {scratch!r} not under /tmp/"
+    # F-07: resolve symlinks/'..'; require the resolved path strictly under /tmp/. F-12: umask 077.
+    scratch = os.path.realpath(scratch) if scratch else ""
+    if not scratch.startswith("/tmp/"):
+        sys.exit(f"SAFETY ABORT: scratch {scratch!r} must resolve strictly under /tmp/")
+    os.umask(0o077)
     os.environ["PAPERLESS_DATA_DIR"] = f"{scratch}/data"
     os.environ["PAPERLESS_MEDIA_ROOT"] = f"{scratch}/media"
     os.environ["PAPERLESS_STATICDIR"] = f"{scratch}/static"
@@ -1770,8 +2108,10 @@ import sys
 
 PAGE = os.sysconf("SC_PAGE_SIZE")
 scratch = sys.argv[1] if len(sys.argv) > 1 else None
-if not scratch or not scratch.startswith("/tmp/"):
-    sys.exit("usage: modules_check.py <scratch-root-under-/tmp>")
+# F-07: resolve symlinks/'..'; require the resolved path strictly under /tmp/.
+scratch = os.path.realpath(scratch) if scratch else ""
+if not scratch.startswith("/tmp/"):
+    sys.exit("usage: modules_check.py <scratch-root-strictly-under-/tmp>")
 os.environ["PAPERLESS_DATA_DIR"] = scratch + "/data"
 os.environ["PAPERLESS_MEDIA_ROOT"] = scratch + "/media"
 os.environ["PAPERLESS_STATICDIR"] = scratch + "/static"
@@ -1811,16 +2151,459 @@ print(json.dumps({
 ```bash
 # Helper: create a fresh, migrated scratch instance directory
 mkscratch() {
-  local S="$1"
-  rm -rf "$S"
-  mkdir -p "$S"/data "$S"/media/documents/originals "$S"/media/documents/archive "$S"/media/documents/thumbnails "$S"/static "$S"/consume "$S"/data/index "$S"/data/log
-  ( cd /app/src && PAPERLESS_DATA_DIR="$S/data" PAPERLESS_MEDIA_ROOT="$S/media" PAPERLESS_STATICDIR="$S/static" PAPERLESS_CONSUMPTION_DIR="$S/consume" python manage.py migrate --no-input >/dev/null 2>&1 )
+  umask 077                        # F-12: scratch dirs/files created private (0700/0600)
+  local S R
+  S="$1"
+  # F-07: resolve symlinks/'..' and refuse to `rm -rf` anything not strictly under /tmp/.
+  R="$(readlink -f -- "$S" 2>/dev/null || true)"
+  case "$R" in
+    /tmp/?*) : ;;
+    *) echo "SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: '$S' (resolved: '$R')" >&2; return 1 ;;
+  esac
+  rm -rf -- "$R"
+  mkdir -p "$R"/data "$R"/media/documents/originals "$R"/media/documents/archive "$R"/media/documents/thumbnails "$R"/static "$R"/consume "$R"/data/index "$R"/data/log
+  ( cd /app/src && PAPERLESS_DATA_DIR="$R/data" PAPERLESS_MEDIA_ROOT="$R/media" PAPERLESS_STATICDIR="$R/static" PAPERLESS_CONSUMPTION_DIR="$R/consume" python manage.py migrate --no-input >/dev/null 2>&1 )
 }
 # Helper: export env for a scratch instance
 scenv() {
-  local S="$1"
-  export PAPERLESS_DATA_DIR="$S/data" PAPERLESS_MEDIA_ROOT="$S/media" PAPERLESS_STATICDIR="$S/static" PAPERLESS_CONSUMPTION_DIR="$S/consume"
+  local S R
+  S="$1"
+  # F-07: resolve symlinks/'..'; refuse to point Django at anything not strictly under /tmp/.
+  R="$(readlink -f -- "$S" 2>/dev/null || true)"
+  case "$R" in
+    /tmp/?*) : ;;
+    *) echo "SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: '$S' (resolved: '$R')" >&2; return 1 ;;
+  esac
+  export PAPERLESS_DATA_DIR="$R/data" PAPERLESS_MEDIA_ROOT="$R/media" PAPERLESS_STATICDIR="$R/static" PAPERLESS_CONSUMPTION_DIR="$R/consume"
 }
+```
+
+#### F-04 / F-05 consume-path probes (OCR feasibility and concurrency)
+
+**`make_scanned_inputs.py`** — F-04: builds a synthetic image-only scanned PDF + a PNG (text rendered with PIL) that REQUIRE OCR.
+
+```python
+#!/usr/bin/env python3
+"""Create synthetic 'scanned' inputs that REQUIRE OCR (image-only, no text layer):
+   - a PNG with rendered text
+   - an image-only PDF built from that PNG (img2pdf; no embedded text)
+The rendered text is a known sentence so we can assert OCR extracted it.
+"""
+import sys
+from PIL import Image, ImageDraw, ImageFont
+
+OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/ocr_inputs"
+SENTENCE = "PAPERLESS OCR MEMORY PROBE ALPHA BRAVO CHARLIE 2018"
+
+def find_font(size):
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+def make_png(path):
+    W, H = 1240, 1754  # ~A4 at 150 dpi
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    font = find_font(48)
+    small = find_font(34)
+    y = 120
+    d.text((90, y), SENTENCE, fill="black", font=font); y += 120
+    for i in range(1, 9):
+        d.text((90, y), "Line %d: the quick brown fox jumps over the lazy dog." % i,
+                fill="black", font=small); y += 70
+    img.save(path, "PNG", dpi=(150, 150))
+    return path
+
+def make_pdf(png_path, pdf_path):
+    import img2pdf
+    with open(pdf_path, "wb") as f:
+        f.write(img2pdf.convert(png_path))
+    return pdf_path
+
+if __name__ == "__main__":
+    import os
+    os.makedirs(OUT, exist_ok=True)
+    png = make_png(os.path.join(OUT, "scanned_probe.png"))
+    pdf = make_pdf(png, os.path.join(OUT, "scanned_probe.pdf"))
+    print("SENTENCE:", SENTENCE)
+    print("PNG:", png, os.path.getsize(png), "bytes")
+    print("PDF:", pdf, os.path.getsize(pdf), "bytes")
+```
+
+**`consume_probe.py`** — F-04: exercises the canonical consume task documents.tasks.consume_file on one file and reports the created Document (content/archive/thumbnail) + peak RSS.
+
+```python
+#!/usr/bin/env python3
+"""
+consume_probe.py - exercises the REAL canonical consume task
+documents.tasks.consume_file(path) (src/documents/tasks.py:184 -> Consumer().try_consume_file
+at tasks.py:236), the exact function a Django-Q worker runs for each queued document.
+
+GOAL (F-04): demonstrate that full OCR consume of a scanned (image-only) PDF and of a PNG
+SUCCEEDS on the canonical image WITHOUT the jbig2 binary (absent) — producing a Document with
+OCR-extracted content, an archive PDF, and a thumbnail. Reports peak RSS/tracemalloc so the
+per-document consume footprint is visible.
+
+SAFETY: forced scratch env under /tmp/; measured file copied into a scratch consumption dir.
+FALSIFIABILITY: asserts a Document row was created and that OCR content is non-empty.
+"""
+import argparse
+import gc
+import json
+import os
+import shutil
+import sys
+import tracemalloc
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+
+def force_scratch_env(scratch_root):
+    # F-07: resolve symlinks/'..' so a crafted argument cannot escape /tmp via a symlinked
+    # path component; require the RESOLVED path to live strictly under /tmp/.
+    # F-12: umask 077 so scratch dirs/files created afterwards are private (0700/0600).
+    scratch_root = os.path.realpath(scratch_root) if scratch_root else ""
+    if not scratch_root.startswith("/tmp/"):
+        sys.exit("SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: %r" % scratch_root)
+    os.umask(0o077)
+    os.environ["PAPERLESS_DATA_DIR"] = scratch_root + "/data"
+    os.environ["PAPERLESS_MEDIA_ROOT"] = scratch_root + "/media"
+    os.environ["PAPERLESS_STATICDIR"] = scratch_root + "/static"
+    os.environ["PAPERLESS_CONSUMPTION_DIR"] = scratch_root + "/consume"
+    os.environ["DJANGO_SETTINGS_MODULE"] = "paperless.settings"
+    sys.path.insert(0, "/app/src")
+
+
+def rss_mb():
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * PAGE / (1024 * 1024)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scratch", required=True)
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--label", default="consume")
+    args = ap.parse_args()
+
+    force_scratch_env(args.scratch)
+    import django
+    django.setup()
+
+    from documents.tasks import consume_file
+    from documents.models import Document
+
+    consume_dir = os.environ["PAPERLESS_CONSUMPTION_DIR"]
+    os.makedirs(consume_dir, exist_ok=True)
+    staged = os.path.join(consume_dir, os.path.basename(args.file))
+    shutil.copy2(args.file, staged)
+
+    n_before = Document.objects.count()
+    gc.collect()
+    base = rss_mb()
+    tracemalloc.start()
+
+    result_msg = consume_file(staged)            # canonical task function (synchronous)
+
+    peak_rss = rss_mb()
+    cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    n_after = Document.objects.count()
+    doc = Document.objects.order_by("-pk").first()
+    content = (doc.content or "") if doc else ""
+    has_archive = bool(doc and doc.has_archive_version)
+    thumb_path = doc.thumbnail_path if doc else None
+    thumb_exists = bool(thumb_path and os.path.exists(thumb_path))
+    orig_path = doc.source_path if doc else None
+    orig_exists = bool(orig_path and os.path.exists(orig_path))
+
+    # FALSIFIABLE: a document was created and OCR produced non-empty content.
+    assert n_after == n_before + 1, "expected 1 new Document, got %d" % (n_after - n_before)
+    assert len(content.strip()) > 0, "OCR content is empty"
+
+    print(json.dumps({
+        "label": args.label,
+        "input_file": args.file,
+        "input_bytes": os.path.getsize(args.file),
+        "consume_result_msg": result_msg,
+        "documents_before": n_before,
+        "documents_after": n_after,
+        "doc_pk": doc.pk if doc else None,
+        "doc_mime_type": doc.mime_type if doc else None,
+        "content_len": len(content),
+        "content_snippet": content.strip()[:120],
+        "content_has_MEMORY": "MEMORY" in content.upper(),
+        "content_has_PROBE": "PROBE" in content.upper(),
+        "has_archive_version": has_archive,
+        "archive_exists_on_disk": bool(doc and doc.archive_path and os.path.exists(doc.archive_path)) if doc else False,
+        "original_exists_on_disk": orig_exists,
+        "thumbnail_exists_on_disk": thumb_exists,
+        "checksum": doc.checksum if doc else None,
+        "base_rss_mb": round(base, 1),
+        "peak_rss_mb": round(peak_rss, 1),
+        "consume_rss_delta_mb": round(peak_rss - base, 1),
+        "tm_peak_mb": round(peak / 1048576, 1),
+    }))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**`tika_docx_probe.py`** — F-04: demonstrates the true Office/DOCX limitation — the real TikaDocumentParser.parse() cannot start a Java-backed Tika server.
+
+```python
+#!/usr/bin/env python3
+"""
+tika_docx_probe.py - demonstrates the TRUE bounded limitation for Office/DOCX consume (F-04):
+Tika is DISABLED by default (.docx unsupported); when ENABLED, .docx routes to the real
+TikaDocumentParser (paperless_tika/parsers.py), whose parse() calls
+tika.parser.from_file(path, PAPERLESS_TIKA_ENDPOINT) (parsers.py:55) against an EXTERNAL
+Tika/Gotenberg server backed by Java. Java is absent from the image, so the call fails and
+parse() raises ParseError. Exercised through the REAL parser class.
+"""
+import os
+import sys
+import zipfile
+
+sys.path.insert(0, "/app/src")
+os.environ["DJANGO_SETTINGS_MODULE"] = "paperless.settings"
+os.environ["PAPERLESS_DATA_DIR"] = "/tmp/s_ocr/data"
+os.environ["PAPERLESS_MEDIA_ROOT"] = "/tmp/s_ocr/media"
+os.environ["PAPERLESS_STATICDIR"] = "/tmp/s_ocr/static"
+os.environ["PAPERLESS_CONSUMPTION_DIR"] = "/tmp/s_ocr/consume"
+
+
+def make_min_docx(path):
+    ct = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+          '</Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+            '</Relationships>')
+    doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+           '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           '<w:body><w:p><w:r><w:t>Tika probe office document CHARLIE 2018</w:t></w:r></w:p></w:body>'
+           '</w:document>')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ct)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", doc)
+    return path
+
+
+def main():
+    docx = make_min_docx("/tmp/ocr_inputs/office_probe.docx")
+    os.environ["PAPERLESS_TIKA_ENABLED"] = "1"
+    import django
+    django.setup()
+    from django.conf import settings
+    from paperless_tika.parsers import TikaDocumentParser
+    from documents.parsers import ParseError
+
+    print("PAPERLESS_TIKA_ENABLED:", settings.PAPERLESS_TIKA_ENABLED)
+    print("PAPERLESS_TIKA_ENDPOINT:", settings.PAPERLESS_TIKA_ENDPOINT)
+    print("docx bytes:", os.path.getsize(docx))
+    p = TikaDocumentParser(logging_group=None)
+    try:
+        p.parse(docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        print("UNEXPECTED: parse() returned without error; text=%r" % (p.get_text(),))
+    except ParseError as e:
+        print("ParseError (expected):", str(e))
+    finally:
+        try:
+            p.cleanup()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**`make_n_pdfs.py`** — F-05: builds N DISTINCT scanned PDFs (distinct checksums) for the concurrency test.
+
+```python
+#!/usr/bin/env python3
+"""Create N DISTINCT synthetic scanned (image-only) PDFs (distinct content -> distinct
+checksums, so none are rejected as duplicates during concurrent consume)."""
+import os, sys
+from PIL import Image, ImageDraw, ImageFont
+import img2pdf
+
+OUT = sys.argv[1]; N = int(sys.argv[2])
+os.makedirs(OUT, exist_ok=True)
+
+def font(sz):
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try: return ImageFont.truetype(p, sz)
+        except OSError: pass
+    return ImageFont.load_default()
+
+for i in range(N):
+    W,H=1240,1754
+    img=Image.new("RGB",(W,H),"white"); d=ImageDraw.Draw(img)
+    big=font(48); small=font(34); y=120
+    d.text((90,y),"PAPERLESS OCR CONCURRENCY DOC %03d TOKEN%03d 2018"%(i,i),fill="black",font=big); y+=120
+    for j in range(1,9):
+        d.text((90,y),"Doc %d line %d: the quick brown fox jumps over the lazy dog."%(i,j),fill="black",font=small); y+=70
+    png=os.path.join(OUT,"conc_%03d.png"%i)
+    img.save(png,"PNG",dpi=(150,150))
+    with open(os.path.join(OUT,"conc_%03d.pdf"%i),"wb") as f:
+        f.write(img2pdf.convert(png))
+    os.remove(png)
+print("created %d distinct pdfs in %s"%(N,OUT))
+```
+
+**`tree_sampler.py`** — F-05: samples the full process tree rooted at a PID — peak summed-RSS (KiB) and peak PID count — until a sentinel appears.
+
+```python
+#!/usr/bin/env python3
+"""Sample the FULL process tree rooted at a given PID: peak summed-RSS (KiB) and peak PID
+count, until a sentinel file appears. Used to measure the Django-Q cluster's total footprint
+(master + 11 workers + transient native OCR subprocesses) during concurrent consume."""
+import os, sys, time
+root=int(sys.argv[1]); sentinel=sys.argv[2]; out=sys.argv[3]
+PAGE=os.sysconf("SC_PAGE_SIZE")
+def cmap():
+    m={}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit(): continue
+        try:
+            with open("/proc/%s/stat"%pid) as f: parts=f.read().rsplit(")",1)[-1].split()
+            ppid=int(parts[1]); m.setdefault(ppid,[]).append(int(pid))
+        except Exception: continue
+    return m
+def tree(r):
+    m=cmap(); seen=set(); st=[r]
+    while st:
+        p=st.pop()
+        if p in seen: continue
+        seen.add(p); st.extend(m.get(p,[]))
+    return seen
+def rss_kib(pid):
+    try:
+        with open("/proc/%d/statm"%pid) as f: return int(f.read().split()[1])*PAGE//1024
+    except Exception: return 0
+peak=0; peak_pids=0; samples=0
+while not os.path.exists(sentinel):
+    pids=tree(root); total=sum(rss_kib(p) for p in pids)
+    peak=max(peak,total); peak_pids=max(peak_pids,len(pids)); samples+=1
+    time.sleep(0.12)
+open(out,"w").write("%d %d %d\n"%(peak,peak_pids,samples))
+```
+
+**`count_tree.py`** — F-05: prints the current PID count in the process tree rooted at a PID (used to detect when the qcluster workers are up).
+
+```python
+import os,sys
+root=int(sys.argv[1])
+def cmap():
+    m={}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit(): continue
+        try:
+            with open("/proc/%s/stat"%pid) as f: parts=f.read().rsplit(")",1)[-1].split()
+            ppid=int(parts[1]); m.setdefault(ppid,[]).append(int(pid))
+        except Exception: continue
+    return m
+m=cmap(); seen=set(); st=[root]
+while st:
+    p=st.pop()
+    if p in seen: continue
+    seen.add(p); st.extend(m.get(p,[]))
+print(len(seen))
+```
+
+**`concurrency_probe.sh`** — F-05: starts the canonical 11-worker qcluster + document_consumer --oneshot, samples the tree during N concurrent consumes, reports peak tree RSS + peak PID count.
+
+```bash
+#!/bin/bash
+# F-05: measure full process-tree peak RSS + peak PID count for N concurrent OCR consumes
+# under the DEFAULT 11-worker Django-Q cluster (canonical qcluster + document_consumer path).
+set -u
+umask 077                          # F-12: scratch dirs/files created private (0700/0600)
+SCRATCH="$1"; N="$2"; LABEL="$3"; PDFDIR="$4"
+# F-07: resolve symlinks/'..' and refuse to `rm -rf` anything not strictly under /tmp/.
+SCRATCH="$(readlink -f -- "$SCRATCH" 2>/dev/null || true)"
+case "$SCRATCH" in
+  /tmp/?*) : ;;
+  *) echo "SAFETY ABORT: scratch root must resolve strictly under /tmp/, got: '$1'" >&2; exit 2 ;;
+esac
+# F-13: validate the concurrency count is a positive integer (literal, no shell interpolation).
+case "$N" in
+  ''|*[!0-9]*) echo "INPUT ERROR: N (concurrency) must be a non-negative integer, got: '$N'" >&2; exit 2 ;;
+esac
+[ "$N" -ge 1 ] || { echo "INPUT ERROR: N (concurrency) must be >= 1, got: $N" >&2; exit 2; }
+export PAPERLESS_DATA_DIR="$SCRATCH/data" PAPERLESS_MEDIA_ROOT="$SCRATCH/media"
+export PAPERLESS_STATICDIR="$SCRATCH/static" PAPERLESS_CONSUMPTION_DIR="$SCRATCH/consume"
+export DJANGO_SETTINGS_MODULE=paperless.settings
+
+# fresh scratch + migrate
+rm -rf -- "$SCRATCH"
+mkdir -p "$SCRATCH/data/index" "$SCRATCH/media/documents/originals" "$SCRATCH/media/documents/archive" "$SCRATCH/media/documents/thumbnails" "$SCRATCH/static" "$SCRATCH/consume"
+cd /app/src
+python manage.py migrate --no-input >"$SCRATCH/migrate.log" 2>&1 || { echo "MIGRATE_FAIL"; tail "$SCRATCH/migrate.log"; exit 1; }
+
+# stage N distinct PDFs into the consumption dir
+i=0
+for f in "$PDFDIR"/*.pdf; do
+  [ "$i" -ge "$N" ] && break
+  cp "$f" "$PAPERLESS_CONSUMPTION_DIR/stage_${i}_$(basename "$f")"
+  i=$((i+1))
+done
+
+SENT="$SCRATCH/.sampler_done"; OUT="$SCRATCH/.sampler_out"; rm -f "$SENT" "$OUT"
+
+# start the canonical Django-Q cluster (default 11 workers)
+python manage.py qcluster >"$SCRATCH/qcluster.log" 2>&1 &
+QPID=$!
+
+# wait until workers are up (tree has master+workers) or 25s
+for _ in $(seq 1 250); do
+  c=$(python /tmp/scripts/count_tree.py "$QPID" 2>/dev/null || echo 0)
+  [ "$c" -ge 12 ] && break
+  sleep 0.1
+done
+sleep 1  # let workers settle at idle baseline
+
+# start the tree sampler against the cluster
+python /tmp/scripts/tree_sampler.py "$QPID" "$SENT" "$OUT" &
+SPID=$!
+sleep 0.3
+
+# enqueue all staged files (async_task -> redis -> workers) via canonical oneshot consumer
+python manage.py document_consumer --oneshot "$PAPERLESS_CONSUMPTION_DIR" >"$SCRATCH/consumer.log" 2>&1
+
+# wait until N documents exist (or 240s)
+for _ in $(seq 1 2400); do
+  n=$(python -c "import django;django.setup();from documents.models import Document;print(Document.objects.count())" 2>/dev/null || echo 0)
+  [ "$n" -ge "$N" ] && break
+  sleep 0.1
+done
+DOCS="$n"
+sleep 0.5
+touch "$SENT"
+wait "$SPID" 2>/dev/null
+read PEAK_KIB PEAK_PIDS SAMPLES < "$OUT"
+
+# stop the cluster (targeted pid we spawned)
+kill "$QPID" 2>/dev/null
+for _ in $(seq 1 50); do kill -0 "$QPID" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$QPID" 2>/dev/null
+
+echo "{\"label\":\"$LABEL\",\"n_queued\":$N,\"docs_created\":$DOCS,\"peak_tree_rss_kib\":$PEAK_KIB,\"peak_pids\":$PEAK_PIDS,\"samples\":$SAMPLES,\"q_workers\":11}"
 ```
 
 ### 13.3 Cleanup (leaves the host and repository unchanged)
@@ -1833,8 +2616,12 @@ set -euo pipefail
 docker rm -f "$CNAME"
 # Remove host-side temporary probe scripts, evidence copies, and the terminal renderer:
 rm -rf /tmp/mem_probe /tmp/render_terminal.py
-# Verify the repository shows ONLY the deliverable as changed:
-cd <repo-root> && git status --porcelain    # => " M blitzy/documentation/paperless-ngx_542221a38dff.md"
+# Verify the working tree is CLEAN — the deliverable is committed, so porcelain is empty:
+cd <repo-root> && git status --porcelain          # => (no output: clean working tree)
+# Confirm the ONLY change this branch introduces vs. the base (origin/dev) is the single
+# deliverable file, added — no source/config/dependency/test file was touched:
+git diff --name-status "$(git merge-base HEAD origin/dev)"..HEAD
+# => A       blitzy/documentation/paperless-ngx_542221a38dff.md
 ```
 
 ### 13.4 Complete `/usr/bin/time -v` — every exporter run (both runs per scenario)
