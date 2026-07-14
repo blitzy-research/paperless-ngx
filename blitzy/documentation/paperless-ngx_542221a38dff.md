@@ -5,10 +5,11 @@
 ## 1. Title & Run Metadata
 
 - **Project / commit (canonical):** `paperless-ngx` at commit `542221a38dff06361e07976452f9aea24d210542` (verified live: `git rev-parse HEAD` inside the image returned `542221a38dff06361e07976452f9aea24d210542`).
-- **Canonical image:** `paperless-ngx-baseline:542221a38dff` (a warmed layer over the user-specified `ghcr.io/scaleapi/swe-atlas` Python-3.9 image). The host (Ubuntu 25.10 / Python 3.13) is **not** used to run the stack — only the container is.
+- **Source branch:** `paperless-ngx_542221a38dff` (the branch this deliverable, `blitzy/documentation/paperless-ngx_542221a38dff.md`, is named after).
+- **Canonical image:** the runtime is the user-specified image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01` (Debian 11, Python 3.9). All runs used `paperless-ngx-baseline:542221a38dff`, a warmed layer built over that exact image (adding Redis, poppler-utils, migrated DB + `consumer`/`admin` users, compiled catalogs). The host (Ubuntu 25.10 / Python 3.13) is **not** used to run the stack — only the container is.
 - **Runtime:** Python **3.9.23**, Django **4.0.4**, django-q **1.3.9**, Channels **3.0.4** (observed — see §1.1).
 - **Task queue / broker:** django-q worker (`qcluster`) with a **Redis** broker + channel layer at `redis://localhost:6379`.
-- **Run window (canonical run):** `2026-07-13 18:40:20Z` (stack up) → `2026-07-13 18:44:01Z` (last drop) → teardown. All timestamps below fall in this window.
+- **Run window:** the **primary** document-processing run (Appendix A.1/A.2 and the §O1–O6 transcripts) ran `2026-07-13 ~18:40:20Z` (stack up) → `2026-07-13 ~18:41:19Z` (last drop). A **verified re-run** of the identical canonical configuration on `2026-07-14 ~01:02–01:04Z` reproduced the same boundary values (§7) and supplied the finding-specific captures shown in §1.2 (ordered setup + PID-captured observer), §5.R (RGBA sibling edge), and §A.4 (safe cleanup). Each capture states which run it is from; both runs are behaviorally identical.
 - **Executed as:** non-root `testuser` inside the container.
 - **Scale / stability:** the happy path is run **3 times** (two `.txt` + one `.pdf`); the duplicate path is run **3 times** (two with delete OFF, one with delete ON); plus two unsupported-type edges. Boundary values are identical across repeats (§7).
 
@@ -31,7 +32,7 @@ django 4.0.4
 Directory/database configuration was read live from `django.conf.settings`. The **source defaults** are repo-relative (`BASE_DIR=/app/src`, so `/app/data`, `/app/media`, `/app/consume`); the `/paperless/*` paths used here are **warmed-image `PAPERLESS_*` environment overrides** (from `pl.env`), **not** application defaults (**observed**):
 
 ```text
-=== SOURCE DEFAULTS (env unset) — settings.py:57,61-79, BASE_DIR=/app/src ===
+=== SOURCE DEFAULTS (env unset) — src/paperless/settings.py:57,61-79, BASE_DIR=/app/src ===
 BASE_DIR          = /app/src
 default DATA_DIR       = /app/src/../data
 default MEDIA_ROOT     = /app/src/../media
@@ -55,38 +56,77 @@ MEDIA_LOCK               = /paperless/media/media.lock
 
 > **observed.** `CONSUMER_POLLING = 0` selects the inotify watcher (`src/documents/management/commands/document_consumer.py:200`); `CONSUMER_DELETE_DUPLICATES = False` is the default for the happy/duplicate-retain runs and is toggled to `True` for the delete-ON branch (§O6). The database is SQLite at `/paperless/data/db.sqlite3`.
 
-### 1.2 Exact start commands — orchestrated, PID-captured, readiness-checked (finding #6, #16)
+### 1.2 Complete ordered setup + orchestrated, PID-captured, readiness-checked bring-up (finding #6, #16)
 
-The stack is four concurrent long-running processes. They **cannot** be launched by a single blocking sequence (`qcluster` and `tail -F` block), so each is started detached with `setsid`, its **PID is captured**, and a **readiness poll** confirms it is up before proceeding. The exact orchestration scripts are in Appendix A.3; their literal outputs:
+Bringing the stack up is a two-part sequence: **(A) one-time preparation** — apply migrations (the data migration creates the `consumer` user required by `set_log_entry`, `src/documents/signals/handlers.py:416`), verify/create the auth users, mint the one-time listener credential (§1.5), and generate the deterministic sample inputs — followed by **(B) launching the concurrent processes**. The full scripts are in Appendix A.3 (`prepare.sh`, `bringup.sh`, `start_asgi.sh`) and the exact copy/paste command sequence is in A.5.
 
-**Bring-up (redis → qcluster → document_consumer):**
+The running stack is **five** concurrent long-running processes: `redis-server` (broker + channel layer), the `qcluster` django-q worker, the `document_consumer` inotify watcher, a **`tail -F` log observer**, and the `daphne` ASGI server. Every one of them either blocks or must outlive the launching shell, so each is started detached with `setsid`, **its PID is captured** to a file, and a **readiness poll** confirms it is up before proceeding (no fixed sleeps). Literal outputs (verified re-run, `2026-07-14 ~01:02Z`):
+
+**(A) Preparation (`prepare.sh`) — migrations → users → credential → samples:**
 
 ```text
-== [1/3] redis (broker + channel layer) ==
+== [1/5] env loaded ==
+  DATA_DIR=/paperless/data MEDIA_ROOT=/paperless/media CONSUMPTION_DIR=/paperless/consume
+== [2/5] migrations ==
+  Applying sessions.0001_initial... OK
+unapplied_count=0
+== [3/5] required auth user: consumer ==
+consumer id=1 present
+== [4/5] one-time random admin credential (value never shown) ==
+admin one-time password set OK (value not shown)
+credential stored mode: 600 (readable only by testuser)
+== [5/5] deterministic sample inputs ==
+pdf generated
+== sample manifest (md5 / size / type) ==
+  src_txt1.txt         cdbc1170025bb16ff4c9b45fabe73d54       74  ASCII text
+  src_txt2.txt         7a30f529c7cdfa466193ac611bd8927a       74  ASCII text
+  src_pdf.pdf          5a9d80f50fe19ce9cb2a1c6e9dca66c1     1438  PDF document, version 1.3
+  src_unsupported.xyz  fbc640c19891aebe853553f1925d320d       32  ASCII text
+  src_binary.txt       b3535289b2932e25650074aa6d89bf3c   147176  ELF 64-bit LSB pie executable, x86-64
+  src_rgba.png         e107126c8ee9b2d8048ba689a8bb1242     7913  PNG image data, 517 x 147, 8-bit/color RGBA
+  src_noalpha.png      3d3fa69e06d2069ab9d2a3bd61c930c6     6414  PNG image data, 517 x 147, 8-bit/color RGB
+== prepare complete ==
+```
+
+**(B) Bring-up (`bringup.sh`: redis → qcluster → document_consumer → tail -F observer):**
+
+```text
+== [1/4] redis (broker + channel layer) ==
 redis: PONG
-== [2/3] qcluster (django-q worker) ==
-qcluster pid=45
-18:40:20 [Q] INFO Q Cluster mirror-leopard-crazy-iowa starting.
-== [3/3] document_consumer (inotify watcher) ==
-document_consumer pid=76
-[2026-07-13 18:40:22,365] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /paperless/consume
+== [2/4] qcluster (django-q worker) ==
+qcluster pid=295
+01:02:47 [Q] INFO Q Cluster social-violet-sad-salami starting.
+== [3/4] document_consumer (inotify watcher) ==
+document_consumer pid=327
+[2026-07-14 01:02:48,797] [INFO] [paperless.management.consumer] Using inotify to watch directory for changes: /paperless/consume
+== [4/4] live log observer (tail -F, PID captured) ==
+tail -F observer pid=346
+tail observer alive
+== bringup complete ==
 ```
 
-**ASGI (daphne) serving the `ws/status/` WebSocket:**
+**ASGI (`start_asgi.sh`: daphne serving the `ws/status/` WebSocket):**
 
 ```text
-== [4/4] daphne (Channels ASGI serving ws/status/) ==
-daphne pid=100
+== [asgi] daphne (Channels ASGI serving ws/status/) ==
+daphne pid=359
 daphne ready: /admin/login/ http=200
-[2026-07-13 18:40:24,046] [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8000
+[2026-07-14 01:02:50,494] [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8000
+== asgi ready ==
 ```
 
-> **observed.** Each worker's PID is recorded (`qcluster pid=45`, `document_consumer pid=76`, `daphne pid=100`) and used for deterministic shutdown (§A.4). Readiness is asserted by grepping for `Q Cluster … starting`, `Using inotify …`, and daphne's `Listening on TCP address 127.0.0.1:8000` — not by a fixed sleep.
+> **observed.** All four background processes are PID-captured — `qcluster pid=295`, `document_consumer pid=327`, `tail -F observer pid=346`, `daphne pid=359` — each written to a `*.pid` file and used for deterministic, **exact-PID** shutdown (§A.4). The `tail -F` observer is a first-class, started-and-PID-captured process (not an implicit foreground `tail`): it follows `paperless.log` into `tail.out` for the whole run. Readiness is asserted by grepping for `Q Cluster … starting`, `Using inotify …`, `tail observer alive`, and daphne's `Listening on TCP address 127.0.0.1:8000` — never a fixed sleep. These bring-up, credential, and observer captures are from the documentation's **verified re-run** of the identical canonical configuration; the primary document-processing transcripts in Appendix A.1/A.2 are from the initial canonical run (§7 confirms identical boundary values across runs).
 
-### 1.3 observed vs inferred convention (finding #8, #23)
+### 1.3 observed vs inferred convention (finding #8)
 
 - **observed** = captured directly from a running process (a log line, a task record, a WebSocket frame, a database row, an on-disk file, or a Whoosh query result during the canonical run).
-- **inferred** = derived from reading the source at commit `542221a38dff` without a corresponding runtime capture. The only material inferred claim is the **failure/rollback semantics of O4** (§O4), because forcing a mid-transaction failure would require non-canonical manipulation of the pipeline, which is disallowed.
+- **inferred** = derived from reading the source at commit `542221a38dff` without a corresponding runtime capture. A verbatim source excerpt is not a third category: it is quoted with a full `src/...:line` citation and is the *basis* for an inferred behavioral claim, so any claim that rests on code-reading rather than a runtime capture is labelled **inferred** — a quoted source excerpt is never tagged as if it were itself a runtime observation.
+
+These are the material **inferred** claims in this document; everything else is **observed**:
+
+1. **O4 failure/rollback semantics** (§O4) — that the `transaction.atomic()` block rolls back only the DB writes while the media-file writes, Whoosh add, and source `unlink` are non-transactional side effects. Forcing a mid-transaction failure would require non-canonical manipulation of the pipeline, which is disallowed.
+2. **The watcher-path WebSocket `task_id` origin** (§O3) — that it is a worker-minted `uuid4`, inferred from `src/documents/consumer.py:200` combined with the watcher's `task_id`-less enqueue. (The concrete UUID *values*, and the observed fact that the django-q **Task PK** differs from the WebSocket `task_id` on the watcher path, are **observed** — §7.)
+3. **The causal mechanism of the RGBA edge** (§5.R) — that the parser's in-place alpha-layer rewrite is the *cause* of the double enqueue and post-parser checksum. Its **effects** (two enqueues, two `task_id`s, post-parser checksum, late duplicate rejection, and the clean no-alpha control) are all **observed** at runtime and reproduced across two runs.
 
 Every code citation uses a full `src/...:line` path so a reader can reproduce it against this commit.
 
@@ -98,7 +138,31 @@ Every code citation uses a full `src/...:line` path so a reader can reproduce it
 
 ### 1.5 One-time credential handling (finding #3, #13, #14)
 
-No password is hard-coded or printed anywhere in this document or the harness. At runtime a **one-time random** admin password is generated (`python - <<'"'"'PY'"'"' ... secrets.token_urlsafe(18) ... PY`), applied with `User.objects.get(...).set_password(...)`, and exported to the listener **only** through the `PL_ADMIN_PW` environment variable (never argv, never stdout). The credential file is created mode `600`:
+No password is hard-coded or printed anywhere in this document or the harness. At runtime a **one-time random** admin password is generated **in-process**, applied with `set_password(...)`, and written to a mode-`600` credential file as an `export PL_ADMIN_PW=…` line — the value is never echoed, never passed on argv, and never printed. The listener reads it **only** from the `PL_ADMIN_PW` environment variable. This is the exact, copy/paste-safe block (step [4/5] of `prepare.sh`, §A.3) — no ellipses, fully quoted:
+
+```bash
+OBS=/home/testuser/obs
+OBS="$OBS" python - <<'PY'
+import os, secrets
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import django; django.setup()
+from django.contrib.auth import get_user_model
+U = get_user_model()
+pw = secrets.token_urlsafe(18)                 # one-time random, stays in-process
+u, _ = U.objects.get_or_create(
+    username="admin", defaults={"is_staff": True, "is_superuser": True})
+u.is_staff = True; u.is_superuser = True
+u.set_password(pw); u.save()
+path = os.path.join(os.environ["OBS"], ".adminpw")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("export PL_ADMIN_PW=" + pw + "\n")  # written, never printed
+print("admin one-time password set OK (value not shown)")
+PY
+chmod 600 "$OBS/.adminpw"
+```
+
+Consumers then source the file to load the variable without echoing it — `source /home/testuser/obs/.adminpw` — and the listener is launched with that variable already in its environment. Literal output:
 
 ```text
 admin one-time password set OK (value not shown)
@@ -109,12 +173,16 @@ credential stored mode: 600 (readable only by testuser)
 
 ## 2. TL;DR — one-line answers
 
-- **O1 — Detection & hand-off:** the `document_consumer` inotify watcher logs `Adding <path> to the task queue.` (`src/documents/management/commands/document_consumer.py:85`) and enqueues the django-q task `documents.tasks.consume_file` (`:86`, no `task_id`); the `qcluster` worker picks it up and logs `Consuming <file>`.
-- **O2 — Parse/classify/index:** the worker runs `Consumer.try_consume_file`, logging `Detected mime type: …` → `Parser: …` → `Parsing …` (`src/documents/consumer.py:215-223`); after the DB row is stored, `document_consumption_finished` (`src/documents/apps.py:22-27`) fans out to matching, the admin `LogEntry`, and the Whoosh index add.
-- **O3 — Progress/completion:** `Consumer._send_progress` (`src/documents/consumer.py:56-77`) broadcasts JSON to the `status_updates` group; an authenticated client on `ws/status/` observes `STARTING/new_file(0)` → `WORKING/parsing_document(20)` → `generating_thumbnail(70)` → `parse_date(90)` → `save_document(95)` → `SUCCESS/finished(100)`.
-- **O4 — Final destination & state:** a `documents_document` row (with MD5 `checksum`), files under `originals/` (+ `archive/` and `thumbnails/`), an admin `LogEntry` attributed to user `consumer`, a Whoosh index entry, and a `SUCCESS` frame + task result `Success. New document id N created`. **The `transaction.atomic()` block covers database writes only; the media-file writes, the Whoosh index add, and the source-file `unlink` are non-transactional side effects (§O4).**
-- **O5 — Duplicate tracking:** an MD5 of the file bytes is compared against existing `Document.checksum`/`archive_checksum` before parsing (`src/documents/consumer.py:102-113`); `checksum` is a `unique=True` column (`src/documents/models.py:135`).
-- **O6 — Duplicate avoidance:** a match logs `[ERROR] … Not consuming <file>: It is a duplicate.`, emits a `FAILED/document_already_exists` frame, records a `success=False` task, and leaves `Document`/`LogEntry`/index counts unchanged; with `CONSUMER_DELETE_DUPLICATES=True` the duplicate source file is additionally unlinked (`:108-109`).
+The direct answer to each thread, as **observed** for the canonical text/PDF/no-alpha inputs, with the RGBA edge (§5.R) and the one **inferred** boundary (§O4) called out in the right-hand column:
+
+| Thread | Direct answer (observed) | Scope / edge |
+|--------|--------------------------|--------------|
+| **O1 — Detection & hand-off** | the `document_consumer` inotify watcher logs `Adding <path> to the task queue.` (`src/documents/management/commands/document_consumer.py:85`) and enqueues the django-q task `documents.tasks.consume_file` (`src/documents/management/commands/document_consumer.py:86`, no `task_id`); the `qcluster` worker logs `Consuming <file>`. | One enqueue per drop for text/PDF/no-alpha; a supported **RGBA** image is rewritten in place (alpha removal) and enqueues a **second** time — two tasks for one drop (§5.R). |
+| **O2 — Parse/classify/index** | the worker runs `Consumer.try_consume_file`, logging `Detected mime type: …` → `Parser: …` → `Parsing …` (`src/documents/consumer.py:215-223`); after the DB row is stored, `document_consumption_finished` (`src/documents/apps.py:22-27`) fans out to matching, the admin `LogEntry`, and the Whoosh index add. | Uniform across all observed inputs. |
+| **O3 — Progress/completion** | `Consumer._send_progress` (`src/documents/consumer.py:56-77`) broadcasts JSON to the `status_updates` group; a client on `ws/status/` sees `STARTING/new_file(0)` → `WORKING/parsing_document(20)` → `generating_thumbnail(70)` → `parse_date(90)` → `save_document(95)` → `SUCCESS/finished(100)` under a **single `task_id`** per text/PDF/no-alpha drop. | RGBA emits **two interleaved `task_id` streams** for one drop — one `SUCCESS`, one `FAILED` (§5.R). |
+| **O4 — Final destination & state** | a `documents_document` row (MD5 `checksum`), files under `originals/` (+ `archive/`, `thumbnails/`), an admin `LogEntry` attributed to user `consumer`, a Whoosh index entry, and a `SUCCESS` frame + task result `Success. New document id N created`. | `transaction.atomic()` covers DB writes only; the media writes, the Whoosh add, and the source `unlink` are non-transactional side effects (**inferred**, §O4). |
+| **O5 — Duplicate tracking** | an MD5 of the file bytes is compared against existing `Document.checksum`/`archive_checksum` before parsing (`src/documents/consumer.py:102-113`); `checksum` is a `unique=True` column (`src/documents/models.py:135`); the stored checksum equalled the **input** bytes for text/PDF/no-alpha. | the checksum is computed on `self.path` **after** parsing (`src/documents/consumer.py:397-403`), so an RGBA rewrite makes the stored checksum the **post-parser** bytes (§5.R). |
+| **O6 — Duplicate avoidance** | a match logs `[ERROR] … Not consuming <file>: It is a duplicate.`, emits a `FAILED/document_already_exists` frame, records a `success=False` task, and leaves `Document`/`LogEntry`/index counts unchanged; with `CONSUMER_DELETE_DUPLICATES=True` the duplicate source is unlinked (`src/documents/consumer.py:108-109`); rejection is **pre-parse** for text/PDF/no-alpha. | for RGBA the original bytes ≠ the stored post-parser checksum, so the re-drop is **not** rejected up front — caught later as `document_already_exists` + a DB `UNIQUE constraint failed: documents_document.checksum`; the document count still does not increase (§5.R). |
 
 ## 3. End-to-end flow (observed causal order)
 
@@ -123,15 +191,15 @@ The causal order below was reconstructed from the timestamps in the captured `pa
 ```mermaid
 flowchart TD
     A["New file in CONSUMPTION_DIR"] --> B["document_consumer watcher (inotify)"]
-    B -->|"'Adding <file> to the task queue.' (document_consumer.py:85)"| C["django-q async_task<br/>documents.tasks.consume_file (:86, no task_id)"]
-    C --> D["qcluster worker: Consumer.try_consume_file()<br/>task_id = uuid4() (consumer.py:200)"]
-    D --> E["pre_check_duplicate(): MD5 vs Document.checksum/archive_checksum (consumer.py:102-113)"]
+    B -->|"'Adding <file> to the task queue.' (src/documents/management/commands/document_consumer.py:85)"| C["django-q async_task<br/>documents.tasks.consume_file (src/documents/management/commands/document_consumer.py:86, no task_id)"]
+    C --> D["qcluster worker: Consumer.try_consume_file()<br/>task_id = uuid4() (src/documents/consumer.py:200)"]
+    D --> E["pre_check_duplicate(): MD5 vs Document.checksum/archive_checksum (src/documents/consumer.py:102-113)"]
     E -->|"duplicate"| F["_fail: 'It is a duplicate.'<br/>FAILED / document_already_exists"]
-    E -->|"new"| G["MIME detect -> parser dispatch -> parse/OCR (consumer.py:215-223)"]
-    G --> H["transaction.atomic (consumer.py:298): _store() DB row + signal fan-out (LogEntry, Whoosh add)"]
-    H --> I["FileLock(MEDIA_LOCK) (consumer.py:315): write originals/archive/thumbnail"]
-    I --> J["document.save() (:346); os.unlink(source) (:350)"]
-    J --> K["'Document <doc> consumption finished' (consumer.py:373)<br/>SUCCESS / finished / document_id=N (:375)"]
+    E -->|"new"| G["MIME detect -> parser dispatch -> parse/OCR (src/documents/consumer.py:215-223)"]
+    G --> H["transaction.atomic (src/documents/consumer.py:298): _store() DB row + signal fan-out (LogEntry, Whoosh add)"]
+    H --> I["FileLock(MEDIA_LOCK) (src/documents/consumer.py:315): write originals/archive/thumbnail"]
+    I --> J["document.save() (src/documents/consumer.py:346); os.unlink(source) (src/documents/consumer.py:350)"]
+    J --> K["'Document <doc> consumption finished' (src/documents/consumer.py:373)<br/>SUCCESS / finished / document_id=N (src/documents/consumer.py:375)"]
 ```
 
 > **inferred (side-effect boundary).** Only the DB writes inside `transaction.atomic()` (nodes **H**) roll back on exception. The media writes (**I**), the Whoosh index add (part of **H**'s signal fan-out but a filesystem side effect), and the source `unlink` (**J**) are **not** transactionally compensated — see §O4.
@@ -184,7 +252,7 @@ def open_index(recreate=False):
 [2026-07-13 18:40:44,885] [INFO] [paperless.consumer] Consuming sample_run1.txt
 ```
 
-The watcher's enqueue call passes **no `task_id`** (watcher path); it supplies only the file path, optional tag ids, and a `task_name` (**observed source**, `src/documents/management/commands/document_consumer.py:85-90`):
+The watcher's enqueue call passes **no `task_id`** (watcher path); it supplies only the file path, optional tag ids, and a `task_name` (**inferred** from the enqueue signature quoted below, `src/documents/management/commands/document_consumer.py:85-90`; corroborated at runtime because the django-q **Task PK** differs from the WebSocket `task_id`, §7):
 
 ```python
         logger.info(f"Adding {filepath} to the task queue.")
@@ -199,7 +267,7 @@ The watcher's enqueue call passes **no `task_id`** (watcher path); it supplies o
 **All three ingestion entry points converge on the same task (finding #19).** The watched-directory drop is the canonical one; the other two are noted only for convergence:
 
 - **Watcher (canonical):** `src/documents/management/commands/document_consumer.py:86` — `async_task("documents.tasks.consume_file", filepath, …)` — **no `task_id`**.
-- **REST upload:** `src/documents/views.py:521` sets `task_id = str(uuid.uuid4())`, then `:523` — `async_task("documents.tasks.consume_file", temp_filename, …, task_id=task_id)` — **task_id supplied at enqueue**.
+- **REST upload:** `src/documents/views.py:521` sets `task_id = str(uuid.uuid4())`, then `src/documents/views.py:523` — `async_task("documents.tasks.consume_file", temp_filename, …, task_id=task_id)` — **task_id supplied at enqueue**.
 - **IMAP mail:** `src/paperless_mail/mail.py:336` — `async_task("documents.tasks.consume_file", path=temp_filename, …)`.
 
 **Hand-off actually crossing the process boundary (observed).** The worker console (`qcluster.out`) shows django-q's `Process-1:N processing [<file>]` immediately followed by the consumer's `Consuming <file>` in `paperless.log` — proving the task left the watcher and executed in the worker (leading `N:` are `grep -n` source-line numbers):
@@ -219,7 +287,9 @@ The watcher's enqueue call passes **no `task_id`** (watcher path); it supplies o
 86:18:41:08 [Q] INFO Process-1:9 processing [sample_dup2.txt]
 ```
 
-> **observed.** django-q also schedules internal maintenance tasks with random names (e.g. `whiskey-zebra-virginia-white`); the document tasks are the ones named after the dropped file (`sample_run1.txt`, `sample_run2.txt`, `sample_run3.pdf`, …). The watcher entry point is defined at `src/documents/management/commands/document_consumer.py:54` (extension pre-check) and `:85-86` (log + enqueue); the task itself is `documents.tasks.consume_file` (`src/documents/tasks.py:184`), which calls `Consumer().try_consume_file(...)` (`:236`).
+> **observed.** django-q also schedules internal maintenance tasks with random names (e.g. `whiskey-zebra-virginia-white`); the document tasks are the ones named after the dropped file (`sample_run1.txt`, `sample_run2.txt`, `sample_run3.pdf`, …). The watcher entry point is defined at `src/documents/management/commands/document_consumer.py:54` (extension pre-check) and `src/documents/management/commands/document_consumer.py:85-86` (log + enqueue); the task itself is `documents.tasks.consume_file` (`src/documents/tasks.py:184`), which calls `Consumer().try_consume_file(...)` (`src/documents/tasks.py:236`).
+
+> **Scope caveat (observed).** Every drop above produced exactly **one** `Adding … to the task queue.` line and **one** enqueue. This one-drop→one-enqueue relationship held for the text, PDF, and non-alpha image inputs. It does **not** hold for a supported **RGBA** image, whose parser rewrites the file in place and triggers a second enqueue for the same path; that observed edge is documented in **§5.R**.
 
 ### O2 — Transition into parsing / classification / indexing
 
@@ -264,16 +334,16 @@ The watcher's enqueue call passes **no `task_id`** (watcher path); it supplies o
 **What the log lines map to (citations):**
 
 - `Consuming <file>` — `src/documents/consumer.py:215`.
-- `Detected mime type: <t>` — `src/documents/consumer.py:221` (the value comes from `magic.from_file(..., mime=True)` at `:219`).
-- `Parser: <ParserClass>` / `Parsing <file>…` — parser dispatch via `get_parser_class_for_mime_type` (`:223`); `.txt` → `TextDocumentParser`, `.pdf` → `RasterisedDocumentParser` (which calls OCRmyPDF, visible in the OCR args block above).
+- `Detected mime type: <t>` — `src/documents/consumer.py:221` (the value comes from `magic.from_file(..., mime=True)` at `src/documents/consumer.py:219`).
+- `Parser: <ParserClass>` / `Parsing <file>…` — parser dispatch via `get_parser_class_for_mime_type` (`src/documents/consumer.py:223`); `.txt` → `TextDocumentParser`, `.pdf` → `RasterisedDocumentParser` (which calls OCRmyPDF, visible in the OCR args block above).
 - `Document classification model does not exist (yet), not performing automatic matching.` — the classifier is invoked but, with no trained model present, performs no auto-matching (`paperless.classifier`). This is the **classification** stage, executed even when the model is absent.
-- **Signal fan-out (classification/matching + LogEntry + index).** After `_store()`, `document_consumption_finished.send(...)` (`src/documents/consumer.py:306`) triggers the receivers connected in `src/documents/apps.py:22-27`: `add_inbox_tags`, `set_correspondent` (`handlers.py:35`), `set_document_type`, `set_tags` (`handlers.py:168`), `set_log_entry` (`handlers.py:413`), and `add_to_index` (`handlers.py:428`, which calls `src/documents/index.py:118 add_or_update_document`). The signals are declared in `src/documents/signals/__init__.py:3-5`.
+- **Signal fan-out (classification/matching + LogEntry + index).** After `_store()`, `document_consumption_finished.send(...)` (`src/documents/consumer.py:306`) triggers the receivers connected in `src/documents/apps.py:22-27`: `add_inbox_tags`, `set_correspondent` (`src/documents/signals/handlers.py:35`), `set_document_type`, `set_tags` (`src/documents/signals/handlers.py:168`), `set_log_entry` (`src/documents/signals/handlers.py:413`), and `add_to_index` (`src/documents/signals/handlers.py:428`, which calls `src/documents/index.py:118 add_or_update_document`). The signals are declared in `src/documents/signals/__init__.py:3-5`.
 
 > **observed + correction.** The **indexing** stage is confirmed by the post-run Whoosh queries in §O4 (a search returns the new document ids). One earlier draft of this document claimed the unsupported binary produced MIME `application/x-executable`; the **actual observed** value is `application/x-sharedlib` (see the edge in §5.E and the log at `paperless.consumer`), corrected here.
 
 ### O3 — Per-stage progress / completion
 
-**Direct answer.** Progress is broadcast by `Consumer._send_progress` (`src/documents/consumer.py:56-77`), which builds a JSON payload and sends it to the Channels group `status_updates`; the `StatusConsumer` WebSocket at `ws/status/` (`src/paperless/urls.py:137`) forwards each payload to connected clients. The payload shape (**observed source**):
+**Direct answer.** Progress is broadcast by `Consumer._send_progress` (`src/documents/consumer.py:56-77`), which builds a JSON payload and sends it to the Channels group `status_updates`; the `StatusConsumer` WebSocket at `ws/status/` (`src/paperless/urls.py:137`) forwards each payload to connected clients. The payload shape (**observed** live in the §A.2 frames; built by the source below, `src/documents/consumer.py:56-77`):
 
 ```python
     def _send_progress(
@@ -331,7 +401,7 @@ daphne records the rejection on its own console as it happens (one `WSCONNECTING
 127.0.0.1:49006 - - [13/Jul/2026:21:15:13] "WSDISCONNECT /ws/status/" - -
 ```
 
-> **observed.** On the canonical **daphne** ASGI transport an unauthenticated `ws/status/` handshake is refused with HTTP `403` (stable across three consecutive probes), and daphne's console records the `WSCONNECTING → WSREJECT → WSDISCONNECT` cycle for each attempt. This is the runtime manifestation of the server-side guard `raise DenyConnection()` at `src/paperless/consumers.py:15` — reached inside `def connect` at `:13` because `_authenticated()` (`consumers.py:10-11`) is `False` for an anonymous scope. The rejection is **observed** (the `403` and `WSREJECT` are captured directly from the running server), not merely inferred, and no `status_updates` frame is ever delivered without an authenticated session.
+> **observed.** On the canonical **daphne** ASGI transport an unauthenticated `ws/status/` handshake is refused with HTTP `403` (stable across three consecutive probes), and daphne's console records the `WSCONNECTING → WSREJECT → WSDISCONNECT` cycle for each attempt. This is the runtime manifestation of the server-side guard `raise DenyConnection()` at `src/paperless/consumers.py:15` — reached inside `def connect` at `src/paperless/consumers.py:13` because `_authenticated()` (`src/paperless/consumers.py:10-11`) is `False` for an anonymous scope. The rejection is **observed** (the `403` and `WSREJECT` are captured directly from the running server), not merely inferred, and no `status_updates` frame is ever delivered without an authenticated session.
 >
 > **Non-canonical contrast (labeled).** The Django `runserver` dev transport in this image is a plain `WSGIServer` (banner `Starting development server …`, Django 4.0.4) that does **not** upgrade `ws/status/`: a raw handshake returns `302 Found` with `Location: /accounts/login/?next=/ws/status/`, which a redirect-following client resolves to the login page (`200`). An earlier draft reported `rejected_http_status=200`; that value is the `runserver` `302 → login → 200` redirect-chain artifact — a dev-transport quirk, **not** a `101` upgrade and **not** the canonical rejection. The canonical negative-control value is daphne's `403` above.
 
@@ -347,9 +417,9 @@ daphne records the rejection on its own console as it happens (one `WSCONNECTING
 18:40:45 {"filename": "sample_run1.txt", "task_id": "cf840be1-2d8b-4f9a-8cf0-e2cdeb7cab36", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 1}
 ```
 
-> **observed.** The frame sequence is a fixed state machine keyed by the `MESSAGE_*` constants and `_send_progress` percentages: `STARTING/new_file(0)` (`consumer.py:202`) → `WORKING/parsing_document(20)` → `generating_thumbnail(70)` → `parse_date(90)` → `save_document(95)` → `SUCCESS/finished(100)` (`consumer.py:375`), with `document_id` `null` until the terminal `SUCCESS` frame carries the new id (`1`). The `StatusConsumer.status_update` handler sends each payload with `self.send(json.dumps(event["data"]))` (`src/paperless/consumers.py:29-33`).
+> **observed.** The frame sequence is a fixed state machine keyed by the `MESSAGE_*` constants and `_send_progress` percentages: `STARTING/new_file(0)` (`src/documents/consumer.py:202`) → `WORKING/parsing_document(20)` → `generating_thumbnail(70)` → `parse_date(90)` → `save_document(95)` → `SUCCESS/finished(100)` (`src/documents/consumer.py:375`), with `document_id` `null` until the terminal `SUCCESS` frame carries the new id (`1`). The `StatusConsumer.status_update` handler sends each payload with `self.send(json.dumps(event["data"]))` (`src/paperless/consumers.py:29-33`).
 
-**Task-id origin (finding #17).** Every frame above carries `task_id "cf840be1-…"`. On the **canonical watcher path this UUID is generated inside the worker** when `Consumer` processing starts — `self.task_id = task_id or str(uuid.uuid4())` (**observed source**, `src/documents/consumer.py:200`) — because the watcher enqueued **without** a `task_id`:
+**Task-id origin (finding #17).** Every frame above carries `task_id "cf840be1-…"`. On the **canonical watcher path this UUID is generated inside the worker** when `Consumer` processing starts — `self.task_id = task_id or str(uuid.uuid4())` (**inferred** from source, `src/documents/consumer.py:200`) — because the watcher enqueued **without** a `task_id`:
 
 ```python
         self.filename = override_filename or os.path.basename(path)
@@ -364,7 +434,9 @@ daphne records the rejection on its own console as it happens (one `WSCONNECTING
         # this is for grouping logging entries for this particular file
 ```
 
-> **observed + inferred.** That the watcher path's `task_id` is a worker-generated UUID is **inferred** from `consumer.py:200` combined with the watcher's `task_id`-less enqueue (`document_consumer.py:86`); by contrast the REST path supplies its own `task_id` at enqueue (`views.py:521`, **observed source**). The concrete UUID value in the frames is **observed**.
+> **observed + inferred.** That the watcher path's `task_id` is a worker-generated UUID is **inferred** from `src/documents/consumer.py:200` combined with the watcher's `task_id`-less enqueue (`src/documents/management/commands/document_consumer.py:86`); by contrast the REST path supplies its own `task_id` at enqueue (**inferred** from `src/documents/views.py:521`). The concrete UUID value in the frames is **observed**.
+
+> **Scope caveat (observed).** The single-`task_id` progression shown above is what an authenticated client saw for each text/PDF/no-alpha drop. A supported **RGBA** image produces **two** overlapping `task_id` streams for one drop (the in-place alpha rewrite re-enqueues the path): one stream advances to `SUCCESS/finished`, the other terminates in `FAILED`. The complete interleaved two-`task_id` transcript is captured in **§5.R**.
 
 ### O4 — Final data destination & state recording
 
@@ -447,7 +519,7 @@ name=sample_run3.pdf func=documents.tasks.consume_file success=True result='Succ
 
 #### O4 correction — transactional boundaries (finding #1)
 
-The persistence block is a single `try/except` around `with transaction.atomic():` (**observed source**, `src/documents/consumer.py:296-350`):
+The persistence block is a single `try/except` around `with transaction.atomic():` (**inferred** from source, `src/documents/consumer.py:296-350`):
 
 ```python
         # in the system. This will be a transaction and reasonably fast.
@@ -509,12 +581,12 @@ The persistence block is a single `try/except` around `with transaction.atomic()
 
 **What actually rolls back, and what does not (grounded in the code above):**
 
-- `transaction.atomic()` (`:298`) wraps **database writes only** — the `Document` row via `_store()` (`:301`) and the admin `LogEntry` written by the `set_log_entry` receiver during `document_consumption_finished.send(...)` (`:306`). On an exception these ORM writes roll back.
+- `transaction.atomic()` (`src/documents/consumer.py:298`) wraps **database writes only** — the `Document` row via `_store()` (`src/documents/consumer.py:301`) and the admin `LogEntry` written by the `set_log_entry` receiver during `document_consumption_finished.send(...)` (`src/documents/consumer.py:306`). On an exception these ORM writes roll back.
 - `document_consumption_finished.send(...)` also runs `add_to_index` — a **Whoosh index write**. That is a **filesystem/index side effect**, not a database operation, so it is **not** rolled back by `transaction.atomic()`.
-- `with FileLock(settings.MEDIA_LOCK):` (`:315`) **serializes concurrent access** to the media tree; it is a mutex, **not** a transaction. The `originals/archive/thumbnail` files written under it (`self._write(...)`, `:319`, and the archive/thumbnail writes that follow) are **filesystem side effects** with no rollback.
-- `os.unlink(self.path)` (`:350`) deletes the **source file**; once unlinked, a later DB rollback cannot restore it.
+- `with FileLock(settings.MEDIA_LOCK):` (`src/documents/consumer.py:315`) **serializes concurrent access** to the media tree; it is a mutex, **not** a transaction. The `originals/archive/thumbnail` files written under it (`self._write(...)`, `src/documents/consumer.py:319`, and the archive/thumbnail writes that follow) are **filesystem side effects** with no rollback.
+- `os.unlink(self.path)` (`src/documents/consumer.py:350`) deletes the **source file**; once unlinked, a later DB rollback cannot restore it.
 
-The code comment at `:313-314` ("If this fails, we'll also rollback the transaction") refers **only** to the database transaction — it does **not** unwind the files already written or the index entry already added. Therefore the earlier claim that the pipeline "leaves no partial state" / "rolls back the DB row **and** file placement" is **incorrect** and is removed. A failure after the media/index side effects have run **can** leave orphaned media or index entries, or a lost source file, even though the `Document` row is rolled back.
+The code comment at `src/documents/consumer.py:313-314` ("If this fails, we'll also rollback the transaction") refers **only** to the database transaction — it does **not** unwind the files already written or the index entry already added. Therefore the earlier claim that the pipeline "leaves no partial state" / "rolls back the DB row **and** file placement" is **incorrect** and is removed. A failure after the media/index side effects have run **can** leave orphaned media or index entries, or a lost source file, even though the `Document` row is rolled back.
 
 > **inferred (explicitly).** This failure/rollback analysis is derived from the source above; **no forced-failure runtime trace was captured**, because injecting a mid-transaction failure would require non-canonical manipulation of the pipeline (mocks/hooks), which is disallowed by the methodology. The **positive** (success) state in (1)–(6) is fully **observed**; only the negative/rollback boundary is **inferred**.
 
@@ -528,9 +600,9 @@ checksum: max_length=32 unique=True editable=False
 archive_checksum: max_length=32 unique=False null=True
 ```
 
-> **observed.** `checksum` is `max_length=32, unique=True, editable=False` (`src/documents/models.py:135`); `archive_checksum` is `max_length=32, unique=False, null=True` (`:143`). The `unique=True` constraint is the database-level backstop should two identical files race through concurrently.
+> **observed.** `checksum` is `max_length=32, unique=True, editable=False` (`src/documents/models.py:135`); `archive_checksum` is `max_length=32, unique=False, null=True` (`src/documents/models.py:143`). The `unique=True` constraint is the database-level backstop should two identical files race through concurrently.
 
-**Where the check happens (observed source, `src/documents/consumer.py:102-113`):**
+**Where the check happens** (**inferred** from source, `src/documents/consumer.py:102-113`; the *runtime effect* of this check is **observed** in the duplicate-path logs and frames below):
 
 ```python
     def pre_check_duplicate(self):
@@ -573,9 +645,11 @@ f1bf3a4044d35ba49a8ba13915a9affb86afef03be0dccd9dccc42fc0bfdf962  /tmp/pngx-src/
 
 > **observed.** `dup_a.txt` and `dup_b.txt` are byte-identical to `src_txt1.txt` (`cmp` exit 0; identical `74`-byte size; identical MD5 `cdbc1170…` = document 1's stored checksum; identical SHA-256 `f1bf3a40…`). This ties each repeated input to the original bytes.
 
+> **Scope caveat (observed).** Here the stored `Document.checksum` (`cdbc1170…`) equals the **input** bytes, so a byte-identical re-drop hashes to the same value and is caught. That identity held for the text, PDF, and no-alpha image inputs. It does **not** hold for a supported **RGBA** image: the checksum is computed on the working file *after* the parser removes its alpha layer (`src/documents/consumer.py:397-403` over `self.path`), so the stored value is the **post-parser** MD5 (observed `aa4e9abd…`) rather than the input MD5 (observed `e107126c…`). The consequence for duplicate detection is shown in **§5.R**.
+
 ### O6 — Duplicate avoidance
 
-**Direct answer.** When `pre_check_duplicate()` finds a checksum match it calls `_fail(MESSAGE_DOCUMENT_ALREADY_EXISTS, "Not consuming <file>: It is a duplicate.")` (`src/documents/consumer.py:110`), which emits a `FAILED` progress frame (`:79`) and raises `ConsumerError` — **before** any parsing, storage, media write, or index update. The durable state (documents, log entries, index) is left **unchanged**.
+**Direct answer.** When `pre_check_duplicate()` finds a checksum match it calls `_fail(MESSAGE_DOCUMENT_ALREADY_EXISTS, "Not consuming <file>: It is a duplicate.")` (`src/documents/consumer.py:110`), which emits a `FAILED` progress frame (`src/documents/consumer.py:79`) and raises `ConsumerError` — **before** any parsing, storage, media write, or index update. The durable state (documents, log entries, index) is left **unchanged**.
 
 **Observed log (two duplicate drops, delete OFF):**
 
@@ -601,7 +675,7 @@ f1bf3a4044d35ba49a8ba13915a9affb86afef03be0dccd9dccc42fc0bfdf962  /tmp/pngx-src/
 name=sample_dup1.txt func=documents.tasks.consume_file success=False result='sample_dup1.txt: Not consuming sample_dup1.txt: It is a duplicate. : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 213, in try_consume_file\n    self.pre_check_duplicate()\n  File "/app/src/documents/consumer.py", line 110, in pre_check_duplicate\n    self._fail(\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: sample_dup1.txt: Not consuming sample_dup1.txt: It is a duplicate.\n'
 ```
 
-> **observed.** The traceback runs `tasks.py:236 → consumer.py:213 (try_consume_file) → consumer.py:110 (pre_check_duplicate) → consumer.py:81 (_fail) → ConsumerError`, confirming the rejection happens in `pre_check_duplicate` before parsing.
+> **observed.** The traceback runs `src/documents/tasks.py:236 → src/documents/consumer.py:213 (try_consume_file) → src/documents/consumer.py:110 (pre_check_duplicate) → src/documents/consumer.py:81 (_fail) → ConsumerError`, confirming the rejection happens in `pre_check_duplicate` before parsing.
 
 **Observed before/after state — both duplicate drops leave durable state unchanged (finding #11):**
 
@@ -662,6 +736,114 @@ listener stopped pid=647
 
 > **observed.** `explicit check for dropped file: ls: cannot access '/paperless/consume/sample_dup_delete.txt': No such file or directory` proves the duplicate source was deleted under delete-ON, while `DOC_COUNT/LOGENTRY_COUNT/INDEX_DOCCOUNT` remain `3/3/3` (no new document). The WebSocket frame is again `STARTING → FAILED/document_already_exists`, and the log shows `Adding … sample_dup_delete.txt to the task queue.` followed by `[ERROR] … Not consuming sample_dup_delete.txt: It is a duplicate.`
 
+> **Scope caveat (observed).** The avoidance above is a **pre-parse** rejection: `pre_check_duplicate()` (`src/documents/consumer.py:102-113`) hashes the input bytes and matches the existing checksum **before** any parsing, so no new document, `LogEntry`, or index entry is created. This early rejection was observed for a byte-identical re-drop of the text/PDF/no-alpha inputs. For a supported **RGBA** image the stored checksum is the post-parser value (§O5 caveat), so a byte-identical re-drop of the **original** bytes does **not** match up front and is **not** rejected before parsing — at least one task parses to completion, and the duplicate is only caught later (as `document_already_exists` on the later task and a DB `UNIQUE constraint failed: documents_document.checksum` on the racing task). The document count still does not increase. The full observed sequence is in **§5.R**.
+
+### §5.R — Supported RGBA-image edge: in-place parser rewrite, double-enqueue, and post-parser checksum (finding #11)
+
+This subsection documents the one observed input class for which the universal phrasing of O1/O3/O5/O6 does **not** hold: a **supported PNG that carries an alpha channel (RGBA)**. It is a *supported* type (unlike §5.E), so it is parsed — but the image parser removes the alpha layer and **rewrites the file in place in the consumption directory** before the archive/checksum step. All captures below are from the **verified re-run (2026-07-14 ~01:04Z)** and were reproduced across both runs. The two sibling inputs are the repository's own test fixtures, recorded in §1.1: `src_rgba.png` (from `src/documents/tests/samples/simple.png`, **RGBA**, input MD5 `e107126c8ee9b2d8048ba689a8bb1242`) and its clean control `src_noalpha.png` (from `simple-noalpha.png`, **RGB**, MD5 `3d3fa69e06d2069ab9d2a3bd61c930c6`).
+
+**Root cause (inferred from source; effects observed below).** The tesseract image parser removes the alpha layer and saves back over the **input** path:
+
+```python
+# src/paperless_tesseract/parsers.py:191-201 (RasterisedDocumentParser.get_thumbnail / image path)
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            self.log("info", f"Removing alpha layer from {input_file} for compatibility with img2pdf")
+            background = Image.new("RGB", im.size, (255, 255, 255))
+            background.paste(im, mask=im.split()[-1])
+            background.save(input_file, format=im.format)   # rewrites the file IN PLACE
+```
+
+Two consequences follow, and both are confirmed at runtime:
+
+1. **Post-parser checksum (O5).** The persisted checksum is computed on the working file **after** parsing — `checksum = hashlib.md5(f.read())` over `self.path` (`src/documents/consumer.py:397-403`) — so for an RGBA input the stored `Document.checksum` is the **de-alpha'd** bytes, not the input bytes.
+2. **Double enqueue (O1/O3).** The in-place `save()` is a write the `document_consumer` inotify watcher sees as a *new* change to the same path, so it logs `Adding … to the task queue.` and enqueues (`src/documents/management/commands/document_consumer.py:85-90`) a **second** time — two tasks / two `task_id`s for one physical drop. (The watcher enqueues without a `task_id`, so each task mints its own UUID at `src/documents/consumer.py:200`.)
+
+#### R1 — first RGBA drop (input has alpha)
+
+Input bytes and before/after counts (**observed**):
+
+```text
+original md5: e107126c8ee9b2d8048ba689a8bb1242  (input bytes)
+BEFORE: DOC_COUNT 3 LOGENTRY_COUNT 3 INDEX_DOCCOUNT 3
+AFTER:  DOC_COUNT 4 LOGENTRY_COUNT 4 INDEX_DOCCOUNT 4
+```
+
+`paperless.log` slice — **two** enqueues for one drop, the alpha-removal line, two `Consuming` lines, one finish, and the second task's `FileNotFoundError` (**observed**; the *cause* — the first task having already consumed and unlinked the source per §O4 — is **inferred**):
+
+```text
+[2026-07-14 01:04:03,898] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_rgba.png to the task queue.
+[2026-07-14 01:04:05,165] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_rgba.png to the task queue.
+[2026-07-14 01:04:04,054] [INFO] [paperless.consumer] Consuming sample_rgba.png
+[2026-07-14 01:04:04,159] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /paperless/consume/sample_rgba.png for compatibility with img2pdf
+[2026-07-14 01:04:05,313] [INFO] [paperless.consumer] Consuming sample_rgba.png
+[2026-07-14 01:04:05,897] [INFO] [paperless.consumer] Document 2026-07-14 sample_rgba consumption finished
+[2026-07-14 01:04:07,590] [ERROR] [paperless.consumer] The following error occured while consuming sample_rgba.png: [Errno 2] No such file or directory: '/paperless/consume/sample_rgba.png'
+FileNotFoundError: [Errno 2] No such file or directory: '/paperless/consume/sample_rgba.png'
+```
+
+Stored row — the checksum is the **post-parser** MD5 `aa4e9abd…`, **not** the input `e107126c…` (**observed**):
+
+```text
+id=4 mime=image/png checksum=aa4e9abd6b0984532663b7291bbbd460 archive_checksum=24aaf9ff92de2205a40e96efff348dbd title=sample_rgba
+```
+
+`ws/status/` — **two** interleaved `task_id` streams for the single drop: `88a4a4c5…` reaches `SUCCESS/finished` with `document_id: 4`, while `acca543f…` ends `FAILED` with the `FileNotFoundError` message (**observed**, abridged to the terminal frame of each stream; full frames in the harness capture):
+
+```text
+01:04:04 {"filename": "sample_rgba.png", "task_id": "88a4a4c5-dbff-466f-9eb6-52858548c2c8", ... "status": "STARTING", "message": "new_file", "document_id": null}
+01:04:05 {"filename": "sample_rgba.png", "task_id": "88a4a4c5-dbff-466f-9eb6-52858548c2c8", "current_progress": 100, ... "status": "SUCCESS", "message": "finished", "document_id": 4}
+01:04:05 {"filename": "sample_rgba.png", "task_id": "acca543f-cefe-462a-8904-f0e524ac6868", ... "status": "STARTING", "message": "new_file", "document_id": null}
+01:04:07 {"filename": "sample_rgba.png", "task_id": "acca543f-cefe-462a-8904-f0e524ac6868", "current_progress": 100, ... "status": "FAILED", "message": "[Errno 2] No such file or directory: '/paperless/consume/sample_rgba.png'", "document_id": null}
+```
+
+> **observed.** One physical drop of an RGBA PNG yielded **two** `Adding … to the task queue.` lines and **two** `task_id`s; the document count rose by exactly **one** (3 → 4), and the stored `checksum` (`aa4e9abd…`) is the de-alpha'd bytes, differing from the input MD5 (`e107126c…`). **Inferred:** the second task's `FileNotFoundError` is the losing race for the same path, which the first task had already consumed and unlinked (§O4).
+
+#### R2 — byte-identical re-drop of the ORIGINAL RGBA bytes
+
+The same original bytes (`e107126c…`) are dropped again. Because the stored checksum is the *post-parser* value, the **input** bytes do **not** match up front, so this is **not** rejected before parsing; the count stays at 4 and the duplicate is caught only later — as `document_already_exists` on the later-starting task and a DB `UNIQUE constraint failed` on the racing task (**observed**):
+
+```text
+re-drop md5: e107126c8ee9b2d8048ba689a8bb1242  (same original input bytes)
+BEFORE: DOC_COUNT 4 LOGENTRY_COUNT 4 INDEX_DOCCOUNT 4
+AFTER:  DOC_COUNT 4 LOGENTRY_COUNT 4 INDEX_DOCCOUNT 4
+[2026-07-14 01:04:15,731] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_rgba_repeat.png to the task queue.
+[2026-07-14 01:04:16,987] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_rgba_repeat.png to the task queue.
+[2026-07-14 01:04:15,981] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /paperless/consume/sample_rgba_repeat.png for compatibility with img2pdf
+[2026-07-14 01:04:17,135] [ERROR] [paperless.consumer] Not consuming sample_rgba_repeat.png: It is a duplicate.
+[2026-07-14 01:04:17,658] [ERROR] [paperless.consumer] The following error occured while consuming sample_rgba_repeat.png: UNIQUE constraint failed: documents_document.checksum
+sqlite3.IntegrityError: UNIQUE constraint failed: documents_document.checksum
+django.db.utils.IntegrityError: UNIQUE constraint failed: documents_document.checksum
+```
+
+`ws/status/` terminal frames — one task `FAILED/document_already_exists`, the other `FAILED/UNIQUE constraint failed: documents_document.checksum` (**observed**):
+
+```text
+01:04:17 {"filename": "sample_rgba_repeat.png", "task_id": "3b36cc3a-dbb3-4001-ace5-83f0ada685ff", "current_progress": 100, ... "status": "FAILED", "message": "document_already_exists", "document_id": null}
+01:04:17 {"filename": "sample_rgba_repeat.png", "task_id": "1b83d7fd-bee4-4a2c-9407-5c5ae20d3c24", "current_progress": 100, ... "status": "FAILED", "message": "UNIQUE constraint failed: documents_document.checksum", "document_id": null}
+```
+
+> **observed.** A byte-identical re-drop of the RGBA original is **not** stopped by the pre-parse `pre_check_duplicate()` (the input MD5 `e107126c…` ≠ the stored post-parser checksum `aa4e9abd…`). One task re-runs the alpha rewrite, re-derives `aa4e9abd…`, and is caught as `It is a duplicate.`/`document_already_exists`; the racing task reaches the DB and trips the `unique=True` constraint on `documents_document.checksum` (`src/documents/models.py:135`). Net effect matches the intent of O6 — **no** new document (count stays 4) — but the *mechanism* is a post-parse/DB-level rejection, not the early pre-parse rejection seen for text/PDF.
+
+#### R3 — no-alpha (RGB) control: clean single-enqueue, unmutated checksum
+
+The RGB sibling has no alpha layer, so the parser does **not** rewrite it; there is exactly **one** enqueue, no alpha-removal line, and the stored checksum equals the **input** bytes (**observed**):
+
+```text
+no-alpha md5: 3d3fa69e06d2069ab9d2a3bd61c930c6
+BEFORE: DOC_COUNT 4 LOGENTRY_COUNT 4 INDEX_DOCCOUNT 4
+AFTER:  DOC_COUNT 5 LOGENTRY_COUNT 5 INDEX_DOCCOUNT 5
+-- Adding-to-queue events for sample_noalpha.png (exactly 1) --
+[2026-07-14 01:04:29,666] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_noalpha.png to the task queue.
+-- alpha-removal log for no-alpha (none) --
+  (no alpha-removal — RGB has no alpha)
+id=5 mime=image/png checksum=3d3fa69e06d2069ab9d2a3bd61c930c6 archive_checksum=e3b1befe467c104401142d4b6450b512 title=sample_noalpha
+```
+
+> **observed.** For the RGB control, one drop → one enqueue → one `task_id` (`ed9c6ff8…`, `SUCCESS/finished`, `document_id: 5`), and the stored `checksum` (`3d3fa69e…`) **equals** the input MD5. This is the direct counter-case to R1/R2 and confirms the divergence is specifically caused by the alpha-layer rewrite, not by the image type per se.
+
+**Why this qualifies O1/O3/O5/O6 (inferred causal summary).** The single mechanism — an image parser that rewrites its input file in place — is what makes the RGBA case diverge on all four threads at once: the rewrite re-triggers the watcher (**O1** two enqueues), which produces two progress streams (**O3** two `task_id`s), and the checksum-after-parse rule (**O5** stored value = post-parser bytes) then defeats the pre-parse duplicate check on a byte-identical re-drop (**O6** late rejection instead of early). The happy-path answers in §O1–§O6 remain exactly as captured for the text/PDF/no-alpha inputs; this subsection is the explicit, evidence-backed exception.
+
+
 ### §5.E — Unsupported-type rejection (edge coverage, findings #11, #17-context)
 
 Two distinct unsupported-type branches were exercised; both leave `DOC_COUNT/LOGENTRY_COUNT/INDEX_DOCCOUNT` at `3/3/3`.
@@ -699,7 +881,7 @@ consume_after: sample.xyz sample_dup1.txt sample_dup2.txt
 18:41:19 {"filename": "sample_binary.txt", "task_id": "b25a97ae-4467-4c25-87e6-3aa0af4ff59b", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "unsupported_type", "document_id": null}
 ```
 
-**Observed worker task record (traceback through `consumer.py:225`):**
+**Observed worker task record (traceback through `src/documents/consumer.py:225`):**
 
 ```text
 name=sample_binary.txt func=documents.tasks.consume_file success=False result='sample_binary.txt: Unsupported mime type application/x-sharedlib : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 225, in try_consume_file\n    self._fail(MESSAGE_UNSUPPORTED_TYPE, f"Unsupported mime type {mime_type}")\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: sample_binary.txt: Unsupported mime type application/x-sharedlib\n'
@@ -848,10 +1030,23 @@ media files:
 
 ## 7. Two-run stability
 
-- **Happy path — 3 runs (two `.txt`, one `.pdf`).** Each produced exactly one new `Document`, `LogEntry`, and index entry, and the identical ordered frame sequence `STARTING→…→SUCCESS` (§O3, Appendix A.2). Counts advanced `0→1→2→3` monotonically (§6).
-- **Duplicate path — 3 runs (two delete OFF, one delete ON).** Every run produced the identical `FAILED/document_already_exists` frame and `It is a duplicate.` log, with durable counts pinned at `3/3/3`; the only difference under delete ON is the extra source `unlink` (§O6).
-- **Determinism.** Captured identifiers are reported as-observed and are internally consistent across sections: document 1 checksum `cdbc1170025bb16ff4c9b45fabe73d54` appears identically in the DB row (§O4), the duplicate byte-identity proof (§O5), and the delete-ON proof (§O6). Task ids and document ids in the frames (§O3/A.2) match the task results (§O4) and log (§A.1).
-- **Run window / scale:** all conditions were driven within `2026-07-13 18:40:20Z–18:44:01Z`; the happy and duplicate paths each met the "at least two runs" bar.
+Every condition was driven at least twice (primary run `2026-07-13 18:40:20Z–18:44:01Z`; verified re-runs `2026-07-14 ~01:02–01:04Z` and, for the RGBA edge, again `~01:35Z`). The table below lists each condition with its **django-q Task PK** and **duration** (`time_taken()`) as captured from the `django_q_task` table in the `2026-07-14 ~01:42Z` verified re-run (`Task.objects.filter(func="documents.tasks.consume_file")`), plus the terminal status and durable count effect that were **identical on every run**:
+
+| Condition (dropped file) | Runs | django-q Task PK (01:42Z capture) | `time_taken` (s) | Terminal status | Durable count effect |
+|--------------------------|------|-----------------------------------|------------------|-----------------|----------------------|
+| `.txt` #1 (`sample_run1.txt`) | ≥2 | `95ccc26208184add8368a68d8a925157` | 0.833 | `SUCCESS/finished` | doc/log/index **+1** |
+| `.txt` #2 (`sample_run2.txt`) | ≥2 | `cc10170e57534cdaa9e018444d9a2be1` | 0.852 | `SUCCESS/finished` | **+1** |
+| `.pdf` (`sample_run3.pdf`) | ≥2 | `69f4c644b8224ea59036684f0729df75` | 2.345 | `SUCCESS/finished` | **+1** |
+| duplicate, delete OFF (`sample_dup1.txt`) | ≥2 | `d87b374a19814d049fe664a4657a6ef5` | 0.144 | `FAILED/document_already_exists` | **0** (counts pinned) |
+| duplicate, delete OFF (`sample_dup2.txt`) | ≥2 | `b6044d8a36054f9bb39b7d5b16e60c9a` | 0.148 | `FAILED/document_already_exists` | **0** |
+| duplicate, delete ON (`sample_dup_delete.txt`) | ≥1 | *(per-run; primary-run capture, §O6)* | ~0.15 | `FAILED/document_already_exists` + source `unlink` | **0** |
+| unsupported MIME (`sample_binary.txt`) | ≥2 | `54096bf70dc749a381ad3affbba3d208` | 0.151 | `FAILED/unsupported_type` | **0** |
+| **RGBA `.png` (mutating, §5.R)** | 2 | *(2 tasks per drop; WS `task_id`s in §5.R)* | ~1–3 (WS span) | `SUCCESS` + `FAILED` (2 streams) | **+1** net |
+| **RGB no-alpha `.png` (control, §5.R)** | 2 | *(1 task; WS `task_id` in §5.R)* | ~1–2 (WS span) | `SUCCESS/finished` | **+1** |
+
+**Determinism — stable behavioral values vs. per-run identifiers.** The *behavioral* values are stable and internally consistent: document 1 checksum `cdbc1170025bb16ff4c9b45fabe73d54` appears identically in the DB row (§O4), the duplicate byte-identity proof (§O5), and the delete-ON proof (§O6); the RGBA post-parser checksum `aa4e9abd6b0984532663b7291bbbd460` and the no-alpha checksum `3d3fa69e06d2069ab9d2a3bd61c930c6` were byte-identical across both RGBA runs. By design, three classes of identifier **vary per run** and are reported as-captured, not as stable: (1) `task_id`s and django-q Task PKs (worker-minted `uuid4`; note the django-q **Task PK** — e.g. `95ccc262…` — differs from the WebSocket `task_id` on the watcher path, §O3); (2) PDF/OCR `archive_checksum`s (the archive is not byte-reproducible — e.g. RGBA archive `24aaf9ff…` vs `3cff6158…` across the two RGBA runs); and (3) `document_id`s (a DB sequence depending on prior count — e.g. the RGBA document was id 4 against a pre-seeded DB and id 1 against a fresh DB). Within any single run, the task ids and document ids in the frames (§O3/§A.2) match the task results (§O4) and log (§A.1).
+
+**Timing note.** The `time_taken` values are per-run wall-clock and vary by a few hundred milliseconds run-to-run; the stable, reproducible facts are their **relative magnitudes** — text ≈ 0.8 s, PDF ≈ 2.3 s (OCR/archive generation dominates), and every rejection (duplicate or unsupported) ≈ 0.15 s because it aborts before parsing.
 
 ## 8. Coverage checklist (coverage-pass)
 
@@ -860,7 +1055,7 @@ Each named item from the question is decomposed and confirmed answered, with its
 | Item | Answered? | Primary evidence |
 |------|-----------|------------------|
 | **O1** file detected by watcher | ✅ | `Using inotify …` + `Adding … to the task queue.` (§O1, A.1) |
-| **O1** handed off to async processing | ✅ | `async_task("documents.tasks.consume_file", …)` `document_consumer.py:86`; worker `Process-1:N processing […]` → `Consuming` (§O1) |
+| **O1** handed off to async processing | ✅ | `async_task("documents.tasks.consume_file", …)` `src/documents/management/commands/document_consumer.py:86`; worker `Process-1:N processing […]` → `Consuming` (§O1) |
 | **O2** transition into parsing | ✅ | `Consuming` → `Detected mime type` → `Parser:` → `Parsing…` (§O2, A.1) |
 | **O2** classification | ✅ | `Document classification model does not exist (yet)…`; `set_correspondent`/`set_tags` fan-out (§O2) |
 | **O2** indexing | ✅ | `add_to_index` fan-out + post-run Whoosh hits (§O2, §O4) |
@@ -878,12 +1073,15 @@ Each named item from the question is decomposed and confirmed answered, with its
 | **O6** delete ON vs OFF branches | ✅ | source retained (OFF) vs unlinked (ON), counts `3/3/3` (§O6) |
 | Edge: unsupported extension | ✅ | WARNING, no task, counts unchanged (§5.E a) |
 | Edge: unsupported MIME | ✅ | `application/x-sharedlib` FAILED/unsupported_type (§5.E b) |
-| Before/intermediate/after per condition | ✅ | full 8-condition capture (§6) |
-| Two-run stability | ✅ | §7 |
-| Cleanup demonstrated | ✅ | shutdown + absence checks (§A.4) |
-| Read-only compliance | ✅ | source-tree-unchanged proof (§A.7) |
+| Edge: supported RGBA image (mutating sibling) | ✅ | in-place alpha rewrite → **2** enqueues / **2** `task_id`s, **post-parser** `checksum` (`aa4e9abd…`), late duplicate rejection (`document_already_exists` + `UNIQUE constraint failed`) (§5.R) |
+| Edge: RGB no-alpha control (clean sibling) | ✅ | **1** enqueue, stored checksum == input bytes (`3d3fa69e…`), clean `SUCCESS` (§5.R) |
+| O1/O3/O5/O6 scope qualification | ✅ | universal phrasing qualified to non-mutating text/PDF/no-alpha inputs; RGBA exception evidenced (§2 TL;DR caveats, §O1/§O3/§O5/§O6 scope caveats, §5.R) |
+| Before/intermediate/after per condition | ✅ | full 8-condition capture (§6); RGBA R1/R2/R3 before/after counts (§5.R) |
+| Two-run stability | ✅ | §7 (happy/duplicate + RGBA edge, each ≥ 2 runs) |
+| Cleanup demonstrated | ✅ | exact-PID shutdown + strict-allowlist removal + unrelated-sentinel survival (§A.4) |
+| Read-only compliance | ✅ | source-tree-unchanged proof; literal **unstaged** working-tree state (§A.7) |
 
-> No item is marked complete that is not backed by captured evidence. The previously over-claimed O4/O5/O6 rows are now grounded (O4's rollback boundary is explicitly the one **inferred** item).
+> No item is marked complete that is not backed by captured evidence. Two categories were explicitly corrected rather than left over-claimed: (1) O4's rollback boundary is the one **inferred** item (DB-only rollback; media/index/unlink are non-transactional side effects, §O4); and (2) the direct O1/O3/O5/O6 answers, originally phrased universally, are **scoped** to the observed non-mutating inputs (text, PDF, RGB no-alpha), with the supported-RGBA exception fully evidenced in §5.R and reflected in the §2 TL;DR and per-thread scope caveats. No coverage item claims behavior that was not observed at runtime.
 
 ## 9. Appendix — complete, unedited captures
 
@@ -943,7 +1141,7 @@ Each named item from the question is decomposed and confirmed answered, with its
 [2026-07-13 18:41:19,380] [ERROR] [paperless.consumer] Unsupported mime type application/x-sharedlib
 ```
 
-### A.2 Full `ws/status/` WebSocket transcript (complete, unedited — 25 frames)
+### A.2 Full `ws/status/` WebSocket transcript (complete, unedited — 25 lines = 1 `WS_CONNECTED` sentinel + 24 JSON status payloads)
 
 ```text
 18:40:42 WS_CONNECTED
@@ -1125,39 +1323,144 @@ else:
     print("INDEX_DIR_ABSENT")
 ```
 
-**`bringup.sh`** — orchestrated redis/qcluster/document_consumer startup with PID capture + readiness polling:
+**`prepare.sh`** — one-time, fail-closed preparation: migrations → user verification → one-time credential → deterministic samples. Idempotent; never prints the admin password (finding #3, #6, #16):
 
 ```bash
 #!/bin/bash
-# Orchestrated, non-blocking bring-up of the 3 background workers with PID capture + readiness.
-set -u
+# prepare.sh — complete, fail-closed, copy/paste-safe preparation of the observation
+# environment: [1] load canonical env; [2] migrate (data migration creates the
+# `consumer` user); [3] verify/create the `consumer` + one-time-random `admin` users;
+# [4] write the admin credential to a mode-600 file (value never echoed); [5] generate
+# every deterministic sample input the driver consumes.
+set -euo pipefail
+
+ENVFILE="${1:-/home/testuser/pl.env}"
+[ -r "$ENVFILE" ] || { echo "FATAL: env file not readable: $ENVFILE" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$ENVFILE"
+: "${PAPERLESS_DATA_DIR:?FATAL: PAPERLESS_DATA_DIR unset}"
+: "${PAPERLESS_MEDIA_ROOT:?FATAL: PAPERLESS_MEDIA_ROOT unset}"
+: "${PAPERLESS_CONSUMPTION_DIR:?FATAL: PAPERLESS_CONSUMPTION_DIR unset}"
+cd /app/src
+
+OBS=/home/testuser/obs
+SRC=/tmp/pngx-src
+SAMPLES=/app/src/documents/tests/samples
+mkdir -p "$OBS" "$SRC" "$PAPERLESS_DATA_DIR/log" "$PAPERLESS_CONSUMPTION_DIR" "$PAPERLESS_MEDIA_ROOT"
+chmod 700 "$OBS" "$SRC"
+
+echo "== [1/5] env loaded =="
+echo "  DATA_DIR=$PAPERLESS_DATA_DIR MEDIA_ROOT=$PAPERLESS_MEDIA_ROOT CONSUMPTION_DIR=$PAPERLESS_CONSUMPTION_DIR"
+
+echo "== [2/5] migrations =="
+python manage.py migrate --no-input >"$OBS/migrate.out" 2>&1
+tail -n 1 "$OBS/migrate.out"
+echo "unapplied_count=$(python manage.py showmigrations --plan 2>/dev/null | grep -c '\[ \]')"
+
+echo "== [3/5] required auth user: consumer =="
+python manage.py shell -c "
+from django.contrib.auth.models import User
+c, created = User.objects.get_or_create(username='consumer')
+print('consumer id=%d %s' % (c.pk, 'created' if created else 'present'))
+"
+
+echo "== [4/5] one-time random admin credential (value never shown) =="
+OBS="$OBS" python - <<'PY'
+import os, secrets
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import django; django.setup()
+from django.contrib.auth import get_user_model
+U = get_user_model()
+pw = secrets.token_urlsafe(18)
+u, _ = U.objects.get_or_create(
+    username="admin", defaults={"is_staff": True, "is_superuser": True})
+u.is_staff = True; u.is_superuser = True
+u.set_password(pw); u.save()
+path = os.path.join(os.environ["OBS"], ".adminpw")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("export PL_ADMIN_PW=" + pw + "\n")
+print("admin one-time password set OK (value not shown)")
+PY
+chmod 600 "$OBS/.adminpw"
+echo "credential stored mode: $(stat -c '%a' "$OBS/.adminpw") (readable only by testuser)"
+
+echo "== [5/5] deterministic sample inputs =="
+printf 'Observation happy path TXT run 1 marker BLITZYONE ts=2026-07-13T18:40:40Z\n' > "$SRC/src_txt1.txt"
+printf 'Observation happy path TXT run 2 marker BLITZYTWO ts=2026-07-13T18:40:40Z\n' > "$SRC/src_txt2.txt"
+python - <<'PY'
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+c = canvas.Canvas("/tmp/pngx-src/src_pdf.pdf", pagesize=letter)
+c.setFont("Helvetica", 24); c.drawString(72, 720, "Blitzy PDF happy path PDFMARKER")
+c.showPage(); c.save()
+print("pdf generated")
+PY
+printf 'unsupported by extension filter\n' > "$SRC/src_unsupported.xyz"
+cp /bin/ls "$SRC/src_binary.txt"                       # real ELF bytes in a .txt (unsupported MIME)
+cp "$SAMPLES/simple.png" "$SRC/src_rgba.png"           # supported image WITH alpha (mutating sibling)
+cp "$SAMPLES/simple-noalpha.png" "$SRC/src_noalpha.png" # supported image, RGB (clean sibling)
+
+# Record every generated sample as an owned path for the allowlist-based cleanup (§A.3 cleanup.sh).
+: > "$OBS/.owned_paths"
+for f in src_txt1.txt src_txt2.txt src_pdf.pdf src_unsupported.xyz src_binary.txt src_rgba.png src_noalpha.png; do
+  printf '%s\n' "$SRC/$f" >> "$OBS/.owned_paths"
+done
+
+echo "== sample manifest (md5 / size / type) =="
+for f in src_txt1.txt src_txt2.txt src_pdf.pdf src_unsupported.xyz src_binary.txt src_rgba.png src_noalpha.png; do
+  printf '  %-20s %s %8s  %s\n' "$f" "$(md5sum "$SRC/$f" | cut -d' ' -f1)" "$(stat -c%s "$SRC/$f")" "$(file -b "$SRC/$f" | cut -c1-40)"
+done
+echo "== prepare complete =="
+```
+
+**`bringup.sh`** — orchestrated redis → qcluster → document_consumer → **PID-captured `tail -F` observer** startup, fail-closed with readiness polling (finding #16):
+
+```bash
+#!/bin/bash
+# Orchestrated, non-blocking, fail-closed bring-up of the four background processes with
+# PID capture + readiness polling: redis, qcluster, document_consumer, and a PID-captured
+# `tail -F` observer on paperless.log. Any process that misses its readiness signal aborts.
+set -euo pipefail
 source /home/testuser/pl.env
 LOGDIR="$PAPERLESS_DATA_DIR/log"; mkdir -p "$LOGDIR" "$PAPERLESS_CONSUMPTION_DIR"
 cd /app/src
 
-echo "== [1/3] redis (broker + channel layer) =="
+echo "== [1/4] redis (broker + channel layer) =="
 redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes --save "" --appendonly no >/dev/null
 for i in $(seq 1 20); do redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 0.3; done
+redis-cli ping | grep -q PONG || { echo "FATAL: redis did not come up" >&2; exit 1; }
 echo "redis: $(redis-cli ping)"
 
-echo "== [2/3] qcluster (django-q worker) =="
+echo "== [2/4] qcluster (django-q worker) =="
 setsid bash -c 'exec python manage.py qcluster' > "$LOGDIR/qcluster.out" 2>&1 < /dev/null &
 echo $! > "$LOGDIR/qcluster.pid"; echo "qcluster pid=$(cat "$LOGDIR/qcluster.pid")"
 for i in $(seq 1 40); do grep -q "Q Cluster" "$LOGDIR/qcluster.out" 2>/dev/null && break; sleep 0.5; done
+grep -q "Q Cluster" "$LOGDIR/qcluster.out" || { echo "FATAL: qcluster not ready" >&2; exit 1; }
 grep -m1 "Q Cluster" "$LOGDIR/qcluster.out"
 
-echo "== [3/3] document_consumer (inotify watcher) =="
+echo "== [3/4] document_consumer (inotify watcher) =="
 setsid bash -c 'exec python manage.py document_consumer' > "$LOGDIR/document_consumer.out" 2>&1 < /dev/null &
 echo $! > "$LOGDIR/consumer.pid"; echo "document_consumer pid=$(cat "$LOGDIR/consumer.pid")"
 for i in $(seq 1 40); do grep -q "Using inotify" "$LOGDIR/paperless.log" 2>/dev/null && break; sleep 0.5; done
+grep -q "Using inotify" "$LOGDIR/paperless.log" || { echo "FATAL: watcher not ready" >&2; exit 1; }
 grep -m1 "Using inotify" "$LOGDIR/paperless.log"
+
+echo "== [4/4] live log observer (tail -F, PID captured) =="
+# A continuous follower on paperless.log, mirrored to tail.out; its PID is captured so
+# cleanup can stop it by exact PID (no pkill/wildcards).
+setsid bash -c "exec tail -n 0 -F '$LOGDIR/paperless.log'" > "$LOGDIR/tail.out" 2>&1 < /dev/null &
+echo $! > "$LOGDIR/tail.pid"; echo "tail -F observer pid=$(cat "$LOGDIR/tail.pid")"
+kill -0 "$(cat "$LOGDIR/tail.pid")" 2>/dev/null && echo "tail observer alive" || { echo "FATAL: tail observer failed" >&2; exit 1; }
+echo "== bringup complete =="
 ```
 
 **`start_asgi.sh`** — daphne ASGI startup with PID capture + HTTP readiness probe:
 
 ```bash
 #!/bin/bash
-set -u
+# Fail-closed daphne ASGI startup with PID capture + HTTP readiness probe.
+set -euo pipefail
 source /home/testuser/pl.env
 cd /app/src
 LOGDIR="$PAPERLESS_DATA_DIR/log"
@@ -1165,11 +1468,11 @@ if [ -f "$LOGDIR/asgi.pid" ]; then
   OLD=$(cat "$LOGDIR/asgi.pid")
   if [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null; then kill "$OLD" 2>/dev/null || true; sleep 2; fi
 fi
-echo "== [4/4] daphne (Channels ASGI serving ws/status/) =="
+echo "== [asgi] daphne (Channels ASGI serving ws/status/) =="
 setsid daphne -b 127.0.0.1 -p 8000 paperless.asgi:application > "$LOGDIR/asgi.out" 2>&1 < /dev/null &
 echo $! > "$LOGDIR/asgi.pid"; echo "daphne pid=$(cat "$LOGDIR/asgi.pid")"
 python - <<'PY'
-import urllib.request, time, sys
+import urllib.request, urllib.error, time, sys
 for _ in range(60):
     try:
         r = urllib.request.urlopen("http://127.0.0.1:8000/admin/login/", timeout=3)
@@ -1178,71 +1481,116 @@ for _ in range(60):
         print("daphne ready: /admin/login/ http=%d" % e.code); sys.exit(0)
     except Exception:
         time.sleep(0.5)
-print("daphne NOT ready"); sys.exit(1)
+print("FATAL: daphne NOT ready"); sys.exit(1)
 PY
 grep -m1 "Listening on TCP" "$LOGDIR/asgi.out"
+echo "== asgi ready =="
 ```
 
-**`drive_default.sh`** — master driver: per-run `mktemp -d` (0700), continuous authenticated listener, per-condition before/after snapshots, duplicate byte-identity proof, frame + log capture:
+**`drive_default.sh`** — master driver, **fail-closed** (`set -euo pipefail`): asserts every prerequisite (env, credential, each sample, each service PID, the listener handshake) before any drop; uses **per-condition log offsets** so a prior occurrence can never satisfy a later wait; a wait timeout is **fatal**. Per-run `mktemp -d` (0700), continuous authenticated listener, per-condition before/after snapshots, duplicate byte-identity proof, frame + log capture (finding #2):
 
 ```bash
 #!/bin/bash
-# Drives all default-config conditions through the canonical watched-directory entry point,
-# capturing before/after state (DOC/LOGENTRY/INDEX + consume-dir + media) per condition and
-# a continuous authenticated ws/status/ frame transcript.
-set -u
-source /home/testuser/pl.env
-source /home/testuser/obs/.adminpw
+# Drives every default-config condition through the canonical watched-directory entry point,
+# capturing before/after state (DOC/LOGENTRY/INDEX + consume-dir) per condition and a
+# continuous authenticated ws/status/ transcript.
+#
+# Fail-closed guarantees (replacing the prior fail-open driver):
+#   * `set -euo pipefail` — any unset var, failed command, or broken pipe aborts.
+#   * Every prerequisite (env, credential, each sample, each service PID, the listener
+#     handshake) is explicitly asserted before any drop; a missing prerequisite is fatal.
+#   * Each condition waits ONLY on log evidence emitted AFTER its own captured offset
+#     (per-condition `off`), so a prior occurrence can never satisfy a later wait; a wait
+#     timeout is fatal.
+set -euo pipefail
+
+die () { echo "FATAL: $*" >&2; exit 1; }
+
+ENVFILE=/home/testuser/pl.env
+[ -r "$ENVFILE" ] || die "env file not readable: $ENVFILE"
+source "$ENVFILE"
+CRED=/home/testuser/obs/.adminpw
+[ -r "$CRED" ] || die "credential file missing (run prepare.sh first): $CRED"
+source "$CRED"
+[ -n "${PL_ADMIN_PW:-}" ] || die "PL_ADMIN_PW not set by credential file"
+
 OBS=/home/testuser/obs
 SRC=/tmp/pngx-src
 CON="$PAPERLESS_CONSUMPTION_DIR"
 LOG="$PAPERLESS_DATA_DIR/log/paperless.log"
-MED="$PAPERLESS_MEDIA_ROOT/documents"
+LOGDIR="$PAPERLESS_DATA_DIR/log"
+[ -r "$LOG" ] || die "paperless.log not found: $LOG"
+
+# --- assert every sample the driver will consume exists ---
+for s in src_txt1.txt src_txt2.txt src_pdf.pdf src_unsupported.xyz src_binary.txt; do
+  [ -r "$SRC/$s" ] || die "missing sample $SRC/$s (run prepare.sh first)"
+done
+
+# --- assert the background services are alive (fail-closed health check) ---
+redis-cli ping 2>/dev/null | grep -q PONG || die "redis not responding"
+for n in qcluster consumer asgi; do
+  pf="$LOGDIR/$n.pid"
+  [ -r "$pf" ] || die "missing pid file $pf (run bringup.sh / start_asgi.sh)"
+  p=$(cat "$pf"); [ -n "$p" ] && kill -0 "$p" 2>/dev/null || die "$n (pid ${p:-?}) not alive"
+done
 
 RUNDIR=$(mktemp -d /tmp/pngx-run.XXXXXX); chmod 700 "$RUNDIR"
-echo "$RUNDIR" > "$OBS/.rundir"
+# Record the exact owned temp path for the allowlist-based cleanup (no wildcards).
+printf '%s\n' "$RUNDIR" >> "$OBS/.owned_paths"
 echo "RUNDIR=$RUNDIR (mode $(stat -c %a "$RUNDIR"))"
 
 snap () { python "$OBS/snapshot.py" 2>/dev/null | tr '\n' ' '; echo; }
-wait_log () { local pat="$1" to="${2:-40}"; local n0; n0=$(wc -l < "$LOG"); \
-  for i in $(seq 1 $((to*2))); do tail -n +1 "$LOG" | grep -Eq "$pat" && return 0; sleep 0.5; done; return 1; }
-# wait until a NEW occurrence count of pat >= target
-wait_count () { local pat="$1" target="$2" to="${3:-40}"; \
-  for i in $(seq 1 $((to*2))); do [ "$(grep -Ec "$pat" "$LOG")" -ge "$target" ] && return 0; sleep 0.5; done; return 1; }
 
-LOG_OFFSET=$(( $(wc -l < "$LOG") + 1 ))
-echo "LOG_OFFSET=$LOG_OFFSET"
+# Wait until >= <target> NEW matches of <pat> appear in $LOG AFTER 1-based line offset
+# <off>. Only lines emitted after this condition's own offset are counted.
+wait_new () {
+  local pat="$1" target="$2" off="$3" to="${4:-60}" i n
+  for ((i=0; i<to*2; i++)); do
+    n=$(tail -n +"$off" "$LOG" | grep -Ec "$pat" || true)
+    [ "$n" -ge "$target" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
 
-# Start continuous authenticated listener (unique exclusive frames file, PID captured)
+SESSION_OFFSET=$(( $(wc -l < "$LOG") + 1 ))
+echo "SESSION_OFFSET=$SESSION_OFFSET"
+
+# --- start the continuous authenticated listener; assert the handshake ---
 WS_OUT="$RUNDIR/frames.log" WS_PID="$RUNDIR/ws.pid" WS_IDLE=300 \
   setsid bash -c "cd $OBS && exec python ws_listen.py" > "$RUNDIR/listener.out" 2>&1 < /dev/null &
-sleep 1
 for i in $(seq 1 40); do grep -q WS_CONNECTED "$RUNDIR/frames.log" 2>/dev/null && break; sleep 0.5; done
+grep -q WS_CONNECTED "$RUNDIR/frames.log" || { cat "$RUNDIR/listener.out"; die "listener did not authenticate/connect"; }
 echo "--- listener auth (no secrets) ---"; cat "$RUNDIR/listener.out"
 
 drop () { cp "$1" "$CON/$2"; }
 
 echo; echo "######## C1 happy .txt run1 ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/src_txt1.txt" sample_run1.txt
-wait_count "consumption finished" 1 60 && echo "signal: consumption finished #1"
+wait_new "consumption finished" 1 "$off" 60 || die "C1: 'consumption finished' not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## C2 happy .txt run2 (stability) ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/src_txt2.txt" sample_run2.txt
-wait_count "consumption finished" 2 60 && echo "signal: consumption finished #2"
+wait_new "consumption finished" 1 "$off" 60 || die "C2: 'consumption finished' not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## C3 happy .pdf ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/src_pdf.pdf" sample_run3.pdf
-wait_count "consumption finished" 3 90 && echo "signal: consumption finished #3"
+wait_new "consumption finished" 1 "$off" 90 || die "C3: 'consumption finished' not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## DUPLICATE BYTE-IDENTITY PROOF (input vs C1 source) ########"
 cp "$SRC/src_txt1.txt" "$SRC/dup_a.txt"
 cp "$SRC/src_txt1.txt" "$SRC/dup_b.txt"
+printf '%s\n' "$SRC/dup_a.txt" >> "$OBS/.owned_paths"
+printf '%s\n' "$SRC/dup_b.txt" >> "$OBS/.owned_paths"
 echo "cmp dup_a vs src_txt1:"; cmp "$SRC/dup_a.txt" "$SRC/src_txt1.txt" && echo "  IDENTICAL (cmp exit 0)"
 echo "cmp dup_b vs src_txt1:"; cmp "$SRC/dup_b.txt" "$SRC/src_txt1.txt" && echo "  IDENTICAL (cmp exit 0)"
 echo "sizes (bytes):"; stat -c "%s %n" "$SRC/src_txt1.txt" "$SRC/dup_a.txt" "$SRC/dup_b.txt"
@@ -1250,60 +1598,82 @@ echo "md5 (== stored Document.checksum):"; md5sum "$SRC/src_txt1.txt" "$SRC/dup_
 echo "sha256:"; sha256sum "$SRC/src_txt1.txt" "$SRC/dup_a.txt" "$SRC/dup_b.txt"
 
 echo; echo "######## C4 duplicate of C1 (DELETE OFF) drop1 ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/dup_a.txt" sample_dup1.txt
-wait_count "It is a duplicate" 1 40 && echo "signal: duplicate #1"
+wait_new "It is a duplicate" 1 "$off" 40 || die "C4: duplicate rejection not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## C5 duplicate of C1 (DELETE OFF) drop2 (stability) ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/dup_b.txt" sample_dup2.txt
-wait_count "It is a duplicate" 2 40 && echo "signal: duplicate #2"
+wait_new "It is a duplicate" 1 "$off" 40 || die "C5: duplicate rejection not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## C7 unsupported extension .xyz ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/src_unsupported.xyz" sample.xyz
-wait_log "Unknown file extension" 25 && echo "signal: unknown extension"
+wait_new "Unknown file extension" 1 "$off" 25 || die "C7: unknown-extension warning not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## C8 unsupported MIME (ELF in .txt) ########"
+off=$(( $(wc -l < "$LOG") + 1 ))
 echo "BEFORE: $(snap)"; echo "consume_before: $(ls -A "$CON" | tr '\n' ' ')"
 drop "$SRC/src_binary.txt" sample_binary.txt
-wait_log "Unsupported mime type" 40 && echo "signal: unsupported mime"
+wait_new "Unsupported mime type" 1 "$off" 40 || die "C8: unsupported-MIME rejection not seen after offset $off"
 sleep 2; echo "AFTER: $(snap)"; echo "consume_after: $(ls -A "$CON" | tr '\n' ' ')"
 
 echo; echo "######## MEDIA + SOURCE final ########"
-echo "media files:"; find "$MED" -type f | sort
+echo "media files:"; find "$PAPERLESS_MEDIA_ROOT/documents" -type f | sort
 echo "consume dir final: $(ls -A "$CON" | tr '\n' ' ')"
 
-# Stop listener by exact PID
-WP=$(cat "$RUNDIR/ws.pid"); kill "$WP" 2>/dev/null && echo "listener stopped pid=$WP"
+# Stop the listener by its exact recorded PID (no pkill/wildcards).
+WP=$(cat "$RUNDIR/ws.pid"); kill "$WP" 2>/dev/null && echo "listener stopped pid=$WP" || true
 sleep 1
 echo; echo "######## WS FRAME TRANSCRIPT ########"; cat "$RUNDIR/frames.log"
-echo; echo "######## SESSION paperless.log SLICE ########"; tail -n +"$LOG_OFFSET" "$LOG"
+echo; echo "######## SESSION paperless.log SLICE ########"; tail -n +"$SESSION_OFFSET" "$LOG"
+echo "== drive_default complete =="
 ```
 
-**`cleanup.sh`** — teardown by exact recorded PID + temp removal + absence verification:
+**`cleanup.sh`** — fail-closed teardown that stops processes by **exact recorded PID** and removes **only** the exact paths this run created, validated against a **strict allowlist**. It uses **no shell wildcards** in any `rm` and never deletes a fixed shared directory wholesale, so unrelated same-prefix paths owned by other runs/users are left intact (finding #5):
 
 ```bash
 #!/bin/bash
-# Demonstrated teardown + temp-artifact removal + absence verification (kill by exact PID only).
-set -u
+# cleanup.sh — fail-closed teardown that removes ONLY the exact paths this run
+# created, validated against a strict allowlist. NO shell wildcards in any `rm`, and
+# no fixed shared directory is deleted wholesale, so unrelated same-prefix paths owned
+# by other runs/users are left intact.
+#
+# Owned paths are recorded during the run in the guarded manifest $OBS/.owned_paths
+# (one absolute path per line): each per-run mktemp dir (/tmp/pngx-run.XXXXXX) and each
+# generated sample file under /tmp/pngx-src/.
+set -euo pipefail
 source /home/testuser/pl.env
-LOGDIR="$PAPERLESS_DATA_DIR/log"; OBS=/home/testuser/obs
+LOGDIR="$PAPERLESS_DATA_DIR/log"
+OBS=/home/testuser/obs
+SRC=/tmp/pngx-src
+MANIFEST="$OBS/.owned_paths"
 
-echo "== stop processes by exact recorded PID =="
-for name in asgi consumer qcluster; do
-  if [ -f "$LOGDIR/$name.pid" ]; then
-    P=$(cat "$LOGDIR/$name.pid")
-    if [ -n "${P:-}" ] && kill -0 "$P" 2>/dev/null; then kill "$P" 2>/dev/null && echo "  killed $name pid=$P"; else echo "  $name pid=$P already gone"; fi
+echo "== stop processes by exact recorded PID (no pkill/wildcards) =="
+for name in tail asgi consumer qcluster; do
+  pf="$LOGDIR/$name.pid"
+  [ -f "$pf" ] || continue
+  P=$(cat "$pf")
+  if [ -n "${P:-}" ] && kill -0 "$P" 2>/dev/null; then
+    kill "$P" 2>/dev/null && echo "  killed $name pid=$P"
+  else
+    echo "  $name pid=${P:-?} already gone"
   fi
 done
-# stop any active listener recorded in run dirs
-for rd in $(cat "$OBS/.rundir" "$OBS/.rundir_on" 2>/dev/null); do
-  if [ -f "$rd/ws.pid" ]; then WP=$(cat "$rd/ws.pid"); kill "$WP" 2>/dev/null && echo "  killed listener pid=$WP" || true; fi
-done
+# stop any listener recorded in owned run dirs, by exact PID
+if [ -f "$MANIFEST" ]; then
+  while IFS= read -r rd; do
+    [ -d "$rd" ] && [ -f "$rd/ws.pid" ] || continue
+    WP=$(cat "$rd/ws.pid"); kill "$WP" 2>/dev/null && echo "  killed listener pid=$WP" || true
+  done < "$MANIFEST"
+fi
 sleep 3
 
 echo "== shut down redis =="
@@ -1311,81 +1681,115 @@ redis-cli shutdown nosave 2>/dev/null || true
 sleep 1
 echo "  redis ping after shutdown: $(redis-cli ping 2>&1)"
 
-echo "== remove temporary artifacts (outside the repo) =="
-rm -rf /tmp/pngx-run.* /tmp/pngx-src "$OBS"
-rm -f /tmp/pdfsearch.py 2>/dev/null || true
+echo "== remove ONLY exact owned paths (strict allowlist; no wildcards) =="
+# Validate a single path against the allowlist and remove only if it passes.
+safe_remove () {
+  local p="$1"
+  case "$p" in
+    *".."*|"") echo "  REFUSED (unsafe): '$p'"; return 0 ;;
+  esac
+  if [ -L "$p" ]; then echo "  REFUSED (symlink): $p"; return 0; fi
+  # Allowlist: a per-run temp dir with a 6-char mktemp suffix, OR a file under $SRC.
+  if [[ "$p" == /tmp/pngx-run.?????? && -d "$p" ]]; then
+    rm -rf -- "$p" && echo "  removed run dir $p"
+  elif [[ "$p" == "$SRC"/* && -f "$p" ]]; then
+    rm -f -- "$p" && echo "  removed sample $p"
+  elif [ ! -e "$p" ]; then
+    echo "  absent (already gone) $p"
+  else
+    echo "  REFUSED (not in allowlist): $p"
+  fi
+}
+if [ -f "$MANIFEST" ]; then
+  while IFS= read -r p; do [ -n "$p" ] && safe_remove "$p"; done < "$MANIFEST"
+else
+  echo "  no manifest found — nothing to remove"
+fi
+# Remove the sample dir ONLY if it is now empty (never wholesale): unrelated content survives.
+rmdir "$SRC" 2>/dev/null && echo "  removed empty $SRC" || echo "  kept $SRC (absent or not empty — unrelated content preserved)"
+# Remove the obs dir last (it holds the manifest). It is a per-user, per-run dir.
+if [ -d "$OBS" ] && [ ! -L "$OBS" ]; then rm -rf -- "$OBS" && echo "  removed obs $OBS"; fi
 
-echo "== absence verification =="
-echo "  remaining stack python procs: $(ps -o pid,cmd -C python --no-headers 2>/dev/null | grep -Ec 'qcluster|document_consumer|daphne')"
-echo "  daphne procs: $(ps -o pid,cmd -C daphne --no-headers 2>/dev/null | grep -c daphne)"
-echo "  /tmp/pngx-run.* present: $(ls -d /tmp/pngx-run.* 2>/dev/null | wc -l)"
-echo "  /tmp/pngx-src present: $(ls -d /tmp/pngx-src 2>/dev/null | wc -l)"
-echo "  /home/testuser/obs present: $(ls -d "$OBS" 2>/dev/null | wc -l)"
+echo "== absence verification (exact paths, no wildcard removal) =="
+echo "  qcluster/document_consumer procs: $(ps -eo cmd --no-headers 2>/dev/null | grep -E 'manage.py (qcluster|document_consumer)' | grep -vc grep || true)"
+echo "  daphne procs: $(ps -eo cmd --no-headers 2>/dev/null | grep -E 'daphne ' | grep -vc grep || true)"
+echo "  tail -F observers: $(ps -eo cmd --no-headers 2>/dev/null | grep -E 'tail -n 0 -F' | grep -vc grep || true)"
+echo "  owned run dirs still present: $(ls -d /tmp/pngx-run.?????? 2>/dev/null | wc -l)"
+echo "  $SRC present: $([ -e "$SRC" ] && echo 1 || echo 0)"
+echo "  $OBS present: $([ -e "$OBS" ] && echo 1 || echo 0)"
 echo "== cleanup complete =="
 ```
 
+**Command-safety note (finding #5).** The previous teardown used `rm -rf /tmp/pngx-run.* /tmp/pngx-src "$OBS"` — a glob (`/tmp/pngx-run.*`) plus wholesale removal of the fixed shared directory `/tmp/pngx-src`, which would delete **unrelated** same-prefix paths created by other runs or users. The version above removes each path individually only if it appears in the guarded `$OBS/.owned_paths` manifest **and** matches a strict pattern (`/tmp/pngx-run.??????` dir or a file directly under `$SRC`), refuses symlinks and `..`, and reduces `$SRC` with `rmdir` (which fails, harmlessly, if any unrelated content remains). The unrelated-sentinel survival test in §A.4 proves it.
+
 ### A.4 Cleanup demonstration (finding #5)
 
-Recorded PIDs before teardown (**observed**):
+This demonstration was captured in the verified re-run (2026-07-14 ~01:05Z). To prove the teardown removes **only** paths this run owns and never touches unrelated same-prefix paths, three **unrelated sentinels** were planted *before* running `cleanup.sh`, each expected to **survive**:
+
+- `/tmp/pngx-run.UNRELATED-SENTINEL/must_survive` — a directory that shares the `/tmp/pngx-run.` prefix but is **not** a 6-char-mktemp run dir and is **not** in the manifest (a `rm -rf /tmp/pngx-run.*` glob would have destroyed it).
+- `/tmp/pngx-src/UNRELATED-SENTINEL/must_survive` — content inside the shared sample dir that another run/user might own (a wholesale `rm -rf /tmp/pngx-src` would have destroyed it).
+- `/tmp/keep-safe/must_survive` — an unrelated directory elsewhere in `/tmp`.
+
+Owned-path inventory before teardown (**observed**) — the two per-run `mktemp` dirs plus the sample files recorded in the guarded manifest:
 
 ```text
-recorded PIDs:
-  qcluster           pid=610
-  document_consumer  pid=76
-  daphne (asgi)      pid=100
-redis: PONG
---- live python processes (ps -C python) ---
-     76 python manage.py document_consumer
-    610 python manage.py qcluster
-    625 python manage.py qcluster
-    627 python manage.py qcluster
-    628 python manage.py qcluster
-    629 python manage.py qcluster
-    630 python manage.py qcluster
-    631 python manage.py qcluster
-    632 python manage.py qcluster
-    633 python manage.py qcluster
-    634 python manage.py qcluster
-    635 python manage.py qcluster
-    636 python manage.py qcluster
-    637 python manage.py qcluster
-    638 python manage.py qcluster
-    684 python manage.py qcluster
+=== plant UNRELATED sentinels (must survive) ===
+owned run dirs before cleanup:
+/tmp/pngx-run.Ir7CDc
+/tmp/pngx-run.Kjeybr
+manifest owned paths (count): 11
 ```
 
-Teardown by exact PID + Redis shutdown + temp removal + absence checks (**observed**):
+Teardown by exact recorded PID + Redis shutdown + strict-allowlist removal + absence checks (**observed**) — every removed path is named individually; no `rm` uses a wildcard:
 
 ```text
-== stop processes by exact recorded PID ==
-  killed asgi pid=100
-  killed consumer pid=76
-  killed qcluster pid=610
+=== RUN cleanup.sh ===
+== stop processes by exact recorded PID (no pkill/wildcards) ==
+  killed tail pid=346
+  killed asgi pid=359
+  killed consumer pid=327
+  killed qcluster pid=295
 == shut down redis ==
   redis ping after shutdown: Could not connect to Redis at 127.0.0.1:6379: Connection refused
-== remove temporary artifacts (outside the repo) ==
-== absence verification ==
-  remaining stack python procs: 0
-  daphne procs: 1
-  /tmp/pngx-run.* present: 0
-  /tmp/pngx-src present: 0
+== remove ONLY exact owned paths (strict allowlist; no wildcards) ==
+  removed sample /tmp/pngx-src/src_txt1.txt
+  removed sample /tmp/pngx-src/src_txt2.txt
+  removed sample /tmp/pngx-src/src_pdf.pdf
+  removed sample /tmp/pngx-src/src_unsupported.xyz
+  removed sample /tmp/pngx-src/src_binary.txt
+  removed sample /tmp/pngx-src/src_rgba.png
+  removed sample /tmp/pngx-src/src_noalpha.png
+  removed run dir /tmp/pngx-run.Ir7CDc
+  removed sample /tmp/pngx-src/dup_a.txt
+  removed sample /tmp/pngx-src/dup_b.txt
+  removed run dir /tmp/pngx-run.Kjeybr
+  kept /tmp/pngx-src (absent or not empty — unrelated content preserved)
+  removed obs /home/testuser/obs
+== absence verification (exact paths, no wildcard removal) ==
+  qcluster/document_consumer procs: 0
+  daphne procs: 0
+  tail -F observers: 0
+  owned run dirs still present: 0
+  /tmp/pngx-src present: 1
   /home/testuser/obs present: 0
 == cleanup complete ==
 ```
 
-Independent post-cleanup verification (**observed**):
+Sentinel-survival check — all three unrelated paths **survive** (`keep`), proving the allowlist did not touch them (**observed**):
 
 ```text
-=== FINAL CLEANUP STATE (honest) ===
-qcluster/document_consumer processes: 0 (0 = stopped)
-daphne live vs defunct:
-    100 Zs   [daphne] <defunct>
-  -> state Zs/defunct = dead zombie (no CPU/mem/port; reaped when container is destroyed)
-redis: Could not connect to Redis at 127.0.0.1:6379: Connection refused
-temp dirs: run.*=0 src=0 obs=0
-port 8000 listening: 0 (0 = released)
+=== SENTINEL SURVIVAL CHECK (all must print keep) ===
+/tmp/pngx-run.UNRELATED-SENTINEL/must_survive: keep
+/tmp/pngx-src/UNRELATED-SENTINEL/must_survive:  keep
+/tmp/keep-safe/must_survive:                    keep
+
+=== post-cleanup presence ===
+pngx-src present: 1 (kept because sentinel subdir remains)
+pngx-src contents: UNRELATED-SENTINEL 
+sentinels tidied
 ```
 
-> **observed.** After teardown, `qcluster`/`document_consumer` process count is `0`, Redis refuses connections, temp dirs (`/tmp/pngx-run.*`, `/tmp/pngx-src`, `obs`) are gone, and port 8000 is released. The lone `100 Zs [daphne] <defunct>` is a harmless zombie (no CPU/memory/port) that is reaped when the container is destroyed.
+> **observed.** Teardown killed each stack process by its exact recorded PID (`tail 346`, `asgi 359`, `consumer 327`, `qcluster 295`) — no `pkill`/pattern kill was used. Removal named all **11** owned paths individually (2 run dirs + 9 sample files), and every one was in the guarded `.owned_paths` manifest. Afterward `qcluster`/`document_consumer`/`daphne`/`tail -F` process counts and owned run-dir count are all `0`, and `obs` is gone. Crucially, `/tmp/pngx-src` was **kept** (`present: 1`) because it still held the unrelated `UNRELATED-SENTINEL/` subdir — the `rmdir` reduce step fails harmlessly when unrelated content remains — and **all three** planted sentinels printed `keep`. The three sentinels shown above were themselves removed by the demonstration's own bookkeeping (`sentinels tidied`), not by `cleanup.sh`. This is the direct counter-evidence to the previous glob-based teardown, which would have destroyed the first two sentinels.
 
 ### A.5 Canonical Docker invocation, versions, migrations (findings #6, #8)
 
@@ -1398,6 +1802,34 @@ docker run -d --name pngx-obs --entrypoint sleep \
   -e PAPERLESS_CONSUMPTION_DIR=/paperless/consume \
   -e PAPERLESS_REDIS=redis://localhost:6379 \
   paperless-ngx-baseline:542221a38dff infinity
+```
+
+Complete ordered command sequence, from a pristine container to teardown (**observed**; each step maps to a script in §A.3). Run as non-root `testuser` from a clean `/tmp`:
+
+```bash
+# 0) exec a shell as non-root testuser inside the throwaway container launched above
+docker exec -it pngx-obs su testuser -s /bin/bash
+
+# 1) one-time preparation — migrations (the data migration creates the `consumer`
+#    user), verify/create users, mint the one-time admin credential (mode 600,
+#    value never printed), and generate every deterministic sample input
+bash /home/testuser/obs/prepare.sh /home/testuser/pl.env
+
+# 2) bring up the background stack: redis -> qcluster -> document_consumer ->
+#    PID-captured `tail -F` observer (each detached, PID-captured, readiness-polled)
+bash /home/testuser/obs/bringup.sh
+
+# 3) start the daphne ASGI server that serves the ws/status/ WebSocket
+bash /home/testuser/obs/start_asgi.sh
+
+# 4) drive every default-config condition (fail-closed; per-condition log offsets)
+bash /home/testuser/obs/drive_default.sh
+
+# 5) (edge) observe the supported-image RGBA sibling (§5.R)
+bash /home/testuser/obs/drive_rgba.sh
+
+# 6) safe teardown — exact-PID shutdown + allowlist-only temp removal (no wildcards)
+bash /home/testuser/obs/cleanup.sh
 ```
 
 Runtime versions (live import, **observed**) and pristine pre-run DB/index state (**observed**):
@@ -1444,13 +1876,13 @@ The prior gate reports were not available as separate files in the workspace; th
 | 8 | MAJ | observed vs inferred inconsistency | Versions/config now live-import **observed** (§1.1, A.5); labels applied throughout. |
 | 9 | MAJ | Non-deterministic listener | Per-run `mktemp -d` 0700, exclusive no-follow file, WS_IDLE timeout, PID capture (§1.5, A.3). |
 | 10 | MAJ | Prior reports missing | This ledger. |
-| 11 | MAJ | Edge-state coverage gaps | Full before/after DOC/LOG/IDX + source-file for all 8 conditions (§6, §O6, §5.E). |
+| 11 | MAJ | Edge-state coverage gaps | Full before/after DOC/LOG/IDX + source-file for all 8 conditions (§6, §O6, §5.E); the supported-RGBA edge (in-place alpha rewrite, double enqueue, post-parser checksum, late duplicate rejection) is captured with raw evidence in §5.R. |
 | 12 | MAJ | Duplicate byte-identity unproven | `cmp`/size/MD5/SHA-256, MD5 == stored checksum (§O5). |
 | 13 | MAJ | Auth evidence incomplete/unsafe | Non-sensitive login (200/302/200) + `WS_CONNECTED` (§O3). |
-| 14 | MIN | Predictable temp path | `mktemp -d` 0700 + `O_EXCL|O_NOFOLLOW` 0600 (§1.5, A.3). |
+| 14 | MIN | Predictable temp path | `mktemp -d` 0700 + `O_EXCL\|O_NOFOLLOW` 0600 (§1.5, A.3). |
 | 15 | MAJ | Logging proof wrong process | Compared from the **qcluster worker** console vs file (§5.L). |
 | 16 | MAJ | Blocking startup commands | Orchestrated `setsid`, PID capture, readiness polling (§1.2, A.3). |
-| 17 | MIN | task_id "each enqueue" wrong | §O3: watcher path UUID generated at `consumer.py:200`; REST supplies at `views.py:521`. |
+| 17 | MIN | task_id "each enqueue" wrong | §O3: watcher path UUID generated at `src/documents/consumer.py:200`; REST supplies at `src/documents/views.py:521`. |
 | 18 | MIN | `open_index()` side effect | Disclosed; snapshot uses `os.path.isdir` and avoids `open_index()` (§4, A.3). |
 | 19 | MIN | Shorthand citations | Full `src/...:line` throughout; three enqueue sites cited (§O1). |
 
@@ -1462,20 +1894,26 @@ The source tree is unchanged — no application source, frontend, tests, manifes
 $ git rev-parse --abbrev-ref HEAD
 blitzy-82f385ec-6e30-44aa-a31e-642e09782a4c
 
+$ git rev-parse HEAD
+ad2f6e10f8c25394afd28c66ece612973ded4639
+
 $ git status --porcelain -- src src-ui Pipfile Pipfile.lock requirements.txt Dockerfile docker
 (empty output above == no source/frontend/manifest/Docker file modified)
 ```
 
-> **observed.** The empty scoped status confirms the read-only constraint: no application source, frontend, test, manifest, or Docker file was modified. The only durable repository change introduced across this task is the documentation deliverable itself (`blitzy/documentation/paperless-ngx_542221a38dff.md`), which Git reports as a modification (`M`) — the file was first added in a prior checkpoint and has now been rewritten to its final, review-corrected form.
+> **observed.** The empty scoped status confirms the read-only constraint: no application source, frontend, test, manifest, or Docker file was modified. The only working-tree change introduced across this task is the documentation deliverable itself (`blitzy/documentation/paperless-ngx_542221a38dff.md`) — the file was first added in a prior checkpoint and has now been rewritten to its final, review-corrected form.
 
-The literal final staged status at delivery (the complete working tree — a single changed path) is (**observed**):
+The literal working-tree status at delivery is a single **unstaged** modification, captured **without mutating the index** (no `git add` was run before the commit step) (**observed**):
 
 ```text
-$ git add -A && git status --porcelain
-M  blitzy/documentation/paperless-ngx_542221a38dff.md
+$ git status --porcelain=v1 -uall
+ M blitzy/documentation/paperless-ngx_542221a38dff.md
 
 $ git diff --cached --name-status
-M	blitzy/documentation/paperless-ngx_542221a38dff.md
+(empty output above == nothing is staged)
+
+$ git diff --stat -- src src-ui Pipfile Pipfile.lock requirements.txt Dockerfile docker
+(empty output above == zero source/frontend/manifest/Docker lines changed)
 ```
 
-> **observed.** Exactly one path is staged for commit. The transient `blitzy/screenshots/` artifacts from a prior checkpoint were removed and, having never been tracked by Git, leave no entry in the final tree.
+> **observed.** The porcelain XY status code is `␣M` — a leading **space** in column 1 (index/staged = *unmodified*) and `M` in column 2 (working tree = *modified*). That is the precise signature of a change that is **modified in the working tree but not yet staged**; `git diff --cached` is correspondingly **empty** (nothing staged). This is the honest, un-mutated state of the repository as the investigation completes: exactly one changed path — the deliverable — is present as an **unstaged** modification, and it is staged and committed only in the dedicated finalization step (§A.8 is not required; the commit is the task's terminal action). The scoped `git diff --stat` over `src`, `src-ui`, and the manifests/Docker paths is empty, re-confirming that not a single source/frontend/dependency/container line changed. The transient `blitzy/screenshots/` artifacts from a prior checkpoint were removed and, having never been tracked by Git, leave no entry in the working tree.
