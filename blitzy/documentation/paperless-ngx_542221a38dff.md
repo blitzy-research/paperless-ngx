@@ -2,7 +2,7 @@
 
 **Source baseline commit:** `542221a38` — the paperless-ngx commit under investigation (baseline `HEAD` before this document was added).
 **Investigation type:** read-only, run-first, evidence-grounded Q&A.
-**Deliverable:** this document only. No existing source file was modified (complete cleanup and integrity proof in §12). This answer is the sole net-new file; once committed it becomes the branch `HEAD` as a `docs:` commit atop the baseline, so the pre-commit snapshot in §12 shows `HEAD = 542221a38` with this file still untracked.
+**Deliverable:** this document only. No existing source file was modified (complete cleanup and integrity proof in §12). This answer is the sole net-new file relative to the source baseline `542221a38`; it has been refined across a short series of `docs:` commits atop that baseline, so the pre-commit snapshot in §12 shows this document as the only tracked, modified path in the working tree, with no source file changed.
 
 ---
 
