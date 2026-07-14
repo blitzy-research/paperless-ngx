@@ -114,7 +114,7 @@ Real paperless config vs. the harness config, side by side (observed):
 
 ```
 === Real paperless resolved config (DJANGO_SETTINGS_MODULE=paperless.settings) ===
-$ cd /app/src && DJANGO_SETTINGS_MODULE=paperless.settings python3 /tmp/harness/dump_config.py
+$ cd /app/src && PYTHONPATH=/app/src DJANGO_SETTINGS_MODULE=paperless.settings python3 /tmp/harness/dump_config.py
 Q_CLUSTER = {
   "catch_up": false,
   "name": "paperless",
@@ -1905,7 +1905,7 @@ value is timing-dependent.
 | `02_config_real.txt` | Full `Q_CLUSTER`/`CHANNEL_LAYERS` dump from the real `paperless.settings` |
 | `03_config_harness.txt` | Same dump from the isolated `harness_settings` (mirrors the defaults) |
 | `34_versions.txt` | Interpreter + queue-library versions vs. the manifest pins (Python 3.9.23) |
-| `05_secretkey_match.txt` | Proof the harness signs with a DIFFERENT key than DB-0 (isolation) |
+| `05_secretkey_match.txt` | Proof the harness signs with the **same (inherited)** key as paperless; isolation is by the Redis DB index |
 | `06_migrate.txt` | `migrate` output creating `django_q_task`/`django_q_ormq`/`django_q_schedule` |
 | `07_badsignature.txt` | WAITING->rejected: a foreign-key-signed package hits `BadSignature` |
 | `08_badsig_trace.txt` | The full `BadSignature` traceback from the pusher (`cluster.py:357`) |
@@ -1946,7 +1946,7 @@ directory outside the repository; nothing here is committed to the source tree.
 
 ### G.1  Reusable harness base (isolated on Redis DB 1, mirrors paperless defaults)
 
-**`harness_settings.py`** — Django settings for the throwaway harness: `Q_CLUSTER` mirrors paperless's exact defaults but points at Redis **DB 1** with its OWN `SECRET_KEY`, so it can never collide with the real DB-0 queue.
+**`harness_settings.py`** — Django settings for the throwaway harness: `Q_CLUSTER` mirrors paperless's exact defaults (including **inheriting** paperless's `SECRET_KEY`) but points at Redis **DB 1**; isolation is by the Redis **logical-DB index** (0 -> 1), not by a different key, so the harness queue can never collide with the real DB-0 queue.
 
 ```python
 # harness_settings.py — isolated, throwaway Django-Q observation harness.
