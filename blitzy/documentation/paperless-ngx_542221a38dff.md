@@ -32,15 +32,11 @@ sha256:6e699f225ced49182033cf995daf2a07d3628fe29bb573f5aa4c4188c253969f [ghcr.io
 
 ########## PROVENANCE: exact container create/run command used ##########
 $ docker run -d --name pngx-qna --entrypoint sleep paperless-ngx-qna:ready infinity
+b0d4205737a63c2deea9089173e0e65ec17c8c37586b5c4e7b2fce83598bc2cf
 
 ########## PROVENANCE: docker inspect pngx-qna (security posture) ##########
 $ docker inspect pngx-qna --format 'Privileged={{.HostConfig.Privileged}} ReadonlyRootfs={{.HostConfig.ReadonlyRootfs}} CapAdd={{.HostConfig.CapAdd}} CapDrop={{.HostConfig.CapDrop}} NetworkMode={{.HostConfig.NetworkMode}} Mounts={{range .Mounts}}{{.Source}}->{{.Destination}} {{end}}'
-Privileged=false
-ReadonlyRootfs=false
-CapAdd=[]
-CapDrop=[]
-NetworkMode=bridge
-Mounts=(none if empty)
+Privileged=false ReadonlyRootfs=false CapAdd=[] CapDrop=[] NetworkMode=bridge Mounts=
 ```
 
 The container is **unprivileged**, has **no bind mounts** (its `/app` is entirely separate from the repository checkout on the host), adds/drops no capabilities, and uses the default bridge network. All commands were run as the non-root `testuser` (uid 1000) from a clean `/tmp`, as the setup notes require (running as root makes four permission tests spuriously pass/fail and pollutes `/tmp`).
@@ -98,7 +94,7 @@ Django's system check passes cleanly in the container:
 
 ```text
 ########## BUILD/CHECK ##########
-$ python3 manage.py check
+$ docker exec -u testuser -w /app/src pngx-qna bash -c 'python3 manage.py check; echo "check exit=$?"'
 System check identified no issues (0 silenced).
 check exit=0
 ```
@@ -110,6 +106,7 @@ The `.py` files exercised below are byte-for-byte identical between the containe
 ```text
 ########## SOURCE IDENTITY: md5 container /app/src vs repo src ##########
 --- container ---
+$ docker exec -u testuser -w /app/src pngx-qna md5sum documents/classifier.py documents/tasks.py documents/matching.py documents/consumer.py documents/parsers.py documents/signals/handlers.py paperless_tesseract/parsers.py paperless/settings.py setup.cfg
 e8ca934a3dabb7498ae7bf98aca481f6  documents/classifier.py
 8af1ca06493ef50129f4314cc16d5686  documents/tasks.py
 0db85577a13a7d9d34c9071a7221cf1c  documents/matching.py
@@ -119,7 +116,8 @@ d843d2ecf7344f1ed7b8225f59dc8744  documents/parsers.py
 26a6bc09de30be58becdeaab91d8f6e7  paperless_tesseract/parsers.py
 c719bb0ae75f5dd438cd5937ba3d0955  paperless/settings.py
 190d884f99b96408a1f687f1b5757c15  setup.cfg
---- repo ---
+--- repo (host) ---
+$ cd /tmp/blitzy/paperless-ngx/blitzy-5fa640eb-6577-4b56-a9e5-a622258d47bf_735501/src && md5sum documents/classifier.py documents/tasks.py documents/matching.py documents/consumer.py documents/parsers.py documents/signals/handlers.py paperless_tesseract/parsers.py paperless/settings.py setup.cfg
 e8ca934a3dabb7498ae7bf98aca481f6  documents/classifier.py
 8af1ca06493ef50129f4314cc16d5686  documents/tasks.py
 0db85577a13a7d9d34c9071a7221cf1c  documents/matching.py
@@ -226,6 +224,92 @@ Reading the capture:
 - **Empty corpus → `ValueError` — [observed] + [fallback].** With `Document.objects.count() = 0`, `train()` raised `ValueError: 'No training data available.'` (`src/documents/classifier.py:158-159`).
 - **Training-corpus query & inbox exclusion — [code-grounded].** `train()` reads the corpus with `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` (`src/documents/classifier.py:125-127`); the `1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).` log line is that query's result.
 
+#### 2.2.1 High-resolution lifecycle — `st_mtime_ns` / model size / SHA-256 / loaded `data_hash`, a physically-separate incompatible on-disk model through the *real* loader, and the task-level empty-corpus paths — [observed]
+
+The capture above establishes reuse-vs-retrain from `st_mtime` (float seconds) and a **patched** loader. This subsection is the high-resolution complement requested for a byte-level answer: it records, after **each** `tasks.train_classifier()` call, the corpus count, the file's nanosecond `st_mtime_ns`, its size in bytes, the SHA-256 of the serialized model, and the `data_hash` (hex) read back by `load_classifier()`; it then loads a **compatible v7** model, writes a **physically-separate incompatible** model to disk (a real pickle whose first value is `999`, *not* a patched loader) and drives the **unmodified** `load_classifier()` over it, and finally exercises both task-level empty-corpus paths. Every quantitative invariant below was confirmed stable across two runs (Run 1 here; complete Run 2 in Appendix §7.3.7).
+
+Command (Run 1):
+
+```text
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna python3 /tmp/obs_q1_hires.py 1
+```
+
+```text
+================ Q1-HIRES RUN 1 ================
+--- A: reuse/retrain, high-resolution (st_mtime_ns / size / sha256 / loaded data_hash) ---
+  corpus_count = 1
+  [before] exists=False
+  LOG DEBUG paperless.classifier: Document classification model does not exist (yet), not performing automatic matching.
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG DEBUG paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+  LOG DEBUG paperless.classifier: Vectorizing data...
+  LOG DEBUG paperless.classifier: There are no tags. Not training tags classifier.
+  LOG DEBUG paperless.classifier: Training correspondent classifier...
+  LOG DEBUG paperless.classifier: There are no document types. Not training document type classifier.
+  LOG INFO paperless.tasks: Saving updated classifier model to /tmp/pngx-q1h-t765yv4_/classification_model.pickle...
+  [after#1 initial-save] exists=True corpus_count=1 size=22382 st_mtime_ns=1783990152997975541 sha256=283d1502a6d3ad7146956746bc8bdd8f98292833bc761ed4eb6216ba92084aec
+  [after#1] load_classifier()=OK loaded_data_hash=93c9a15dcb127652822b68bfbd2f11d6eedc1bea classes_=[1]
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG DEBUG paperless.tasks: Training data unchanged.
+  [after#2 unchanged] exists=True corpus_count=1 size=22382 st_mtime_ns=1783990152997975541 sha256=283d1502a6d3ad7146956746bc8bdd8f98292833bc761ed4eb6216ba92084aec
+  [after#2] load_classifier()=OK loaded_data_hash=93c9a15dcb127652822b68bfbd2f11d6eedc1bea classes_=[1]
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG DEBUG paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+  LOG DEBUG paperless.classifier: Vectorizing data...
+  LOG DEBUG paperless.classifier: There are no tags. Not training tags classifier.
+  LOG DEBUG paperless.classifier: Training correspondent classifier...
+  LOG DEBUG paperless.classifier: There are no document types. Not training document type classifier.
+  LOG INFO paperless.tasks: Saving updated classifier model to /tmp/pngx-q1h-t765yv4_/classification_model.pickle...
+  [after#3 changed] exists=True corpus_count=1 size=37002 st_mtime_ns=1783990153026975831 sha256=0b39de64e7244eb401566a939f50f0196f6323775d91b58b08aaa56ece14784d
+  [after#3] load_classifier()=OK loaded_data_hash=441e8b90dd526a0de6491ab6b8567fcf082a4b5f classes_=[1]
+  REUSE   (call#2 vs #1): size_same=True mtime_ns_same=True sha256_same=True loaded_hash_same=True
+  RETRAIN (call#3 vs #2): mtime_ns_changed=True sha256_changed=True loaded_hash_changed=True
+--- B: compatible v7 load (real load_classifier() succeeds) ---
+  on-disk schema_version=7 FORMAT_VERSION=7 compatible=True
+  [compatible-v7] load_classifier()=OK loaded_data_hash=441e8b90dd526a0de6491ab6b8567fcf082a4b5f classes_=[1]
+--- C: PHYSICALLY-SEPARATE incompatible on-disk model -> real load_classifier() deletes it ---
+  wrote incompatible model directly to disk: schema_version=999 exists_before=True
+  LOG ERROR paperless.classifier: Unrecoverable error while loading document classification model, deleting model file.
+  load_classifier() returned=None exists_after=False (False => os.unlink at classifier.py:48 ran)
+--- D: direct empty-corpus DocumentClassifier().train() -> ValueError ---
+  corpus_count = 0
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  ValueError: 'No training data available.'
+--- E: task-level empty corpus (auto correspondent present, 0 docs) ---
+  LOG DEBUG paperless.classifier: Document classification model does not exist (yet), not performing automatic matching.
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG WARNING paperless.tasks: Classifier error: No training data available.
+  train_classifier() returned=None model_exists=False (ValueError caught at tasks.py:70-72 => no save)
+--- E2: no auto matching models at all -> early return, no train ---
+  train_classifier() returned=None model_exists=False (guard at tasks.py:49-55 => early return)
+================ Q1-HIRES RUN 1 SUMMARY ================
+  reuse_byte_identical=True retrain_all_changed=True loaded_hash reuse=True retrain=True
+```
+
+Concise state table (one row per lifecycle stage; full SHA-256 and `data_hash` values are in the capture above and in Appendix §7.3.7):
+
+| Stage | corpus_count | file exists | size (bytes) | `st_mtime_ns` | model SHA-256 | loaded `data_hash` | return / exception |
+|-------|--------------|-------------|--------------|---------------|---------------|--------------------|--------------------|
+| before any train | 1 | **False** | — | — | — | — | — |
+| after #1 initial save | 1 | True | 22382 | 1783990152997975541 | `283d1502…084aec` | `93c9a15d…1bea` | `train()`→`True` → `save()` |
+| after #2 unchanged (**REUSE**) | 1 | True | **22382** | **1783990152997975541** | **`283d1502…084aec`** | **`93c9a15d…1bea`** | `train()`→`False`; `Training data unchanged.` |
+| after #3 changed (**RETRAIN**) | 1 | True | 37002 | 1783990153026975831 | `0b39de64…14784d` | `441e8b90…4b5f` | `train()`→`True` → `save()` |
+| compatible v7 load | 1 | True | 37002 | (unchanged) | (unchanged) | `441e8b90…4b5f` | `load_classifier()`→OK (`schema_version=7`) |
+| incompatible (`999`) on disk | 1 → 0 file | write→True; **after load→False** | — | — | — | — | `load_classifier()`→`None`; `os.unlink` @`classifier.py:48` |
+| direct `train()` empty corpus | 0 | False | — | — | — | — | **`ValueError('No training data available.')`** |
+| task empty (auto corr., 0 docs) | 0 | False | — | — | — | — | `train_classifier()`→`None`; `Classifier error: …` (no save) |
+| task, no auto models | 0 | False | — | — | — | — | `train_classifier()`→`None`; early `return` |
+
+Reading the high-resolution capture:
+
+- **Reuse is byte-identical — [observed].** Call #2 (unchanged data) left the file **byte-for-byte** the same as call #1: identical `size` (22382), identical `st_mtime_ns` (`1783990152997975541`), identical model `sha256` (`283d1502…084aec`), and identical loaded `data_hash` (`93c9a15d…1bea`) — because `train()` returned `False` at the SHA-1 guard (`src/documents/classifier.py:163-164`) and `tasks.train_classifier()` therefore never called `save()` (`src/documents/tasks.py:62-69`). Reuse is not an in-memory shortcut; the on-disk artifact is literally untouched.
+- **Retrain changes every byte-level field — [observed].** After mutating the document's content, call #3 re-saved: `st_mtime_ns` advanced, `size` changed (22382 → 37002), the model `sha256` changed (`283d1502…` → `0b39de64…`), and the loaded `data_hash` changed (`93c9a15d…` → `441e8b90…`).
+- **The reuse guard is content-deterministic even though the model bytes are not — [observed] + cross-check to §6.4/§6.5.** Across the two runs the loaded `data_hash` values are **byte-identical** — `93c9a15dcb127652822b68bfbd2f11d6eedc1bea` for the original content and `441e8b90dd526a0de6491ab6b8567fcf082a4b5f` for the changed content — because `data_hash` is a SHA-1 over the ordered preprocessed content and label ids (`src/documents/classifier.py:124-161`), which is deterministic. In contrast, the **model-file** `size`/`sha256` **differ run-to-run** (Run 2 recorded `size=22439`, `sha256=28e2bda7…`, and `size=36983`, `sha256=83c3914f…`; see §7.3.7): the serialized `MLPClassifier` weights are not deterministic (unseeded — see §6.4). Thus the reuse decision does **not** depend on the volatile model bytes; it depends only on the deterministic data hash.
+- **Compatible v7 load succeeds — [observed].** The model just saved carries `schema_version=7`, equal to `DocumentClassifier.FORMAT_VERSION = 7` (`src/documents/classifier.py:63`), so the real `load_classifier()` returns a live classifier.
+- **A physically-separate incompatible on-disk model is deleted by the real loader — [observed] (canonical).** Writing a genuine pickle whose first value is `999` and then running the **unmodified** `load_classifier()` (which compares against its real `FORMAT_VERSION=7` at `src/documents/classifier.py:80-83`) logged `Unrecoverable error while loading document classification model, deleting model file.`, returned `None`, and left the file **absent** (`exists_after=False`) — the `os.unlink(settings.MODEL_FILE)` at `src/documents/classifier.py:48` ran. This is the canonical version of the patched-loader demonstration in §2.2-B: no source is patched; the incompatibility lives entirely in the on-disk bytes.
+- **Both task-level empty-corpus paths yield no model — [observed].** With an auto correspondent present but **zero** documents, `tasks.train_classifier()` reaches `classifier.train()`, which raises `ValueError('No training data available.')` (`src/documents/classifier.py:158-159`); the task's `except Exception` catches it and logs `Classifier error: No training data available.` (`src/documents/tasks.py:71-72`), returning `None` and writing **no** model. With **no** auto-matching model of any kind, the guard at `src/documents/tasks.py:49-55` short-circuits with an early `return` — again no training, no model. Either way, `model_exists=False`.
+
+
 ### 2.3 Observed — the canonical tests through pytest — [observed]
 
 ```text
@@ -240,7 +324,6 @@ $ docker exec -u testuser -w /app/src -e DJANGO_SETTINGS_MODULE=paperless.settin
 ```text
 ============================= test session starts ==============================
 platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python3
-cachedir: .pytest_cache
 django: version: 4.0.4, settings: paperless.settings (from env)
 rootdir: /app/src
 configfile: setup.cfg
@@ -281,7 +364,7 @@ documents/tests/test_classifier.py::TestClassifier::testNoTrainingData PASSED [1
 ======================== 4 passed, 6 warnings in 2.18s =========================
 ```
 
-`test_train_classifier` (`src/documents/tests/test_tasks.py:75-94`) asserts the exact mtime reuse/retrain behavior observed above; `testVersionIncreased` and `testNoTrainingData` cover the version-guard and empty-corpus paths. All pass.
+`test_train_classifier` (`src/documents/tests/test_tasks.py:75-94`) asserts the exact mtime reuse/retrain behavior observed above; `testVersionIncreased` and `testNoTrainingData` cover the version-guard and empty-corpus paths. All pass. The invocation passes `-p no:cacheprovider` (disables pytest's cache plugin, so no `cachedir:` line is printed and no `.pytest_cache` directory is written) and `-o addopts=""` (overrides the `setup.cfg` `addopts`, so this run is serial with no `--numprocesses`/coverage) — a deliberately minimal, side-effect-free serial run of just these four tests.
 
 ### 2.4 Cross-test isolation — model file, DB identity, and factory usage
 
@@ -412,9 +495,44 @@ $ docker exec -u testuser -w /app/src -e DJANGO_SETTINGS_MODULE=paperless.settin
 ```
 
 ```text
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python3
+django: version: 4.0.4, settings: paperless.settings (from env)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 2 items
+
 documents/tests/test_classifier.py::TestClassifier::test_one_correspondent_predict PASSED [ 50%]
 documents/tests/test_classifier.py::TestClassifier::test_one_correspondent_predict_manydocs PASSED [100%]
-======================== 2 passed, 6 warnings in 1.88s =========================
+
+=============================== warnings summary ===============================
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:67
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:67: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version = StrictVersion(hiredis.__version__)
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:69
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:69: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('0.1.3')
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:71
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:71: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('0.1.4')
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:73
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:73: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('1.0.0')
+
+../../usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229
+  /usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229: RemovedInDjango50Warning: The USE_L10N setting is deprecated. Starting with Django 5.0, localized formatting of data will always be enabled. For example Django will display numbers and dates using the format of the current locale.
+    warnings.warn(USE_L10N_DEPRECATED_MSG, RemovedInDjango50Warning)
+
+../../usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9
+  /usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9: RemovedInDjango50Warning: The django.utils.baseconv module is deprecated.
+    from django.utils import baseconv
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 2 passed, 6 warnings in 1.87s =========================
 ```
 
 ---
@@ -681,10 +799,10 @@ paperless_tesseract/tests/test_parser.py::TestParser::test_with_form_error_notex
 
 ### 5.1 Answers
 
-- **(a) How many document records come from a single input file:** `separate_pages()` mechanically produces **N+1 fragment files** for **N** separator pages (`src/documents/tasks.py:113-161`). When those fragments are consumed, each **byte-distinct** fragment becomes one `Document` row; **byte-identical** fragments are rejected by `pre_check_duplicate` (`src/documents/consumer.py:102-113`, md5 at `:104`). Observed: `several-patcht-codes.pdf` (2 separators → 3 fragment files, 2 distinct) → **2** rows; `patch-code-t-middle.pdf` (1 separator → 2 fragment files, 1 distinct) → **1** row. **[observed]** + **[code-grounded]**
+- **(a) How many document records come from a single input file:** `separate_pages()` mechanically produces **N+1 fragment files** for **N** separator pages (`src/documents/tasks.py:113-161`). A fragment becomes a `Document` row only when the Consumer **successfully parses** it **and** it is **not a byte-duplicate** of an already-stored fragment: byte-identical fragments are rejected by `pre_check_duplicate` (`src/documents/consumer.py:102-113`, md5 at `:104`), and fragments the parser cannot process yield **no** row — e.g. the two 0-page fragments produced by a **page-0** separator both fail with `ValueError: max_workers must be greater than 0` and create 0 rows (see §5.5.2). Observed for the common cases: `several-patcht-codes.pdf` (2 separators → 3 fragment files, 2 distinct) → **2** rows; `patch-code-t-middle.pdf` (1 separator → 2 fragment files, 1 distinct) → **1** row. **[observed]** + **[code-grounded]**
 - **(b) Which barcode values trigger a split:** the single value configured by `CONSUMER_BARCODE_STRING`, default **`"PATCHT"`** (`src/paperless/settings.py:506`), read at split time in `scan_file_for_separating_barcodes` (`src/documents/tasks.py:102`). The symbology is irrelevant — CODE39, QR, and CODE128 all trigger a split as long as the **decoded string equals** the configured value; a different value (e.g. `"CUSTOM BARCODE"`) only triggers when `CONSUMER_BARCODE_STRING` is set to it. **[observed]** + **[code-grounded]**
 - **(c) Where the split decision is made:** in `scan_file_for_separating_barcodes`, which reads each rendered page's barcodes (`current_barcodes = barcode_reader(page)`, `src/documents/tasks.py:107`) and then, at `if separator_barcode in current_barcodes:` (`src/documents/tasks.py:108`), appends the page index to the separator list (`:109`). The whole barcode path is gated by `settings.CONSUMER_ENABLE_BARCODES` (default `False`) in `consume_file` (`src/documents/tasks.py:195`). **[code-grounded]**
-- **(d) Does splitting change the effective training data during a run:** **yes.** The `consume_file` *split* path itself creates **zero** `Document` rows — it copies fragments to the consumption directory and unlinks the original (`src/documents/tasks.py:210,214`), returning `"File successfully split"`. But when the fragments are subsequently consumed, each distinct fragment becomes a `Document`, and `train()` reads the current corpus via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` (`src/documents/classifier.py:125-127`) — so one input file enlarges the training corpus by up to N+1 rows. **[observed]** + **[code-grounded]**
+- **(d) Does splitting change the effective training data during a run:** **yes.** The `consume_file` *split* path itself creates **zero** `Document` rows — it copies fragments to the consumption directory and unlinks the original (`src/documents/tasks.py:210,214`), returning `"File successfully split"`. But when the fragments are subsequently consumed, each **successfully-parsed, nonduplicate** fragment becomes a `Document`, and `train()` reads the current corpus via `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` (`src/documents/classifier.py:125-127`) — so one input file enlarges the training corpus by **at most** N+1 rows, and **fewer** when fragments are byte-duplicates or fail to parse. The staged before→split→consume→dedupe→retrain timeline is in §5.5.1. **[observed]** + **[code-grounded]**
 
 ### 5.2 Observed — import-time binding of the `save_to_dir` destination (`/app/consume`)
 
@@ -737,6 +855,65 @@ scan(barcode-128-custom.pdf) -> [0] (now matches because decoded value == config
 ```
 
 Every scan result matches the canonical tests: `simple.pdf`→`[]` (no barcode), `patch-code-t.pdf`→`[0]` (separator on page 0), `patch-code-t-middle.pdf`→`[1]`, `several-patcht-codes.pdf`→`[2, 5]`, `patch-code-t-qr.pdf`→`[0]` (QR). The `barcode_reader` PNG edges show an **unreadable** barcode yields `[]` and a **custom-value** barcode decodes to `'CUSTOM BARCODE'` (not `PATCHT`), so under the default string it would not trigger; setting `CONSUMER_BARCODE_STRING='CUSTOM BARCODE'` makes `scan(barcode-128-custom.pdf)`→`[0]`. Each decoded value is logged as `Barcode of type <SYMBOLOGY> found: <value>` (`src/documents/tasks.py:90-92`).
+
+#### 5.3.1 Complete `CONSUMER_BARCODE_STRING` value matrix, and enabled-vs-disabled — case/whitespace/empty/custom/nonmatching — [observed]
+
+The split decision is an **exact string membership** test — `if separator_barcode in current_barcodes` (`src/documents/tasks.py:108`), where `separator_barcode = settings.CONSUMER_BARCODE_STRING` — so it is both **case-sensitive** and **whitespace-sensitive**. The matrix below drives the real `scan_file_for_separating_barcodes()` over two fixtures — `patch-code-t.pdf` (its barcode decodes to `PATCHT` via CODE39) and `barcode-128-custom.pdf` (decodes to `CUSTOM BARCODE` via CODE128) — for six configured values. Every cell is stable across both runs (complete unedited capture, including every per-scan `Barcode of type … found` log line, in Appendix §7.3.8). Command:
+
+```text
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna python3 /tmp/obs_q4_matrix.py 1
+```
+
+```text
+--- (M) CONSUMER_BARCODE_STRING value matrix -> scan() separators (case/whitespace/empty/custom/nonmatching) ---
+fixtures: patch-code-t.pdf (decodes 'PATCHT', CODE39); barcode-128-custom.pdf (decodes 'CUSTOM BARCODE', CODE128)
+CONSUMER_BARCODE_STRING scan(patch-code-t.pdf)   scan(barcode-128-custom.pdf)
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'PATCHT'               [0]                      []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'patcht'               []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'PATCHT '              []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+''                     []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'CUSTOM BARCODE'       []                       [0]                     
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'NONEXISTENT VALUE'    []                       []                      
+```
+
+Matrix (the `%r` form in the capture shows quotes, revealing the trailing space and the empty string):
+
+| `CONSUMER_BARCODE_STRING` | `scan(patch-code-t.pdf)` (decodes `PATCHT`) | `scan(barcode-128-custom.pdf)` (decodes `CUSTOM BARCODE`) | verdict |
+|---------------------------|---------------------------------------------|----------------------------------------------------------|---------|
+| `'PATCHT'` (exact default) | `[0]` | `[]` | matches `PATCHT` only |
+| `'patcht'` (lowercase)     | `[]`  | `[]` | **no match — case-sensitive** |
+| `'PATCHT '` (trailing space) | `[]` | `[]` | **no match — whitespace-sensitive** |
+| `''` (empty)               | `[]`  | `[]` | **never matches** |
+| `'CUSTOM BARCODE'` (custom) | `[]` | `[0]` | matches `CUSTOM BARCODE` only |
+| `'NONEXISTENT VALUE'` (nonmatching) | `[]` | `[]` | no match despite a valid barcode present |
+
+Reading the matrix:
+
+- **Case-sensitive.** `'patcht'` does **not** match the decoded `'PATCHT'` — the membership test at `src/documents/tasks.py:108` compares raw strings with no case-folding.
+- **Whitespace-sensitive.** `'PATCHT '` (one trailing space) does **not** match `'PATCHT'` — no trimming is applied.
+- **Empty string never matches.** `''` yields `[]` for both fixtures (`'' in ['PATCHT']` is `False`; and a barcode-free page yields `current_barcodes == []`).
+- **Symbology-independent, value-driven.** `PATCHT` was decoded from **CODE39** and `CUSTOM BARCODE` from **CODE128** (QR elsewhere, §5.3); the trigger is the decoded **value**, not the symbology — each decode is logged as `Barcode of type <SYMBOLOGY> found: <value>` (`src/documents/tasks.py:90-92`).
+- **Custom vs nonmatching.** Setting the value to `'CUSTOM BARCODE'` makes only the custom fixture split; `'NONEXISTENT VALUE'` matches nothing even though a valid `PATCHT` barcode is present.
+
+**Enabled vs. disabled, and nonmatching → whole-file consume → exactly one row — [observed].** When the barcode path is **disabled** (`CONSUMER_ENABLE_BARCODES=False`, the default) or **enabled but the string does not match**, `consume_file` finds no separator, skips the split block, and falls through to the whole-file `Consumer().try_consume_file(path,…)` at `src/documents/tasks.py:236`, returning `"Success. New document id N created"` and adding **exactly one** `Document` row (complete consume subprocess logs in Appendix §7.3.8):
+
+```text
+  DISABLED / patch-code-t-middle.pdf         enable=False string='PATCHT'           -> 'Success. New document id 1 created' | rows 0->1 (delta=1)
+  NONMATCHING / patch-code-t-qr.pdf          enable=True  string='NONEXISTENT VALUE' -> 'Success. New document id 2 created' | rows 1->2 (delta=1)
+```
+
 
 ### 5.4 Observed — (a) N separators → N+1 fragment files — [observed]
 
@@ -830,6 +1007,149 @@ DocumentClassifier().train() returned = True (reads Document.objects at classifi
 
 So splitting **did** change the effective training data: two input files yielded 3 net `Document` rows (`several-patcht-codes.pdf`→2 distinct, `patch-code-t-middle.pdf`→1 distinct), and `DocumentClassifier().train()` returned `True` on that split-produced corpus. (The fragment md5 **values** vary run-to-run because `pikepdf`'s save is not byte-deterministic across processes, but the **distinct-count** invariant — 2-of-3 and 1-of-2 — and the resulting row counts are stable across both runs; see §7.3.) **[observed]** + **[inferred]**
 
+#### 5.5.1 Staged DB/model timeline for a `[2, 5]` split — before / file-only split / each fragment consume / retrain — [observed]
+
+To make the "effect on training data" concrete and ordered, this probe drives the **real** entry points against `several-patcht-codes.pdf` (separators `[2, 5]`, so N+1 = 3 fragments) with a **fresh, isolated** database (`Document.objects.all().delete()` at the start; `/app/media` and `/app/consume` redirected to per-run temp dirs via `override_settings` + `save_to_dir.__defaults__` rebinding, §7.2), sampling `Document.objects.count()` at six stages. Command:
+
+```text
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna python3 /tmp/obs_q4_matrix.py 1
+```
+
+The staged table (the complete capture — every `paperless.tasks`/`paperless.consumer`/OCR subprocess line for each fragment — is in Appendix §7.3.8):
+
+```text
+  STAGE                      Doc.count  NOTE
+  0 before split             0          input file only
+  1 after file-only split    0          'File successfully split'; original unlinked=True; 3 fragments=['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
+  2 after consume frag_0     1          several-patcht-codes_document_0.pdf CREATED pk=3 (md5=d74161c9d1a271807ae51a6b25a10aad)
+  3 after consume frag_1     1          several-patcht-codes_document_1.pdf REJECTED duplicate (md5=d74161c9d1a271807ae51a6b25a10aad)
+  4 after consume frag_2     2          several-patcht-codes_document_2.pdf CREATED pk=4 (md5=17c11e09a10bb4a0762a6cba8d817035)
+  5 after retrain            2          train() returned True; effective corpus (inbox-excluded) = 2
+```
+
+Reading the timeline:
+
+- **Stage 0 → 1 (the split itself adds nothing):** `consume_file(...)` returns `'File successfully split'`, unlinks the original (`src/documents/tasks.py:214`), and writes **3 fragment files** — but the `Document` count stays **0**. The split path never creates rows; it only produces files (§5.5).
+- **Stage 1 → 2 (frag_0 → +1):** consuming fragment 0 creates `Document pk=3`; count `0 → 1`.
+- **Stage 2 → 3 (frag_1 → +0, duplicate):** fragment 1 is byte-identical to fragment 0 (same md5), so `pre_check_duplicate` (`src/documents/consumer.py:102-113`, md5 at :104) rejects it — `It is a duplicate.` — count stays **1**.
+- **Stage 3 → 4 (frag_2 → +1):** fragment 2 is distinct; creates `Document pk=4`; count `1 → 2`.
+- **Stage 4 → 5 (retrain reads the enlarged corpus):** `DocumentClassifier().train()` returns `True` and reports an effective (inbox-excluded) corpus of **2** — the two rows that the split produced. This is the observed "effect on training data": a single input file materially changed what a later `train()` sees.
+- **Stability:** the per-stage counts (`0,0,1,1,2,2`), the CREATED/REJECTED pattern, and `train()==True` are **identical across both runs** (§7.3.8). Only the fragment **md5 values** differ run-to-run (pikepdf's save is not byte-deterministic across processes: run 1 `d74161c9…`/`17c11e09…`; run 2 `71fd51f1…`/`55539372…`), which does not affect the row counts because the duplicate relationship (frag_1 == frag_0) is preserved within each run. **[observed]**
+
+#### 5.5.2 Boundary case — a **page-0** separator yields two 0-page fragments that both fail to parse (0 rows) yet the split still "succeeds" and leaks non-daemon threads — [observed]
+
+The N+1 arithmetic (§5.4) and the "distinct fragment → row" rule (§5.1(a)) both have a boundary the happy-path fixtures never exercise: a separator on **page 0**. `patch-code-t.pdf` is a **single-page** PDF whose only page carries the `PATCHT` barcode, so `scan_file_for_separating_barcodes()` returns `[0]`. `separate_pages()` then builds `document_0` from the pages *before* the separator (there are none) and one fragment *after* the separator page (which it skips) — producing **two 0-page PDFs**. This probe inspects both fragments and passes each through the **real** `Consumer`. Because the process ends up with live non-daemon threads (see step 5), it does **not** exit on its own — it is run under a hard timeout and terminates with **`rc=124` (hang)**; that non-exit is itself part of the observation and is stable across both runs. Command:
+
+```text
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna timeout 120 python3 /tmp/obs_q4_page0.py; echo "exit=$?"
+... (see full capture below) ...
+exit=124
+```
+
+Steps (1) scan and (2) fragment inspection — both fragments are **0-page, 315 bytes, byte-identical**:
+
+```text
+input patch-code-t.pdf pages=1 size=40893
+
+--- (1) scan_file_for_separating_barcodes(patch-code-t.pdf) ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+separators = [0]
+
+--- (2) separate_pages(patch-code-t.pdf, [0]) -> inspect each emitted fragment ---
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmpgcjbsc2k/paperless-m5c7ach8
+LOG DEBUG paperless.tasks: Count: 0 page_number: 0
+LOG DEBUG paperless.tasks: pdf no:0 has 0 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmpgcjbsc2k/paperless-m5c7ach8/patch-code-t_document_0.pdf', '/tmp/tmpgcjbsc2k/paperless-m5c7ach8/patch-code-t_document_1.pdf']
+fragment count = 2
+  fragment patch-code-t_document_0.pdf              pages=0 size=315 md5=23ca22d022b120dbed9ad7024e174cda sha256=3b2d9eca14f0cd809195671cb16e9c0d814a3c622862dc3bd788e02bf4ef0cd9
+  fragment patch-code-t_document_1.pdf              pages=0 size=315 md5=23ca22d022b120dbed9ad7024e174cda sha256=3b2d9eca14f0cd809195671cb16e9c0d814a3c622862dc3bd788e02bf4ef0cd9
+  both fragments byte-identical to each other? True
+  all fragments 0-page? True ; all 315 bytes? True
+```
+
+Step (3) — passing fragment 0 through the real `Consumer` raises the root `ValueError: max_workers must be greater than 0` inside OCRmyPDF's executor setup, which is wrapped as `ParseError` (`src/paperless_tesseract/parsers.py:314`, from the `ocrmypdf.ocr(**args)` call at `:261`) and surfaced by the consumer (`src/documents/consumer.py:261`) as a `ConsumerError` — producing **0 rows**. The complete traceback (fragment 0 shown; fragment 1 produces the byte-identical traceback — full both-fragment capture in Appendix §7.3.9):
+
+```text
+--- (3) pass EACH 0-page fragment through the REAL Consumer -> exact exception, 0 rows ---
+Document.objects.count() BEFORE = 0
+LOG INFO paperless.consumer: Consuming patch-code-t_document_0.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t_document_0.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4p0-frag-enyi2scg/patch-code-t_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4p0-frag-enyi2scg/patch-code-t_document_0.pdf', 'output_file': '/tmp/tmpgcjbsc2k/paperless-4msoukax/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpgcjbsc2k/paperless-4msoukax/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpgcjbsc2k/paperless-4msoukax
+LOG ERROR paperless.consumer: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 385, in run_pipeline
+    exec_concurrent(context, executor)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 274, in exec_concurrent
+    executor(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_concurrent.py", line 82, in __call__
+    self._execute(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/builtin_plugins/concurrency.py", line 127, in _execute
+    with self.pbar_class(**tqdm_kwargs) as pbar, executor_class(
+  File "/usr/local/lib/python3.9/concurrent/futures/thread.py", line 144, in __init__
+    raise ValueError("max_workers must be greater than 0")
+ValueError: max_workers must be greater than 0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 314, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: ValueError: max_workers must be greater than 0
+  consumed patch-code-t_document_0.pdf              -> ConsumerError: patch-code-t_document_0.pdf: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0
+Document.objects.count() AFTER  = 0 (0 => neither 0-page fragment produced a row)
+```
+
+Step (4) — despite both fragments failing to parse, `consume_file(...)` still returns `'File successfully split'` and unlinks the original (`src/documents/tasks.py:214`), leaving 0 rows:
+
+```text
+--- (4) consume_file(patch-code-t.pdf, CONSUMER_ENABLE_BARCODES=True) still 'File successfully split' + unlink ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Pages with separators found in: /tmp/pngx-q4p0-in-l_8ar02x/patch-code-t.pdf
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmpgcjbsc2k/paperless-kx8qbd82
+LOG DEBUG paperless.tasks: Count: 0 page_number: 0
+LOG DEBUG paperless.tasks: pdf no:0 has 0 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmpgcjbsc2k/paperless-kx8qbd82/patch-code-t_document_0.pdf', '/tmp/tmpgcjbsc2k/paperless-kx8qbd82/patch-code-t_document_1.pdf']
+LOG DEBUG paperless.tasks: Deleting file /tmp/pngx-q4p0-in-l_8ar02x/patch-code-t.pdf
+LOG WARNING paperless.tasks: OSError. It could be, the broker cannot be reached.
+LOG WARNING paperless.tasks: Multiple exceptions: [Errno 111] Connect call failed ('::1', 6379, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 6379)
+  consume_file(...) returned = 'File successfully split'
+  original input still exists? = False (False => os.unlink at tasks.py:214)
+  isolated consume dir contents = ['patch-code-t_document_0.pdf', 'patch-code-t_document_1.pdf']
+  Document.objects.count() after split = 0
+```
+
+Step (5) — after OCRmyPDF's failed executor setup, **three non-daemon threads remain alive**, which is why the process cannot exit and the run times out:
+
+```text
+--- (5) live threads after OCRmyPDF ran (non-daemon threads keep the process alive) ---
+  thread name='MainThread'             daemon=False alive=True
+  thread name='Thread-8'               daemon=True  alive=True
+  thread name='Thread-9'               daemon=False alive=True
+  thread name='Thread-11'              daemon=False alive=True
+  thread name='ThreadPoolExecutor-3_0' daemon=False alive=True
+  non-daemon non-main threads still alive = 3 -> ['Thread-9', 'Thread-11', 'ThreadPoolExecutor-3_0']
+================ END OF SCRIPT BODY ================
+main thread returning now; if a non-daemon thread is alive the process will NOT exit (timeout => hang)
+```
+
+Reading the boundary case:
+
+- **Fragment count still follows N+1:** one page-0 separator (N=1) yields **2** fragment files — the arithmetic holds — but both are **empty (0-page) PDFs**, so this is the degenerate end of the range.
+- **0 rows, not 2:** the "distinct fragment → Document row" rule (§5.1(a)) is conditioned on *successful parse*; here the real `Consumer` raises `ConsumerError` for **both** fragments (root cause `ValueError: max_workers must be greater than 0` at `concurrent/futures/thread.py:144`, reached via `ocrmypdf/_concurrent.py:82` → `builtin_plugins/concurrency.py:127`), so the split produces **0** `Document` rows — directly substantiating the narrowed §5.1(a)/(d) wording.
+- **"Success" is reported regardless:** `consume_file` returns `'File successfully split'` and deletes the original input even though nothing was ingested — a silent-data-loss shape for a page-0 separator.
+- **Stable across runs, with expected digest volatility:** separators `[0]`, fragment count 2, `pages=0`, `size=315`, byte-identical fragments, the exact `ValueError`/`ParseError`/`ConsumerError` chain, `AFTER=0`, and the `rc=124` hang with the same three non-daemon threads (`Thread-9`, `Thread-11`, `ThreadPoolExecutor-3_0`) all reproduce identically in **both** runs. Only the empty-PDF digests differ (run 1 `md5=23ca22d0… sha256=3b2d9eca…`; run 2 `md5=2bf6a7ed… sha256=3a07eff7…`), again from pikepdf's non-deterministic save — the 0-page / 315-byte / byte-identical invariants are preserved within each run. **[observed]**
+
+
 ### 5.6 Observed — canonical Q4 tests, and the `/app/consume` pollution they cause — [observed]
 
 ```text
@@ -844,12 +1164,47 @@ $ docker exec -u testuser -w /app/src -e DJANGO_SETTINGS_MODULE=paperless.settin
 ```
 
 ```text
+============================= test session starts ==============================
+platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python3
+django: version: 4.0.4, settings: paperless.settings (from env)
+rootdir: /app/src
+configfile: setup.cfg
+plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
+collecting ... collected 5 items
+
 documents/tests/test_tasks.py::TestTasks::test_separate_pages PASSED     [ 20%]
 documents/tests/test_tasks.py::TestTasks::test_barcode_splitter PASSED   [ 40%]
 documents/tests/test_tasks.py::TestTasks::test_consume_barcode_file PASSED [ 60%]
 documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes PASSED [ 80%]
 documents/tests/test_tasks.py::TestTasks::test_scan_file_for_separating_barcodes4 PASSED [100%]
-======================== 5 passed, 6 warnings in 3.29s =========================
+
+=============================== warnings summary ===============================
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:67
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:67: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version = StrictVersion(hiredis.__version__)
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:69
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:69: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('0.1.3')
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:71
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:71: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('0.1.4')
+
+../../usr/local/lib/python3.9/site-packages/redis/connection.py:73
+  /usr/local/lib/python3.9/site-packages/redis/connection.py:73: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+    hiredis_version >= StrictVersion('1.0.0')
+
+../../usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229
+  /usr/local/lib/python3.9/site-packages/django/conf/__init__.py:229: RemovedInDjango50Warning: The USE_L10N setting is deprecated. Starting with Django 5.0, localized formatting of data will always be enabled. For example Django will display numbers and dates using the format of the current locale.
+    warnings.warn(USE_L10N_DEPRECATED_MSG, RemovedInDjango50Warning)
+
+../../usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9
+  /usr/local/lib/python3.9/site-packages/django_q/core_signing.py:9: RemovedInDjango50Warning: The django.utils.baseconv module is deprecated.
+    from django.utils import baseconv
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 5 passed, 6 warnings in 3.35s =========================
 ```
 
 `test_consume_barcode_file` (`src/documents/tests/test_tasks.py:395`) does not pass a `target_dir`, so via the import-bound default it copies `patch-code-t-middle_document_0.pdf` and `patch-code-t-middle_document_1.pdf` into the shared `/app/consume`. This investigation inventoried that directory before/after every probe and every non-determinism run, isolated it during split probes, and deleted only those exact test-created files afterward (§7.5). **[observed]**
@@ -882,6 +1237,7 @@ The shell CPU count is **128**, and `-n auto` resolves to `created: 128/128 work
 The two suites in question (`documents/tests/test_classifier.py` and `documents/tests/test_tasks.py`) were run **10 times** under the default config. Before each run, the one shared mutable target, `/app/consume`, was emptied so every run starts from an identical filesystem state; the inventory before/after each run and the repository's `git status` before/after the whole loop are recorded in §7.5. The per-run manifest (exit code, wall-clock duration, output line count, `/app/consume` inventory before/after, and pytest's own summary line):
 
 ```text
+$ mkdir -p /tmp/nd
 $ for i in $(seq 1 10); do
 >   rm -f /app/consume/* 2>/dev/null
 >   before="$(ls -A /app/consume | tr '\n' ',')"; [ -z "$before" ] && before="(empty)"
@@ -906,7 +1262,7 @@ run 9 | exit=0 | wall=35.73s | lines=35 | consume_before=(empty) | consume_after
 run 10 | exit=0 | wall=33.54s | lines=35 | consume_before=(empty) | consume_after=patch-code-t-middle_document_0.pdf,patch-code-t-middle_document_1.pdf, | 62 passed, 1 skipped, 774 warnings in 31.21s
 ```
 
-**Observed distribution: 10/10 all-pass** — every run exited `0` with `62 passed, 1 skipped, 774 warnings`. `consume_before` is `(empty)` for all ten runs and `consume_after` is the same two fragment files for all ten — proving each run began from an identical state and produced an identical result. The reported "sometimes fails" behavior **did not reproduce** for these two suites in the canonical container under the default parallel config; this is honest **non-reproduction**, not proof that the suites are structurally incapable of flaking (see §6.5).
+**Observed distribution: 10/10 all-pass** — every run exited `0` with `62 passed, 1 skipped, 774 warnings`. `consume_before` is `(empty)` for all ten runs and `consume_after` is the same two fragment files for all ten — proving each run began from an identical state and produced an identical result. The reported "sometimes fails" behavior **did not reproduce** for these two suites in the canonical container under the default parallel config; this is honest **non-reproduction** at the suite level, not proof that the suites are structurally incapable of flaking. The underlying prediction-path flip that drives the reported flakiness **is** directly reproduced in isolation — 54 MATCH / 66 NONE over 120 fresh processes on a byte-identical corpus (see §6.5–§6.6).
 
 A single complete run is only **35 lines** (there is no large per-file coverage table on the terminal — with `--cov-report=html` the terminal shows only a three-line coverage footer and `Coverage HTML written to dir htmlcov`), so all ten complete, unedited runs are reproduced in Appendix §7.4. Here is run 1 in full — **[observed]**:
 
@@ -952,16 +1308,16 @@ The `s..............................................................` line is th
 
 ### 6.4 The concrete code-level mechanism — an unseeded `MLPClassifier` — [observed] + [code-grounded]
 
-The most defensible concrete candidate for run-to-run classification non-determinism is that the classifier's `MLPClassifier` is **unseeded**. All three estimators are constructed as `MLPClassifier(tol=0.01)` with **no `random_state`** (`src/documents/classifier.py:219` tags, `:227` correspondents, `:238` document types); a grep finds no RNG seeding anywhere. Training identical data in two separate process invocations yields **different** learned weights (they would be identical if seeded), while the argmax prediction stays stable on well-separated fixtures:
+The concrete code-level cause of run-to-run classification non-determinism is that the classifier's `MLPClassifier` is **unseeded**. All three estimators are constructed as `MLPClassifier(tol=0.01)` with **no `random_state`** (`src/documents/classifier.py:219` tags, `:227` correspondents, `:238` document types); a grep finds no RNG seeding anywhere. Training identical data in two separate process invocations yields **different** learned weights (they would be identical if seeded). Whether that weight difference changes the *prediction* depends entirely on the prediction input: for an input whose tokens **overlap** the training vocabulary the argmax is stable, but for an input whose tokens do **not** overlap it flips run-to-run — reproduced directly in §6.5. The cross-process capture below uses the overlapping input `'this is a document from c1'`, so its `[1]` prediction is stable even though the weight *values* are volatile by construction (they differ every process, and will differ again on any re-run):
 
 ```text
 ########## Cross-process unseeded MLP (two separate invocations, identical data) ##########
 $ python3 /tmp/obs_q1_rng.py A   ;  python3 /tmp/obs_q1_rng.py B
 === PROCESS A ===
-first 5 correspondent-MLP weights = [-0.0019321648136633172, 0.0019423598020853678, 0.016298689330098728, -0.0003242765430265773, 0.2242488854615288]
+first 5 correspondent-MLP weights = [0.16484243335059118, 0.024833631206164587, -0.10771502193460243, 0.18496734298036752, -0.1746059464784781]
 predict_correspondent('this is a document from c1') = [1] (c1.pk=1)
 === PROCESS B ===
-first 5 correspondent-MLP weights = [0.0002728923593665325, -0.012477450506852715, -0.0025893042218007537, -0.01169012809750399, 0.16755901770974968]
+first 5 correspondent-MLP weights = [0.09845402569574553, -0.011958840241269615, -0.16824946018903553, -0.10334667421713604, -0.006218273932036396]
 predict_correspondent('this is a document from c1') = [1] (c1.pk=1)
 
 ########## grep for any RNG seeding in classifier.py ##########
@@ -973,13 +1329,57 @@ $ grep -nE 'MLPClassifier\(' documents/classifier.py
 238:            self.document_type_classifier = MLPClassifier(tol=0.01)
 ```
 
-### 6.5 Assessment — observed vs. bounded hypothesis
+### 6.5 Direct reproduction of the argmax flip on an unseen-vocabulary input — [observed]
 
-- **[observed]** 10/10 all-pass for the two suites under default `--numprocesses auto` (128 workers), from an identical state.
-- **[observed] + [code-grounded]** `DirectoriesMixin` isolates `MODEL_FILE` and `SCRATCH_DIR` per test (`src/documents/tests/utils.py:37,45`), removed at `tearDown` (`:53-57`), and each `TestCase` runs in a rolled-back transaction — so there is **no shared on-disk model file and no shared DB state** across workers for these two suites. Model-file isolation is therefore a **separate** concern from the RNG/order coupling below.
-- **[observed] + [inferred]** The unseeded `MLPClassifier` (`src/documents/classifier.py:219,227,238`) draws initial weights from NumPy's process-global RNG. Test order / worker assignment under xdist can therefore alter initial weights even when model files are isolated. On a borderline / less-separable corpus this could flip an argmax between runs and produce intermittent prediction-assertion failures **independent of any file sharing**. My fixtures were separable enough that the argmax never flipped across 10 runs and 2 processes, so the flakiness did not surface here. This RNG/order coupling is offered as a **clearly-bounded hypothesis** for the reported flakiness, not a proven cause; the observation is bounded to the 10/10 result.
+§6.4 establishes the mechanism (unseeded weights); this section reproduces the **actual run-to-run flip** through the real entry points. The trigger is the *prediction input's vocabulary*: when the text being classified shares no tokens with the training corpus, `CountVectorizer.transform` produces a near-zero feature vector, the two output classes `{-1, c1.pk}` sit at the MLP's decision boundary, and the unseeded initial weights alone decide the argmax — so it flips process-to-process. This is exactly the corpus/input Report 5 describes.
+
+**Corpus (canonical, built and trained through `tasks.train_classifier()`):** one `Correspondent(name='Auto C1', matching_algorithm=MATCH_AUTO)`; three `Document` rows — a labeled training doc (`content='acme invoice alpha repeated signal'`, `correspondent=Auto C1`), an unlabeled doc (`'garden weather banana unrelated neutral'`, `correspondent=None`), and an inbox-tagged doc (`'inbox excluded acme invoice'`) that `train()` drops via `.exclude(tags__is_inbox_tag=True)` (`src/documents/classifier.py:127`). Effective corpus = 2 docs, classes `{-1, 1}`. **Prediction input:** `'totally unseen vocabulary tokens'` — zero overlap with the corpus. The full probe source is in Appendix §7.2 (`obs_q6_nd.py`).
+
+Command — 30 fresh single-process invocations, each a complete `train_classifier()` → `load_classifier()` → `predict_correspondent()` → `match_correspondents()` cycle. The loop is redirected to a file (so it prints nothing to stdout); each subsequent command shows its real, complete output. The 30 raw `RUN=` lines are reproduced verbatim in Appendix §7.4.11.
+
+```text
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src \
+      -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna \
+      bash -c 'for i in $(seq 1 30); do python3 /tmp/obs_q6_nd.py $i 2>/dev/null | grep "^RUN="; done' \
+      > /tmp/nd30.txt
+
+$ grep -c verdict=MATCH /tmp/nd30.txt ; grep -c verdict=NONE /tmp/nd30.txt
+14
+16
+
+$ grep -oE 'corpus_sha1=[0-9a-f]+' /tmp/nd30.txt | sort -u
+corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754
+
+$ grep -oE 'corpus_sha1=[0-9a-f]+' /tmp/nd30.txt | sort -u | wc -l
+1
+
+$ grep -oE 'model_sha256=[0-9a-f]+' /tmp/nd30.txt | sort -u | wc -l
+30
+```
+
+Compact verdict sequence for those 30 processes — each token is one process's accept/reject decision on the **same unchanged input**:
+
+```text
+MATCH NONE MATCH MATCH MATCH NONE MATCH NONE NONE NONE NONE NONE MATCH MATCH MATCH MATCH NONE MATCH NONE MATCH NONE NONE NONE MATCH NONE NONE NONE MATCH NONE MATCH
+```
+
+Observations, all from the block above:
+
+- **The corpus is provably identical across all 30 runs** — exactly one distinct `corpus_sha1 = 98b0e672e43fbc7863208b65051bd70b50571754`, byte-identical to the value Report 5 reports, so the flip is **not** caused by any input variation.
+- **Every trained model is a distinct artifact** — 30 distinct `model_sha256` digests over 30 runs — confirming the unseeded weights of §6.4 at the persisted-model level.
+- **The accept/reject verdict flips on that fixed input:** 14 MATCH / 16 NONE in this batch — the same unchanged document is assigned the correspondent on some runs and left unassigned on others.
+
+**Distribution across four independent 30-process batches** (to show a genuine near-even flip, not a fixed ratio): `14/16`, `13/17`, `15/15`, `12/18` → **54 MATCH / 66 NONE over 120 fresh processes (~45% accept)**; across all 120 there is still exactly **1** distinct `corpus_sha1` and **120** distinct `model_sha256`.
+
+**Why the document's own Q2 fixtures never surfaced this:** the flip is contingent on *unseen* prediction vocabulary. A side-by-side probe (`obs_q6_contrast.py`, source in Appendix §7.2; full 20-line output in Appendix §7.4.12) trains the identical corpus once per process and predicts on two inputs — an overlapping one (`'acme invoice'`, whose tokens appear in training) and the unseen one (`'totally unseen vocabulary tokens'`). Over 20 fresh processes the overlapping input is **stable at 20/20 MATCH**, while the unseen input flips at **12/20 MATCH, 8/20 NONE**. The document's Q2 acceptance fixtures (§3) predict on overlapping vocabulary, which is why their argmax is stable and the suites pass 10/10 (§6.3) even though the model weights are volatile by construction.
+
+### 6.6 Assessment — observed and reproduced
+
+- **[observed]** 10/10 all-pass for the two suites under default `--numprocesses auto` (128 workers), from an identical state (§6.3). This is consistent with §6.5: the suites' Q2 fixtures predict on overlapping vocabulary, so their argmax does not flip.
+- **[observed] + [code-grounded]** `DirectoriesMixin` isolates `MODEL_FILE` and `SCRATCH_DIR` per test (`src/documents/tests/utils.py:37,45`), removed at `tearDown` (`:53-57`), and each `TestCase` runs in a rolled-back transaction — so there is **no shared on-disk model file and no shared DB state** across workers for these two suites. Model-file isolation is therefore a **separate** concern from the RNG-driven prediction flip.
+- **[observed] + [code-grounded]** The unseeded `MLPClassifier` (`src/documents/classifier.py:219,227,238`) draws initial weights from NumPy's process-global RNG, so identical training data yields a different model — and a different argmax at the decision boundary — in every process (30 distinct `model_sha256` over 30 runs, §6.5). On an input whose vocabulary does not overlap the training corpus this flips the accept/reject decision run-to-run: **directly observed and reproduced at 54 MATCH / 66 NONE over 120 fresh processes on a byte-identical corpus** (§6.5). This is a **reproduced cause** of prediction non-determinism, not a bounded hypothesis. The one link that remains **[inferred]** is the final step from a reproduced *prediction* flip to an intermittent *test-assertion* failure in the full parallel suite: that additionally requires xdist test order / worker assignment to perturb the shared process-global NumPy RNG relative to a threshold-sensitive assertion — a mechanism consistent with the code but not separately observed here.
 - **[inferred, code-grounded]** Secondary structural suspect: the fixed shared `SCRATCH_DIR = /tmp/paperless` (`src/paperless/settings.py:84`). Any code path that does not go through a `DirectoriesMixin` override writes there; under 128 parallel workers that is a plausible cross-worker collision point — but it is **not** a factor for these two suites, both of which override `SCRATCH_DIR` per test.
-- No behavior above is attributed to vague environmental causes (containerization, scheduler jitter, networking); the concrete code-level mechanism is the unseeded `MLPClassifier`, with the fixed shared `SCRATCH_DIR` as a secondary structural suspect for suites outside these two.
+- No behavior above is attributed to vague environmental causes (containerization, scheduler jitter, networking); the concrete, reproduced code-level mechanism is the unseeded `MLPClassifier`, with the fixed shared `SCRATCH_DIR` as a secondary structural suspect for suites outside these two.
 
 ---
 
@@ -989,11 +1389,14 @@ This appendix reproduces (a) the full source of every observation script, (b) th
 
 ### 7.1 How to reproduce
 
-Each script was delivered into the container's `/tmp` with `docker cp` and executed as:
+Each script was delivered into the container's `/tmp` with `docker cp` and executed with a run-index argument. To reproduce: save any script's full source from §7.2 to a local file under its listed name (for example `obs_q1_hires.py`), copy it into the container, and run it — the trailing integer is the run index (`1`, `2`, …). A concrete, copy-pasteable example (the Q1 high-resolution lifecycle probe, run 1):
 
 ```text
-$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna python3 /tmp/<script>.py <run-number>
+$ docker cp obs_q1_hires.py pngx-qna:/tmp/obs_q1_hires.py
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna python3 /tmp/obs_q1_hires.py 1
 ```
+
+Substitute any other script name from §7.2 (`obs_q2.py`, `obs_q3.py`, `obs_q4.py`, `obs_q4_matrix.py`, `obs_q4_page0.py`, `obs_q6_nd.py`, `obs_q6_contrast.py`, …) and the desired run index in the same two commands.
 
 Every script creates its own test database and per-probe `tempfile.mkdtemp()` directories (mode `0700`, no predictable names — CWE-377 safe), attaches DEBUG handlers to the `paperless.*` (and, for OCR, `ocrmypdf.*`) loggers, and cleans up in a `try/finally` with a post-run inventory. The scripts import only existing project modules and live only under the container's `/tmp`; they are removed after the investigation and never enter the repository.
 
@@ -1558,41 +1961,634 @@ print("scan edges: simple=[], patch0=[0], middle=[1], several=[2,5], qr=[0]; unr
       "fragments consumed -> N+1 Document rows -> corpus grows | /app/consume untouched")
 ```
 
+#### `/tmp/obs_q6_nd.py` (§6 — non-determinism: run-to-run argmax flip on an unseen-vocabulary input)
+
+```python
+#!/usr/bin/env python3
+"""Q6/non-determinism probe: reproduce the reported run-to-run 'sometimes matches,
+sometimes not' behavior of the automatic (MATCH_AUTO) correspondent path, through the
+REAL entry points documents.tasks.train_classifier() -> load_classifier() ->
+DocumentClassifier.predict_correspondent() -> matching.match_correspondents().
+
+Each invocation is a FRESH process with an identical, fixed corpus and an identical,
+fixed prediction input whose tokens do NOT appear in the training vocabulary.  It prints
+one machine-parseable line: the corpus SHA-1 (stable across runs => identical corpus),
+the trained model SHA-256 (varies => unseeded MLP), the learned classes_, the raw
+prediction, the accepted correspondent names, and a MATCH/NONE verdict.  Secure temp dirs
++ full cleanup; nothing is written outside the container /tmp."""
+import os, sys, hashlib, tempfile, shutil
+
+RUN = sys.argv[1] if len(sys.argv) > 1 else "1"
+scratch = tempfile.mkdtemp(prefix="pngx-nd-")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+
+import django
+from django.conf import settings
+from django.test import override_settings
+django.setup()
+from django.test.utils import setup_test_environment
+from django.db import connection
+setup_test_environment()
+connection.creation.create_test_db(verbosity=0)
+
+ovr = override_settings(
+    MODEL_FILE=os.path.join(scratch, "classification_model.pickle"),
+    DATA_DIR=scratch,
+    SCRATCH_DIR=scratch,
+)
+ovr.enable()
+
+from documents import tasks, matching
+from documents.classifier import load_classifier, preprocess_content
+from documents.models import Correspondent, Document, Tag, MatchingModel
+
+PREDICT_INPUT = "totally unseen vocabulary tokens"
+
+def corpus_sha1():
+    """Replicate DocumentClassifier.train()'s SHA-1 over the effective (non-inbox) corpus."""
+    m = hashlib.sha1()
+    for doc in Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True):
+        pc = preprocess_content(doc.content)
+        m.update(pc.encode("utf-8"))
+        y = -1
+        dt = doc.document_type
+        if dt and dt.matching_algorithm == MatchingModel.MATCH_AUTO:
+            y = dt.pk
+        m.update(y.to_bytes(4, "little", signed=True))
+        y = -1
+        cor = doc.correspondent
+        if cor and cor.matching_algorithm == MatchingModel.MATCH_AUTO:
+            y = cor.pk
+        m.update(y.to_bytes(4, "little", signed=True))
+        tags = sorted(t.pk for t in doc.tags.filter(matching_algorithm=MatchingModel.MATCH_AUTO))
+        for t in tags:
+            m.update(t.to_bytes(4, "little", signed=True))
+    return m.hexdigest()
+
+try:
+    # ---- fixed corpus (identical every run) ----
+    c1 = Correspondent.objects.create(name="Auto C1", matching_algorithm=MatchingModel.MATCH_AUTO)
+    inbox = Tag.objects.create(name="Inbox", is_inbox_tag=True, matching_algorithm=MatchingModel.MATCH_ANY)
+    Document.objects.create(title="d1", content="acme invoice alpha repeated signal",
+                            correspondent=c1, checksum="nd-1")
+    Document.objects.create(title="d2", content="garden weather banana unrelated neutral",
+                            checksum="nd-2")
+    d3 = Document.objects.create(title="d3", content="inbox excluded acme invoice",
+                                 correspondent=c1, checksum="nd-3")
+    d3.tags.add(inbox)
+
+    chash = corpus_sha1()
+    total = Document.objects.count()
+    effective = Document.objects.exclude(tags__is_inbox_tag=True).count()
+
+    # ---- REAL training + persistence ----
+    tasks.train_classifier()
+    with open(settings.MODEL_FILE, "rb") as fh:
+        model_sha256 = hashlib.sha256(fh.read()).hexdigest()
+
+    # ---- REAL load + predict (production path) ----
+    clf = load_classifier()
+    classes_ = clf.correspondent_classifier.classes_.tolist()
+    pred = clf.predict_correspondent(PREDICT_INPUT)
+    pred_repr = None if pred is None else pred.tolist()
+
+    # ---- REAL acceptance via match_correspondents on a probe doc ----
+    probe = Document.objects.create(title="probe", content=PREDICT_INPUT, checksum="nd-probe")
+    names = [o.name for o in matching.match_correspondents(probe, clf)]
+    verdict = "MATCH" if names else "NONE"
+
+    print(f"RUN={RUN} total={total} effective={effective} c1.pk={c1.pk} "
+          f"corpus_sha1={chash} model_sha256={model_sha256} classes_={classes_} "
+          f"pred={pred_repr} match={names} verdict={verdict}")
+finally:
+    ovr.disable()
+    try:
+        connection.creation.destroy_test_db(":memory:", verbosity=0)
+    except Exception:
+        pass
+    shutil.rmtree(scratch, ignore_errors=True)
+```
+
+#### `/tmp/obs_q6_contrast.py` (§6 — non-determinism: overlapping-input stability vs. unseen-input flip)
+
+```python
+#!/usr/bin/env python3
+"""Q6 contrast probe: across fresh processes with the identical fixed corpus, predict TWO
+inputs through the loaded model: (I) an input whose tokens OVERLAP the training vocabulary
+('acme invoice alpha repeated signal', = the labeled doc), and (U) an input whose tokens do
+NOT ('totally unseen vocabulary tokens'). Shows the overlapping input's argmax is stable
+while the unseen input's argmax flips — the reason the original document fixture (an
+overlapping input) never surfaced the flip. Real train_classifier()/load_classifier()/
+predict_correspondent(). Secure temp dirs + cleanup."""
+import os, sys, tempfile, shutil
+RUN = sys.argv[1] if len(sys.argv) > 1 else "1"
+scratch = tempfile.mkdtemp(prefix="pngx-ndc-")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import django
+from django.conf import settings
+from django.test import override_settings
+django.setup()
+from django.test.utils import setup_test_environment
+from django.db import connection
+setup_test_environment()
+connection.creation.create_test_db(verbosity=0)
+ovr = override_settings(MODEL_FILE=os.path.join(scratch, "classification_model.pickle"),
+                        DATA_DIR=scratch, SCRATCH_DIR=scratch)
+ovr.enable()
+from documents import tasks
+from documents.classifier import load_classifier
+from documents.models import Correspondent, Document, Tag, MatchingModel
+OVERLAP = "acme invoice alpha repeated signal"
+UNSEEN = "totally unseen vocabulary tokens"
+try:
+    c1 = Correspondent.objects.create(name="Auto C1", matching_algorithm=MatchingModel.MATCH_AUTO)
+    inbox = Tag.objects.create(name="Inbox", is_inbox_tag=True, matching_algorithm=MatchingModel.MATCH_ANY)
+    Document.objects.create(title="d1", content=OVERLAP, correspondent=c1, checksum="c-1")
+    Document.objects.create(title="d2", content="garden weather banana unrelated neutral", checksum="c-2")
+    d3 = Document.objects.create(title="d3", content="inbox excluded acme invoice", correspondent=c1, checksum="c-3")
+    d3.tags.add(inbox)
+    tasks.train_classifier()
+    clf = load_classifier()
+    po = clf.predict_correspondent(OVERLAP)
+    pu = clf.predict_correspondent(UNSEEN)
+    vo = "MATCH" if po is not None else "NONE"
+    vu = "MATCH" if pu is not None else "NONE"
+    print(f"RUN={RUN} overlap_pred={None if po is None else po.tolist()} overlap={vo} | "
+          f"unseen_pred={None if pu is None else pu.tolist()} unseen={vu}")
+finally:
+    ovr.disable()
+    try: connection.creation.destroy_test_db(":memory:", verbosity=0)
+    except Exception: pass
+    shutil.rmtree(scratch, ignore_errors=True)
+```
+
+#### `/tmp/obs_q1_hires.py` (Q1/§2.2.1 — high-resolution lifecycle: `st_mtime_ns`/size/SHA-256/loaded `data_hash`, physically-separate incompatible model, task-level empty corpus)
+
+```python
+#!/usr/bin/env python3
+"""Q1 high-resolution lifecycle probe (MINOR-3): capture per-call corpus count,
+st_mtime_ns, model size, SHA-256, and the loaded data_hash (hex) across the REAL
+tasks.train_classifier() reuse/retrain cycle; then exercise (B) a compatible v7 load,
+(C) a PHYSICALLY-SEPARATE incompatible on-disk model through the real load_classifier()
+(deletion), (D) a direct empty-corpus DocumentClassifier().train() ValueError, and
+(E) task-level empty-corpus (train_classifier() catches it, returns None, writes no
+model). Real entry points only; secure temp dirs + full cleanup; nothing written outside
+the container /tmp."""
+import os, sys, pickle, hashlib, logging, tempfile, shutil
+
+RUN = sys.argv[1] if len(sys.argv) > 1 else "1"
+scratch = tempfile.mkdtemp(prefix="pngx-q1h-")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+
+import django
+from django.conf import settings
+from django.test import override_settings
+django.setup()
+from django.test.utils import setup_test_environment
+from django.db import connection
+setup_test_environment()
+connection.creation.create_test_db(verbosity=0)
+
+ovr = override_settings(
+    MODEL_FILE=os.path.join(scratch, "classification_model.pickle"),
+    DATA_DIR=scratch,
+    SCRATCH_DIR=scratch,
+)
+ovr.enable()
+
+# surface the real paperless.* log lines (same convention as the other Q1 probe)
+class _H(logging.Handler):
+    def emit(self, r):
+        print(f"  LOG {r.levelname} {r.name}: {r.getMessage()}")
+for _n in ("paperless.tasks", "paperless.classifier"):
+    lg = logging.getLogger(_n)
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(_H())
+    lg.propagate = False
+
+from documents import tasks
+from documents.classifier import DocumentClassifier, load_classifier
+from documents.models import Correspondent, Document, MatchingModel
+
+MF = settings.MODEL_FILE
+
+
+def stat(tag):
+    if not os.path.isfile(MF):
+        print(f"  [{tag}] exists=False")
+        return None
+    b = open(MF, "rb").read()
+    st = os.stat(MF)
+    sha = hashlib.sha256(b).hexdigest()
+    print(f"  [{tag}] exists=True corpus_count={Document.objects.count()} "
+          f"size={st.st_size} st_mtime_ns={st.st_mtime_ns} sha256={sha}")
+    return (st.st_size, st.st_mtime_ns, sha)
+
+
+def loaded_hash(tag):
+    clf = load_classifier()
+    if clf is None:
+        print(f"  [{tag}] load_classifier()=None")
+        return None
+    dh = clf.data_hash.hex() if clf.data_hash else None
+    print(f"  [{tag}] load_classifier()=OK loaded_data_hash={dh} "
+          f"classes_={clf.correspondent_classifier.classes_.tolist()}")
+    return dh
+
+
+try:
+    print(f"================ Q1-HIRES RUN {RUN} ================")
+    c1 = Correspondent.objects.create(name="Auto C1",
+                                      matching_algorithm=MatchingModel.MATCH_AUTO)
+    d1 = Document.objects.create(title="d1", content="acme invoice alpha",
+                                 correspondent=c1, checksum="q1h-1")
+
+    print("--- A: reuse/retrain, high-resolution (st_mtime_ns / size / sha256 / loaded data_hash) ---")
+    print("  corpus_count =", Document.objects.count())
+    stat("before")
+    tasks.train_classifier();                s1 = stat("after#1 initial-save")
+    h1 = loaded_hash("after#1")
+    tasks.train_classifier();                s2 = stat("after#2 unchanged")
+    h2 = loaded_hash("after#2")
+    d1.content = "acme invoice alpha CHANGED extra tokens"; d1.save()
+    tasks.train_classifier();                s3 = stat("after#3 changed")
+    h3 = loaded_hash("after#3")
+    print(f"  REUSE   (call#2 vs #1): size_same={s1[0]==s2[0]} "
+          f"mtime_ns_same={s1[1]==s2[1]} sha256_same={s1[2]==s2[2]} loaded_hash_same={h1==h2}")
+    print(f"  RETRAIN (call#3 vs #2): mtime_ns_changed={s2[1]!=s3[1]} "
+          f"sha256_changed={s2[2]!=s3[2]} loaded_hash_changed={h2!=h3}")
+
+    print("--- B: compatible v7 load (real load_classifier() succeeds) ---")
+    with open(MF, "rb") as f:
+        ondisk = pickle.load(f)
+    print(f"  on-disk schema_version={ondisk} FORMAT_VERSION={DocumentClassifier.FORMAT_VERSION} "
+          f"compatible={ondisk == DocumentClassifier.FORMAT_VERSION}")
+    loaded_hash("compatible-v7")
+
+    print("--- C: PHYSICALLY-SEPARATE incompatible on-disk model -> real load_classifier() deletes it ---")
+    with open(MF, "wb") as f:            # write a real pickle whose schema_version != 7
+        pickle.dump(999, f)
+        pickle.dump(None, f)
+    print(f"  wrote incompatible model directly to disk: schema_version=999 exists_before={os.path.isfile(MF)}")
+    r = load_classifier()
+    print(f"  load_classifier() returned={r} exists_after={os.path.isfile(MF)} "
+          f"(False => os.unlink at classifier.py:48 ran)")
+
+    print("--- D: direct empty-corpus DocumentClassifier().train() -> ValueError ---")
+    Document.objects.all().delete()
+    print("  corpus_count =", Document.objects.count())
+    try:
+        DocumentClassifier().train()
+        print("  NO ERROR (unexpected)")
+    except ValueError as e:
+        print("  ValueError:", repr(str(e)))
+
+    print("--- E: task-level empty corpus (auto correspondent present, 0 docs) ---")
+    if os.path.isfile(MF):
+        os.unlink(MF)
+    ret = tasks.train_classifier()
+    print(f"  train_classifier() returned={ret} model_exists={os.path.isfile(MF)} "
+          f"(ValueError caught at tasks.py:70-72 => no save)")
+
+    print("--- E2: no auto matching models at all -> early return, no train ---")
+    c1.matching_algorithm = MatchingModel.MATCH_ANY   # no longer AUTO
+    c1.save()
+    ret2 = tasks.train_classifier()
+    print(f"  train_classifier() returned={ret2} model_exists={os.path.isfile(MF)} "
+          f"(guard at tasks.py:49-55 => early return)")
+
+    print(f"================ Q1-HIRES RUN {RUN} SUMMARY ================")
+    print(f"  reuse_byte_identical={s1==s2} retrain_all_changed={(s2[1]!=s3[1]) and (s2[2]!=s3[2])} "
+          f"loaded_hash reuse={h1==h2} retrain={h2!=h3}")
+finally:
+    ovr.disable()
+    try:
+        connection.creation.destroy_test_db(":memory:", verbosity=0)
+    except Exception:
+        pass
+    shutil.rmtree(scratch, ignore_errors=True)
+```
+
+#### `/tmp/obs_q4_matrix.py` (Q4/§5.3.1+§5.5.1 — value matrix, enabled/disabled, staged [2,5] timeline)
+
+```python
+#!/usr/bin/env python3
+"""Q4 matrix/timeline probe (MINOR-4): (M) complete CONSUMER_BARCODE_STRING value matrix
+(exact PATCHT, lowercase, trailing-space, empty, custom, nonmatching) x two fixtures
+(PATCHT-bearing CODE39 vs CUSTOM-bearing CODE128) establishing case/whitespace sensitivity
+at the real decision site tasks.py:108; (EN) enabled-vs-disabled and nonmatching -> whole-file
+consume -> exactly 1 Document row via consume_file tasks.py:236; (ST) staged DB timeline for a
+normal [2,5] split: before / after file-only split / after each fragment consume / after dup
+rejection / after retrain. Real entry points; ALL media/data/scratch isolated to mkdtemp dirs
+(DirectoriesMixin kwargs), full cleanup; nothing written to /app/media or /app/consume."""
+import os, sys, shutil, logging, tempfile, hashlib
+RUN = sys.argv[1] if len(sys.argv) > 1 else "1"
+import django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+from django.conf import settings
+from django.test.utils import setup_test_environment, teardown_test_environment
+from django.test import override_settings
+from django.db import connection
+from unittest import mock
+from documents import tasks
+from documents.classifier import DocumentClassifier
+from documents.consumer import Consumer, ConsumerError
+from documents.models import Document, Correspondent
+
+BARCODES = "/app/src/documents/tests/samples/barcodes"
+_h = logging.StreamHandler(sys.stdout)
+_h.setFormatter(logging.Formatter("LOG %(levelname)s %(name)s: %(message)s"))
+for name in ("paperless.tasks", "paperless.consumer", "paperless.parsing",
+             "paperless.parsing.tesseract"):
+    lg = logging.getLogger(name); lg.setLevel(logging.DEBUG); lg.handlers = [_h]; lg.propagate = False
+
+def hr(t): print("\n--- " + t + " ---")
+print("================ Q4-MATRIX RUN %s ================" % RUN)
+setup_test_environment()
+old_name = connection.creation.create_test_db(verbosity=0)
+
+# isolate ALL dirs (DirectoriesMixin kwargs) so /app/media and /app/consume are never touched
+data_dir = tempfile.mkdtemp(); media_dir = tempfile.mkdtemp()
+scratch_dir = tempfile.mkdtemp(); consumption_dir = tempfile.mkdtemp()
+originals = os.path.join(media_dir, "documents", "originals")
+thumbs = os.path.join(media_dir, "documents", "thumbnails")
+archive = os.path.join(media_dir, "documents", "archive")
+index_dir = os.path.join(data_dir, "index"); logging_dir = os.path.join(data_dir, "log")
+for d in (originals, thumbs, archive, index_dir, logging_dir):
+    os.makedirs(d, exist_ok=True)
+ovr = override_settings(
+    DATA_DIR=data_dir, SCRATCH_DIR=scratch_dir, MEDIA_ROOT=media_dir,
+    ORIGINALS_DIR=originals, THUMBNAIL_DIR=thumbs, ARCHIVE_DIR=archive,
+    CONSUMPTION_DIR=consumption_dir, LOGGING_DIR=logging_dir, INDEX_DIR=index_dir,
+    MODEL_FILE=os.path.join(data_dir, "classification_model.pickle"),
+    MEDIA_LOCK=os.path.join(media_dir, "media.lock"),
+)
+ovr.enable()
+_tmp = [data_dir, media_dir, scratch_dir, consumption_dir]
+def mkroot(p):
+    d = tempfile.mkdtemp(prefix=p); _tmp.append(d); return d
+try:
+    # ---------- Part M: complete value matrix ----------
+    hr("(M) CONSUMER_BARCODE_STRING value matrix -> scan() separators (case/whitespace/empty/custom/nonmatching)")
+    pt = os.path.join(BARCODES, "patch-code-t.pdf")            # CODE39 barcode decodes to 'PATCHT'
+    cu = os.path.join(BARCODES, "barcode-128-custom.pdf")      # CODE128 barcode decodes to 'CUSTOM BARCODE'
+    print("fixtures: patch-code-t.pdf (decodes 'PATCHT', CODE39); barcode-128-custom.pdf (decodes 'CUSTOM BARCODE', CODE128)")
+    print("%-22s %-24s %-24s" % ("CONSUMER_BARCODE_STRING", "scan(patch-code-t.pdf)", "scan(barcode-128-custom.pdf)"))
+    for cfg in ["PATCHT", "patcht", "PATCHT ", "", "CUSTOM BARCODE", "NONEXISTENT VALUE"]:
+        with override_settings(CONSUMER_BARCODE_STRING=cfg):
+            s_pt = tasks.scan_file_for_separating_barcodes(pt)
+            s_cu = tasks.scan_file_for_separating_barcodes(cu)
+        print("%-22r %-24s %-24s" % (cfg, str(s_pt), str(s_cu)))
+
+    # ---------- Part EN: enabled/disabled + nonmatching -> whole-file consume -> 1 row ----------
+    hr("(EN) barcodes DISABLED and nonmatching-string -> whole-file consume -> exactly 1 Document row")
+    def whole_file_consume(label, src_name, enable, bcstring):
+        src = os.path.join(BARCODES, src_name)
+        stage = os.path.join(mkroot("pngx-q4m-en-"), src_name)
+        shutil.copy(src, stage)
+        n0 = Document.objects.count()
+        try:
+            with override_settings(CONSUMER_ENABLE_BARCODES=enable, CONSUMER_BARCODE_STRING=bcstring):
+                with mock.patch("documents.consumer.Consumer._send_progress"):
+                    res = tasks.consume_file(stage)
+            n1 = Document.objects.count()
+            print("  %-42s enable=%-5s string=%-18r -> %r | rows %d->%d (delta=%d)"
+                  % (label, enable, bcstring, res, n0, n1, n1 - n0))
+        except ConsumerError as e:
+            print("  %-42s enable=%-5s string=%-18r -> ConsumerError: %s"
+                  % (label, enable, bcstring, str(e)))
+    whole_file_consume("DISABLED / patch-code-t-middle.pdf", "patch-code-t-middle.pdf", False, "PATCHT")
+    whole_file_consume("NONMATCHING / patch-code-t-qr.pdf", "patch-code-t-qr.pdf", True, "NONEXISTENT VALUE")
+
+    # ---------- Part ST: staged timeline for a normal [2,5] split ----------
+    hr("(ST) staged DB timeline for several-patcht-codes.pdf split=[2,5] (before/split/consume x3/retrain)")
+    iso = mkroot("pngx-q4m-consume-")
+    orig_def = tasks.save_to_dir.__defaults__
+    tasks.save_to_dir.__defaults__ = (orig_def[0], iso)
+    stages = []; created = []
+    # isolate the [2,5] timeline from the Part EN documents so the staged counts start clean
+    Document.objects.all().delete()
+    try:
+        stages.append(("0 before split", Document.objects.count(), "input file only"))
+        with override_settings(CONSUMER_ENABLE_BARCODES=True, CONSUMER_BARCODE_STRING="PATCHT"):
+            scratch_in = os.path.join(mkroot("pngx-q4m-in-"), "several-patcht-codes.pdf")
+            shutil.copy(os.path.join(BARCODES, "several-patcht-codes.pdf"), scratch_in)
+            with mock.patch("documents.consumer.Consumer._send_progress"):
+                res = tasks.consume_file(scratch_in)
+        frags = sorted(os.listdir(iso))
+        stages.append(("1 after file-only split", Document.objects.count(),
+                       "%r; original unlinked=%s; %d fragments=%s"
+                       % (res, not os.path.exists(scratch_in), len(frags), frags)))
+        labels = ["2 after consume frag_0", "3 after consume frag_1", "4 after consume frag_2"]
+        for i, fname in enumerate(frags):
+            stage = os.path.join(mkroot("pngx-q4m-frag-"), fname)
+            shutil.copy(os.path.join(iso, fname), stage)
+            md5 = hashlib.md5(open(stage, "rb").read()).hexdigest()
+            try:
+                with mock.patch("documents.consumer.Consumer._send_progress"):
+                    doc = Consumer().try_consume_file(stage)
+                created.append(doc.pk); note = "%s CREATED pk=%s (md5=%s)" % (fname, doc.pk, md5)
+            except ConsumerError:
+                note = "%s REJECTED duplicate (md5=%s)" % (fname, md5)
+            stages.append((labels[i] if i < len(labels) else "consume %d" % i,
+                           Document.objects.count(), note))
+    finally:
+        tasks.save_to_dir.__defaults__ = orig_def
+    corr = Correspondent.objects.create(name="Q4mCorr", matching_algorithm=Correspondent.MATCH_AUTO)
+    for i, pk in enumerate(created):
+        d = Document.objects.get(pk=pk); d.content = "alpha bravo fragment %d token%d" % (i, i)
+        d.correspondent = corr; d.save()
+    eff = Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True).count()
+    trained = DocumentClassifier().train()
+    stages.append(("5 after retrain", Document.objects.count(),
+                   "train() returned %s; effective corpus (inbox-excluded) = %d" % (trained, eff)))
+    print("  %-26s %-10s %s" % ("STAGE", "Doc.count", "NOTE"))
+    for s, c, note in stages:
+        print("  %-26s %-10d %s" % (s, c, note))
+    print("SUMMARY: [2,5] -> 3 fragment files -> 2 distinct rows (1 duplicate rejected) -> effective training corpus %d" % eff)
+finally:
+    ovr.disable()
+    connection.creation.destroy_test_db(old_name, verbosity=0)
+    teardown_test_environment()
+    for d in _tmp:
+        shutil.rmtree(d, ignore_errors=True)
+print("\n================ Q4-MATRIX RUN %s SUMMARY ================" % RUN)
+print("matrix: only exact configured string matches (case- & whitespace-sensitive); empty never matches; "
+      "custom matches only its own value; nonmatching -> [] | disabled/nonmatching -> whole-file consume -> 1 row | "
+      "[2,5] staged: 0->0(split)->1->1(dup)->2->retrain(corpus 2)")
+```
+
+#### `/tmp/obs_q4_page0.py` (Q4/§5.5.2 — page-0 boundary: two 0-page fragments, `max_workers` ValueError, thread-leak hang)
+
+```python
+#!/usr/bin/env python3
+"""Q4 page-0 boundary probe (MINOR-4): a separator on page 0 of patch-code-t.pdf.
+Shows (1) scan -> [0]; (2) separate_pages emits TWO fragments, each inspected with
+pikepdf (page count), byte size, SHA-256, md5 -> both 0-page and byte-identical;
+(3) each fragment passed through the REAL Consumer FAILS with the exact exception
+(ValueError: max_workers must be greater than 0) -> 0 Document rows; (4) consume_file
+still returns 'File successfully split' and unlinks the original; (5) after OCRmyPDF runs,
+non-daemon worker/executor threads (e.g. Thread-9, Thread-11, ThreadPoolExecutor-3_0)
+are left alive, so an isolated process reaches the end of the script but does NOT exit
+(times out). Run under `timeout`; rc=124 == the hang.
+All dirs isolated to mkdtemp; nothing written to /app/media or /app/consume."""
+import os, sys, shutil, logging, tempfile, hashlib, threading
+import django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+from django.conf import settings
+from django.test.utils import setup_test_environment, teardown_test_environment
+from django.test import override_settings
+from django.db import connection
+from unittest import mock
+from pikepdf import Pdf
+from documents import tasks
+from documents.consumer import Consumer, ConsumerError
+from documents.models import Document
+
+BARCODES = "/app/src/documents/tests/samples/barcodes"
+_h = logging.StreamHandler(sys.stdout)
+_h.setFormatter(logging.Formatter("LOG %(levelname)s %(name)s: %(message)s"))
+for name in ("paperless.tasks", "paperless.consumer", "paperless.parsing",
+             "paperless.parsing.tesseract"):
+    lg = logging.getLogger(name); lg.setLevel(logging.DEBUG); lg.handlers = [_h]; lg.propagate = False
+def P(*a): print(*a, flush=True)
+def hr(t): P("\n--- " + t + " ---")
+P("================ Q4-PAGE0 ================")
+setup_test_environment()
+old_name = connection.creation.create_test_db(verbosity=0)
+data_dir = tempfile.mkdtemp(); media_dir = tempfile.mkdtemp()
+scratch_dir = tempfile.mkdtemp(); consumption_dir = tempfile.mkdtemp()
+originals = os.path.join(media_dir, "documents", "originals")
+thumbs = os.path.join(media_dir, "documents", "thumbnails")
+archive = os.path.join(media_dir, "documents", "archive")
+index_dir = os.path.join(data_dir, "index"); logging_dir = os.path.join(data_dir, "log")
+for d in (originals, thumbs, archive, index_dir, logging_dir):
+    os.makedirs(d, exist_ok=True)
+ovr = override_settings(
+    DATA_DIR=data_dir, SCRATCH_DIR=scratch_dir, MEDIA_ROOT=media_dir,
+    ORIGINALS_DIR=originals, THUMBNAIL_DIR=thumbs, ARCHIVE_DIR=archive,
+    CONSUMPTION_DIR=consumption_dir, LOGGING_DIR=logging_dir, INDEX_DIR=index_dir,
+    MODEL_FILE=os.path.join(data_dir, "classification_model.pickle"),
+    MEDIA_LOCK=os.path.join(media_dir, "media.lock"),
+)
+ovr.enable()
+_tmp = [data_dir, media_dir, scratch_dir, consumption_dir]
+def mkroot(p):
+    d = tempfile.mkdtemp(prefix=p); _tmp.append(d); return d
+try:
+    src = os.path.join(BARCODES, "patch-code-t.pdf")
+    with Pdf.open(src) as pdf:
+        P("input patch-code-t.pdf pages=%d size=%d" % (len(pdf.pages), os.path.getsize(src)))
+
+    hr("(1) scan_file_for_separating_barcodes(patch-code-t.pdf)")
+    seps = tasks.scan_file_for_separating_barcodes(src)
+    P("separators =", seps)
+
+    hr("(2) separate_pages(patch-code-t.pdf, %s) -> inspect each emitted fragment" % seps)
+    frags = tasks.separate_pages(src, seps)
+    P("fragment count =", len(frags))
+    digests = []
+    for f in frags:
+        b = open(f, "rb").read()
+        with Pdf.open(f) as pdf:
+            npages = len(pdf.pages)
+        sha = hashlib.sha256(b).hexdigest(); md5 = hashlib.md5(b).hexdigest()
+        digests.append((npages, len(b), sha, md5))
+        P("  fragment %-40s pages=%d size=%d md5=%s sha256=%s"
+          % (os.path.basename(f), npages, len(b), md5, sha))
+    P("  both fragments byte-identical to each other? %s" % (len(set(d[3] for d in digests)) == 1))
+    P("  all fragments 0-page? %s ; all 315 bytes? %s"
+      % (all(d[0] == 0 for d in digests), all(d[1] == 315 for d in digests)))
+
+    hr("(3) pass EACH 0-page fragment through the REAL Consumer -> exact exception, 0 rows")
+    P("Document.objects.count() BEFORE =", Document.objects.count())
+    for f in frags:
+        stage = os.path.join(mkroot("pngx-q4p0-frag-"), os.path.basename(f))
+        shutil.copy(f, stage)
+        try:
+            with mock.patch("documents.consumer.Consumer._send_progress"):
+                doc = Consumer().try_consume_file(stage)
+            P("  consumed %-40s -> Document pk=%s (UNEXPECTED)" % (os.path.basename(f), doc.pk))
+        except ConsumerError as e:
+            P("  consumed %-40s -> ConsumerError: %s" % (os.path.basename(f), str(e)))
+        except Exception as e:
+            P("  consumed %-40s -> %s: %s" % (os.path.basename(f), type(e).__name__, str(e)))
+    P("Document.objects.count() AFTER  =", Document.objects.count(), "(0 => neither 0-page fragment produced a row)")
+
+    hr("(4) consume_file(patch-code-t.pdf, CONSUMER_ENABLE_BARCODES=True) still 'File successfully split' + unlink")
+    iso = mkroot("pngx-q4p0-consume-")
+    orig_def = tasks.save_to_dir.__defaults__
+    tasks.save_to_dir.__defaults__ = (orig_def[0], iso)
+    try:
+        with override_settings(CONSUMER_ENABLE_BARCODES=True, CONSUMER_BARCODE_STRING="PATCHT"):
+            scratch_in = os.path.join(mkroot("pngx-q4p0-in-"), "patch-code-t.pdf")
+            shutil.copy(src, scratch_in)
+            with mock.patch("documents.consumer.Consumer._send_progress"):
+                res = tasks.consume_file(scratch_in)
+            P("  consume_file(...) returned =", repr(res))
+            P("  original input still exists? =", os.path.exists(scratch_in), "(False => os.unlink at tasks.py:214)")
+            P("  isolated consume dir contents =", sorted(os.listdir(iso)))
+            P("  Document.objects.count() after split =", Document.objects.count())
+    finally:
+        tasks.save_to_dir.__defaults__ = orig_def
+finally:
+    try: connection.creation.destroy_test_db(old_name, verbosity=0)
+    except Exception: pass
+    ovr.disable(); teardown_test_environment()
+    for d in _tmp:
+        shutil.rmtree(d, ignore_errors=True)
+
+hr("(5) live threads after OCRmyPDF ran (non-daemon threads keep the process alive)")
+for t in threading.enumerate():
+    P("  thread name=%-24r daemon=%-5s alive=%s" % (t.name, t.daemon, t.is_alive()))
+nondaemon = [t for t in threading.enumerate() if not t.daemon and t is not threading.main_thread()]
+P("  non-daemon non-main threads still alive = %d -> %s"
+  % (len(nondaemon), [t.name for t in nondaemon]))
+P("================ END OF SCRIPT BODY ================")
+P("main thread returning now; if a non-daemon thread is alive the process will NOT exit (timeout => hang)")
+```
+
+
+
 ### 7.3 Two-run stability — complete captures of both runs
 
-Every quantitative claim in this document was produced twice, from an identical starting state, and confirmed stable. `[observed]` Rather than assert stability, the two runs are compared directly. Each pair of outputs was normalized by masking only the tokens that are volatile by construction (secure `mkdtemp` names, ocrmypdf/unpaper internal temp dirs, ffmpeg heap addresses, wall-clock timestamps, model-file mtimes, and — for Q4 — the pikepdf-nondeterministic fragment checksums), then compared with `diff`. All four normalized diffs are empty:
+Every quantitative claim in this document was produced twice, from an identical starting state, and confirmed stable. `[observed]` Rather than merely assert stability, the two runs are compared directly with a concrete `normalize` function that masks **only** the tokens that are volatile by construction, then `diff`. The function is defined here (copy-pasteable Bash; extended-regex `sed`):
+
+```bash
+# normalize <file> : emit the file with ONLY by-design-volatile tokens masked.
+normalize() {
+  sed -E \
+    -e 's/RUN [0-9]+/RUN N/g' \
+    -e 's#paperless-[A-Za-z0-9_]+#paperless-<tmp>#g' \
+    -e 's#ocrmypdf\.io\.[A-Za-z0-9_]+#ocrmypdf.io.<tmp>#g' \
+    -e 's#/tmp/tmp[A-Za-z0-9_]+#/tmp/tmp<X>#g' \
+    -e 's#/tmp/pngx-[A-Za-z0-9_-]+#/tmp/pngx-<mkdtemp>#g' \
+    -e 's/0x[0-9a-fA-F]+/0x<addr>/g' \
+    -e 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,]+\]/[<ts>]/g' \
+    -e 's/17[0-9]{8}\.[0-9]+/<mtime>/g' \
+    -e 's/\b[0-9a-f]{32}\b/<md5>/g' \
+    -e 's/\b[0-9a-f]{64}\b/<sha256>/g' \
+    "$1"
+}
+```
+
+The masks correspond one-to-one to the by-design-volatile tokens: the `RUN N` label, secure per-probe `mkdtemp` names (CWE-377 safe), ocrmypdf/unpaper internal temp dirs, ffmpeg heap addresses in the unpaper banner, wall-clock log timestamps, the model-file `st_mtime` float, and — for Q4 — the pikepdf-nondeterministic fragment md5/sha256 checksums. Saving each question's two complete runs to files `qN_run1.txt` / `qN_run2.txt` (run 1 in the body/appendix, run 2 in §7.3.1–§7.3.6) and running `diff <(normalize run1) <(normalize run2)` gives an **empty** diff for every question — the raw diff is non-empty only in those masked tokens. The actual command and its complete output:
 
 ```text
-Two-run stability test — normalized diff method
------------------------------------------------
-For each question, run1 and run2 outputs were normalized by masking ONLY the
-by-design volatile tokens, then compared with `diff`:
-
-  mask:  RUN 1|RUN 2                       -> RUN N          (run label)
-         /tmp/pngx-<label>-<rand>          -> /tmp/pngx-<mkdtemp>   (secure per-probe temp dir, CWE-377 safe)
-         ocrmypdf.io.<rand>                -> ocrmypdf.io.<tmp>     (ocrmypdf internal work dir)
-         /tmp/tmp<rand>, paperless-<rand>  -> /tmp/tmp<X>, paperless-<tmp> (unpaper/parser temp)
-         0x<hex>                           -> 0x<addr>        (ffmpeg heap address in unpaper banner)
-         [YYYY-MM-DD HH:MM:SS,mmm]         -> [<ts>]          (wall-clock log timestamp)
-         17XXXXXXXX.XXXX                   -> <mtime>         (model-file st_mtime float)
-         <32-hex>                          -> <md5>           (pikepdf-nondeterministic fragment checksum)
-
-  result (command: diff <(normalize run1) <(normalize run2)):
-         Q1  -> EMPTY   (0 differing lines)
-         Q2  -> EMPTY   (0 differing lines)
-         Q3  -> EMPTY   (0 differing lines)
-         Q4  -> EMPTY   (0 differing lines)
-
-Interpretation: after masking tokens that are volatile by construction, the two
-runs are byte-identical. Every answer-bearing line — booleans (REUSE/RETRAIN
-True), counts (3 fragments, 2 rows, corpus 0->3), classes_, mime_type='image/png',
-gs '-dPDFA=2' argv, skip_text:True->force_ocr:True args dicts, 'No text was found'
-warning — is reproduced exactly across both runs.
-
-Q4 note: pikepdf's PDF writer is not byte-deterministic across processes, so the
-raw fragment md5 VALUES differ run-to-run; the DERIVED answers (distinct-md5 count
-2-of-3 and 1-of-2, and the resulting 2 and 1 Document rows, corpus 0->3) are stable.
+$ for q in q1 q2 q3 q4; do
+>   raw=$(diff ${q}_run1.txt ${q}_run2.txt | grep -cE '^[<>]')
+>   norm=$(diff <(normalize ${q}_run1.txt) <(normalize ${q}_run2.txt) | grep -cE '^[<>]')
+>   echo "$q | raw differing lines=$raw | normalized differing lines=$norm"
+> done
+q1 | raw differing lines=16 | normalized differing lines=0
+q2 | raw differing lines=6 | normalized differing lines=0
+q3 | raw differing lines=150 | normalized differing lines=0
+q4 | raw differing lines=96 | normalized differing lines=0
 ```
+
+Interpretation: after masking tokens that are volatile by construction, the two runs are byte-identical. Every answer-bearing line — booleans (REUSE/RETRAIN True), counts (3 fragments, 2 rows, corpus 0->3), `classes_`, `mime_type='image/png'`, gs `'-dPDFA=2'` argv, `skip_text:True`->`force_ocr:True` args dicts, the `'No text was found'` warning — is reproduced exactly across both runs. (Q4 note: pikepdf's PDF writer is not byte-deterministic across processes, so the raw fragment md5 VALUES differ run-to-run; the DERIVED answers — distinct-md5 count 2-of-3 and 1-of-2, and the resulting 2 and 1 Document rows, corpus 0->3 — are stable.)
 
 The complete, unedited output of **both** runs follows. (The Q1 first run appears in §2.2 and the Q2 first run in §3; their complete second runs are given here. The Q3 and Q4 bodies quoted slices, so both complete runs are given here.)
 
@@ -2683,7 +3679,614 @@ scratch roots remaining: []
 scan edges: simple=[], patch0=[0], middle=[1], several=[2,5], qr=[0]; unreadable/custom via barcode_reader; custom string matches only its own value | separate_pages N->N+1 | consume split delta=0 rows | fragments consumed -> N+1 Document rows -> corpus grows | /app/consume untouched
 ```
 
-### 7.4 Non-determinism probe — all ten complete runs
+#### 7.3.7 Q1 high-resolution lifecycle — complete second run (`python3 /tmp/obs_q1_hires.py 2`)
+
+Run 1 is reproduced in full in §2.2.1. The complete second run is below. The reuse/retrain **invariants** are identical to Run 1 (`reuse_byte_identical=True`, `retrain_all_changed=True`); the deterministic `loaded_data_hash` values are byte-identical to Run 1 (`93c9a15d…1bea` for the original content, `441e8b90…4b5f` for the changed content); only the model-file `size`/`st_mtime_ns`/`sha256` differ from Run 1, because the serialized `MLPClassifier` weights are unseeded (see §6.4). Command:
+
+```text
+$ docker exec -u testuser -w /app/src -e PYTHONPATH=/app/src -e DJANGO_SETTINGS_MODULE=paperless.settings pngx-qna python3 /tmp/obs_q1_hires.py 2
+```
+
+```text
+================ Q1-HIRES RUN 2 ================
+--- A: reuse/retrain, high-resolution (st_mtime_ns / size / sha256 / loaded data_hash) ---
+  corpus_count = 1
+  [before] exists=False
+  LOG DEBUG paperless.classifier: Document classification model does not exist (yet), not performing automatic matching.
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG DEBUG paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+  LOG DEBUG paperless.classifier: Vectorizing data...
+  LOG DEBUG paperless.classifier: There are no tags. Not training tags classifier.
+  LOG DEBUG paperless.classifier: Training correspondent classifier...
+  LOG DEBUG paperless.classifier: There are no document types. Not training document type classifier.
+  LOG INFO paperless.tasks: Saving updated classifier model to /tmp/pngx-q1h-5l3z5tt0/classification_model.pickle...
+  [after#1 initial-save] exists=True corpus_count=1 size=22439 st_mtime_ns=1783990174017185669 sha256=28e2bda79eebd751569125be48487ed565fe8f81370951be62a4b13f919a454b
+  [after#1] load_classifier()=OK loaded_data_hash=93c9a15dcb127652822b68bfbd2f11d6eedc1bea classes_=[1]
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG DEBUG paperless.tasks: Training data unchanged.
+  [after#2 unchanged] exists=True corpus_count=1 size=22439 st_mtime_ns=1783990174017185669 sha256=28e2bda79eebd751569125be48487ed565fe8f81370951be62a4b13f919a454b
+  [after#2] load_classifier()=OK loaded_data_hash=93c9a15dcb127652822b68bfbd2f11d6eedc1bea classes_=[1]
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG DEBUG paperless.classifier: 1 documents, 0 tag(s), 1 correspondent(s), 0 document type(s).
+  LOG DEBUG paperless.classifier: Vectorizing data...
+  LOG DEBUG paperless.classifier: There are no tags. Not training tags classifier.
+  LOG DEBUG paperless.classifier: Training correspondent classifier...
+  LOG DEBUG paperless.classifier: There are no document types. Not training document type classifier.
+  LOG INFO paperless.tasks: Saving updated classifier model to /tmp/pngx-q1h-5l3z5tt0/classification_model.pickle...
+  [after#3 changed] exists=True corpus_count=1 size=36983 st_mtime_ns=1783990174044185939 sha256=83c3914f0570c6aadfbc98bbaee350f17ef7ad12823ad1fad8144d0c8f54bdbf
+  [after#3] load_classifier()=OK loaded_data_hash=441e8b90dd526a0de6491ab6b8567fcf082a4b5f classes_=[1]
+  REUSE   (call#2 vs #1): size_same=True mtime_ns_same=True sha256_same=True loaded_hash_same=True
+  RETRAIN (call#3 vs #2): mtime_ns_changed=True sha256_changed=True loaded_hash_changed=True
+--- B: compatible v7 load (real load_classifier() succeeds) ---
+  on-disk schema_version=7 FORMAT_VERSION=7 compatible=True
+  [compatible-v7] load_classifier()=OK loaded_data_hash=441e8b90dd526a0de6491ab6b8567fcf082a4b5f classes_=[1]
+--- C: PHYSICALLY-SEPARATE incompatible on-disk model -> real load_classifier() deletes it ---
+  wrote incompatible model directly to disk: schema_version=999 exists_before=True
+  LOG ERROR paperless.classifier: Unrecoverable error while loading document classification model, deleting model file.
+  load_classifier() returned=None exists_after=False (False => os.unlink at classifier.py:48 ran)
+--- D: direct empty-corpus DocumentClassifier().train() -> ValueError ---
+  corpus_count = 0
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  ValueError: 'No training data available.'
+--- E: task-level empty corpus (auto correspondent present, 0 docs) ---
+  LOG DEBUG paperless.classifier: Document classification model does not exist (yet), not performing automatic matching.
+  LOG DEBUG paperless.classifier: Gathering data from database...
+  LOG WARNING paperless.tasks: Classifier error: No training data available.
+  train_classifier() returned=None model_exists=False (ValueError caught at tasks.py:70-72 => no save)
+--- E2: no auto matching models at all -> early return, no train ---
+  train_classifier() returned=None model_exists=False (guard at tasks.py:49-55 => early return)
+================ Q1-HIRES RUN 2 SUMMARY ================
+  reuse_byte_identical=True retrain_all_changed=True loaded_hash reuse=True retrain=True
+```
+
+#### 7.3.8 Q4 value matrix, enabled/disabled, and staged `[2, 5]` timeline — complete both runs (`python3 /tmp/obs_q4_matrix.py {1,2}`)
+
+Run 1:
+
+```text
+================ Q4-MATRIX RUN 1 ================
+[1m
+
+  This is a one-time only migration to generate thumbnails for all of your
+  documents so that future UIs will have something to work with.  If you have
+  a lot of documents though, this may take a while, so a coffee break may be
+  in order.
+[0m
+
+--- (M) CONSUMER_BARCODE_STRING value matrix -> scan() separators (case/whitespace/empty/custom/nonmatching) ---
+fixtures: patch-code-t.pdf (decodes 'PATCHT', CODE39); barcode-128-custom.pdf (decodes 'CUSTOM BARCODE', CODE128)
+CONSUMER_BARCODE_STRING scan(patch-code-t.pdf)   scan(barcode-128-custom.pdf)
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'PATCHT'               [0]                      []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'patcht'               []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'PATCHT '              []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+''                     []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'CUSTOM BARCODE'       []                       [0]                     
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'NONEXISTENT VALUE'    []                       []                      
+
+--- (EN) barcodes DISABLED and nonmatching-string -> whole-file consume -> exactly 1 Document row ---
+LOG INFO paperless.consumer: Consuming patch-code-t-middle.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t-middle.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-en-o3vtrgt4/patch-code-t-middle.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-en-o3vtrgt4/patch-code-t-middle.pdf', 'output_file': '/tmp/tmpuuvxzqlj/paperless-xnl3qagx/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpuuvxzqlj/paperless-xnl3qagx/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpuuvxzqlj/paperless-xnl3qagx/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for patch-code-t-middle.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-xnl3qagx/archive.pdf[0] /tmp/tmpuuvxzqlj/paperless-xnl3qagx/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpuuvxzqlj/paperless-xnl3qagx/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-xnl3qagx/gs_out.png /tmp/tmpuuvxzqlj/paperless-xnl3qagx/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpuuvxzqlj/paperless-xnl3qagx/convert_gs.png -out /tmp/tmpuuvxzqlj/paperless-xnl3qagx/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-en-o3vtrgt4/patch-code-t-middle.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpuuvxzqlj/paperless-xnl3qagx
+LOG INFO paperless.consumer: Document 2010-12-01 patch-code-t-middle consumption finished
+  DISABLED / patch-code-t-middle.pdf         enable=False string='PATCHT'           -> 'Success. New document id 1 created' | rows 0->1 (delta=1)
+LOG DEBUG paperless.tasks: Barcode of type QRCODE found: PATCHT
+LOG INFO paperless.consumer: Consuming patch-code-t-qr.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t-qr.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-en-ciifvmah/patch-code-t-qr.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-en-ciifvmah/patch-code-t-qr.pdf', 'output_file': '/tmp/tmpuuvxzqlj/paperless-pwsqdjjv/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpuuvxzqlj/paperless-pwsqdjjv/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for patch-code-t-qr.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/archive.pdf[0] /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpuuvxzqlj/paperless-pwsqdjjv/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/gs_out.png /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/convert_gs.png -out /tmp/tmpuuvxzqlj/paperless-pwsqdjjv/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-en-ciifvmah/patch-code-t-qr.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpuuvxzqlj/paperless-pwsqdjjv
+LOG INFO paperless.consumer: Document 2026-07-14 patch-code-t-qr consumption finished
+  NONMATCHING / patch-code-t-qr.pdf          enable=True  string='NONEXISTENT VALUE' -> 'Success. New document id 2 created' | rows 1->2 (delta=1)
+
+--- (ST) staged DB timeline for several-patcht-codes.pdf split=[2,5] (before/split/consume x3/retrain) ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Pages with separators found in: /tmp/pngx-q4m-in-_mb657p7/several-patcht-codes.pdf
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmpuuvxzqlj/paperless-yzindt3j
+LOG DEBUG paperless.tasks: Count: 0 page_number: 2
+LOG DEBUG paperless.tasks: page_number: 2 next_page: 5
+LOG DEBUG paperless.tasks: page_number: 2 next_page: 5
+LOG DEBUG paperless.tasks: pdf no:0 has 2 pages
+LOG DEBUG paperless.tasks: Count: 1 page_number: 5
+LOG DEBUG paperless.tasks: page_number: 5 next_page: 7
+LOG DEBUG paperless.tasks: pdf no:1 has 1 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmpuuvxzqlj/paperless-yzindt3j/several-patcht-codes_document_0.pdf', '/tmp/tmpuuvxzqlj/paperless-yzindt3j/several-patcht-codes_document_1.pdf', '/tmp/tmpuuvxzqlj/paperless-yzindt3j/several-patcht-codes_document_2.pdf']
+LOG DEBUG paperless.tasks: Deleting file /tmp/pngx-q4m-in-_mb657p7/several-patcht-codes.pdf
+LOG WARNING paperless.tasks: OSError. It could be, the broker cannot be reached.
+LOG WARNING paperless.tasks: Multiple exceptions: [Errno 111] Connect call failed ('::1', 6379, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 6379)
+LOG INFO paperless.consumer: Consuming several-patcht-codes_document_0.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing several-patcht-codes_document_0.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-frag-37lcf33c/several-patcht-codes_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-frag-37lcf33c/several-patcht-codes_document_0.pdf', 'output_file': '/tmp/tmpuuvxzqlj/paperless-t4oyopht/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpuuvxzqlj/paperless-t4oyopht/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpuuvxzqlj/paperless-t4oyopht/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for several-patcht-codes_document_0.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-t4oyopht/archive.pdf[0] /tmp/tmpuuvxzqlj/paperless-t4oyopht/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpuuvxzqlj/paperless-t4oyopht/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-t4oyopht/gs_out.png /tmp/tmpuuvxzqlj/paperless-t4oyopht/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpuuvxzqlj/paperless-t4oyopht/convert_gs.png -out /tmp/tmpuuvxzqlj/paperless-t4oyopht/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-frag-37lcf33c/several-patcht-codes_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpuuvxzqlj/paperless-t4oyopht
+LOG INFO paperless.consumer: Document 2026-07-14 several-patcht-codes_document_0 consumption finished
+LOG ERROR paperless.consumer: Not consuming several-patcht-codes_document_1.pdf: It is a duplicate.
+LOG INFO paperless.consumer: Consuming several-patcht-codes_document_2.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing several-patcht-codes_document_2.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-frag-w33ttlx5/several-patcht-codes_document_2.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-frag-w33ttlx5/several-patcht-codes_document_2.pdf', 'output_file': '/tmp/tmpuuvxzqlj/paperless-9jtabtsk/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpuuvxzqlj/paperless-9jtabtsk/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpuuvxzqlj/paperless-9jtabtsk/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for several-patcht-codes_document_2.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-9jtabtsk/archive.pdf[0] /tmp/tmpuuvxzqlj/paperless-9jtabtsk/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpuuvxzqlj/paperless-9jtabtsk/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpuuvxzqlj/paperless-9jtabtsk/gs_out.png /tmp/tmpuuvxzqlj/paperless-9jtabtsk/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpuuvxzqlj/paperless-9jtabtsk/convert_gs.png -out /tmp/tmpuuvxzqlj/paperless-9jtabtsk/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-frag-w33ttlx5/several-patcht-codes_document_2.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpuuvxzqlj/paperless-9jtabtsk
+LOG INFO paperless.consumer: Document 2026-07-14 several-patcht-codes_document_2 consumption finished
+  STAGE                      Doc.count  NOTE
+  0 before split             0          input file only
+  1 after file-only split    0          'File successfully split'; original unlinked=True; 3 fragments=['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
+  2 after consume frag_0     1          several-patcht-codes_document_0.pdf CREATED pk=3 (md5=d74161c9d1a271807ae51a6b25a10aad)
+  3 after consume frag_1     1          several-patcht-codes_document_1.pdf REJECTED duplicate (md5=d74161c9d1a271807ae51a6b25a10aad)
+  4 after consume frag_2     2          several-patcht-codes_document_2.pdf CREATED pk=4 (md5=17c11e09a10bb4a0762a6cba8d817035)
+  5 after retrain            2          train() returned True; effective corpus (inbox-excluded) = 2
+SUMMARY: [2,5] -> 3 fragment files -> 2 distinct rows (1 duplicate rejected) -> effective training corpus 2
+
+================ Q4-MATRIX RUN 1 SUMMARY ================
+matrix: only exact configured string matches (case- & whitespace-sensitive); empty never matches; custom matches only its own value; nonmatching -> [] | disabled/nonmatching -> whole-file consume -> 1 row | [2,5] staged: 0->0(split)->1->1(dup)->2->retrain(corpus 2)
+```
+
+Run 2 (matrix and staged counts identical to run 1; only fragment md5 values differ, as noted in §5.5.1):
+
+```text
+================ Q4-MATRIX RUN 2 ================
+[1m
+
+  This is a one-time only migration to generate thumbnails for all of your
+  documents so that future UIs will have something to work with.  If you have
+  a lot of documents though, this may take a while, so a coffee break may be
+  in order.
+[0m
+
+--- (M) CONSUMER_BARCODE_STRING value matrix -> scan() separators (case/whitespace/empty/custom/nonmatching) ---
+fixtures: patch-code-t.pdf (decodes 'PATCHT', CODE39); barcode-128-custom.pdf (decodes 'CUSTOM BARCODE', CODE128)
+CONSUMER_BARCODE_STRING scan(patch-code-t.pdf)   scan(barcode-128-custom.pdf)
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'PATCHT'               [0]                      []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'patcht'               []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'PATCHT '              []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+''                     []                       []                      
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'CUSTOM BARCODE'       []                       [0]                     
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE128 found: CUSTOM BARCODE
+'NONEXISTENT VALUE'    []                       []                      
+
+--- (EN) barcodes DISABLED and nonmatching-string -> whole-file consume -> exactly 1 Document row ---
+LOG INFO paperless.consumer: Consuming patch-code-t-middle.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t-middle.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-en-cc4h0k4u/patch-code-t-middle.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-en-cc4h0k4u/patch-code-t-middle.pdf', 'output_file': '/tmp/tmpdw6lfz_j/paperless-gzey1ehg/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpdw6lfz_j/paperless-gzey1ehg/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpdw6lfz_j/paperless-gzey1ehg/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for patch-code-t-middle.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-gzey1ehg/archive.pdf[0] /tmp/tmpdw6lfz_j/paperless-gzey1ehg/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpdw6lfz_j/paperless-gzey1ehg/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-gzey1ehg/gs_out.png /tmp/tmpdw6lfz_j/paperless-gzey1ehg/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpdw6lfz_j/paperless-gzey1ehg/convert_gs.png -out /tmp/tmpdw6lfz_j/paperless-gzey1ehg/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-en-cc4h0k4u/patch-code-t-middle.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpdw6lfz_j/paperless-gzey1ehg
+LOG INFO paperless.consumer: Document 2010-12-01 patch-code-t-middle consumption finished
+  DISABLED / patch-code-t-middle.pdf         enable=False string='PATCHT'           -> 'Success. New document id 1 created' | rows 0->1 (delta=1)
+LOG DEBUG paperless.tasks: Barcode of type QRCODE found: PATCHT
+LOG INFO paperless.consumer: Consuming patch-code-t-qr.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t-qr.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-en-y0js4ytj/patch-code-t-qr.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-en-y0js4ytj/patch-code-t-qr.pdf', 'output_file': '/tmp/tmpdw6lfz_j/paperless-93esjsvc/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpdw6lfz_j/paperless-93esjsvc/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpdw6lfz_j/paperless-93esjsvc/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for patch-code-t-qr.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-93esjsvc/archive.pdf[0] /tmp/tmpdw6lfz_j/paperless-93esjsvc/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpdw6lfz_j/paperless-93esjsvc/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-93esjsvc/gs_out.png /tmp/tmpdw6lfz_j/paperless-93esjsvc/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpdw6lfz_j/paperless-93esjsvc/convert_gs.png -out /tmp/tmpdw6lfz_j/paperless-93esjsvc/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-en-y0js4ytj/patch-code-t-qr.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpdw6lfz_j/paperless-93esjsvc
+LOG INFO paperless.consumer: Document 2026-07-14 patch-code-t-qr consumption finished
+  NONMATCHING / patch-code-t-qr.pdf          enable=True  string='NONEXISTENT VALUE' -> 'Success. New document id 2 created' | rows 1->2 (delta=1)
+
+--- (ST) staged DB timeline for several-patcht-codes.pdf split=[2,5] (before/split/consume x3/retrain) ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Pages with separators found in: /tmp/pngx-q4m-in-7yza3v7j/several-patcht-codes.pdf
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmpdw6lfz_j/paperless-49vzpebj
+LOG DEBUG paperless.tasks: Count: 0 page_number: 2
+LOG DEBUG paperless.tasks: page_number: 2 next_page: 5
+LOG DEBUG paperless.tasks: page_number: 2 next_page: 5
+LOG DEBUG paperless.tasks: pdf no:0 has 2 pages
+LOG DEBUG paperless.tasks: Count: 1 page_number: 5
+LOG DEBUG paperless.tasks: page_number: 5 next_page: 7
+LOG DEBUG paperless.tasks: pdf no:1 has 1 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmpdw6lfz_j/paperless-49vzpebj/several-patcht-codes_document_0.pdf', '/tmp/tmpdw6lfz_j/paperless-49vzpebj/several-patcht-codes_document_1.pdf', '/tmp/tmpdw6lfz_j/paperless-49vzpebj/several-patcht-codes_document_2.pdf']
+LOG DEBUG paperless.tasks: Deleting file /tmp/pngx-q4m-in-7yza3v7j/several-patcht-codes.pdf
+LOG WARNING paperless.tasks: OSError. It could be, the broker cannot be reached.
+LOG WARNING paperless.tasks: Multiple exceptions: [Errno 111] Connect call failed ('::1', 6379, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 6379)
+LOG INFO paperless.consumer: Consuming several-patcht-codes_document_0.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing several-patcht-codes_document_0.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-frag-1yz4j6sl/several-patcht-codes_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-frag-1yz4j6sl/several-patcht-codes_document_0.pdf', 'output_file': '/tmp/tmpdw6lfz_j/paperless-ea_i2l_1/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpdw6lfz_j/paperless-ea_i2l_1/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for several-patcht-codes_document_0.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/archive.pdf[0] /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpdw6lfz_j/paperless-ea_i2l_1/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/gs_out.png /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/convert_gs.png -out /tmp/tmpdw6lfz_j/paperless-ea_i2l_1/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-frag-1yz4j6sl/several-patcht-codes_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpdw6lfz_j/paperless-ea_i2l_1
+LOG INFO paperless.consumer: Document 2026-07-14 several-patcht-codes_document_0 consumption finished
+LOG ERROR paperless.consumer: Not consuming several-patcht-codes_document_1.pdf: It is a duplicate.
+LOG INFO paperless.consumer: Consuming several-patcht-codes_document_2.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing several-patcht-codes_document_2.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4m-frag-hml_otea/several-patcht-codes_document_2.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4m-frag-hml_otea/several-patcht-codes_document_2.pdf', 'output_file': '/tmp/tmpdw6lfz_j/paperless-i2rxpf7j/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpdw6lfz_j/paperless-i2rxpf7j/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Incomplete sidecar file: discarding.
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/archive.pdf
+LOG DEBUG paperless.consumer: Generating thumbnail for several-patcht-codes_document_2.pdf...
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/archive.pdf[0] /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/convert.png
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/tmpdw6lfz_j/paperless-i2rxpf7j/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+LOG WARNING paperless.parsing: Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+LOG DEBUG paperless.parsing: Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/gs_out.png /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/convert_gs.png
+LOG DEBUG paperless.parsing.tesseract: Execute: optipng -silent -o5 /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/convert_gs.png -out /tmp/tmpdw6lfz_j/paperless-i2rxpf7j/thumb_optipng.png
+LOG DEBUG paperless.consumer: Saving record to database
+LOG DEBUG paperless.consumer: Deleting file /tmp/pngx-q4m-frag-hml_otea/several-patcht-codes_document_2.pdf
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpdw6lfz_j/paperless-i2rxpf7j
+LOG INFO paperless.consumer: Document 2026-07-14 several-patcht-codes_document_2 consumption finished
+  STAGE                      Doc.count  NOTE
+  0 before split             0          input file only
+  1 after file-only split    0          'File successfully split'; original unlinked=True; 3 fragments=['several-patcht-codes_document_0.pdf', 'several-patcht-codes_document_1.pdf', 'several-patcht-codes_document_2.pdf']
+  2 after consume frag_0     1          several-patcht-codes_document_0.pdf CREATED pk=3 (md5=71fd51f158983f9366b65ccbc04d9d27)
+  3 after consume frag_1     1          several-patcht-codes_document_1.pdf REJECTED duplicate (md5=71fd51f158983f9366b65ccbc04d9d27)
+  4 after consume frag_2     2          several-patcht-codes_document_2.pdf CREATED pk=4 (md5=55539372c78b5926bb2baedf1f80993c)
+  5 after retrain            2          train() returned True; effective corpus (inbox-excluded) = 2
+SUMMARY: [2,5] -> 3 fragment files -> 2 distinct rows (1 duplicate rejected) -> effective training corpus 2
+
+================ Q4-MATRIX RUN 2 SUMMARY ================
+matrix: only exact configured string matches (case- & whitespace-sensitive); empty never matches; custom matches only its own value; nonmatching -> [] | disabled/nonmatching -> whole-file consume -> 1 row | [2,5] staged: 0->0(split)->1->1(dup)->2->retrain(corpus 2)
+```
+
+#### 7.3.9 Q4 page-0 boundary — complete both runs (`timeout 120 python3 /tmp/obs_q4_page0.py; echo "exit=$?"` → `exit=124`)
+
+Run 1 (`exit=124` — the non-daemon-thread hang):
+
+```text
+================ Q4-PAGE0 ================
+[1m
+
+  This is a one-time only migration to generate thumbnails for all of your
+  documents so that future UIs will have something to work with.  If you have
+  a lot of documents though, this may take a while, so a coffee break may be
+  in order.
+[0m
+input patch-code-t.pdf pages=1 size=40893
+
+--- (1) scan_file_for_separating_barcodes(patch-code-t.pdf) ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+separators = [0]
+
+--- (2) separate_pages(patch-code-t.pdf, [0]) -> inspect each emitted fragment ---
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmpgcjbsc2k/paperless-m5c7ach8
+LOG DEBUG paperless.tasks: Count: 0 page_number: 0
+LOG DEBUG paperless.tasks: pdf no:0 has 0 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmpgcjbsc2k/paperless-m5c7ach8/patch-code-t_document_0.pdf', '/tmp/tmpgcjbsc2k/paperless-m5c7ach8/patch-code-t_document_1.pdf']
+fragment count = 2
+  fragment patch-code-t_document_0.pdf              pages=0 size=315 md5=23ca22d022b120dbed9ad7024e174cda sha256=3b2d9eca14f0cd809195671cb16e9c0d814a3c622862dc3bd788e02bf4ef0cd9
+  fragment patch-code-t_document_1.pdf              pages=0 size=315 md5=23ca22d022b120dbed9ad7024e174cda sha256=3b2d9eca14f0cd809195671cb16e9c0d814a3c622862dc3bd788e02bf4ef0cd9
+  both fragments byte-identical to each other? True
+  all fragments 0-page? True ; all 315 bytes? True
+
+--- (3) pass EACH 0-page fragment through the REAL Consumer -> exact exception, 0 rows ---
+Document.objects.count() BEFORE = 0
+LOG INFO paperless.consumer: Consuming patch-code-t_document_0.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t_document_0.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4p0-frag-enyi2scg/patch-code-t_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4p0-frag-enyi2scg/patch-code-t_document_0.pdf', 'output_file': '/tmp/tmpgcjbsc2k/paperless-4msoukax/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpgcjbsc2k/paperless-4msoukax/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpgcjbsc2k/paperless-4msoukax
+LOG ERROR paperless.consumer: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 385, in run_pipeline
+    exec_concurrent(context, executor)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 274, in exec_concurrent
+    executor(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_concurrent.py", line 82, in __call__
+    self._execute(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/builtin_plugins/concurrency.py", line 127, in _execute
+    with self.pbar_class(**tqdm_kwargs) as pbar, executor_class(
+  File "/usr/local/lib/python3.9/concurrent/futures/thread.py", line 144, in __init__
+    raise ValueError("max_workers must be greater than 0")
+ValueError: max_workers must be greater than 0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 314, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: ValueError: max_workers must be greater than 0
+  consumed patch-code-t_document_0.pdf              -> ConsumerError: patch-code-t_document_0.pdf: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0
+LOG INFO paperless.consumer: Consuming patch-code-t_document_1.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t_document_1.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4p0-frag-etuap_ly/patch-code-t_document_1.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4p0-frag-etuap_ly/patch-code-t_document_1.pdf', 'output_file': '/tmp/tmpgcjbsc2k/paperless-h2aases_/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpgcjbsc2k/paperless-h2aases_/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmpgcjbsc2k/paperless-h2aases_
+LOG ERROR paperless.consumer: Error while consuming document patch-code-t_document_1.pdf: ValueError: max_workers must be greater than 0
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 385, in run_pipeline
+    exec_concurrent(context, executor)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 274, in exec_concurrent
+    executor(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_concurrent.py", line 82, in __call__
+    self._execute(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/builtin_plugins/concurrency.py", line 127, in _execute
+    with self.pbar_class(**tqdm_kwargs) as pbar, executor_class(
+  File "/usr/local/lib/python3.9/concurrent/futures/thread.py", line 144, in __init__
+    raise ValueError("max_workers must be greater than 0")
+ValueError: max_workers must be greater than 0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 314, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: ValueError: max_workers must be greater than 0
+  consumed patch-code-t_document_1.pdf              -> ConsumerError: patch-code-t_document_1.pdf: Error while consuming document patch-code-t_document_1.pdf: ValueError: max_workers must be greater than 0
+Document.objects.count() AFTER  = 0 (0 => neither 0-page fragment produced a row)
+
+--- (4) consume_file(patch-code-t.pdf, CONSUMER_ENABLE_BARCODES=True) still 'File successfully split' + unlink ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Pages with separators found in: /tmp/pngx-q4p0-in-l_8ar02x/patch-code-t.pdf
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmpgcjbsc2k/paperless-kx8qbd82
+LOG DEBUG paperless.tasks: Count: 0 page_number: 0
+LOG DEBUG paperless.tasks: pdf no:0 has 0 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmpgcjbsc2k/paperless-kx8qbd82/patch-code-t_document_0.pdf', '/tmp/tmpgcjbsc2k/paperless-kx8qbd82/patch-code-t_document_1.pdf']
+LOG DEBUG paperless.tasks: Deleting file /tmp/pngx-q4p0-in-l_8ar02x/patch-code-t.pdf
+LOG WARNING paperless.tasks: OSError. It could be, the broker cannot be reached.
+LOG WARNING paperless.tasks: Multiple exceptions: [Errno 111] Connect call failed ('::1', 6379, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 6379)
+  consume_file(...) returned = 'File successfully split'
+  original input still exists? = False (False => os.unlink at tasks.py:214)
+  isolated consume dir contents = ['patch-code-t_document_0.pdf', 'patch-code-t_document_1.pdf']
+  Document.objects.count() after split = 0
+
+--- (5) live threads after OCRmyPDF ran (non-daemon threads keep the process alive) ---
+  thread name='MainThread'             daemon=False alive=True
+  thread name='Thread-8'               daemon=True  alive=True
+  thread name='Thread-9'               daemon=False alive=True
+  thread name='Thread-11'              daemon=False alive=True
+  thread name='ThreadPoolExecutor-3_0' daemon=False alive=True
+  non-daemon non-main threads still alive = 3 -> ['Thread-9', 'Thread-11', 'ThreadPoolExecutor-3_0']
+================ END OF SCRIPT BODY ================
+main thread returning now; if a non-daemon thread is alive the process will NOT exit (timeout => hang)
+```
+
+Run 2 (`exit=124`; all invariants identical to run 1; only the empty-PDF digests differ, as noted in §5.5.2):
+
+```text
+================ Q4-PAGE0 ================
+[1m
+
+  This is a one-time only migration to generate thumbnails for all of your
+  documents so that future UIs will have something to work with.  If you have
+  a lot of documents though, this may take a while, so a coffee break may be
+  in order.
+[0m
+input patch-code-t.pdf pages=1 size=40893
+
+--- (1) scan_file_for_separating_barcodes(patch-code-t.pdf) ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+separators = [0]
+
+--- (2) separate_pages(patch-code-t.pdf, [0]) -> inspect each emitted fragment ---
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmp48eugg2t/paperless-v64g2eof
+LOG DEBUG paperless.tasks: Count: 0 page_number: 0
+LOG DEBUG paperless.tasks: pdf no:0 has 0 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmp48eugg2t/paperless-v64g2eof/patch-code-t_document_0.pdf', '/tmp/tmp48eugg2t/paperless-v64g2eof/patch-code-t_document_1.pdf']
+fragment count = 2
+  fragment patch-code-t_document_0.pdf              pages=0 size=315 md5=2bf6a7ed6166329588c1a2baacbe8a8e sha256=3a07eff7a44525888f0c965ef565f0ab59ceedd70562b2dde271402feb5f0d6d
+  fragment patch-code-t_document_1.pdf              pages=0 size=315 md5=2bf6a7ed6166329588c1a2baacbe8a8e sha256=3a07eff7a44525888f0c965ef565f0ab59ceedd70562b2dde271402feb5f0d6d
+  both fragments byte-identical to each other? True
+  all fragments 0-page? True ; all 315 bytes? True
+
+--- (3) pass EACH 0-page fragment through the REAL Consumer -> exact exception, 0 rows ---
+Document.objects.count() BEFORE = 0
+LOG INFO paperless.consumer: Consuming patch-code-t_document_0.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t_document_0.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4p0-frag-s6yooqct/patch-code-t_document_0.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4p0-frag-s6yooqct/patch-code-t_document_0.pdf', 'output_file': '/tmp/tmp48eugg2t/paperless-tgzjzyje/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmp48eugg2t/paperless-tgzjzyje/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmp48eugg2t/paperless-tgzjzyje
+LOG ERROR paperless.consumer: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 385, in run_pipeline
+    exec_concurrent(context, executor)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 274, in exec_concurrent
+    executor(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_concurrent.py", line 82, in __call__
+    self._execute(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/builtin_plugins/concurrency.py", line 127, in _execute
+    with self.pbar_class(**tqdm_kwargs) as pbar, executor_class(
+  File "/usr/local/lib/python3.9/concurrent/futures/thread.py", line 144, in __init__
+    raise ValueError("max_workers must be greater than 0")
+ValueError: max_workers must be greater than 0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 314, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: ValueError: max_workers must be greater than 0
+  consumed patch-code-t_document_0.pdf              -> ConsumerError: patch-code-t_document_0.pdf: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0
+LOG INFO paperless.consumer: Consuming patch-code-t_document_1.pdf
+LOG DEBUG paperless.consumer: Detected mime type: application/pdf
+LOG DEBUG paperless.consumer: Parser: RasterisedDocumentParser
+LOG DEBUG paperless.consumer: Parsing patch-code-t_document_1.pdf...
+LOG DEBUG paperless.parsing.tesseract: Extracted text from PDF file /tmp/pngx-q4p0-frag-oyvv7gio/patch-code-t_document_1.pdf
+LOG DEBUG paperless.parsing.tesseract: Calling OCRmyPDF with args: {'input_file': '/tmp/pngx-q4p0-frag-oyvv7gio/patch-code-t_document_1.pdf', 'output_file': '/tmp/tmp48eugg2t/paperless-dc7mszm3/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmp48eugg2t/paperless-dc7mszm3/sidecar.txt'}
+LOG DEBUG paperless.parsing.tesseract: Deleting directory /tmp/tmp48eugg2t/paperless-dc7mszm3
+LOG ERROR paperless.consumer: Error while consuming document patch-code-t_document_1.pdf: ValueError: max_workers must be greater than 0
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 385, in run_pipeline
+    exec_concurrent(context, executor)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 274, in exec_concurrent
+    executor(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_concurrent.py", line 82, in __call__
+    self._execute(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/builtin_plugins/concurrency.py", line 127, in _execute
+    with self.pbar_class(**tqdm_kwargs) as pbar, executor_class(
+  File "/usr/local/lib/python3.9/concurrent/futures/thread.py", line 144, in __init__
+    raise ValueError("max_workers must be greater than 0")
+ValueError: max_workers must be greater than 0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 314, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: ValueError: max_workers must be greater than 0
+  consumed patch-code-t_document_1.pdf              -> ConsumerError: patch-code-t_document_1.pdf: Error while consuming document patch-code-t_document_1.pdf: ValueError: max_workers must be greater than 0
+Document.objects.count() AFTER  = 0 (0 => neither 0-page fragment produced a row)
+
+--- (4) consume_file(patch-code-t.pdf, CONSUMER_ENABLE_BARCODES=True) still 'File successfully split' + unlink ---
+LOG DEBUG paperless.tasks: Barcode of type CODE39 found: PATCHT
+LOG DEBUG paperless.tasks: Pages with separators found in: /tmp/pngx-q4p0-in-b5te3kkh/patch-code-t.pdf
+LOG DEBUG paperless.tasks: Temp dir is /tmp/tmp48eugg2t/paperless-u7ves424
+LOG DEBUG paperless.tasks: Count: 0 page_number: 0
+LOG DEBUG paperless.tasks: pdf no:0 has 0 pages
+LOG DEBUG paperless.tasks: Temp files are ['/tmp/tmp48eugg2t/paperless-u7ves424/patch-code-t_document_0.pdf', '/tmp/tmp48eugg2t/paperless-u7ves424/patch-code-t_document_1.pdf']
+LOG DEBUG paperless.tasks: Deleting file /tmp/pngx-q4p0-in-b5te3kkh/patch-code-t.pdf
+LOG WARNING paperless.tasks: OSError. It could be, the broker cannot be reached.
+LOG WARNING paperless.tasks: Multiple exceptions: [Errno 111] Connect call failed ('::1', 6379, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 6379)
+  consume_file(...) returned = 'File successfully split'
+  original input still exists? = False (False => os.unlink at tasks.py:214)
+  isolated consume dir contents = ['patch-code-t_document_0.pdf', 'patch-code-t_document_1.pdf']
+  Document.objects.count() after split = 0
+
+--- (5) live threads after OCRmyPDF ran (non-daemon threads keep the process alive) ---
+  thread name='MainThread'             daemon=False alive=True
+  thread name='Thread-8'               daemon=True  alive=True
+  thread name='Thread-9'               daemon=False alive=True
+  thread name='Thread-11'              daemon=False alive=True
+  thread name='ThreadPoolExecutor-3_0' daemon=False alive=True
+  non-daemon non-main threads still alive = 3 -> ['Thread-9', 'Thread-11', 'ThreadPoolExecutor-3_0']
+================ END OF SCRIPT BODY ================
+main thread returning now; if a non-daemon thread is alive the process will NOT exit (timeout => hang)
+```
+
+
+### 7.4 Non-determinism probe — the ten suite runs and the isolated prediction-path flip
 
 The two named suites (`src/documents/tests/test_classifier.py` and `src/documents/tests/test_tasks.py`) were run ten times from an identical starting state (the import-bound consumption directory `/app/consume` emptied before each run) under the default `src/setup.cfg` configuration. `[observed]` The command for run *k* was:
 
@@ -3093,43 +4696,124 @@ Coverage HTML written to dir htmlcov
 62 passed, 1 skipped, 774 warnings in 31.21s
 ```
 
+#### 7.4.11 Isolated prediction-path flip — one 30-process batch, complete (`obs_q6_nd.py`)
+
+This is the canonical batch referenced by §6.5. Command and complete, unedited output (30 fresh single-process invocations; the corpus SHA-1 is byte-identical to the value Report 5 reports, every model SHA-256 is distinct, and the `verdict` flips on the same unchanged input):
+
+```text
+$ for i in $(seq 1 30); do python3 /tmp/obs_q6_nd.py $i 2>/dev/null | grep "^RUN="; done
+RUN=1 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=32b335849823ba7fbb3af023c3562b19d658065703ec052e35bafaccaaa0dac2 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=2 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=5b0be3c80b03a4c10b9bd4d0c6e777ca18f90aaf55b44694855e625c8172163c classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=3 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=d9fa57ef7d55d08082f3b0e49c895d82b5a0d4381811db3b514fa86612a16426 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=4 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=17bb6de9f25c07ec0a8bdd56610f3bdf241bbdd59c4d57e520fb4fa388177005 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=5 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=1b76d4be0d9f5329ccc5a8a3ccf358045f5803aec946f6765966b9bc86a966f1 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=6 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=e4cd60e91ab53e521d1aa583280b4656e10dd05131f6e0fec138355b7e141c06 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=7 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=345b6485fbc2eaa57da56c6c0ce9881dba4c84fd2d258abf80ad73f1205c41e6 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=8 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=2af4bfe9847730274c3089a3c7d3c06f5d4810177b47aab07bc7e7d383aba43b classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=9 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=d3d4998a27814473ea076cf226734b073adb5009febeb24d42d283ad4dcae360 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=10 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=74d68dc489a86f5b8f3ed2aa8f681ab12355590661e820b07ac955b7f4c509a7 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=11 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=94b4234d31e7e35834c6f9066c56711cb68d5e19931d7e192b9df3994a77d3de classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=12 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=25d97e3e9f42b301eec1c777e271b187ae1ab558ce0bd58039862145e037de4e classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=13 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=b15d96f1557bd211b3de25b1cf4f89fd438b198471cd1a4512a58fd41d061232 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=14 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=6c178e5f92fcb3581c1d3aaa7884d00a6aaebfc398175088cefa44407cbc7ce5 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=15 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=e8cb8db6db5018f01ff8313aa2fa41624aa08d2c09a724101230d7401dd005ca classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=16 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=5ec1a0703d9e5ad0a9e077ccef2b5f57596715e0d86af64dab203d8307e84501 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=17 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=87e8cffe65c397bb7feb5c56fbed77933cdb02b8670849542eeb86057c609550 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=18 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=d3db698b039e5b3adcca97e85e197054cfbdda6a774f1e67384b1f2c23500c01 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=19 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=a38813b60865a7b7c9edf4828f0ee60b18a9b15f621693fffe6b77e5d811c363 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=20 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=5179dece524dbf90b17fae37b62d9973400999668782d368267b7fdefc95d9ab classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=21 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=46f00178673cd50314e89484233799fa2b3f10dd76f79c9d0e67b25262d2a924 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=22 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=6173ec104e339986f4cb26bc9e4e56432d9db5c851165663e9252c003d996b8d classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=23 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=dde13f602b79232427a8519b438aa5218e7bdb79fe98f92795af66ef7b4ec152 classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=24 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=49ded29a6a734031475ed534833c2d87cc7e8a14977ae52bd0bb468c473a3e5e classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=25 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=2f3bdb0047821317649f106eacf8e19927c03bea7cec51572b9ea5fbdb7c9a5e classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=26 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=db6519bc85e36132d1ef18ec1f0e66898e76affe5211b0f7932e662feaf23c4f classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=27 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=f4be70489f8a6661fbee1a2fe3c804a7cce21aeb1e0989e184a56ab101a4c44b classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=28 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=21c12f1925cc503b8107536609e7ab3f3780da0c3c255d52d142f2b093f3f53c classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+RUN=29 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=f710d8416eb3fe64be536dfea09506a451b2ccf39b616a329a47092a922ae47f classes_=[-1, 1] pred=None match=[] verdict=NONE
+RUN=30 total=3 effective=2 c1.pk=1 corpus_sha1=98b0e672e43fbc7863208b65051bd70b50571754 model_sha256=f27a0f2a4a284154fc4683a3f34efc6733242d5987ff094d52d58084f5bfc2d1 classes_=[-1, 1] pred=[1] match=['Auto C1'] verdict=MATCH
+```
+
+Tally of this batch: **14 MATCH / 16 NONE**; `distinct corpus_sha1 = 1`; `distinct model_sha256 = 30`. Batch A above is exactly `14/16`; three further independent 30-process batches gave `13/17`, `15/15`, `12/18`, for an aggregate of **54 MATCH / 66 NONE over 120 fresh processes** (1 distinct corpus SHA-1, 120 distinct model SHA-256) — see §6.5.
+
+#### 7.4.12 Overlapping-vs-unseen contrast — 20 processes, complete (`obs_q6_contrast.py`)
+
+Command and complete, unedited output. Each process trains the identical corpus and predicts two inputs; `overlap=` is the overlapping-vocabulary input, `unseen=` is the unseen-vocabulary input. The overlapping input never flips (20/20 MATCH); the unseen input flips (12/20 MATCH, 8/20 NONE):
+
+```text
+$ for i in $(seq 1 20); do python3 /tmp/obs_q6_contrast.py $i 2>/dev/null | grep "^RUN="; done
+RUN=1 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=2 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=3 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=4 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=5 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=6 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=7 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=8 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=9 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=10 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=11 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=12 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=13 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=14 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=15 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=16 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=17 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=18 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+RUN=19 overlap_pred=[1] overlap=MATCH | unseen_pred=[1] unseen=MATCH
+RUN=20 overlap_pred=[1] overlap=MATCH | unseen_pred=None unseen=NONE
+```
+
+
 ### 7.5 Repository and container cleanliness
 
 `[observed]` **The repository checkout was never modified** by the investigation. All observation scripts (§7.2) were delivered into the container's `/tmp` and executed there; the container's `/app` tree is a distinct checkout from the repository under `blitzy-5fa640eb-6577-4b56-a9e5-a622258d47bf_735501`, so container-side artifacts can never appear in the repository's git state. The sole change tracked by the repository is this deliverable, `blitzy/documentation/paperless-ngx_542221a38dff.md`. While this document was being finalized (before committing), it was the only entry in the working-tree status — no source, test, or config file appears:
 
 ```text
-$ git -C <repo> rev-parse --abbrev-ref HEAD
+$ REPO=/tmp/blitzy/paperless-ngx/blitzy-5fa640eb-6577-4b56-a9e5-a622258d47bf_735501
+
+$ git -C "$REPO" rev-parse --abbrev-ref HEAD
 blitzy-5fa640eb-6577-4b56-a9e5-a622258d47bf
 
-$ git -C <repo> status --porcelain     # before committing: sole change is the tracked deliverable
+$ git -C "$REPO" status --porcelain     # sole working-tree change is the tracked deliverable
  M blitzy/documentation/paperless-ngx_542221a38dff.md
 
-$ git -C <repo> diff --name-status HEAD
+$ git -C "$REPO" diff --name-status HEAD
 M	blitzy/documentation/paperless-ngx_542221a38dff.md
 ```
 
-After committing this document, the working tree is clean — `git status --porcelain` produces no output — and, measured from the commit under investigation (`542221a38dff`) to `HEAD`, the deliverable is the **only** added path:
+Measured from the commit under investigation (`542221a38dff`) to `HEAD`, the deliverable is the **only** added path; the real recent history (this finalizing edit is committed on top of `d69ba06cb`) is:
 
 ```text
-$ git status --porcelain          # after committing this document: clean working tree (no output)
-$ git log --oneline -3
-<this-commit> docs(qna): rewrite paperless-ngx runtime investigation with complete canonical evidence
+$ git -C "$REPO" diff --name-status 542221a38dff HEAD   # baseline (commit under investigation) -> HEAD: sole addition
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+
+$ git -C "$REPO" log --oneline -5
+d69ba06cb docs(qna): address Q3-DOC-1/Q3-DOC-2 in paperless-ngx §4.5 (non-default OCR_MODE disclosure + inline pytest capture)
+fce84f647 docs(qna): fix 3 MINOR file:line citation precision issues in paperless-ngx investigation
+93dc64ee5 docs(qna): rewrite paperless-ngx runtime investigation with complete canonical evidence
 4b7d6d724 Add QnA investigation: paperless-ngx classifier/OCR/matching/barcode runtime behavior
 542221a38 Merge pull request #792 from paperless-ngx/dependabot/github_actions/github/codeql-action-2
-
-$ git diff --name-status HEAD~1 HEAD     # this commit changed exactly one file (the deliverable)
-M	blitzy/documentation/paperless-ngx_542221a38dff.md
-
-$ git diff --name-status 542221a38dff HEAD  # baseline (commit under investigation) -> HEAD: sole addition
-A	blitzy/documentation/paperless-ngx_542221a38dff.md
 ```
+
+After this document is committed, `git -C "$REPO" status --porcelain` produces no output (clean working tree) and `git -C "$REPO" diff --name-status 542221a38dff HEAD` still reports the single added deliverable; the exact post-commit `git log --oneline` (the new `docs(qna)` commit on top of `d69ba06cb`) and the clean status are captured immediately after the commit and recorded in the resolution report.
 
 `[observed]` **The import-bound split target `/app/consume` was inventoried and left empty.** As established in §5.1, `documents.tasks.save_to_dir` binds its destination default to `settings.CONSUMPTION_DIR` (`/app/src/../consume` = `/app/consume`) at import time (`src/documents/tasks.py:167`). Any fragment written there by an isolated split probe or by the canonical `test_consume_barcode_file` was removed; the directory is empty at the end of the investigation:
 
 ```text
-$ docker exec -u testuser pngx-qna ls -la /app/consume
+$ docker exec -u testuser pngx-qna ls -la /app/consume        # BEFORE: fragments left by canonical test_consume_barcode_file
+total 32
+drwxr-sr-x 1 testuser testuser 4096 Jul 14 01:25 .
+drwxr-sr-x 1 testuser testuser 4096 Jul 13 16:24 ..
+-rw-r--r-- 1 testuser testuser 8156 Jul 14 01:21 patch-code-t-middle_document_0.pdf
+-rw-r--r-- 1 testuser testuser 8156 Jul 14 01:21 patch-code-t-middle_document_1.pdf
+
+$ docker exec -u testuser pngx-qna sh -c 'rm -f /app/consume/*.pdf; echo "rm exit=$?"'   # cleanup producer: remove only the test-created fragments
+rm exit=0
+
+$ docker exec -u testuser pngx-qna ls -la /app/consume        # AFTER: empty
 total 16
-drwxr-sr-x 1 testuser testuser 4096 Jul 13 18:42 .
+drwxr-sr-x 1 testuser testuser 4096 Jul 14 01:35 .
 drwxr-sr-x 1 testuser testuser 4096 Jul 13 16:24 ..
 
 $ docker exec -u testuser pngx-qna sh -c "ls -1 /app/consume | wc -l"   # import-bound split target: empty
