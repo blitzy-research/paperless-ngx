@@ -1126,10 +1126,10 @@ The verbatim per-stage log for one document (`probe_alpha`) shows the pipeline o
 Read against `Consumer.try_consume_file()` [`consumer.py:L180`], the **actual order** is (this is the
 correction to any "parse → classify → persist" simplification — F3):
 
-1. `Detected mime type` — MIME detection [`consumer.py:L217`], then parser selection
-   [`consumer.py:L221` → `parsers.get_parser_class_for_mime_type()` `parsers.py:L81`].
+1. `Detected mime type` — MIME detection via `magic.from_file(...)` [`consumer.py:L219`], logged at
+   [`consumer.py:L221`], then parser selection [`consumer.py:L223` → `parsers.get_parser_class_for_mime_type()` `parsers.py:L81`].
 2. `Parsing …` — `document_parser.parse(...)` [`consumer.py:L261`].
-3. `Generating thumbnail …` — `get_thumbnail(...)` [`consumer.py:L265`] (the `optipng` line is the
+3. `Generating thumbnail …` — `get_optimised_thumbnail(...)` [`consumer.py:L265`] (the `optipng` line is the
    text parser optimising the thumbnail).
 4. Date resolution — `get_date()` then `parse_date()` if needed [`consumer.py:L271-L275`].
 5. **Then a single DB transaction** `with transaction.atomic():` [`consumer.py:L298`]:
