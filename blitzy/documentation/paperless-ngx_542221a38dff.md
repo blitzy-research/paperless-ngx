@@ -59,7 +59,13 @@ PAPERLESS_DISABLE_DBHANDLER=true
 
 The container was launched (by the environment setup, reproduced here verbatim) with the
 canonical command below, and every experiment was executed inside it via
-`docker exec -w /app/src paperless-work …`:
+`docker exec -w /app/src paperless-work …`. Note the `-lc` argument is written as a **single
+unbroken line**: because it is inside single quotes, a `\`+newline would be taken *literally*
+(it would not join the lines), so keeping it on one line is what makes the container's
+`.Config.Cmd` come out byte-for-byte identical to the JSON shown above (the inner `--save ""`
+appears there as the escaped `--save \"\"`). The `--entrypoint /bin/bash` is required because
+the image's entrypoint is `["/bin/bash"]`, so the `-lc '…'` string is passed to bash as its
+command:
 
 ```bash
 docker run -d --name paperless-work --entrypoint /bin/bash \
@@ -67,8 +73,7 @@ docker run -d --name paperless-work --entrypoint /bin/bash \
   -e PAPERLESS_MEDIA_ROOT=/scratch/media -e PAPERLESS_CONSUMPTION_DIR=/scratch/consume \
   -e PAPERLESS_TIME_ZONE=UTC \
   paperless-ngx-ready:latest \
-  -lc 'mkdir -p /scratch/data /scratch/media /scratch/consume && \
-       redis-server --daemonize yes --save "" --appendonly no && echo READY && sleep infinity'
+  -lc 'mkdir -p /scratch/data /scratch/media /scratch/consume && redis-server --daemonize yes --save "" --appendonly no && echo READY && sleep infinity'
 ```
 
 ### Versions and services
@@ -90,6 +95,9 @@ run 'gs --version'
 run 'unpaper --version'
 run 'qpdf --version | head -1'
 run 'pngquant --version 2>&1 | head -1'
+# /app is owned by testuser but commands here run as root; without this exception git
+# aborts with "fatal: detected dubious ownership in repository at '/app'".
+run 'git config --global --add safe.directory /app'
 run 'git -C /app rev-parse HEAD'
 ```
 
@@ -130,6 +138,8 @@ qpdf version 10.1.0
 
 $ pngquant --version 2>&1 | head -1
 2.12.2 (July 2019)
+
+$ git config --global --add safe.directory /app
 
 $ git -C /app rev-parse HEAD
 542221a38dff06361e07976452f9aea24d210542
@@ -307,15 +317,22 @@ warnings, mismatch errors, duplicate errors, classifier save) surface on both. E
 experiment below therefore captures the log file (and, where useful, also surfaces DEBUG
 on the console with `PAPERLESS_DEBUG=true`) so no evidence is missed.
 
-### Task worker (Django-Q) — used for the canonical async ingestion path (Q4)
+### Task worker (Django-Q) — the canonical async ingestion path used to seed every question
 
 The canonical consume-directory and REST-upload entry points do not run consumption
 inline; they **enqueue** `documents.tasks.consume_file` to Django-Q
 (`src/documents/management/commands/document_consumer.py:86-91`;
-`src/documents/views.py:523-533`), and a **`qcluster`** worker executes it. Q4 therefore
-runs a real `qcluster`. For determinism, no `qcluster` runs during Q1/Q2/Q3/Q5/Q6 (those
-use synchronous management commands / ORM signals), and the Q4 worker is started and then
-stopped by its **specific PID** (never a broad `pkill` pattern). The exact demonstration
+`src/documents/views.py:523-533`), and a **`qcluster`** worker executes it. **Every** question
+in this investigation seeds its document(s) through this same canonical async path — a file
+dropped in the consume directory, enqueued to Django-Q, executed by a running `qcluster`
+worker — so a real `qcluster` runs during the *seeding* phase of Q1–Q6 alike (Q5/Q6 have always
+done so; Q1/Q2/Q3 do too now that they seed through the pipeline rather than by calling the task
+function directly). The questions differ only in the *behavior-under-test* they trigger **after**
+seeding: Q1 fires `m2m_changed`/`document_renamer`, Q2 induces move failures, Q3 runs
+`document_create_classifier`, Q4 re-consumes a duplicate, and Q5/Q6 run the sanity checker —
+of these, only Q4's behavior-under-test is itself an async consume that needs the worker still
+running. In every case the worker is started and then stopped by its **specific PID** (never a
+broad `pkill` pattern). The exact demonstration
 (`docker exec paperless-work bash /scratch/exp/qcluster_demo.sh`):
 
 ```bash
@@ -387,6 +404,9 @@ while not os.path.exists(stop_file) and (time.time() - t0) < 10:
               f"cookie={ev.cookie} flags={'|'.join(names)}", flush=True)
 ```
 
+**Script-materialization convention.** Every helper referenced in this document is a standalone file that is **written to disk first and then invoked by path** — none is typed interactively and none lives in the tracked repository. The environment/setup helpers `env_probe.sh`, `reset.sh`, and `qcluster_demo.sh`; the Q2 observer helpers `fsmon.py` and `race_writer.py`; the per-question drivers `q1.sh`, `q2.sh`, `q2race.sh`, `q3.sh`, `q4.sh`, `q5.sh`, `q5_ocr.sh`, `q6.sh`; and the Q3 Python helpers `q3_readhash.py`, `q3_recompute.py`, `q3_enumerate.py` are all materialized under **`/scratch/exp/`** (a scratch tree *outside* the repository) and invoked as, e.g., `docker cp <file> paperless-work:/scratch/exp/ && docker exec -w /app/src paperless-work bash /scratch/exp/q2.sh`. Two helpers live elsewhere by necessity and are called out where they appear: `cleanup.sh` is placed at the container's **`/tmp/cleanup.sh`** (it deletes `/scratch`, so it must not sit inside the tree it removes), and `git_integrity.sh` is run from the **host repository root** (it inspects the host git checkout that holds this deliverable, not the container's `/app`). None of these files live in or touch the tracked repository, and every one is removed at the end (see the closing "Repository integrity & Cleanup" section), so the checkout is left byte-for-byte unchanged.
+
+**File-descriptor budget for the observer.** `fsmon.py` opens one `inotify` instance and one watch descriptor per directory. Each `INotify()` and each `add_watch` consumes a file descriptor, so a watcher over *many* directories under a low `ulimit -n` can fail with `OSError: [Errno 24] Too many open files`. In this container the process runs as `root` with `ulimit -n = 1048576`, and Q2 watches only **two** directories (`originals/` and `originals/Invoice/`), so the observer starts cleanly (its `READY` sentinel is written and the four move events are captured). If the same observer is run as the setup's non-root `testuser` (whose default `ulimit -n` is `1024`) against a large media tree, raise the soft limit first with `ulimit -n 8192` before launching it; it is unnecessary here because only two watches are opened. `inotify_simple` is already present in the canonical image (no install step is performed).
 
 ---
 
@@ -400,12 +420,16 @@ The relocation happens **only** because `PAPERLESS_FILENAME_FORMAT` embeds a tag
 
 ### Q1 — the exact self-contained script
 
-The script resets a throwaway store, seeds one document through the canonical consume path, records the before-state, fires `m2m_changed` by adding a tag, records the after-state, then repeats the relocation through the second canonical trigger (`document_renamer`). Every printed marker is emitted by a `script` `echo`, so each line in the output below is attributable to this script.
+The script resets a throwaway store, seeds one document through the **canonical ingestion pipeline** — a file dropped in `CONSUMPTION_DIR`, picked up by `document_consumer --oneshot` which *enqueues* `documents.tasks.consume_file` (`document_consumer.py:85-91`) to Django-Q, executed by a running `qcluster` worker (no task is called directly) — records the before-state, fires `m2m_changed` by adding a tag, records the after-state, then repeats the relocation through the second canonical trigger (`document_renamer`). Every printed marker is emitted by a `script` `echo`, so each line in the output below is attributable to this script.
 
 ```bash
 #!/bin/bash
 # Q1 — a tag change (m2m_changed) relocates the original + archive, silently.
-# Self-contained: reset -> seed (canonical consume) -> before -> trigger -> after -> log proof.
+# Self-contained: reset -> seed through the CANONICAL consume pipeline
+# (consume-dir -> `document_consumer --oneshot` enqueues documents.tasks.consume_file
+#  (document_consumer.py:85-91) -> a running qcluster worker executes it) ->
+# before -> trigger (m2m_changed) -> after -> log proof, then the SECOND canonical
+# trigger (document_renamer -> post_save). No task function is ever called directly.
 cd /app/src
 LOG=/scratch/data/log/paperless.log
 
@@ -414,12 +438,23 @@ bash /scratch/exp/reset.sh > /scratch/exp/q1_reset.log 2>&1
 echo "reset+migrate exit=$?  migrations applied OK = $(grep -c '\.\.\. OK' /scratch/exp/q1_reset.log)"
 
 echo
-echo "=== SEED: consume simple.pdf via canonical documents.tasks.consume_file (console at INFO) ==="
+echo "=== SEED: consume simple.pdf through the CANONICAL queue (no task called directly) ==="
+echo "    drop file in CONSUMPTION_DIR -> document_consumer --oneshot enqueues -> qcluster worker consumes"
+python3 manage.py shell -c "from django_q.models import Schedule; n=Schedule.objects.count(); Schedule.objects.all().delete(); print(f'deleted {n} scheduled maintenance job(s) to isolate the queue')" 2>&1 | tail -1
+python3 manage.py qcluster > /scratch/exp/q1_qcluster.log 2>&1 &
+QPID=$!
+for i in $(seq 1 100); do grep -qiE "ready for work" /scratch/exp/q1_qcluster.log 2>/dev/null && break; sleep 0.2; done
+echo "qcluster pid=$QPID; startup:"; grep -E "Q Cluster|ready for work" /scratch/exp/q1_qcluster.log | head -3 | sed 's/^/  /'
 cp /app/src/documents/tests/samples/simple.pdf /scratch/consume/simple.pdf
-python3 manage.py shell <<'PY'
-from documents import tasks
-print("consume_file ->", tasks.consume_file("/scratch/consume/simple.pdf"))
-PY
+python3 manage.py document_consumer --oneshot 2>&1 | sed 's/^/  [consumer] /'
+for i in $(seq 1 200); do
+  n=$(python3 manage.py shell -c "from django_q.models import Task; print(Task.objects.filter(func='documents.tasks.consume_file').count())" 2>/dev/null | tail -1)
+  [ "$n" = "1" ] && break; sleep 0.2
+done
+echo "  consume_file tasks completed = $n"
+kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
+sleep 0.5
+echo "  qcluster stopped (the tag-change move machinery is SYNCHRONOUS; no worker needed henceforth)"
 
 echo
 echo "=== snapshot paperless.log AFTER seed / BEFORE move ==="
@@ -527,16 +562,20 @@ docker exec -w /app/src -e PAPERLESS_FILENAME_FORMAT='{tag_list}/{title}' \
 === PREP: reset throwaway store + migrate (full migrate output is in Methodology) ===
 reset+migrate exit=0  migrations applied OK = 92
 
-=== SEED: consume simple.pdf via canonical documents.tasks.consume_file (console at INFO) ===
-[2026-07-13 18:23:02,463] [INFO] [paperless.consumer] Consuming simple.pdf
-convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
-convert-im6.q16: no images defined `/tmp/paperless/paperless-k56g_lc_/convert.png' @ error/convert.c/ConvertImageCommand/3229.
-[2026-07-13 18:23:02,940] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
-[2026-07-13 18:23:03,855] [INFO] [paperless.consumer] Document 2026-07-13 simple consumption finished
-consume_file -> Success. New document id 1 created
+=== SEED: consume simple.pdf through the CANONICAL queue (no task called directly) ===
+    drop file in CONSUMPTION_DIR -> document_consumer --oneshot enqueues -> qcluster worker consumes
+deleted 4 scheduled maintenance job(s) to isolate the queue
+qcluster pid=2321; startup:
+  01:17:29 [Q] INFO Q Cluster four-cardinal-mango-artist starting.
+  01:17:29 [Q] INFO Process-1:1 ready for work at 2344
+  01:17:29 [Q] INFO Process-1:2 ready for work at 2345
+  [consumer] [2026-07-14 01:17:31,303] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
+  [consumer] 01:17:31 [Q] INFO Enqueued 1
+  consume_file tasks completed = 1
+  qcluster stopped (the tag-change move machinery is SYNCHRONOUS; no worker needed henceforth)
 
 === snapshot paperless.log AFTER seed / BEFORE move ===
-log lines before move = 18
+log lines before move = 19
 
 === BEFORE (no tags): DB paths + on-disk files ===
 filename         = simple.pdf
@@ -567,7 +606,7 @@ tags             = ['Invoice']
 /scratch/media/documents/thumbnails/0000001.png
 
 === LOG PROOF: paperless.log before-move vs after-move ===
-log lines after move  = 18
+log lines after move  = 19
 <<< NO DIFFERENCE: the successful move wrote ZERO new lines to paperless.log >>>
 === grep the ENTIRE log for any move/rename/handlers activity ===
 <<< NONE: no rename/move/paperless.handlers line anywhere in paperless.log >>>
@@ -591,7 +630,7 @@ source_path      = /scratch/media/documents/originals/2026/Invoice/simple.pdf
 archive_path     = /scratch/media/documents/archive/2026/Invoice/simple.pdf
 thumbnail_path   = /scratch/media/documents/thumbnails/0000001.png
 --- LOG PROOF for the document_renamer move ---
-log lines after renamer = 18
+log lines after renamer = 19
 <<< NO DIFFERENCE: document_renamer's move wrote ZERO new lines to paperless.log >>>
 ```
 
@@ -609,7 +648,7 @@ Paths below are the on-disk `find` results and the DB `source_path` / `archive_p
 
 - **The move engine and its two triggers [observed + `file:line`].** The relocation is performed by `update_filename_and_move_files` (`src/documents/signals/handlers.py:312`). It is registered on two signals — `@receiver(m2m_changed, sender=Document.tags.through)` (`:310`) and `@receiver(post_save, sender=Document)` (`:311`) — which is why *both* a tag edit and `document_renamer`'s `post_save.send(...)` (`document_renamer.py:34`) invoke the same function. The whole body runs under `FileLock(settings.MEDIA_LOCK)` (`:325`); the new names come from `generate_unique_filename` (`:330` original, `:338` archive), and the physical moves are the bare `os.rename` calls for the original (`:354`) and the archive (`:359`). The DB row is then updated directly with `Document.objects.filter(pk=instance.pk).update(...)` (`:362`) — a direct `UPDATE` chosen specifically "to prevent infinite recursion" through `post_save`.
 
-- **What log messages appear during the dance? None [observed].** The output shows `log lines before move = 18` and `log lines after move = 18` for the `m2m_changed` trigger, `diff` reports `<<< NO DIFFERENCE ... wrote ZERO new lines >>>`, and a `grep` of the entire log for `rename|Moved|update_filename|paperless.handlers` returns `<<< NONE >>>`. The `document_renamer` trigger likewise leaves the log at `18` lines. **Cause [observed + `file:line`]:** there is no `logger.*` call anywhere inside `update_filename_and_move_files` (`handlers.py:312-410`). The *only* logger in the move path lives in `validate_move` — `logger.fatal(... "has gone.")` (`:298`) and `logger.warning(... "target path ... already exists")` (`:303-306`) — and those fire *only* on the error/edge paths (missing source, or a pre-existing target). On the happy path `validate_move` raises and logs nothing, so a successful relocation is genuinely silent. The observable evidence of a successful move is therefore the path change itself, not any log line. (`document_renamer.py:28` additionally pins the console handler to `ERROR`, but that is irrelevant here since the file-sink log is unchanged too.)
+- **What log messages appear during the dance? None [observed].** The output shows `log lines before move = 19` and `log lines after move = 19` for the `m2m_changed` trigger, `diff` reports `<<< NO DIFFERENCE ... wrote ZERO new lines >>>`, and a `grep` of the entire log for `rename|Moved|update_filename|paperless.handlers` returns `<<< NONE >>>`. The `document_renamer` trigger likewise leaves the log at `19` lines. **Cause [observed + `file:line`]:** there is no `logger.*` call anywhere inside `update_filename_and_move_files` (`handlers.py:312-410`). The *only* logger in the move path lives in `validate_move` — `logger.fatal(... "has gone.")` (`:298`) and `logger.warning(... "target path ... already exists")` (`:303-306`) — and those fire *only* on the error/edge paths (missing source, or a pre-existing target). On the happy path `validate_move` raises and logs nothing, so a successful relocation is genuinely silent. The observable evidence of a successful move is therefore the path change itself, not any log line. (`document_renamer.py:28` additionally pins the console handler to `ERROR`, but that is irrelevant here since the file-sink log is unchanged too.)
 
 - **Why the thumbnail never moves [observed + `file:line`].** In all three stages the thumbnail stays at `thumbnails/0000001.png`. **Cause:** `update_filename_and_move_files` renames only the original (`:354`) and, when `instance.has_archive_version`, the archive (`:359`); it never touches the thumbnail. The thumbnail path is derived from the primary key, not the filename format — `Document.thumbnail_path` builds its name as `"{:07}.png".format(self.pk)` (`src/documents/models.py:274`) — so it is format-independent by construction and is left in place across any number of tag/format changes.
 
@@ -628,7 +667,7 @@ Paths below are the on-disk `find` results and the DB `source_path` / `archive_p
 - **PART A — failure *partway through* (the case the user asks about).** The **original** file is successfully renamed to its new tag directory, then the **archive** step fails. The `except (OSError, DatabaseError, CannotMoveFilesException)` block (`handlers.py:367`) renames the original **back** to its old path (`:376`); the archive — which never moved — is left where it was (`:378` guard is false), and the database row is never updated (the direct `UPDATE` at `:362` is skipped because the exception fired before it). Net result: **both files end exactly where they started**, and the failed move plus its rollback write **zero** log lines. The transient "intermediate" state — the original sitting at its *new* path before the rollback — was captured directly by an **external `inotify` observer** (no product code was patched), as cookie-paired `MOVED_FROM`/`MOVED_TO` events.
 - **PART B — failure *before anything moves*.** If the original file is missing when the move begins, the very first `validate_move` (`handlers.py:352`) detects it and logs `logger.fatal(... "has gone.")` (`:298`), raising `CannotMoveFilesException` (`:299`); nothing is renamed and the database is untouched.
 
-**How the failure was induced (and why the obvious method does not work).** The AAP suggested pre-creating a *conflicting archive target* so that `validate_move`'s "target already exists" branch (`handlers.py:301-307`) would raise. In practice that branch is effectively **unreachable** during a normal move: `generate_unique_filename` (`src/documents/file_handling.py:81`) guarantees a non-existing target — for the archive it first tries `os.path.splitext(doc.filename)[0] + ".pdf"` (`:104`) and otherwise appends `_01`, `_02`, ... in the `while` loop that increments on `os.path.exists` (`:111-125`). A plain blocker file would therefore just yield `simple_01.pdf` and the move would *succeed*. To fail the archive step deterministically I instead placed a **regular file at the path `archive/Invoice`**, so that `create_source_path_directory`'s `os.makedirs("archive/Invoice", exist_ok=True)` (`handlers.py:358`, via `file_handling.py:19-20`) raises `FileExistsError` — a subclass of `OSError` — because a path component is a file, not a directory. This fires *after* the original has already moved (`:354`), which is exactly the "partway through" condition.
+**How the failure was induced (and why the obvious method does not work).** The AAP suggested pre-creating a *conflicting archive target* so that `validate_move`'s "target already exists" branch (`handlers.py:301-307`) would raise. In practice that branch is effectively **unreachable during a normal *single-threaded* move**: `generate_unique_filename` (`src/documents/file_handling.py:81`) guarantees a non-existing target — for the archive it first tries `os.path.splitext(doc.filename)[0] + ".pdf"` (`:104`) and otherwise appends `_01`, `_02`, ... in the `while` loop that increments on `os.path.exists` (`:111-125`). A plain blocker file would therefore just yield `simple_01.pdf` and the move would *succeed*. To fail the archive step deterministically I instead placed a **regular file at the path `archive/Invoice`**, so that `create_source_path_directory`'s `os.makedirs("archive/Invoice", exist_ok=True)` (`handlers.py:358`, via `file_handling.py:19-20`) raises `FileExistsError` — a subclass of `OSError` — because a path component is a file, not a directory. This fires *after* the original has already moved (`:354`), which is exactly the "partway through" condition. (The "target already exists" branch itself *is* reachable — just not single-threaded; I trigger it separately with a concurrent writer in the grounding subsection below, where it is captured as an `[observed]` WARNING.)
 ### Q2 — the exact self-contained script
 
 Every printed marker below is emitted by a `script` `echo`, and the `inotify` event log is written by the external observer `fsmon.py` (shown in the Methodology section).
@@ -637,6 +676,9 @@ Every printed marker below is emitted by a `script` `echo`, and the `inotify` ev
 #!/bin/bash
 # Q2 — the rollback safety net. Two induced failures through the REAL move engine
 # update_filename_and_move_files (handlers.py:312), fired by m2m_changed (handlers.py:310).
+# The document is seeded through the CANONICAL consume pipeline (consume-dir ->
+# document_consumer --oneshot enqueues documents.tasks.consume_file (document_consumer.py:85-91)
+# -> a running qcluster worker executes it); no task function is called directly.
 # PART A: archive move fails AFTER the original already moved -> rollback restores the original.
 #         The transient "intermediate" state (original at its NEW path) is captured by an
 #         EXTERNAL inotify observer (fsmon.py); no product code is patched.
@@ -644,12 +686,21 @@ Every printed marker below is emitted by a `script` `echo`, and the `inotify` ev
 cd /app/src
 LOG=/scratch/data/log/paperless.log
 
-seed() {
+seed() {   # canonical: drop in consume dir -> document_consumer --oneshot enqueues -> qcluster worker consumes
+  python3 manage.py shell -c "from django_q.models import Schedule; Schedule.objects.all().delete()" >/dev/null 2>&1
+  python3 manage.py qcluster > /scratch/exp/q2_qcluster.log 2>&1 &
+  QPID=$!
+  for i in $(seq 1 100); do grep -qiE "ready for work" /scratch/exp/q2_qcluster.log 2>/dev/null && break; sleep 0.2; done
   cp /app/src/documents/tests/samples/simple.pdf /scratch/consume/simple.pdf
-  python3 manage.py shell <<'PY'
-from documents import tasks
-print("seed consume_file ->", tasks.consume_file("/scratch/consume/simple.pdf"))
-PY
+  python3 manage.py document_consumer --oneshot 2>&1 | sed 's/^/  [consumer] /'
+  local n
+  for i in $(seq 1 200); do
+    n=$(python3 manage.py shell -c "from django_q.models import Task; print(Task.objects.filter(func='documents.tasks.consume_file').count())" 2>/dev/null | tail -1)
+    [ "$n" = "1" ] && break; sleep 0.2
+  done
+  echo "  consume_file tasks completed = $n; qcluster stopped (move machinery is synchronous)"
+  kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
+  sleep 0.4
 }
 show() {  # $1 = label
   python3 manage.py shell <<PY
@@ -782,12 +833,9 @@ docker exec -w /app/src -e PAPERLESS_FILENAME_FORMAT='{tag_list}/{title}' \
 reset+migrate exit=0  migrations applied OK = 92
 
 === SEED (canonical consume; PAPERLESS_FILENAME_FORMAT makes tags a directory) ===
-[2026-07-13 18:33:30,377] [INFO] [paperless.consumer] Consuming simple.pdf
-convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
-convert-im6.q16: no images defined `/tmp/paperless/paperless-zzq6a7hq/convert.png' @ error/convert.c/ConvertImageCommand/3229.
-[2026-07-13 18:33:30,819] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
-[2026-07-13 18:33:31,770] [INFO] [paperless.consumer] Document 2026-07-13 simple consumption finished
-seed consume_file -> Success. New document id 1 created
+  [consumer] [2026-07-14 01:18:39,873] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
+  [consumer] 01:18:39 [Q] INFO Enqueued 1
+  consume_file tasks completed = 1; qcluster stopped (move machinery is synchronous)
 
 === BEFORE (no tags) ===
 filename         = simple.pdf
@@ -808,7 +856,7 @@ archive/Invoice is a file? YES
 originals/Invoice is a dir? YES
 
 === START external inotify observer on originals/ and originals/Invoice/ ===
-observer READY (pid 9164), watching originals/ and originals/Invoice/
+observer READY (pid 2586), watching originals/ and originals/Invoice/
 
 === TRIGGER: d.tags.add(Invoice) fires m2m_changed (PAPERLESS_DEBUG=true) ===
 >>> calling d.tags.add(Invoice) (original will move, archive makedirs will fail, rollback)
@@ -816,10 +864,10 @@ observer READY (pid 9164), watching originals/ and originals/Invoice/
 
 === EXTERNAL INOTIFY EVENT LOG (this IS the observed intermediate state) ===
 cookie pairs a MOVED_FROM with its MOVED_TO; the original visibly transits into originals/Invoice/ and back:
-t=+01.1584s dir=/scratch/media/documents/originals name='simple.pdf' cookie=28041896 flags=MOVED_FROM
-t=+01.1585s dir=/scratch/media/documents/originals/Invoice name='simple.pdf' cookie=28041896 flags=MOVED_TO
-t=+01.1585s dir=/scratch/media/documents/originals/Invoice name='simple.pdf' cookie=28041898 flags=MOVED_FROM
-t=+01.1586s dir=/scratch/media/documents/originals name='simple.pdf' cookie=28041898 flags=MOVED_TO
+t=+01.1924s dir=/scratch/media/documents/originals name='simple.pdf' cookie=29059634 flags=MOVED_FROM
+t=+01.1925s dir=/scratch/media/documents/originals/Invoice name='simple.pdf' cookie=29059634 flags=MOVED_TO
+t=+01.1925s dir=/scratch/media/documents/originals/Invoice name='simple.pdf' cookie=29059636 flags=MOVED_FROM
+t=+01.1925s dir=/scratch/media/documents/originals name='simple.pdf' cookie=29059636 flags=MOVED_TO
 
 === AFTER ===
 filename         = simple.pdf
@@ -842,12 +890,9 @@ tags             = ['Invoice']
 reset+migrate exit=0  migrations applied OK = 92
 
 === SEED ===
-[2026-07-13 18:33:39,853] [INFO] [paperless.consumer] Consuming simple.pdf
-convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
-convert-im6.q16: no images defined `/tmp/paperless/paperless-g_ys88_g/convert.png' @ error/convert.c/ConvertImageCommand/3229.
-[2026-07-13 18:33:40,346] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
-[2026-07-13 18:33:41,155] [INFO] [paperless.consumer] Document 2026-07-13 simple consumption finished
-seed consume_file -> Success. New document id 1 created
+  [consumer] [2026-07-14 01:18:56,468] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
+  [consumer] 01:18:56 [Q] INFO Enqueued 1
+  consume_file tasks completed = 1; qcluster stopped (move machinery is synchronous)
 
 === BEFORE ===
 filename         = simple.pdf
@@ -868,7 +913,7 @@ removed '/scratch/media/documents/originals/simple.pdf'
 
 === TRIGGER: d.tags.add(Invoice) fires m2m_changed (PAPERLESS_DEBUG=true so CRITICAL shows on console) ===
 >>> calling d.tags.add(Invoice)
-[2026-07-13 18:33:43,423] [CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.
+[2026-07-14 01:19:03,553] [CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.
 >>> d.tags.add returned WITHOUT raising to the caller
 
 === AFTER ===
@@ -882,10 +927,10 @@ tags             = ['Invoice']
 /scratch/media/documents/thumbnails/0000001.png
 
 === LOG PROOF: new lines written during the failed move ===
-18a19
-> [2026-07-13 18:33:43,423] [CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.
+19a20
+> [2026-07-14 01:19:03,553] [CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.
 === grep the log for validate_move's messages ===
-19:[2026-07-13 18:33:43,423] [CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.
+20:[2026-07-14 01:19:03,553] [CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.
 ```
 
 ### Q2 — the intermediate state, captured externally [observed]
@@ -894,12 +939,12 @@ The four `inotify` lines from PART A are the direct evidence of "what happens pa
 
 | order | dir | name | cookie | flag | meaning |
 |-------|-----|------|--------|------|---------|
-| 1 | `.../originals` | `simple.pdf` | `28041896` | `MOVED_FROM` | original leaves `originals/` |
-| 2 | `.../originals/Invoice` | `simple.pdf` | `28041896` | `MOVED_TO` | original arrives in `originals/Invoice/` — **intermediate state** |
-| 3 | `.../originals/Invoice` | `simple.pdf` | `28041898` | `MOVED_FROM` | rollback: original leaves `originals/Invoice/` |
-| 4 | `.../originals` | `simple.pdf` | `28041898` | `MOVED_TO` | rollback: original restored to `originals/` |
+| 1 | `.../originals` | `simple.pdf` | `29059634` | `MOVED_FROM` | original leaves `originals/` |
+| 2 | `.../originals/Invoice` | `simple.pdf` | `29059634` | `MOVED_TO` | original arrives in `originals/Invoice/` — **intermediate state** |
+| 3 | `.../originals/Invoice` | `simple.pdf` | `29059636` | `MOVED_FROM` | rollback: original leaves `originals/Invoice/` |
+| 4 | `.../originals` | `simple.pdf` | `29059636` | `MOVED_TO` | rollback: original restored to `originals/` |
 
-Events 1–2 (cookie `28041896`) are `os.rename(old_source_path, instance.source_path)` at `handlers.py:354`; events 3–4 (cookie `28041898`) are the recovery `os.rename(instance.source_path, old_source_path)` at `handlers.py:376`. Between event 2 and event 3 the original genuinely existed at `.../originals/Invoice/simple.pdf` — that is the observed intermediate state. Its lifetime here was sub-millisecond (the observer read all four events within the same ~0.0002 s window) because the rollback runs immediately in the `except` block; the ordering, however, is guaranteed by the kernel's event queue and the cookie pairing.
+Events 1–2 (cookie `29059634`) are `os.rename(old_source_path, instance.source_path)` at `handlers.py:354`; events 3–4 (cookie `29059636`) are the recovery `os.rename(instance.source_path, old_source_path)` at `handlers.py:376`. Between event 2 and event 3 the original genuinely existed at `.../originals/Invoice/simple.pdf` — that is the observed intermediate state. Its lifetime here was sub-millisecond (the observer read all four events within the same ~0.0001 s window) because the rollback runs immediately in the `except` block; the ordering, however, is guaranteed by the kernel's event queue and the cookie pairing.
 
 ### Q2 — before / during / after (both parts)
 
@@ -918,9 +963,54 @@ Events 1–2 (cookie `28041896`) are `os.rename(old_source_path, instance.source
 
 - **A move that fails partway is silent [observed + `file:line`].** PART A's `LOG PROOF` reports `<<< NO DIFFERENCE ... wrote ZERO new lines >>>`. **Cause:** there is no `logger.*` call anywhere in `update_filename_and_move_files` (`handlers.py:312-410`), including its `except` block; only `validate_move` logs, and in PART A `validate_move` *passed* for both files (the failure came from `os.makedirs`, not `validate_move`).
 
-- **A move that fails at the start is loud [observed + `file:line`].** PART B's log gains exactly one line — `[CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.` **Cause:** `validate_move` (`handlers.py:352`) sees `not os.path.isfile(old_path)` and calls `logger.fatal(f"Document {str(instance)}: File {old_path} has gone.")` (`:298`) — `logging.fatal` is an alias for `CRITICAL`, which is why the level renders as `[CRITICAL]` — then raises `CannotMoveFilesException` (`:299`). Because the original's `validate_move` is the *first* file operation, no rename ever runs and the archive block (`:356-359`) is never reached.
+- **A move that fails at the start is loud [observed + `file:line`].** PART B's log gains exactly one line — `[CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.` **Cause:** `validate_move` (`handlers.py:352`) sees `not os.path.isfile(old_path)` and calls `logger.fatal(f"Document {str(instance)}: File {old_path} has gone.")` (`:298`) — `logging.fatal` is an alias for `CRITICAL`, which is why the level renders as `[CRITICAL]` — then raises `CannotMoveFilesException` (`:299`). Because the original's `validate_move` is the *first* file operation, no rename ever runs and the archive block (`:356-359`) is never reached.
 
-- **The "target already exists" warning branch is guarded but practically unreachable [observed + inferred].** I could not trigger `logger.warning(... "target path ... already exists")` (`handlers.py:303-306`) through the canonical path: `generate_unique_filename` always returns either the unchanged name or a name that does not exist on disk (`file_handling.py:104`, `:111-125`), so `validate_move`'s `os.path.isfile(new_path)` check (`:301`) is false in normal single-threaded operation. **[Inferred]** this branch exists to defend against a race or an out-of-band file appearing between name generation and rename; reaching it would require a concurrent writer or patching product code, neither of which is a canonical single-threaded invocation. This is the mechanism (collision-avoidance in `generate_unique_filename`) rather than a vague claim.
+- **The "target already exists" warning branch is guarded, and I reached it through the canonical path with a concurrent writer [observed + `file:line`].** In *single-threaded* operation this branch is unreachable: `generate_unique_filename` returns either the unchanged name or a name that does not exist on disk (`file_handling.py:104`, `:111-125`), so `validate_move`'s `os.path.isfile(new_path)` check (`:301`) is false. But the check-then-rename sequence is a classic TOCTOU window: `generate_unique_filename` decides the target is free via `os.path.exists` (`file_handling.py:122`), and only *later* does `validate_move` re-check `os.path.isfile(new_path)` (`handlers.py:301`) and `os.rename` run (`:359`). A second process that creates the target *inside that window* makes `validate_move` observe an existing target and emit the warning — through the **real `m2m_changed` path** (`d.tags.add(Invoice)`), with **no product code patched**. I ran an external writer (`race_writer.py`, below) that repeatedly `O_EXCL`-creates and (size-guarded) unlinks `archive/Invoice/simple.pdf` while `d.tags.add(Invoice)` fires `m2m_changed` in a loop, and captured the warning on the **2nd** iteration (0.21 s):
+
+  ```text
+  === RACE: external writer oscillates archive/Invoice/simple.pdf while d.tags.add fires m2m_changed ===
+  [2026-07-14 01:20:06,324] [WARNING] [paperless.handlers] Document 2026-07-14 simple: Cannot rename file since target path /scratch/media/documents/archive/Invoice/simple.pdf already exists.
+  writer exiting; created=892
+  iterations to capture = 2   elapsed = 0.21s   WARNING captured = True
+  --- the WARNING line emitted by validate_move (handlers.py:303-306), verbatim from paperless.log ---
+  [2026-07-14 01:20:06,324] [WARNING] [paperless.handlers] Document 2026-07-14 simple: Cannot rename file since target path /scratch/media/documents/archive/Invoice/simple.pdf already exists.
+  --- store integrity after the race (O_EXCL writer caused no corruption) ---
+  DB filename        = simple.pdf  (rolled back to simple.pdf)
+  original present=True md5=42995833e01aea9b3edee44bbfdd7ce1
+  archive  present=True md5=3373eeecb48c35f72acf5d720933b807
+  ```
+
+  The external writer is deliberately non-destructive — it uses `O_CREAT|O_EXCL` (so it never opens a file another process owns) and only unlinks a file that is *still* the empty zero-byte file it just created, so it can never truncate or delete the real archive:
+
+  ```python
+  import os, sys, time
+  target = sys.argv[1]
+  stopfile = sys.argv[2]
+  created = 0
+  while not os.path.exists(stopfile):
+      try:
+          fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+          created += 1
+          # size-guard: only unlink if still the empty file we just made
+          try:
+              if os.fstat(fd).st_size == 0:
+                  os.close(fd)
+                  st = os.lstat(target)
+                  if st.st_size == 0:
+                      os.unlink(target)
+              else:
+                  os.close(fd)
+          except OSError:
+              try: os.close(fd)
+              except OSError: pass
+      except FileExistsError:
+          pass
+      except OSError:
+          pass
+  sys.stderr.write(f"writer exiting; created={created}\n")
+  ```
+
+  **Cause→effect [observed + `file:line`]:** the writer's `O_EXCL` create landed between `generate_unique_filename`'s `os.path.exists` check (`file_handling.py:122`) and `validate_move`'s `os.path.isfile(new_path)` re-check (`handlers.py:301`); `validate_move` then logged `logger.warning(f"Document {str(instance)}: Cannot rename file since target path {new_path} already exists.")` (`:303-306`) and raised `CannotMoveFilesException` (`:307`). Because this raise happens *inside* `update_filename_and_move_files` and is caught at `:367`, the store is left consistent: the DB `filename` rolled back to `simple.pdf`, the original's MD5 is still `42995833e01aea9b3edee44bbfdd7ce1`, and the real archive (MD5 `3373eeecb48c35f72acf5d720933b807`, run-specific because OCR output is non-deterministic) is intact — the `O_EXCL` writer never touched it. This is exactly the race the guard was written to defend against: it makes the move *refuse* rather than overwrite. (The archive MD5 differs from PART A's earlier value because each `reset.sh` re-consumes `simple.pdf` and re-OCRs it; only the *original* checksum `42995833…` is byte-deterministic.)
 
 - **A *failed recovery* is silent by design [inferred].** The recovery renames are themselves wrapped in `try: ... except Exception: pass` (`handlers.py:374-390`). I did **not** observe this branch: forcing the recovery `os.rename` at `:376` to fail requires the original's parent directory to become unwritable *after* the forward move succeeded (or a filesystem fault mid-signal). As root the filesystem permissions are bypassed, and as a non-root user an unwritable `originals/` would also block the *forward* move, so the partway-failure precondition could not be met without patching the code. **[Inferred, grounded at `handlers.py:381-390`]:** if recovery fails, the code swallows the error and relies on the sanity checker (Q5) as the backstop — the source comment at `:382-388` states exactly this ("...going to get caught by the santiy [sic] checker. All files remain in place and will never be overwritten...").
 
@@ -928,10 +1018,10 @@ Events 1–2 (cookie `28041896`) are `os.rename(old_source_path, instance.source
 
 ```text
 # first tag (untagged document -> Invoice): pre_add is a no-op, post_add fires once -> 1 line
-[2026-07-13 23:13:25,710] [CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.
+[2026-07-14 01:27:59,586] [CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.
 # second tag on the now already-tagged document (Invoice -> +Receipt), single .add(): pre_add + post_add -> 2 lines
-[2026-07-13 23:13:25,716] [CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.
-[2026-07-13 23:13:25,718] [CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.
+[2026-07-14 01:28:00,840] [CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.
+[2026-07-14 01:28:00,842] [CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.
 ```
 
 (Timestamps are run-specific; the level `CRITICAL`, the logger `paperless.handlers`, the message template, and the path are deterministic. The stored `filename` stayed `simple.pdf` throughout because every attempt failed at `validate_move` before the direct DB `UPDATE` at `handlers.py:362`.)
@@ -942,23 +1032,25 @@ Events 1–2 (cookie `28041896`) are `os.rename(old_source_path, instance.source
 
 > User's words: *"The classifier's behavior puzzles me, sometimes training finishes instantly, other times it takes much longer. I want to trigger both scenarios and see the actual log messages that explain why training was skipped versus why it proceeded with full retraining, including whatever hash or checksum the system uses to detect changes."*
 
-**Direct answer (observed).** Training finishes *instantly* when the change-detection hash is unchanged, and takes *longer* when it changes. The hash is a **SHA-1** digest (`hashlib.sha1()`, `src/documents/classifier.py:124`), 20 raw bytes / 40 hex characters, persisted as `data_hash` inside the model pickle (`classifier.py:102`, restored at `:86`). On each run `DocumentClassifier.train()` recomputes the digest over every document's content plus its `MATCH_AUTO` labels; if it equals the stored value the method returns `False` *before* any scikit-learn work (`classifier.py:163-164`) — that is the "instant" path. Otherwise it vectorizes and trains the neural network, sets `self.data_hash = new_data_hash` (`:247`) and returns `True` (`:249`) — the "longer" path. The two branches produce two different log messages from the caller `train_classifier` (`src/documents/tasks.py:48`):
+**Direct answer (observed).** The *training step itself* finishes near-instantly (~5 ms internally) when the change-detection hash is unchanged, and takes *longer* (tens to hundreds of ms) when it changes — though the *whole command* is always ~2 s because Django startup dominates (measured timing under "The four observed `data_hash` values" below). The hash is a **SHA-1** digest (`hashlib.sha1()`, `src/documents/classifier.py:124`), 20 raw bytes / 40 hex characters, persisted as `data_hash` inside the model pickle (`classifier.py:102`, restored at `:86`). On each run `DocumentClassifier.train()` recomputes the digest over every document's content plus its `MATCH_AUTO` labels; if it equals the stored value the method returns `False` *before* any scikit-learn work (`classifier.py:163-164`) — that is the "instant" path. Otherwise it vectorizes and trains the neural network, sets `self.data_hash = new_data_hash` (`:247`) and returns `True` (`:249`) — the "longer" path. The two branches produce two different log messages from the caller `train_classifier` (`src/documents/tasks.py:48`):
 
 - **skip → `DEBUG` `"Training data unchanged."`** (`tasks.py:69`)
 - **retrain → `INFO` `"Saving updated classifier model to {}..."`** (`tasks.py:64-66`)
 
 Because the skip message is `DEBUG`, it is **invisible on the console** (which is gated at `INFO`, `settings.py:388`) and appears **only** in `data/log/paperless.log` (`settings.py:409`). The experiment below runs the canonical `document_create_classifier` command **without** `PAPERLESS_DEBUG`, so the console shows only the `INFO` line and the skip evidence is read from the log — exactly the observability split the code dictates.
 
-**The four observed `data_hash` values (full 40-char SHA-1):**
+**The four observed `data_hash` values (full 40-char SHA-1), with measured timing:**
 
-| run | data state | log message | `data_hash` |
-|-----|-----------|-------------|-------------|
-| 1 (first train) | 4 docs; Invoice tag on pk 1,2 | `INFO Saving updated classifier model to ...` | `c73f17cbb3e307736041f3910da1b415ee61d226` |
-| 2 (skip #1) | *unchanged* | `DEBUG Training data unchanged.` | `c73f17cbb3e307736041f3910da1b415ee61d226` |
-| 3 (skip #2) | *unchanged* | `DEBUG Training data unchanged.` | `c73f17cbb3e307736041f3910da1b415ee61d226` |
-| 4 (retrain) | Invoice tag added to pk 3 | `INFO Saving updated classifier model to ...` | `ff507d06bb8c392a217f7063311c66331c548ca3` |
+| run | data state | log message | wall time | internal train span | `data_hash` |
+|-----|-----------|-------------|-----------|---------------------|-------------|
+| 1 (first train) | 4 genuine docs; Invoice tag on pk 1,2 | `INFO Saving updated classifier model to ...` | `2.004s` | `471 ms` | `c73f17cbb3e307736041f3910da1b415ee61d226` |
+| 2 (skip #1) | *unchanged* | `DEBUG Training data unchanged.` | `1.881s` | `5 ms` | `c73f17cbb3e307736041f3910da1b415ee61d226` |
+| 3 (skip #2) | *unchanged* | `DEBUG Training data unchanged.` | `2.031s` | `5 ms` | `c73f17cbb3e307736041f3910da1b415ee61d226` |
+| 4 (retrain) | Invoice tag added to pk 3 | `INFO Saving updated classifier model to ...` | `2.106s` | `84 ms` | `ff507d06bb8c392a217f7063311c66331c548ca3` |
 
-Runs 2 and 3 are identical — the skip is **stable across repeated runs**. The digest changes (runs 1 → 4) only because the training data changed.
+Runs 2 and 3 are identical — the skip is **stable across repeated runs**. The digest changes (runs 1 → 4) only because the training data changed. **The measured timing (F5) is the crux of the user's "instant vs. longer" puzzle:** the *wall-clock* time of the whole command is ~1.9–2.1 s in **every** case because it is dominated by Django process startup, not by training. The real "instant vs. longer" difference is the **internal** train span — the elapsed time *inside* `train()` from `Gathering data from database...` (`classifier.py:123`) to the terminal line — which is **~5 ms on a skip** versus **84–471 ms on a full retrain** (the retrain's `CountVectorizer` + `MLPClassifier` work). So "training finishes instantly" is literally true of the *internal* work on the skip path (~5 ms), while the *command* is never instant (~2 s of interpreter/Django boot either way).
+
+**Why these `data_hash` values are exactly what they are — and why genuine consumption reproduces them deterministically [observed + `file:line`].** The four documents are now consumed through the canonical pipeline, so each row's `checksum` is the genuine MD5 of the input file (`f74a78e091ba4d9699e6e0f964bd4cab`, `435870f98cb2e269acb7b8f664cc4e4f`, `76dabadc12ae84ff5de02a17b6ec75f2`, `cbb16a898464c49175a09874c944597a` — each equal to the `md5sum` of its `.txt` shown in the setup) and each `content` is the genuinely parsed text. Crucially, the change-detection digest is computed **only** over preprocessed `content` and the `MATCH_AUTO` label bytes (`classifier.py:128-155`); the document's `checksum` is **never** folded into it. That is why the digest is a deterministic function of the (content, labels) pair alone: with the same four texts and the same tag layout it reproduces `c73f17…`/`ff507d06…` byte-for-byte on every run, independent of how the documents were created. (An earlier version of this document produced the same two digests from hand-built ORM rows; the values were numerically correct but the *method* fabricated checksums. This version reaches the identical digests through genuine ingestion, and the byte enumeration + independent recompute below prove the digest depends on content+labels, not on the now-genuine checksums.)
 
 **The exact byte stream (this is "whatever hash the system uses").** For each document, in `Document.objects.order_by("pk").exclude(tags__is_inbox_tag=True)` order (`classifier.py:125-127`), `train()` feeds the SHA-1 accumulator four things, in this order:
 
@@ -978,10 +1070,23 @@ The script uses two helper snippets executed via `manage.py shell` — a hash re
 # Canonical entry point: python3 manage.py document_create_classifier -> tasks.train_classifier (tasks.py:48)
 #   -> DocumentClassifier.train() (classifier.py:115). Console shows INFO only; DEBUG (incl. the skip
 #   message) lands in data/log/paperless.log (settings.py:409), so we read the skip evidence from the log.
+# The four training documents are CONSUMED THROUGH THE CANONICAL PIPELINE (consume-dir ->
+# document_consumer --oneshot -> qcluster worker -> documents.tasks.consume_file), so each carries a
+# GENUINE checksum (MD5 of its bytes) and GENUINE parsed content; no ORM row is fabricated.
 cd /app/src
 LOG=/scratch/data/log/paperless.log
+MODEL=/scratch/data/classification_model.pickle
 
 readhash() { python3 manage.py shell < /scratch/exp/q3_readhash.py 2>&1; }
+
+modelstate() {  # inode/size/mtime/sha256 of the persisted model — stable on skip, changes on retrain
+  if [ -f "$MODEL" ]; then
+    stat -c '      model: inode=%i size=%s mtime=%Y' "$MODEL"
+    echo "      model sha256=$(sha256sum "$MODEL" | cut -d' ' -f1)"
+  else
+    echo "      model: (absent)"
+  fi
+}
 
 run_train() {  # $1 = run label
   echo ">>> RUN $1: python3 manage.py document_create_classifier"
@@ -989,9 +1094,16 @@ run_train() {  # $1 = run label
   # write happens during this run), so start from an empty snapshot.
   if [ -f "$LOG" ]; then cp "$LOG" /scratch/exp/q3_pre.log; else : > /scratch/exp/q3_pre.log; fi
   echo "    [console output (INFO and above)]:"
+  local t0 t1 wall
+  t0=$(date +%s.%N)
   python3 manage.py document_create_classifier 2>&1 | sed 's/^/      /'
+  t1=$(date +%s.%N)
+  wall=$(python3 -c "print(f'{$t1 - $t0:.3f}')")
+  echo "    [measured wall-clock time for the whole command]: ${wall}s"
   echo "    [NEW lines appended to paperless.log during this run (includes DEBUG)]:"
   diff /scratch/exp/q3_pre.log "$LOG" | grep '^>' | sed 's/^> /      /' || echo "      (none)"
+  echo "    [persisted model file state after RUN $1]:"
+  modelstate
   echo "    [persisted data_hash after RUN $1]:"
   readhash | sed 's/^/      /'
 }
@@ -1001,27 +1113,45 @@ bash /scratch/exp/reset.sh > /scratch/exp/q3_reset.log 2>&1
 echo "reset+migrate exit=$?  migrations applied OK = $(grep -c '\.\.\. OK' /scratch/exp/q3_reset.log)"
 
 echo
-echo "=== SETUP: one MATCH_AUTO tag 'Invoice' + four training documents (docs 1,2 tagged Invoice). ==="
-echo "    Documents are ORM training-data fixtures; the behaviour under test (training) is driven"
-echo "    below strictly through the canonical management command."
+echo "=== SETUP: one MATCH_AUTO tag 'Invoice'; four training documents CONSUMED via the canonical pipeline ==="
+python3 manage.py shell -c "from django_q.models import Schedule; Schedule.objects.all().delete()" >/dev/null 2>&1
+python3 manage.py qcluster > /scratch/exp/q3_qcluster.log 2>&1 &
+QPID=$!
+for i in $(seq 1 100); do grep -qiE "ready for work" /scratch/exp/q3_qcluster.log 2>/dev/null && break; sleep 0.2; done
+echo "  qcluster ready (worker pid $QPID)"
+# The four input documents (a user's own plain-text files); genuine bytes -> genuine checksums.
+mkdir -p /scratch/q3in
+printf 'invoice total amount due now\n'      > /scratch/q3in/doc1.txt
+printf 'invoice payment received thanks\n'    > /scratch/q3in/doc2.txt
+printf 'letter dear sir kind regards\n'       > /scratch/q3in/doc3.txt
+printf 'letter meeting notes agenda today\n'  > /scratch/q3in/doc4.txt
+echo "  input files and their genuine MD5 (== the checksum paperless will store):"
+for f in /scratch/q3in/doc1.txt /scratch/q3in/doc2.txt /scratch/q3in/doc3.txt /scratch/q3in/doc4.txt; do
+  echo "    $(md5sum "$f")"
+done
+# Consume SEQUENTIALLY so the pk order is deterministic (doc1->pk1, ... doc4->pk4).
+for n in 1 2 3 4; do
+  cp /scratch/q3in/doc$n.txt /scratch/consume/doc$n.txt
+  python3 manage.py document_consumer --oneshot >/dev/null 2>&1
+  for i in $(seq 1 100); do
+    c=$(python3 manage.py shell -c "from documents.models import Document; print(Document.objects.count())" 2>/dev/null | tail -1)
+    [ "$c" = "$n" ] && break; sleep 0.2
+  done
+done
+kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
+sleep 0.3
+# Create the MATCH_AUTO tag and apply it to documents 1 & 2 through the canonical ORM (as a user would).
 python3 manage.py shell <<'PY'
 from documents.models import Document, Tag, MatchingModel
-from django.utils import timezone
 inv, _ = Tag.objects.get_or_create(name="Invoice",
         defaults={"matching_algorithm": MatchingModel.MATCH_AUTO})
 inv.matching_algorithm = MatchingModel.MATCH_AUTO; inv.save()
 print("Invoice tag pk =", inv.pk, " matching_algorithm =", inv.matching_algorithm,
       " (MATCH_AUTO constant =", MatchingModel.MATCH_AUTO, ")")
-rows = [("invoice total amount due now", [inv]),
-        ("invoice payment received thanks", [inv]),
-        ("letter dear sir kind regards", []),
-        ("letter meeting notes agenda today", [])]
-for i, (content, tags) in enumerate(rows, 1):
-    d = Document.objects.create(title=f"doc{i}", content=content,
-            checksum=f"{i:032d}", created=timezone.now(),
-            modified=timezone.now(), added=timezone.now(), mime_type="text/plain")
-    for t in tags: d.tags.add(t)
-    print(f"  created pk={d.pk} content={content!r} auto_tags={[t.name for t in d.tags.all()]}")
+for pk in (1, 2):
+    d = Document.objects.get(pk=pk); d.tags.add(inv)
+for d in Document.objects.order_by("pk"):
+    print(f"  pk={d.pk} checksum={d.checksum} content={d.content!r} auto_tags={[t.name for t in d.tags.all()]}")
 print("total documents =", Document.objects.count())
 PY
 
@@ -1155,14 +1285,18 @@ docker exec -w /app/src paperless-work bash /scratch/exp/q3.sh
 === PREP: reset throwaway store + migrate ===
 reset+migrate exit=0  migrations applied OK = 92
 
-=== SETUP: one MATCH_AUTO tag 'Invoice' + four training documents (docs 1,2 tagged Invoice). ===
-    Documents are ORM training-data fixtures; the behaviour under test (training) is driven
-    below strictly through the canonical management command.
+=== SETUP: one MATCH_AUTO tag 'Invoice'; four training documents CONSUMED via the canonical pipeline ===
+  qcluster ready (worker pid 3907)
+  input files and their genuine MD5 (== the checksum paperless will store):
+    f74a78e091ba4d9699e6e0f964bd4cab  /scratch/q3in/doc1.txt
+    435870f98cb2e269acb7b8f664cc4e4f  /scratch/q3in/doc2.txt
+    76dabadc12ae84ff5de02a17b6ec75f2  /scratch/q3in/doc3.txt
+    cbb16a898464c49175a09874c944597a  /scratch/q3in/doc4.txt
 Invoice tag pk = 1  matching_algorithm = 6  (MATCH_AUTO constant = 6 )
-  created pk=1 content='invoice total amount due now' auto_tags=['Invoice']
-  created pk=2 content='invoice payment received thanks' auto_tags=['Invoice']
-  created pk=3 content='letter dear sir kind regards' auto_tags=[]
-  created pk=4 content='letter meeting notes agenda today' auto_tags=[]
+  pk=1 checksum=f74a78e091ba4d9699e6e0f964bd4cab content='invoice total amount due now\n' auto_tags=['Invoice']
+  pk=2 checksum=435870f98cb2e269acb7b8f664cc4e4f content='invoice payment received thanks\n' auto_tags=['Invoice']
+  pk=3 checksum=76dabadc12ae84ff5de02a17b6ec75f2 content='letter dear sir kind regards\n' auto_tags=[]
+  pk=4 checksum=cbb16a898464c49175a09874c944597a content='letter meeting notes agenda today\n' auto_tags=[]
 total documents = 4
 
 === BYTE ENUMERATION of the exact stream fed to hashlib.sha1() for the RUN 1 data state ===
@@ -1197,16 +1331,20 @@ byte stream fed to hashlib.sha1(), in Document.objects.order_by('pk') order:
 ########## RUN 1 — first train (no prior model; data_hash is None) ##########
 >>> RUN 1: python3 manage.py document_create_classifier
     [console output (INFO and above)]:
-      [2026-07-13 18:42:32,909] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+      [2026-07-14 01:38:42,530] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+    [measured wall-clock time for the whole command]: 2.004s
     [NEW lines appended to paperless.log during this run (includes DEBUG)]:
-      [2026-07-13 18:42:32,410] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
-      [2026-07-13 18:42:32,411] [DEBUG] [paperless.classifier] Gathering data from database...
-      [2026-07-13 18:42:32,416] [DEBUG] [paperless.classifier] 4 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
-      [2026-07-13 18:42:32,817] [DEBUG] [paperless.classifier] Vectorizing data...
-      [2026-07-13 18:42:32,818] [DEBUG] [paperless.classifier] Training tags classifier...
-      [2026-07-13 18:42:32,909] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
-      [2026-07-13 18:42:32,909] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
-      [2026-07-13 18:42:32,909] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+      [2026-07-14 01:38:42,059] [DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.
+      [2026-07-14 01:38:42,059] [DEBUG] [paperless.classifier] Gathering data from database...
+      [2026-07-14 01:38:42,064] [DEBUG] [paperless.classifier] 4 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
+      [2026-07-14 01:38:42,458] [DEBUG] [paperless.classifier] Vectorizing data...
+      [2026-07-14 01:38:42,459] [DEBUG] [paperless.classifier] Training tags classifier...
+      [2026-07-14 01:38:42,529] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
+      [2026-07-14 01:38:42,530] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+      [2026-07-14 01:38:42,530] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+    [persisted model file state after RUN 1]:
+      model: inode=546393756 size=88108 mtime=1783993122
+      model sha256=60440c051d2727df89a8ec6b4b925a64cbded812ce35087ba5c07d93e25fb3c5
     [persisted data_hash after RUN 1]:
       FORMAT_VERSION      = 7
       data_hash raw bytes = 20
@@ -1219,9 +1357,13 @@ byte stream fed to hashlib.sha1(), in Document.objects.order_by('pk') order:
 ########## RUN 2 — unchanged data (skip #1) ##########
 >>> RUN 2: python3 manage.py document_create_classifier
     [console output (INFO and above)]:
+    [measured wall-clock time for the whole command]: 1.881s
     [NEW lines appended to paperless.log during this run (includes DEBUG)]:
-      [2026-07-13 18:42:36,701] [DEBUG] [paperless.classifier] Gathering data from database...
-      [2026-07-13 18:42:36,708] [DEBUG] [paperless.tasks] Training data unchanged.
+      [2026-07-14 01:38:46,454] [DEBUG] [paperless.classifier] Gathering data from database...
+      [2026-07-14 01:38:46,459] [DEBUG] [paperless.tasks] Training data unchanged.
+    [persisted model file state after RUN 2]:
+      model: inode=546393756 size=88108 mtime=1783993122
+      model sha256=60440c051d2727df89a8ec6b4b925a64cbded812ce35087ba5c07d93e25fb3c5
     [persisted data_hash after RUN 2]:
       FORMAT_VERSION      = 7
       data_hash raw bytes = 20
@@ -1230,9 +1372,13 @@ byte stream fed to hashlib.sha1(), in Document.objects.order_by('pk') order:
 ########## RUN 3 — unchanged data (skip #2 — confirms the skip is stable across runs) ##########
 >>> RUN 3: python3 manage.py document_create_classifier
     [console output (INFO and above)]:
+    [measured wall-clock time for the whole command]: 2.031s
     [NEW lines appended to paperless.log during this run (includes DEBUG)]:
-      [2026-07-13 18:42:39,687] [DEBUG] [paperless.classifier] Gathering data from database...
-      [2026-07-13 18:42:39,692] [DEBUG] [paperless.tasks] Training data unchanged.
+      [2026-07-14 01:38:49,611] [DEBUG] [paperless.classifier] Gathering data from database...
+      [2026-07-14 01:38:49,616] [DEBUG] [paperless.tasks] Training data unchanged.
+    [persisted model file state after RUN 3]:
+      model: inode=546393756 size=88108 mtime=1783993122
+      model sha256=60440c051d2727df89a8ec6b4b925a64cbded812ce35087ba5c07d93e25fb3c5
     [persisted data_hash after RUN 3]:
       FORMAT_VERSION      = 7
       data_hash raw bytes = 20
@@ -1274,15 +1420,19 @@ byte stream fed to hashlib.sha1(), in Document.objects.order_by('pk') order:
 ########## RUN 4 — data changed -> full retrain ##########
 >>> RUN 4: python3 manage.py document_create_classifier
     [console output (INFO and above)]:
-      [2026-07-13 18:42:44,508] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+      [2026-07-14 01:38:54,914] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+    [measured wall-clock time for the whole command]: 2.106s
     [NEW lines appended to paperless.log during this run (includes DEBUG)]:
-      [2026-07-13 18:42:44,438] [DEBUG] [paperless.classifier] Gathering data from database...
-      [2026-07-13 18:42:44,443] [DEBUG] [paperless.classifier] 4 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
-      [2026-07-13 18:42:44,444] [DEBUG] [paperless.classifier] Vectorizing data...
-      [2026-07-13 18:42:44,444] [DEBUG] [paperless.classifier] Training tags classifier...
-      [2026-07-13 18:42:44,507] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
-      [2026-07-13 18:42:44,507] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
-      [2026-07-13 18:42:44,508] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+      [2026-07-14 01:38:54,830] [DEBUG] [paperless.classifier] Gathering data from database...
+      [2026-07-14 01:38:54,836] [DEBUG] [paperless.classifier] 4 documents, 1 tag(s), 0 correspondent(s), 0 document type(s).
+      [2026-07-14 01:38:54,837] [DEBUG] [paperless.classifier] Vectorizing data...
+      [2026-07-14 01:38:54,838] [DEBUG] [paperless.classifier] Training tags classifier...
+      [2026-07-14 01:38:54,913] [DEBUG] [paperless.classifier] There are no correspondents. Not training correspondent classifier.
+      [2026-07-14 01:38:54,914] [DEBUG] [paperless.classifier] There are no document types. Not training document type classifier.
+      [2026-07-14 01:38:54,914] [INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...
+    [persisted model file state after RUN 4]:
+      model: inode=546395011 size=88108 mtime=1783993134
+      model sha256=2d4268fc3f0a816333b41a42719dc1509c7a6b7c4d3d529d4b82d6bc3e42e94c
     [persisted data_hash after RUN 4]:
       FORMAT_VERSION      = 7
       data_hash raw bytes = 20
@@ -1295,7 +1445,11 @@ byte stream fed to hashlib.sha1(), in Document.objects.order_by('pk') order:
 
 ### Q3 — grounding, observed vs. inferred, and cause→effect
 
-- **Why "instant" vs. "longer" [observed + `file:line`].** On runs 2 and 3 the *only* new log lines are `Gathering data from database...` (`classifier.py:123`) and `Training data unchanged.` (`tasks.py:69`); there is no `Vectorizing data...` or `Training tags classifier...`. On runs 1 and 4 those scikit-learn steps *do* appear. **Cause:** `train()` computes `new_data_hash = m.digest()` (`classifier.py:161`) and then `if self.data_hash and new_data_hash == self.data_hash: return False` (`:163-164`) — this early return happens *before* `CountVectorizer.fit_transform` and the `MLPClassifier` training (`:191` onward), so an unchanged hash short-circuits all the expensive work. That is literally why the skip is instantaneous and the retrain is not.
+- **Why "instant" vs. "longer" [observed + `file:line`].** On runs 2 and 3 the *only* new log lines are `Gathering data from database...` (`classifier.py:123`) and `Training data unchanged.` (`tasks.py:69`); there is no `Vectorizing data...` or `Training tags classifier...`. On runs 1 and 4 those scikit-learn steps *do* appear. **Cause:** `train()` computes `new_data_hash = m.digest()` (`classifier.py:161`) and then `if self.data_hash and new_data_hash == self.data_hash: return False` (`:163-164`) — this early return happens *before* the `Vectorizing data...` step (`:193`), `CountVectorizer.fit_transform` (`:199`), and the subsequent `MLPClassifier` training, so an unchanged hash short-circuits all the expensive work.
+
+- **What "instant" actually measures (F5) [observed].** The measured numbers separate two very different clocks. The *whole-command* wall time is ~1.9–2.1 s on **every** run (`2.004`, `1.881`, `2.031`, `2.106` s) — that cost is Django/interpreter startup and is paid identically whether or not training happens, so "instant" is **not** true of the command as a whole. The *internal* span inside `train()` — read directly from the DEBUG timestamps between `Gathering data from database...` and the branch's terminal line — is where the difference lives: **~5 ms** on a skip (e.g. run 2: `01:38:46,454` → `,459`) versus **84 ms** (run 4) to **471 ms** (run 1) on a full retrain, the extra time being the `Vectorizing data...`/`Training tags classifier...` scikit-learn work. So the user's "sometimes instant, sometimes much longer" is the **internal** short-circuit (the `return False` at `classifier.py:163-164` firing before any vectorization), not a difference a stopwatch on the command alone would cleanly reveal.
+
+- **The persisted model proves the skip did no work (F5) [observed].** The model file `classification_model.pickle` is **byte-for-byte unchanged** across the skip runs and **rewritten** on the retrain. After run 1 it is `inode=546393756 size=88108 sha256=60440c051d2727df89a8ec6b4b925a64cbded812ce35087ba5c07d93e25fb3c5`; runs 2 and 3 report the *identical* inode, size, mtime, and sha256 — the skip path never calls `classifier.save()` (`tasks.py:67` is inside the `if classifier.train()` branch, which returns `False` on a skip). Run 4 shows a **new** `inode=546395011`, a later `mtime`, and a different `sha256=2d4268fc3f0a816333b41a42719dc1509c7a6b7c4d3d529d4b82d6bc3e42e94c` — the file was atomically replaced by `save()` (which writes `MODEL_FILE + ".part"` then renames, `classifier.py:98-100`) after a real retrain. The **reliable, reproducible** signal is therefore: on a skip the model is byte-identical (same `inode`/`mtime`/`sha256` across runs 1→2→3), and on a retrain the file is replaced (new `inode`, later `mtime`, different `sha256` **and** `data_hash`). The `inode`, `mtime`, and exact `size` are run-specific serialization artifacts of the pickled scikit-learn objects (a re-run of this experiment yields different inode/size values but the same skip-stable / retrain-changed pattern and the same two `data_hash` digests); the `data_hash` and the skip-vs-replace behaviour are the deterministic parts.
 
 - **The exact log strings [observed + `file:line`].** Retrain emits `INFO` `Saving updated classifier model to /scratch/data/classification_model.pickle...` (runs 1 and 4), produced by `logger.info(...)` at `tasks.py:64-66` (only reached when `classifier.train()` returns `True`, `:63`). Skip emits `DEBUG` `Training data unchanged.` (runs 2 and 3) from `logger.debug(...)` at `tasks.py:69` (the `else` branch). The retrain message appears on **both** console and log; the skip message appears **only** in the log — consistent with the console handler being gated at `INFO` (`settings.py:388`) while the `paperless` logger writes `DEBUG` to the file handler (`settings.py:409`).
 
@@ -1313,7 +1467,7 @@ byte stream fed to hashlib.sha1(), in Document.objects.order_by('pk') order:
 
 > User's words: *"Duplicate detection feels like magic, two files that look completely different can still be rejected as duplicates, and I want to see the actual checksums being compared at that moment of judgment."*
 
-**Direct answer (observed).** At the moment of judgment the consumer computes the **MD5** of the *incoming* file and rejects it if that MD5 equals **either** the stored `checksum` **or** the stored `archive_checksum` of *any* existing document: `hashlib.md5(f.read()).hexdigest()` (`src/documents/consumer.py:104`) compared via `Document.objects.filter(Q(checksum=checksum) | Q(archive_checksum=checksum))` (`consumer.py:105-107`). That `OR` over `archive_checksum` is why "two files that look completely different" collide — a document's **original** and its **OCR archive rendition** are byte-wise different files with different MD5s, yet uploading *either* is caught as a duplicate of the same document.
+**Direct answer (observed).** At the moment of judgment the consumer computes the **MD5** of the *incoming* file and rejects it if that MD5 equals **either** the stored `checksum` **or** the stored `archive_checksum` of *any* existing document: `hashlib.md5(f.read()).hexdigest()` (`src/documents/consumer.py:104`) compared via `Document.objects.filter(Q(checksum=checksum) | Q(archive_checksum=checksum))` (`consumer.py:105-107`). One nuance is worth stating precisely, because it corrects the intuition in the question: **duplicate detection compares raw bytes, never appearance.** The MD5 is taken over `f.read()` — the file's bytes — so the only way any two files collide is if their bytes (or a stored archive's bytes) are identical. The genuinely surprising collision this enables is not "two files that *look* different" but its inverse: a document's **original** and its **OCR archive rendition** are byte-wise different files (different sizes, different MD5s, different internal PDF structure) that nonetheless render **pixel-for-pixel identically** — and the `OR` over `archive_checksum` catches the archive rendition as a duplicate of the same document. We prove the pixel-identity empirically below (`compare -metric AE = 0`). A pair that truly *looks* different could only be flagged on an exact byte/MD5 match, which cannot happen while their rendered pixels differ; so the real mechanism is byte identity of a visually-identical re-encoding, not appearance matching.
 
 Both rejections below were produced through the **canonical ingestion pipeline** — a file dropped in the consumption directory, picked up by `document_consumer --oneshot` which enqueues `documents.tasks.consume_file` (`src/documents/management/commands/document_consumer.py:85-91`), executed by a running `qcluster` worker. No task function was called directly.
 
@@ -1322,11 +1476,11 @@ Both rejections below were produced through the **canonical ingestion pipeline**
 | | value | verified against |
 |---|-------|------------------|
 | stored `checksum` (original) | `42995833e01aea9b3edee44bbfdd7ce1` | `md5sum originals/0000001.pdf` = `42995833e01aea9b3edee44bbfdd7ce1` ✓ |
-| stored `archive_checksum` (OCR rendition) | `05527bf515905eefa5cc2f3270a03b8f` | `md5sum archive/0000001.pdf` = `05527bf515905eefa5cc2f3270a03b8f` ✓ |
+| stored `archive_checksum` (OCR rendition) *(run-specific — OCR is non-deterministic)* | `7704b07db07d2929e776e92ff41eb0fe` | `md5sum archive/0000001.pdf` = `7704b07db07d2929e776e92ff41eb0fe` ✓ |
 | CASE A incoming MD5 (identical original) | `42995833e01aea9b3edee44bbfdd7ce1` | == stored `checksum` → duplicate |
-| CASE B incoming MD5 (archive rendition) | `05527bf515905eefa5cc2f3270a03b8f` | == stored `archive_checksum`, ≠ original MD5 → duplicate |
+| CASE B incoming MD5 (archive rendition) | `7704b07db07d2929e776e92ff41eb0fe` | == stored `archive_checksum`, ≠ original MD5 → duplicate |
 
-The original (22926 bytes) and the archive rendition (10860 bytes) are plainly different files with different MD5s, which is the whole point of CASE B.
+The original (22926 bytes) and the archive rendition (10859 bytes) are byte-wise different files with different MD5s — that byte difference is the whole point of CASE B. Yet, as the **pixel comparison** at the end of the output block demonstrates, the two files render **visually identically**: rasterized at 150 dpi they are both `1275x1651`, ImageMagick reports `compare -metric AE = 0` differing pixels and `RMSE = 0`, and the two rasterizations share one `sha256`. In other words the colliding pair does not "look completely different"; it looks the *same* while being byte-different — the difference lives entirely in the PDF's internal encoding (the original embeds a `LiberationSerif TrueType/WinAnsi` font subset, the archive a re-encoded `LiberationSerif CID TrueType/Custom` subset produced by the OCR/normalization step), not in the rendered page. *(The original `simple.pdf` already carries a text layer, so the archive is a re-render/normalization of an existing text PDF, not the addition of a text layer to a scan.)*
 ### Q4 — the exact self-contained script
 
 ```bash
@@ -1337,6 +1491,9 @@ The original (22926 bytes) and the archive rendition (10860 bytes) are plainly d
 #   -> Consumer.pre_check_duplicate (consumer.py:102) computes md5 and matches checksum OR
 #      archive_checksum -> _fail logs ERROR + raises ConsumerError (consumer.py:80-81, 110-112).
 # No task function is called directly; every consume goes through the redis-backed queue.
+# The PIXEL COMPARISON section proves the original and its archive rendition are byte-different
+# files that nonetheless render VISUALLY IDENTICALLY (this corrects the "look completely different"
+# framing: appearance is never compared; duplicate detection is purely byte-level MD5).
 cd /app/src
 LOG=/scratch/data/log/paperless.log
 
@@ -1436,6 +1593,35 @@ echo "--- NEW lines in paperless.log during CASE B ---"
 diff /scratch/exp/q4b_before.log "$LOG" | grep '^>' | sed 's/^> //' || echo "(none)"
 
 echo
+echo "############################################################"
+echo "## PIXEL COMPARISON (F4) — do the original and its archive LOOK different?"
+echo "##   They are byte-different files; render both to PNG at 150 dpi and compare pixel-by-pixel."
+echo "############################################################"
+ORIG=/scratch/media/documents/originals/0000001.pdf
+ARCH=/scratch/media/documents/archive/0000001.pdf
+echo "--- byte level: DIFFERENT (size + MD5) ---"
+stat -c '%s bytes  %n' "$ORIG" "$ARCH"
+md5sum "$ORIG" "$ARCH"
+echo "--- structural: original and archive embed DIFFERENT font subsets/encodings; BOTH have a text layer (pdffonts) ---"
+echo "original embedded fonts:"; pdffonts "$ORIG" 2>/dev/null
+echo "archive  embedded fonts:"; pdffonts "$ARCH" 2>/dev/null
+echo "--- render each page to a 150 dpi PNG (pdftoppm) ---"
+rm -f /scratch/exp/q4_orig*.png /scratch/exp/q4_arch*.png /scratch/exp/q4_diff.png
+pdftoppm -r 150 -png "$ORIG" /scratch/exp/q4_orig
+pdftoppm -r 150 -png "$ARCH" /scratch/exp/q4_arch
+OP=$(ls /scratch/exp/q4_orig*.png | head -1)
+AP=$(ls /scratch/exp/q4_arch*.png | head -1)
+echo "rendered: $OP  and  $AP"
+echo "--- pixel dimensions of each rendering (identify) ---"
+identify -format '%f: %wx%h  (%[colorspace])\n' "$OP" "$AP"
+echo "--- ImageMagick compare -metric AE (absolute error = number of differing pixels; 0 = pixel-identical) ---"
+compare -metric AE "$OP" "$AP" /scratch/exp/q4_diff.png 2>&1; echo " differing pixels"
+echo "--- ImageMagick compare -metric RMSE (root-mean-square error; 0 = identical) ---"
+compare -metric RMSE "$OP" "$AP" null: 2>&1; echo " RMSE"
+echo "--- sha256 of the two renderings (identical => pixel-for-pixel identical images) ---"
+sha256sum "$OP" "$AP"
+
+echo
 echo "=== FINAL: only ONE document exists; both duplicates were rejected ==="
 doc_count
 echo "=== stop qcluster by PID $QPID ==="
@@ -1459,37 +1645,37 @@ docker exec -w /app/src paperless-work bash /scratch/exp/q4.sh
 reset+migrate exit=0  migrations applied OK = 92
 deleted 4 scheduled maintenance job(s) (train_classifier, index_optimize, sanity_check, mail) to isolate the experiment; the consume path itself is unchanged
 === start a real qcluster worker (redis broker) ===
-qcluster pid=12327; startup:
-18:53:31 [Q] INFO Q Cluster chicken-eighteen-sierra-river starting.
-18:53:31 [Q] INFO Process-1:1 ready for work at 12350
-18:53:31 [Q] INFO Process-1:2 ready for work at 12351
+qcluster pid=5867; startup:
+01:54:26 [Q] INFO Q Cluster butter-apart-island-eleven starting.
+01:54:26 [Q] INFO Process-1:1 ready for work at 5890
+01:54:26 [Q] INFO Process-1:2 ready for work at 5891
 
 === SEED: consume simple.pdf via the canonical queue ===
-  [consumer] [2026-07-13 18:53:33,191] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
-  [consumer] 18:53:33 [Q] INFO Enqueued 1
+  [consumer] [2026-07-14 01:54:27,511] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
+  [consumer] 01:54:27 [Q] INFO Enqueued 1
   consume_file tasks completed = 1
 Document.objects.count() = 1
 
 === STORED checksums (DB) vs. actual on-disk MD5 (byte-verified in the same run) ===
 pk                    = 1
 checksum (DB)         = 42995833e01aea9b3edee44bbfdd7ce1
-archive_checksum (DB) = 05527bf515905eefa5cc2f3270a03b8f
+archive_checksum (DB) = 7704b07db07d2929e776e92ff41eb0fe
 source_path           = /scratch/media/documents/originals/0000001.pdf
 archive_path          = /scratch/media/documents/archive/0000001.pdf
 has_archive_version   = True
 --- md5sum + size of the actual files on disk ---
 42995833e01aea9b3edee44bbfdd7ce1  /scratch/media/documents/originals/0000001.pdf
-05527bf515905eefa5cc2f3270a03b8f  /scratch/media/documents/archive/0000001.pdf
+7704b07db07d2929e776e92ff41eb0fe  /scratch/media/documents/archive/0000001.pdf
 22926 bytes  /scratch/media/documents/originals/0000001.pdf
-10860 bytes  /scratch/media/documents/archive/0000001.pdf
+10859 bytes  /scratch/media/documents/archive/0000001.pdf
 (original MD5 must equal checksum; archive MD5 must equal archive_checksum)
 
 ############################################################
 ## CASE A — re-consume the IDENTICAL original (checksum match)
 ############################################################
 incoming file MD5 = 42995833e01aea9b3edee44bbfdd7ce1  (compare to checksum above)
-  [consumer] [2026-07-13 18:53:38,642] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
-  [consumer] 18:53:38 [Q] INFO Enqueued 1
+  [consumer] [2026-07-14 01:54:32,960] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
+  [consumer] 01:54:32 [Q] INFO Enqueued 1
   consume_file tasks completed = 2
 Document.objects.count() = 1
 --- django_q Failure record for this attempt (by task name 'simple.pdf') ---
@@ -1498,18 +1684,18 @@ func    = documents.tasks.consume_file
 success = False
 result  = 'simple.pdf: Not consuming simple.pdf: It is a duplicate. : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 213, in try_consume_file\n    self.pre_check_duplicate()\n  File "/app/src/documents/consumer.py", line 110, in pre_check_duplicate\n    self._fail(\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: simple.pdf: Not consuming simple.pdf: It is a duplicate.\n'
 --- NEW lines in paperless.log during CASE A ---
-[2026-07-13 18:53:38,642] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
-[2026-07-13 18:53:38,797] [ERROR] [paperless.consumer] Not consuming simple.pdf: It is a duplicate.
+[2026-07-14 01:54:32,960] [INFO] [paperless.management.consumer] Adding /scratch/consume/simple.pdf to the task queue.
+[2026-07-14 01:54:33,116] [ERROR] [paperless.consumer] Not consuming simple.pdf: It is a duplicate.
 
 ############################################################
 ## CASE B — consume the ARCHIVE rendition (archive_checksum match)
 ##          The archive PDF is an OCR rendition: a byte-wise-different file
 ##          from the original (different MD5), yet rejected as a duplicate.
 ############################################################
-incoming file MD5 = 05527bf515905eefa5cc2f3270a03b8f  (compare to archive_checksum above)
+incoming file MD5 = 7704b07db07d2929e776e92ff41eb0fe  (compare to archive_checksum above)
 original file MD5 = 42995833e01aea9b3edee44bbfdd7ce1  (DIFFERENT bytes from the archive rendition)
-  [consumer] [2026-07-13 18:53:42,887] [INFO] [paperless.management.consumer] Adding /scratch/consume/archive_rendition.pdf to the task queue.
-  [consumer] 18:53:42 [Q] INFO Enqueued 1
+  [consumer] [2026-07-14 01:54:37,194] [INFO] [paperless.management.consumer] Adding /scratch/consume/archive_rendition.pdf to the task queue.
+  [consumer] 01:54:37 [Q] INFO Enqueued 1
   consume_file tasks completed = 3
 Document.objects.count() = 1
 --- django_q Failure record for this attempt (by task name 'archive_rendition.pdf') ---
@@ -1518,26 +1704,59 @@ func    = documents.tasks.consume_file
 success = False
 result  = 'archive_rendition.pdf: Not consuming archive_rendition.pdf: It is a duplicate. : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 213, in try_consume_file\n    self.pre_check_duplicate()\n  File "/app/src/documents/consumer.py", line 110, in pre_check_duplicate\n    self._fail(\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: archive_rendition.pdf: Not consuming archive_rendition.pdf: It is a duplicate.\n'
 --- NEW lines in paperless.log during CASE B ---
-[2026-07-13 18:53:42,887] [INFO] [paperless.management.consumer] Adding /scratch/consume/archive_rendition.pdf to the task queue.
-[2026-07-13 18:53:43,047] [ERROR] [paperless.consumer] Not consuming archive_rendition.pdf: It is a duplicate.
+[2026-07-14 01:54:37,194] [INFO] [paperless.management.consumer] Adding /scratch/consume/archive_rendition.pdf to the task queue.
+[2026-07-14 01:54:37,361] [ERROR] [paperless.consumer] Not consuming archive_rendition.pdf: It is a duplicate.
+
+############################################################
+## PIXEL COMPARISON (F4) — do the original and its archive LOOK different?
+##   They are byte-different files; render both to PNG at 150 dpi and compare pixel-by-pixel.
+############################################################
+--- byte level: DIFFERENT (size + MD5) ---
+22926 bytes  /scratch/media/documents/originals/0000001.pdf
+10859 bytes  /scratch/media/documents/archive/0000001.pdf
+42995833e01aea9b3edee44bbfdd7ce1  /scratch/media/documents/originals/0000001.pdf
+7704b07db07d2929e776e92ff41eb0fe  /scratch/media/documents/archive/0000001.pdf
+--- structural: original and archive embed DIFFERENT font subsets/encodings; BOTH have a text layer (pdffonts) ---
+original embedded fonts:
+name                                 type              encoding         emb sub uni object ID
+------------------------------------ ----------------- ---------------- --- --- --- ---------
+BAAAAA+LiberationSerif               TrueType          WinAnsi          yes yes yes     11  0
+archive  embedded fonts:
+name                                 type              encoding         emb sub uni object ID
+------------------------------------ ----------------- ---------------- --- --- --- ---------
+CHCNYP+LiberationSerif               CID TrueType      Custom           yes yes yes      6  0
+--- render each page to a 150 dpi PNG (pdftoppm) ---
+rendered: /scratch/exp/q4_orig-1.png  and  /scratch/exp/q4_arch-1.png
+--- pixel dimensions of each rendering (identify) ---
+q4_orig-1.png: 1275x1651  (sRGB)
+q4_arch-1.png: 1275x1651  (sRGB)
+--- ImageMagick compare -metric AE (absolute error = number of differing pixels; 0 = pixel-identical) ---
+0 differing pixels
+--- ImageMagick compare -metric RMSE (root-mean-square error; 0 = identical) ---
+0 (0) RMSE
+--- sha256 of the two renderings (identical => pixel-for-pixel identical images) ---
+e3246b0c6b772b060e4d481518df21534525c956d6e7bdf0e987c5a479077cdf  /scratch/exp/q4_orig-1.png
+e3246b0c6b772b060e4d481518df21534525c956d6e7bdf0e987c5a479077cdf  /scratch/exp/q4_arch-1.png
 
 === FINAL: only ONE document exists; both duplicates were rejected ===
 Document.objects.count() = 1
-=== stop qcluster by PID 12327 ===
+=== stop qcluster by PID 5867 ===
 qcluster stopped.
 ```
 
 ### Q4 — grounding, observed vs. inferred, and cause→effect
 
-- **The checksum compared is the incoming file's MD5 [observed + `file:line`].** `pre_check_duplicate` opens the candidate file and computes `checksum = hashlib.md5(f.read()).hexdigest()` (`consumer.py:103-104`). In CASE A the printed `incoming file MD5 = 42995833e01aea9b3edee44bbfdd7ce1` equals the stored `checksum`; in CASE B `incoming file MD5 = 05527bf515905eefa5cc2f3270a03b8f` equals the stored `archive_checksum`. Both stored values were independently confirmed with `md5sum` against the files on disk, so the comparison is byte-verified.
+- **The checksum compared is the incoming file's MD5 [observed + `file:line`].** `pre_check_duplicate` opens the candidate file and computes `checksum = hashlib.md5(f.read()).hexdigest()` (`consumer.py:103-104`). In CASE A the printed `incoming file MD5 = 42995833e01aea9b3edee44bbfdd7ce1` equals the stored `checksum`; in CASE B `incoming file MD5 = 7704b07db07d2929e776e92ff41eb0fe` equals the stored `archive_checksum`. Both stored values were independently confirmed with `md5sum` against the files on disk, so the comparison is byte-verified.
 
-- **The match is against `checksum` OR `archive_checksum` [observed + `file:line`].** The query is `Document.objects.filter(Q(checksum=checksum) | Q(archive_checksum=checksum)).exists()` (`consumer.py:105-107`). CASE B is rejected even though its MD5 differs from the original's `checksum`, because it equals the document's `archive_checksum` — the `OR` branch. This is the mechanism behind "files that look completely different are still duplicates": the fields are `Document.checksum` (`models.py:135-141`, `max_length=32`, `unique=True` — 32 hex chars = one MD5) and `Document.archive_checksum` (`models.py:143-150`).
+- **The match is against `checksum` OR `archive_checksum` [observed + `file:line`].** The query is `Document.objects.filter(Q(checksum=checksum) | Q(archive_checksum=checksum)).exists()` (`consumer.py:105-107`). CASE B is rejected even though its MD5 differs from the original's `checksum`, because it equals the document's `archive_checksum` — the `OR` branch. This is the real mechanism behind the "magic" in the question — and it is worth stating precisely, because the intuition in the prompt is inverted: the comparison is over `f.read()` bytes only, so appearance is *never* consulted. What the `OR` catches is a file that is **byte-different but visually identical** to the archive rendition (proven pixel-for-pixel in the next bullet), not a file that "looks completely different." The fields are `Document.checksum` (`models.py:135-141`, `max_length=32`, `unique=True` — 32 hex chars = one MD5) and `Document.archive_checksum` (`models.py:143-150`).
+
+- **The colliding pair renders pixel-for-pixel identically [observed].** To test the question's premise directly, the same run rasterizes both the original (`0000001.pdf`, 22926 bytes) and its archive rendition (10859 bytes) at 150 dpi with `pdftoppm` and diffs them with ImageMagick. Both rasterize to `1275x1651` sRGB, `compare -metric AE` reports `0 differing pixels`, `compare -metric RMSE` reports `0 (0)`, and the two PNGs share one `sha256` (`e3246b0c6b772b060e4d481518df21534525c956d6e7bdf0e987c5a479077cdf` for both). So the two files are visually indistinguishable. The byte difference is purely internal PDF structure — `pdffonts` shows the original embeds `BAAAAA+LiberationSerif` as `TrueType`/`WinAnsi` (object 11) while the archive embeds `CHCNYP+LiberationSerif` as `CID TrueType`/`Custom` (object 6), i.e. the OCR/normalization step re-encoded the same glyphs into a different font subset. **Inference [labeled]:** because MD5 is computed over raw bytes (`consumer.py:104`) and never over rendered pixels, a pair that *genuinely* looked different could only be flagged on an exact byte/MD5 collision — which cannot arise from two differently-rendering PDFs except via an astronomically unlikely hash collision; the observed collision is the opposite case (identical pixels, different bytes).
 
 - **The rejection is logged at ERROR and raised as `ConsumerError` [observed + `file:line`].** Each case appended exactly one `[ERROR] [paperless.consumer] Not consuming <file>: It is a duplicate.` line to `paperless.log`, emitted by `self.log("error", ...)` in `_fail` (`consumer.py:80`) with the message from `pre_check_duplicate` (`consumer.py:110-112`, message constant `MESSAGE_DOCUMENT_ALREADY_EXISTS = "document_already_exists"`, `consumer.py:37`). `_fail` then raises `ConsumerError(f"{self.filename}: {log_message}")` (`consumer.py:81`). The django_q `Failure` records capture that exception verbatim, and their tracebacks independently confirm the call chain: `tasks.py:236` → `consumer.py:213` (`self.pre_check_duplicate()`) → `consumer.py:110` → `consumer.py:81`.
 
 - **The duplicate is not ingested [observed].** `Document.objects.count()` stays `1` after both attempts, and `success = False` on both django_q `Failure` records — the pre-check runs before any document row is created (`try_consume_file` calls `pre_check_duplicate()` at `consumer.py:213`, early in the pipeline).
 
-- **Why the archive rendition is byte-wise different [observed].** The archive is the OCR/normalized PDF produced during ingestion; its MD5 (`05527bf515905eefa5cc2f3270a03b8f`, 10860 bytes) differs from the original's (`42995833e01aea9b3edee44bbfdd7ce1`, 22926 bytes). This same run also shows the archive MD5 differs from the value seen in other runs of this investigation (Q1/Q5), i.e. the archive rendition is **not** bit-for-bit reproducible across runs; the original's `checksum` is stable. The concrete mechanism for that instability is examined under Q5 (OCR embeds run-specific metadata). For Q4 the archive value is tied to reproducible bytes *within the run* by the `md5sum` verification above.
+- **Why the archive rendition is byte-wise different — and run-specific [observed].** The archive is the OCR/normalized PDF produced during ingestion; its MD5 (`7704b07db07d2929e776e92ff41eb0fe`, 10859 bytes) differs from the original's (`42995833e01aea9b3edee44bbfdd7ce1`, 22926 bytes). The archive is **not** bit-for-bit reproducible across runs: an earlier run of this exact script in the same environment produced `archive_checksum = 5c93734ff3dc6a3dafc65dc103db97c6` at 10860 bytes — a different hash *and* a different byte count for the same input — while the original's `checksum` stayed `42995833…`. Yet the *rendered pixels* were stable: both runs produced the identical rendering `sha256 e3246b0c…` with `AE = 0`. In other words the OCR step varies the archive's bytes (run-specific metadata/encoding) but not its visual output. The concrete mechanism for the byte-instability is examined under Q5. For Q4 the archive value is tied to reproducible bytes *within the run* by the `md5sum` verification above, and is labeled run-specific everywhere it appears.
 
 - **`CONSUMER_DELETE_DUPLICATES` is off by default [observed + `file:line`].** The rejected files remained in the consumption directory (the script removes them between cases); had `settings.CONSUMER_DELETE_DUPLICATES` been true, `pre_check_duplicate` would `os.unlink(self.path)` the incoming file (`consumer.py:108-109`). It defaults to off (`settings.py:486`).
 ## Q5 — Sanity checker output: healthy vs. broken, and the mismatch hashes
@@ -2094,12 +2313,15 @@ full (32 hex chars for MD5, 40 for SHA-1); none are truncated.
 | Q2 | Does the handler restore the original? | Yes — original renamed back to its prior path | `signals/handlers.py:376` | §Q2 PART A |
 | Q2 | What happens to the archive? | Never moved (failure occurred before its rename), so it stays put | `signals/handlers.py:356-359` | §Q2 PART A |
 | Q2 | On-disk state BEFORE | original `originals/simple.pdf`; archive `archive/simple.pdf` | inotify `MOVED_FROM/TO` | §Q2 PART A |
-| Q2 | On-disk state DURING (intermediate) | original at NEW path `originals/Invoice/simple.pdf` (inotify cookie `28041896`) — **[observed]** | external inotify monitor | §Q2 intermediate |
-| Q2 | On-disk state AFTER (rollback) | original restored to `originals/simple.pdf` (inotify cookie `28041898`); archive untouched; DB `filename=simple.pdf` | `signals/handlers.py:376,393-394` | §Q2 PART A |
+| Q2 | On-disk state DURING (intermediate) | original at NEW path `originals/Invoice/simple.pdf` (inotify cookie `29059634`) — **[observed]** | external inotify monitor | §Q2 intermediate |
+| Q2 | On-disk state AFTER (rollback) | original restored to `originals/simple.pdf` (inotify cookie `29059636`); archive untouched; DB `filename=simple.pdf` | `signals/handlers.py:376,393-394` | §Q2 PART A |
 | Q2 | Log/exception text on the rollback path | **None** — the inner recovery is wrapped in an inner `try/except` whose handler is `pass`, so a successful rollback is silent | `signals/handlers.py:374,381,390` | §Q2 PART A |
-| Q2 | Missing-source variant text | `[CRITICAL] [paperless.handlers] Document 2026-07-13 simple: File /scratch/media/documents/originals/simple.pdf has gone.` | `logger.fatal` `signals/handlers.py:298` | §Q2 PART B |
+| Q2 | Missing-source variant text | `[CRITICAL] [paperless.handlers] Document 2026-07-14 simple: File /scratch/media/documents/originals/simple.pdf has gone.` | `logger.fatal` `signals/handlers.py:298` | §Q2 PART B |
+| Q2 | Target-already-exists variant text — **[observed]** via a concurrent-writer TOCTOU race through the real `m2m_changed` path | `[WARNING] [paperless.handlers] Document 2026-07-14 simple: Cannot rename file since target path /scratch/media/documents/archive/Invoice/simple.pdf already exists.` | `logger.warning` `signals/handlers.py:303-306`; TOCTOU window `file_handling.py:122` vs `handlers.py:301` | §Q2 target-exists |
 | Q3 | Trigger the "instant" (skipped) path | RUN2 and RUN3 skipped (stable across two runs) | `classifier.py:163-164` (`return False`) | §Q3 |
 | Q3 | Trigger the "long" (full retrain) path | RUN1 (first train) and RUN4 (after changing AUTO data) | `classifier.py:247,249` | §Q3 |
+| Q3 | Measured timing — "instant" vs "longer" | Whole command ~2 s every run (Django startup dominated); the *training step itself* is ~5 ms on a skip vs ~471 ms (RUN1) / ~84 ms (RUN4) on a real train — the internal short-circuit, not total wall time, is what's "instant" | `classifier.py:163-164` (skip) vs `:166-200` (train) | §Q3 |
+| Q3 | Persisted-model state — skip vs retrain | Byte-identical across skips (same inode/mtime/size/sha256 on RUN1→2→3); atomically replaced on RUN4 (new inode/mtime, different sha256 **and** `data_hash`) | `classifier.py:98-100` (`save`) ; `tasks.py:67` | §Q3 |
 | Q3 | Log string — retrain | `[INFO] [paperless.tasks] Saving updated classifier model to /scratch/data/classification_model.pickle...` | `tasks.py:64-66` | §Q3 |
 | Q3 | Log string — skip | `[DEBUG] [paperless.classifier]`/`[paperless.tasks] Training data unchanged.` | `tasks.py:69` | §Q3 |
 | Q3 | Algorithm of the change-detection hash | **SHA-1** (`hashlib.sha1()`) over preprocessed content + AUTO label bytes | `classifier.py:124,161` | §Q3 |
@@ -2109,8 +2331,9 @@ full (32 hex chars for MD5, 40 for SHA-1); none are truncated.
 | Q4 | Reproduce a duplicate rejection during ingestion | CASE A (identical original) and CASE B (archive rendition), both via the canonical queue | `document_consumer.py:85-91` → `consumer.py:213` | §Q4 |
 | Q4 | Checksum algorithm compared at judgment | **MD5** of the incoming file | `consumer.py:104` | §Q4 |
 | Q4 | Actual value — stored `checksum` (original) | `42995833e01aea9b3edee44bbfdd7ce1` | `models.py:135-141` | §Q4 |
-| Q4 | Actual value — stored `archive_checksum` | `05527bf515905eefa5cc2f3270a03b8f` | `models.py:143-150` | §Q4 |
-| Q4 | Why two "different-looking" files collide | Match is `checksum` **OR** `archive_checksum`; the OCR archive rendition is byte-different from the original yet equals `archive_checksum` | `consumer.py:105-107` | §Q4 |
+| Q4 | Actual value — stored `archive_checksum` *(run-specific)* | `7704b07db07d2929e776e92ff41eb0fe` | `models.py:143-150` | §Q4 |
+| Q4 | Why the premise's "look completely different" is inverted | Detection compares raw bytes (`f.read()`) only — never appearance; the collision is a byte-different but **visually identical** archive rendition, matched via the `checksum` **OR** `archive_checksum` branch | `consumer.py:104,105-107` | §Q4 |
+| Q4 | Pixel comparison of original vs archive rendition | Both rasterize (150 dpi) to `1275x1651`; `compare -metric AE = 0` differing pixels, `RMSE = 0`; identical rendering `sha256 e3246b0c…` — pixel-for-pixel identical despite different bytes/size/font-encoding | ImageMagick `compare` / `pdftoppm` | §Q4 |
 | Q4 | Rejection message | `[ERROR] [paperless.consumer] Not consuming <file>: It is a duplicate.` + `ConsumerError` | `consumer.py:80-81,110-112` | §Q4 |
 | Q5 | Healthy output | `[INFO] [paperless.sanity_checker] Sanity checker detected no issues.` | `sanity_checker.py:26-27` | §Q5 |
 | Q5 | Broken output — original | `[ERROR] Checksum mismatch of document {pk}. Stored: {doc.checksum}, actual: {md5}.` (concrete values two rows below) | `sanity_checker.py:88-91` | §Q5 |
@@ -2237,6 +2460,10 @@ files are untouched:
 #!/bin/bash
 # Proof that the repository is left byte-for-byte unchanged except for this one deliverable.
 # Run from the repository root; base commit is 542221a38dff.
+# (If your host checkout is owned by a different user than the one running git, Git's
+#  dubious-ownership guard applies here too — add an exception first with
+#  `git config --global --add safe.directory "$(pwd)"`. In this environment the checkout is
+#  root-owned and git runs as root, so no exception was needed and the output below is verbatim.)
 echo "+ git rev-parse --abbrev-ref HEAD"
 git rev-parse --abbrev-ref HEAD
 echo
