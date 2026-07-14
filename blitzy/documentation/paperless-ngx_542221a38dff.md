@@ -531,6 +531,26 @@ The Angular client models a page **number**, not a cursor, and assumes a single 
 
 **Mechanism in UI terms:** each page navigation is an **independent** offset query (`LIMIT page_size OFFSET (page-1)*page_size`) over a global order the UI assumes is stable, with total pages computed as `ceil(count / page_size)`. *If* that order were unstable across ties (the H3 mechanism), the offset arithmetic would silently show the same `id` on two adjacent pages and omit another, with `count` (and the computed page total) unchanged — matching the report. At this commit the backend order is *not* unstable during ordinary browsing (§4), so the UI does not surface the artifact here; the UI is the surface on which the latent mechanism *would* become visible if a plan divergence (SQLite) or a non-total ordering were introduced. Full-text **search** is a separate path — "Results are always sorted by search score" (`docs/api.rst:L162`) — so it is not governed by the default `-created` ordering (search scores can themselves tie; search-score tie stability was not separately tested and is out of scope).
 
+**Observed side effect of the `404 → page 1` reset — a transient `undefined: I` error banner [OBSERVED — HTTP + UI; mechanism INFERRED; orthogonal to the H1/H2/H3 thesis; reference-only]:** the reset path in the bullet above (`L158` → `L160` → `L161`) is reached whenever a filter shrinks the result set so the active page falls out of range, and exercising it directly through the real client surfaces a **pre-existing frontend defect** that is *independent* of the ordering/pagination question this document answers. It is recorded here because it is reached through the very same `404`-on-a-stale-page path §8 describes.
+
+*Reproduction (canonical HTTP API + real Angular client; `admin`, default SQLite; 40 seeded documents, `page_size = 25`):* open Documents **page 2**, then enable a tag filter whose result is a single page — e.g. `invoice-paid` (6 documents). The client re-requests the list while `currentPage` is still `2`, which is now out of range.
+
+*OBSERVED (HTTP) — captured from the browser network log:* the stale page-2 request is issued **multiple times concurrently**, each returns `404`, and the reset request for page 1 then succeeds:
+
+```
+GET /api/documents/?page=2&page_size=25&ordering=-created                  → 200      (on page 2, unfiltered)
+GET /api/documents/?page=2&page_size=25&ordering=-created&tags__id__all=5  → 404  ×3  (page 2 now out of range)
+GET /api/documents/?page=1&page_size=25&ordering=-created&tags__id__all=5  → 200      (reset-to-page-1 succeeds)
+```
+
+Each `404` body is the DRF pagination default `{"detail":"Invalid page."}` (`content-length: 26`, `content-type: application/json`, `x-version: 1.7.0`).
+
+*OBSERVED (UI):* despite the page-1 request returning `200`, a full-width red banner reads **`Error while loading documents: undefined: I`** over an **empty** document grid, while the header still reports the correct count (`6 documents (filtered)`) and the pager has collapsed to a single page.
+
+*INFERRED (mechanism, from source):* `reload()` clears `this.error = null` at its start (`src-ui/src/app/services/document-list-view.service.ts:L135`), but the concurrent multi-fetch means a **late** `404` can arrive *after* the reset has already set `currentPage = 1`. That late `404` fails the reset guard `if (activeListViewState.currentPage != 1 && error.status == 404)` (`L158`) and falls into the `else` branch (`L162-181`), which composes the message by looking the response key up in `DOCUMENT_SORT_FIELDS` (`src-ui/src/app/services/rest/document.service.ts:L16-24`). That list has no `detail` entry, so `DOCUMENT_SORT_FIELDS.find((f) => f.field == fieldName)?.name` (`L173`) is `undefined` → the `"undefined"` prefix; the value `error.error['detail']` is the string `"Invalid page."`, and indexing `[0]` (`fieldError[0]`, `L174`) yields `"I"`, producing `this.error = "undefined: I"` (`L180`). The banner is therefore an artifact of the multi-fetch race on the reset path, not of the list order.
+
+*Disposition:* this is a **pre-existing** defect in `document-list-view.service.ts` at this commit; it does not touch the `-created` ordering that is the subject of this document and it neither confirms nor contradicts H1/H2/H3. Per the read-only scope of this investigation (§12), **no fix was applied.** The standard remediation would be to (a) treat non-field response keys (like `detail`) as a plain message in the `else` branch instead of formatting them as `field: value`, and (b) suppress or coalesce error state from superseded/aborted list requests so a late `404` cannot overwrite a successful reset. Recorded **for reference only.**
+
 ---
 
 
@@ -579,6 +599,7 @@ Categories are consistent with the labels defined at the top and reconcile to th
 | 13 | Only `IsAuthenticated`; no object-level perms; no `django-guardian` | STATICALLY VERIFIED + OBSERVED — runtime | `src/documents/views.py:L183`; `pip show`/grep §7 |
 | 14 | Angular navigates by page number; total pages `= ceil(count/page_size)` | STATICALLY VERIFIED | `results.ts:L1-5`; `abstract-paperless-service.ts:L41,44,48`; `document-list-view.service.ts:L93-94,L140-143,L149,L158-161,L276-277`; template `L95-96` |
 | 15 | PostgreSQL guarantees no order among rows tied on the ordering expressions | STATICALLY VERIFIED (external docs) + INFERRED for the bare-ORDER-BY case | PostgreSQL docs (References); not reached here because `.distinct()` makes the order total |
+| 16 | Filtering from an out-of-range page triggers the `404 → page 1` reset; a late `404` on that path renders a transient `undefined: I` banner over an empty grid while `count` stays correct (pre-existing frontend defect, orthogonal to H1/H2/H3) | OBSERVED — HTTP + UI; mechanism INFERRED | §8 note; network log (3×`404` on stale page + reset `200`), `{"detail":"Invalid page."}`; `document-list-view.service.ts:L135,L158,L162-181`; `document.service.ts:L16-24` |
 
 ---
 
