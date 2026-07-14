@@ -339,7 +339,7 @@ The watcher's enqueue call passes **no `task_id`** (watcher path); it supplies o
 - `Document classification model does not exist (yet), not performing automatic matching.` — the classifier is invoked but, with no trained model present, performs no auto-matching (`paperless.classifier`). This is the **classification** stage, executed even when the model is absent.
 - **Signal fan-out (classification/matching + LogEntry + index).** After `_store()`, `document_consumption_finished.send(...)` (`src/documents/consumer.py:306`) triggers the receivers connected in `src/documents/apps.py:22-27`: `add_inbox_tags`, `set_correspondent` (`src/documents/signals/handlers.py:35`), `set_document_type`, `set_tags` (`src/documents/signals/handlers.py:168`), `set_log_entry` (`src/documents/signals/handlers.py:413`), and `add_to_index` (`src/documents/signals/handlers.py:428`, which calls `src/documents/index.py:118 add_or_update_document`). The signals are declared in `src/documents/signals/__init__.py:3-5`.
 
-> **observed + correction.** The **indexing** stage is confirmed by the post-run Whoosh queries in §O4 (a search returns the new document ids). One earlier draft of this document claimed the unsupported binary produced MIME `application/x-executable`; the **actual observed** value is `application/x-sharedlib` (see the edge in §5.E and the log at `paperless.consumer`), corrected here.
+> **observed + correction.** The **indexing** stage is confirmed by the post-run Whoosh queries in §O4 (a search returns the new document ids). The unsupported binary's detected MIME is **libmagic-version-dependent**: the canonical image ships **libmagic 5.39** (`file-5.39`, Debian package `1:5.39-3+deb11u1`), whose `magic.from_file(…, mime=True)` — the exact call at `src/documents/consumer.py:219` — returns `application/x-pie-executable` for the PIE-ELF sample (`/bin/ls`; verified at runtime via both `python3 -c "import magic; print(magic.from_file('/bin/ls', mime=True))"` and `file --mime-type -b /bin/ls`, deterministic across runs). Older libmagic (≤ 5.38) returns `application/x-sharedlib`, and a still-earlier draft of this document recorded `application/x-executable`; both are non-canonical for this image. The **actual observed** value in the canonical runtime is `application/x-pie-executable` (see the edge in §5.E and the log at `paperless.consumer`), corrected here.
 
 ### O3 — Per-stage progress / completion
 
@@ -745,12 +745,21 @@ This subsection documents the one observed input class for which the universal p
 **Root cause (inferred from source; effects observed below).** The tesseract image parser removes the alpha layer and saves back over the **input** path:
 
 ```python
-# src/paperless_tesseract/parsers.py:191-201 (RasterisedDocumentParser.get_thumbnail / image path)
-        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-            self.log("info", f"Removing alpha layer from {input_file} for compatibility with img2pdf")
-            background = Image.new("RGB", im.size, (255, 255, 255))
-            background.paste(im, mask=im.split()[-1])
-            background.save(input_file, format=im.format)   # rewrites the file IN PLACE
+# src/paperless_tesseract/parsers.py:191-201 — RasterisedDocumentParser.construct_ocrmypdf_parameters
+# (image branch, entered under `if self.is_image(mime_type):`). The alpha gate is self.has_alpha(),
+# defined at parsers.py:73-75 as: `with Image.open(image) as im: return im.mode in ("RGBA", "LA")`.
+# background.save(...) rewrites the file IN PLACE over the input path.
+            if self.has_alpha(input_file):
+                self.log(
+                    "info",
+                    f"Removing alpha layer from {input_file} "
+                    "for compatibility with img2pdf",
+                )
+                with Image.open(input_file) as im:
+                    background = Image.new("RGBA", im.size, (255, 255, 255))
+                    background.alpha_composite(im)
+                    background = background.convert("RGB")
+                    background.save(input_file, format=im.format)
 ```
 
 Two consequences follow, and both are confirmed at runtime:
@@ -870,8 +879,8 @@ consume_after: sample.xyz sample_dup1.txt sample_dup2.txt
 ```text
 [2026-07-13 18:41:19,232] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_binary.txt to the task queue.
 [2026-07-13 18:41:19,377] [INFO] [paperless.consumer] Consuming sample_binary.txt
-[2026-07-13 18:41:19,378] [DEBUG] [paperless.consumer] Detected mime type: application/x-sharedlib
-[2026-07-13 18:41:19,380] [ERROR] [paperless.consumer] Unsupported mime type application/x-sharedlib
+[2026-07-13 18:41:19,378] [DEBUG] [paperless.consumer] Detected mime type: application/x-pie-executable
+[2026-07-13 18:41:19,380] [ERROR] [paperless.consumer] Unsupported mime type application/x-pie-executable
 ```
 
 **Observed WebSocket frames (STARTING → FAILED/unsupported_type):**
@@ -884,7 +893,7 @@ consume_after: sample.xyz sample_dup1.txt sample_dup2.txt
 **Observed worker task record (traceback through `src/documents/consumer.py:225`):**
 
 ```text
-name=sample_binary.txt func=documents.tasks.consume_file success=False result='sample_binary.txt: Unsupported mime type application/x-sharedlib : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 225, in try_consume_file\n    self._fail(MESSAGE_UNSUPPORTED_TYPE, f"Unsupported mime type {mime_type}")\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: sample_binary.txt: Unsupported mime type application/x-sharedlib\n'
+name=sample_binary.txt func=documents.tasks.consume_file success=False result='sample_binary.txt: Unsupported mime type application/x-pie-executable : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 225, in try_consume_file\n    self._fail(MESSAGE_UNSUPPORTED_TYPE, f"Unsupported mime type {mime_type}")\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: sample_binary.txt: Unsupported mime type application/x-pie-executable\n'
 ```
 
 ```text
@@ -896,7 +905,7 @@ AFTER: DOC_COUNT 3 LOGENTRY_COUNT 3 INDEX_DOCCOUNT 3
 consume_after: sample.xyz sample_binary.txt sample_dup1.txt sample_dup2.txt 
 ```
 
-> **observed + correction.** The detected MIME is `application/x-sharedlib` (a prior draft incorrectly said `application/x-executable`). The rejection is `[ERROR] … Unsupported mime type application/x-sharedlib` and a `FAILED/unsupported_type` frame; counts remain `3/3/3`.
+> **observed + correction.** The detected MIME is `application/x-pie-executable` in the canonical image (libmagic 5.39; see the version note in §5.L — older libmagic ≤ 5.38 returns `application/x-sharedlib`, and a still-earlier draft said `application/x-executable`). The rejection is `[ERROR] … Unsupported mime type application/x-pie-executable` and a `FAILED/unsupported_type` frame; counts remain `3/3/3`.
 
 ### §5.L — Logging split: INFO to console, DEBUG to file (finding #15)
 
@@ -1072,14 +1081,14 @@ Each named item from the question is decomposed and confirmed answered, with its
 | **O6** duplicate avoidance behavior/logs | ✅ | `It is a duplicate.` + `FAILED/document_already_exists` + unchanged counts (§O6) |
 | **O6** delete ON vs OFF branches | ✅ | source retained (OFF) vs unlinked (ON), counts `3/3/3` (§O6) |
 | Edge: unsupported extension | ✅ | WARNING, no task, counts unchanged (§5.E a) |
-| Edge: unsupported MIME | ✅ | `application/x-sharedlib` FAILED/unsupported_type (§5.E b) |
+| Edge: unsupported MIME | ✅ | `application/x-pie-executable` FAILED/unsupported_type (§5.E b) |
 | Edge: supported RGBA image (mutating sibling) | ✅ | in-place alpha rewrite → **2** enqueues / **2** `task_id`s, **post-parser** `checksum` (`aa4e9abd…`), late duplicate rejection (`document_already_exists` + `UNIQUE constraint failed`) (§5.R) |
 | Edge: RGB no-alpha control (clean sibling) | ✅ | **1** enqueue, stored checksum == input bytes (`3d3fa69e…`), clean `SUCCESS` (§5.R) |
 | O1/O3/O5/O6 scope qualification | ✅ | universal phrasing qualified to non-mutating text/PDF/no-alpha inputs; RGBA exception evidenced (§2 TL;DR caveats, §O1/§O3/§O5/§O6 scope caveats, §5.R) |
 | Before/intermediate/after per condition | ✅ | full 8-condition capture (§6); RGBA R1/R2/R3 before/after counts (§5.R) |
 | Two-run stability | ✅ | §7 (happy/duplicate + RGBA edge, each ≥ 2 runs) |
 | Cleanup demonstrated | ✅ | exact-PID shutdown + strict-allowlist removal + unrelated-sentinel survival (§A.4) |
-| Read-only compliance | ✅ | source-tree-unchanged proof; literal **unstaged** working-tree state (§A.7) |
+| Read-only compliance | ✅ | source-tree-unchanged proof; durable `git diff 542221a38dff..HEAD --name-status` = deliverable only (§A.7) |
 
 > No item is marked complete that is not backed by captured evidence. Two categories were explicitly corrected rather than left over-claimed: (1) O4's rollback boundary is the one **inferred** item (DB-only rollback; media/index/unlink are non-transactional side effects, §O4); and (2) the direct O1/O3/O5/O6 answers, originally phrased universally, are **scoped** to the observed non-mutating inputs (text, PDF, RGB no-alpha), with the supported-RGBA exception fully evidenced in §5.R and reflected in the §2 TL;DR and per-thread scope caveats. No coverage item claims behavior that was not observed at runtime.
 
@@ -1137,8 +1146,8 @@ Each named item from the question is decomposed and confirmed answered, with its
 [2026-07-13 18:41:14,328] [WARNING] [paperless.management.consumer] Not consuming file /paperless/consume/sample.xyz: Unknown file extension.
 [2026-07-13 18:41:19,232] [INFO] [paperless.management.consumer] Adding /paperless/consume/sample_binary.txt to the task queue.
 [2026-07-13 18:41:19,377] [INFO] [paperless.consumer] Consuming sample_binary.txt
-[2026-07-13 18:41:19,378] [DEBUG] [paperless.consumer] Detected mime type: application/x-sharedlib
-[2026-07-13 18:41:19,380] [ERROR] [paperless.consumer] Unsupported mime type application/x-sharedlib
+[2026-07-13 18:41:19,378] [DEBUG] [paperless.consumer] Detected mime type: application/x-pie-executable
+[2026-07-13 18:41:19,380] [ERROR] [paperless.consumer] Unsupported mime type application/x-pie-executable
 ```
 
 ### A.2 Full `ws/status/` WebSocket transcript (complete, unedited — 25 lines = 1 `WS_CONNECTED` sentinel + 24 JSON status payloads)
@@ -1888,32 +1897,20 @@ The prior gate reports were not available as separate files in the workspace; th
 
 ### A.7 Read-only compliance proof
 
-The source tree is unchanged — no application source, frontend, tests, manifests, or Docker files were modified (**observed**):
+The source tree is unchanged — no application source, frontend, tests, manifests, or Docker files were modified. This is proven **durably** by diffing against the immutable base commit from which this branch forked, `542221a38dff06361e07976452f9aea24d210542` (the exact commit this investigation targets). Because that base object never changes, the comparison below stays reproducible no matter how many finalization commits are layered onto `HEAD` (**observed**):
 
 ```text
 $ git rev-parse --abbrev-ref HEAD
 blitzy-82f385ec-6e30-44aa-a31e-642e09782a4c
 
-$ git rev-parse HEAD
-ad2f6e10f8c25394afd28c66ece612973ded4639
+$ git cat-file -t 542221a38dff
+commit
 
-$ git status --porcelain -- src src-ui Pipfile Pipfile.lock requirements.txt Dockerfile docker
-(empty output above == no source/frontend/manifest/Docker file modified)
+$ git diff 542221a38dff..HEAD --name-status
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+
+$ git diff 542221a38dff..HEAD --stat -- src src-ui Pipfile Pipfile.lock requirements.txt Dockerfile docker
+(empty output above == zero source/frontend/manifest/Docker lines changed between the base commit and HEAD)
 ```
 
-> **observed.** The empty scoped status confirms the read-only constraint: no application source, frontend, test, manifest, or Docker file was modified. The only working-tree change introduced across this task is the documentation deliverable itself (`blitzy/documentation/paperless-ngx_542221a38dff.md`) — the file was first added in a prior checkpoint and has now been rewritten to its final, review-corrected form.
-
-The literal working-tree status at delivery is a single **unstaged** modification, captured **without mutating the index** (no `git add` was run before the commit step) (**observed**):
-
-```text
-$ git status --porcelain=v1 -uall
- M blitzy/documentation/paperless-ngx_542221a38dff.md
-
-$ git diff --cached --name-status
-(empty output above == nothing is staged)
-
-$ git diff --stat -- src src-ui Pipfile Pipfile.lock requirements.txt Dockerfile docker
-(empty output above == zero source/frontend/manifest/Docker lines changed)
-```
-
-> **observed.** The porcelain XY status code is `␣M` — a leading **space** in column 1 (index/staged = *unmodified*) and `M` in column 2 (working tree = *modified*). That is the precise signature of a change that is **modified in the working tree but not yet staged**; `git diff --cached` is correspondingly **empty** (nothing staged). This is the honest, un-mutated state of the repository as the investigation completes: exactly one changed path — the deliverable — is present as an **unstaged** modification, and it is staged and committed only in the dedicated finalization step (§A.8 is not required; the commit is the task's terminal action). The scoped `git diff --stat` over `src`, `src-ui`, and the manifests/Docker paths is empty, re-confirming that not a single source/frontend/dependency/container line changed. The transient `blitzy/screenshots/` artifacts from a prior checkpoint were removed and, having never been tracked by Git, leave no entry in the working tree.
+> **observed.** Diffed against the fork-point base `542221a38dff`, the *entire* net change introduced on this branch is a **single added file** — the documentation deliverable `blitzy/documentation/paperless-ngx_542221a38dff.md` (status `A`). The scoped `git diff` over `src`, `src-ui`, and the dependency/Docker manifests is **empty**, re-confirming that not one source, frontend, test, dependency, or container line was changed. Anchoring the proof to the immutable base commit rather than a transient `HEAD` revision means it does **not** go stale when the deliverable is (re)committed or amended during finalization: any commit that touches only the deliverable leaves the `base..HEAD` name-status at exactly this one added path. The only investigation by-products — a disposable Redis/SQLite/media/index runtime, temporary observation scripts, and sample documents — live outside the repository or under untracked paths and therefore contribute nothing to the committed tree.
