@@ -40,24 +40,39 @@ Everything below is therefore analyzed with **Django-Q semantics**.
 
 The reproduction ran **inside the project's own canonical container** — Python **3.9.23**, matching the project's canonical runtime `Dockerfile:18` (`FROM python:3.9-slim-bullseye`) — with **every queue-relevant library pinned exactly to the manifest**, and a **real Redis 6.0** broker (the Compose `broker` service, `docker/compose/docker-compose.sqlite.yml:29` -> `image: redis:6.0`).
 
-**Environment provisioning (run once).** The Redis and application containers on a shared Docker network were provisioned with the commands below (`$REPO` is a checkout at HEAD `542221a38dff06361e07976452f9aea24d210542`; `$IMAGE` is the canonical image shown in the `docker ps` output above). These are the exact, executable commands — no placeholders:
+**Environment provisioning (run once).** The Redis and application containers on a shared Docker network were provisioned with the commands below. These are the exact, executable commands; the **only** value you supply is `REPO` (the absolute path to your own checkout at HEAD `542221a38dff06361e07976452f9aea24d210542`) — everything else, including the literal `IMAGE` and the freshly generated random `SECRET_KEY`, is verbatim and runs as shown:
 
 ```bash
-REPO=/path/to/paperless-ngx-checkout   # working tree at HEAD 542221a38dff
+REPO=/path/to/paperless-ngx-checkout   # <-- SET THIS to your own checkout (working tree at HEAD 542221a38dff)
 IMAGE=ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01
+# A UNIQUE, RANDOM signing key — NOT the repo's public default fallback
+# (src/paperless/settings.py:260-263). This is one half of the CWE-502 mitigation
+# described in the "Security note … (CWE-502 trust boundary)" section below.
+SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(50))')
 docker network create paperless-net-0
-docker run -d --name paperless-redis-0 --network paperless-net-0 --network-alias broker -p 6379:6379 redis:6.0
-docker run -d --name paperless-app-0 --network paperless-net-0 -e PAPERLESS_REDIS=redis://broker:6379 -e DJANGO_SETTINGS_MODULE=paperless.settings -v "$REPO":/app -w /app --entrypoint bash "$IMAGE" -lc 'sleep infinity'
+# Redis is attached to the PRIVATE Docker network ONLY (network-alias "broker") and is
+# deliberately NOT published to the host (no -p), so the broker is unreachable from the
+# host or any untrusted network — the other half of the CWE-502 mitigation below.
+docker run -d --name paperless-redis-0 --network paperless-net-0 --network-alias broker redis:6.0
+# --init installs a real init/reaper (tini) as PID 1 in the throwaway container so no
+# zombie processes accumulate (see the "Cleanup & repository integrity" section below);
+# PAPERLESS_SECRET_KEY injects the unique key generated above.
+docker run -d --name paperless-app-0 --init --network paperless-net-0 -e PAPERLESS_REDIS=redis://broker:6379 -e PAPERLESS_SECRET_KEY="$SECRET_KEY" -e DJANGO_SETTINGS_MODULE=paperless.settings -v "$REPO":/app -w /app --entrypoint bash "$IMAGE" -lc 'sleep infinity'
 ```
 
 **Harness deployment.** The isolated harness (settings, empty URLconf, stand-in tasks, and the helper scripts of Appendix G) was written into the app container's `/tmp/harness` — the container's own filesystem, **not** the bind-mounted repository at `/app` — and the throwaway DB migrated:
 
 ```bash
 docker exec paperless-app-0 bash -lc 'mkdir -p /tmp/harness'
-docker cp harness_settings.py paperless-app-0:/tmp/harness/harness_settings.py
-docker cp harness_urls.py paperless-app-0:/tmp/harness/harness_urls.py
-docker cp harness_tasks.py paperless-app-0:/tmp/harness/harness_tasks.py
-# ...and each helper script from Appendix G (enq.py, measure.py, inspect_pkg.py, ...)
+# Copy EVERY harness/helper script listed in Appendix G into the container's
+# /tmp/harness (the container's own filesystem — NOT the bind-mounted repo at /app):
+for f in harness_settings.py harness_urls.py harness_tasks.py run_harness_cluster.sh \
+         enq.py measure.py inspect_pkg.py dump_config.py show_tables.py \
+         proctree.py procstate.py cfg_overrides.py burst.py poll.py \
+         mixed_enqueue.py channels_probe.py channels_probe2.py \
+         read_task.py readrow.py raw_sql.py save_limit.py mk32.sh mk33.py; do
+  docker cp "$f" paperless-app-0:/tmp/harness/"$f"
+done
 docker exec paperless-app-0 bash -lc 'cd /app/src && rm -f /tmp/harness/harness.sqlite3 && PYTHONPATH=/tmp/harness:/app/src DJANGO_SETTINGS_MODULE=harness_settings python3 manage.py migrate'
 ```
 
@@ -90,6 +105,46 @@ os:Linux 6.6.122+ x86_64
 $ docker network inspect paperless-net-0 --format "{{range .Containers}}{{.Name}} {{end}}"
 paperless-app-0 paperless-redis-0 
 ```
+
+**Security posture of this runbook (observed) — the broker is not host-exposed and the signing key is unique.** Because the async path is a signed-pickle trust boundary (see the "Security note … (CWE-502 trust boundary)" section below), the two preconditions for that CWE-502 exposure — *write access to the broker* **and** *knowledge of the signing key* — are both denied by construction in the provisioning commands above: Redis is attached to the private Docker network only (**no** published host port), and `PAPERLESS_SECRET_KEY` is a unique random value rather than the repository's **public default fallback** (`src/paperless/settings.py:260-263`). Commands and complete, unedited output:
+
+```text
+# (a) the app CAN reach the broker over the private network alias "broker"
+$ docker exec paperless-app-0 python3 -c "import redis; print('app->broker PING:', redis.from_url('redis://broker:6379').ping())"
+app->broker PING: True
+
+# (b) the broker is NOT reachable from the host: no published port -> connection refused
+$ docker port paperless-redis-0        # (no output => no host ports published)
+$ python3 - <<'PY'
+import socket
+s = socket.socket(); s.settimeout(3)
+try:
+    s.connect(("127.0.0.1", 6379)); print("host connect -> CONNECTED (INSECURE)")
+except OSError as e:
+    print("host connect ->", type(e).__name__ + ":", e)
+finally:
+    s.close()
+PY
+host connect -> ConnectionRefusedError: [Errno 111] Connection refused
+
+# (c) the injected key equals paperless's SECRET_KEY (inheritance holds) but is NOT the
+#     public default fallback -- the key value itself is never printed, only two booleans
+$ docker exec -e DEFKEY='e11fl1oa-*ytql8p)(06fbj4ukrlo+n7k&q5+$1md7i+mge=ee' paperless-app-0 \
+    bash -lc 'cd /app/src && PYTHONPATH=/tmp/harness:/app/src DJANGO_SETTINGS_MODULE=harness_settings python3 -c "import os, django; django.setup(); from django.conf import settings as h; from paperless import settings as p; print(\"harness SECRET_KEY == paperless SECRET_KEY:\", h.SECRET_KEY == p.SECRET_KEY); print(\"paperless SECRET_KEY == repo default fallback:\", p.SECRET_KEY == os.environ[\"DEFKEY\"])"'
+harness SECRET_KEY == paperless SECRET_KEY: True
+paperless SECRET_KEY == repo default fallback: False
+
+# (d) the canonical async_task dispatch path still works against the secured broker
+$ docker exec paperless-redis-0 redis-cli -n 1 FLUSHDB >/dev/null
+$ docker exec paperless-app-0 bash -lc 'cd /app/src && PYTHONPATH=/tmp/harness:/app/src DJANGO_SETTINGS_MODULE=harness_settings python3 /tmp/harness/enq.py harness_tasks.slow_ok 30'
+02:41:27 [Q] INFO Enqueued 1                       # Django-Q logger, stderr
+async_task('harness_tasks.slow_ok', *[30]) -> returned id 6ce53121217f41f18e620c68b7f266bf
+Task.objects.count() immediately after enqueue = 0
+get_broker().queue_size() = 1
+```
+
+This is the same dispatch behavior reported throughout this document — enqueue produces a Redis list entry with **zero** database rows (Q2), and the cluster later drains it (Q3–Q5) — but here the runbook itself satisfies the two mitigations described in the "Security note" section, so the reproduction does **not** stand up the very CWE-502 preconditions that section warns against. (The `SECRET_KEY` value is never emitted; only the equality/inequality booleans are, preserving the "never print the key" discipline used elsewhere in this document.)
+
 
 **Library versions (observed) — exactly the manifest pins:**
 
@@ -280,7 +335,7 @@ ROOT_URLCONF = "harness_urls"
 urlpatterns = []
 ```
 
-The per-experiment helper scripts (`enq.py`, `measure.py`, `inspect_pkg.py`, `dump_config.py`, `show_tables.py`, and the Q3/Q4/Q5 helpers `burst.py`, `poll.py`, `read_task.py`, `raw_sql.py`, `save_limit.py`, `channels_probe.py`) are listed verbatim in **Appendix G**. Every per-experiment command in this document names the exact script it runs; the only inline exceptions are a few short `python3 -c` one-liners (used for row counts and a version print) that show their complete output inline — the row-count logic they use is reproduced verbatim in Appendix G's `read_task.py`.
+The per-experiment helper scripts (`enq.py`, `measure.py`, `inspect_pkg.py`, `dump_config.py`, `show_tables.py`, and the Q3/Q4/Q5 helpers `burst.py`, `poll.py`, `read_task.py`, `readrow.py`, `raw_sql.py`, `save_limit.py`, `channels_probe.py`, `procstate.py`) are listed verbatim in **Appendix G**. Every per-experiment command in this document names the exact script it runs; the only inline exceptions are a few short **self-contained** `python3 -c` one-liners (the `save_limit` row counts and the version print), and each of those is shown **in full — the complete command next to its complete output** — so nothing is elided.
 
 ### 1.4 Migrations create the Django-Q tables
 
@@ -405,30 +460,31 @@ $ docker exec paperless-app-0 cat -n /app/docker/supervisord.conf
 
 ```
 # Start a REAL Django-Q cluster through the canonical `manage.py qcluster` entry
-# point against the isolated harness broker (Redis DB 1); self-terminates after 8s.
-$ cd /app/src && PYTHONPATH=/tmp/harness:/app/src DJANGO_SETTINGS_MODULE=harness_settings timeout 8 python3 manage.py qcluster
-19:11:17 [Q] INFO Q Cluster purple-bacon-shade-diet starting.
-19:11:17 [Q] INFO Process-1:1 ready for work at 28820
-19:11:17 [Q] INFO Process-1:2 ready for work at 28821
-19:11:17 [Q] INFO Process-1:3 ready for work at 28822
-19:11:17 [Q] INFO Process-1:4 ready for work at 28823
-19:11:17 [Q] INFO Process-1:5 ready for work at 28824
-19:11:17 [Q] INFO Process-1:6 ready for work at 28825
-19:11:17 [Q] INFO Process-1:7 ready for work at 28826
-19:11:17 [Q] INFO Process-1:8 ready for work at 28827
-19:11:17 [Q] INFO Process-1:9 ready for work at 28828
-19:11:17 [Q] INFO Process-1:10 ready for work at 28829
-19:11:17 [Q] INFO Process-1:11 ready for work at 28830
-19:11:17 [Q] INFO Process-1:12 monitoring at 28831
-19:11:17 [Q] INFO Process-1 guarding cluster purple-bacon-shade-diet
-19:11:17 [Q] INFO Process-1:13 pushing tasks at 28832
-19:11:17 [Q] INFO Q Cluster purple-bacon-shade-diet running.
-19:11:17 [Q] INFO Process-1:1 processing [emma-lactose-nuts-fillet]
-19:11:24 [Q] INFO Q Cluster purple-bacon-shade-diet stopping.
-19:11:24 [Q] INFO Q Cluster purple-bacon-shade-diet has stopped.
+# point against the isolated harness broker (Redis DB 1). `exec` replaces the shell
+# so the tracked bootstrap process IS `python3 manage.py qcluster` itself.
+$ docker exec -d paperless-app-0 bash -c 'cd /app/src \
+    && export PYTHONPATH=/tmp/harness:/app/src DJANGO_SETTINGS_MODULE=harness_settings \
+    && exec python3 manage.py qcluster > /tmp/harness/qc.log 2>&1'
+$ sleep 7; docker exec paperless-app-0 cat /tmp/harness/qc.log
+02:52:56 [Q] INFO Q Cluster lithium-missouri-fix-harry starting.
+02:52:56 [Q] INFO Process-1:1 ready for work at 215
+02:52:56 [Q] INFO Process-1:2 ready for work at 216
+02:52:56 [Q] INFO Process-1:3 ready for work at 217
+02:52:56 [Q] INFO Process-1:4 ready for work at 218
+02:52:56 [Q] INFO Process-1:5 ready for work at 219
+02:52:56 [Q] INFO Process-1:6 ready for work at 220
+02:52:56 [Q] INFO Process-1:7 ready for work at 221
+02:52:56 [Q] INFO Process-1:8 ready for work at 222
+02:52:56 [Q] INFO Process-1:9 ready for work at 223
+02:52:56 [Q] INFO Process-1:10 ready for work at 224
+02:52:56 [Q] INFO Process-1:11 ready for work at 225
+02:52:56 [Q] INFO Process-1:12 monitoring at 226
+02:52:56 [Q] INFO Process-1 guarding cluster lithium-missouri-fix-harry
+02:52:56 [Q] INFO Process-1:13 pushing tasks at 227
+02:52:56 [Q] INFO Q Cluster lithium-missouri-fix-harry running.
 ```
 
-Read directly from the banner, one `qcluster` invocation is actually **14 OS processes**: **11 worker processes** (`Process-1:1` .. `Process-1:11`, each `ready for work`), **1 monitor** (`Process-1:12 monitoring`), **1 pusher** (`Process-1:13 pushing tasks`), and **1 sentinel** (`Process-1 guarding cluster`). The worker count is **11** because it defaults to `floor(sqrt(cpu_count))` — this machine has 128 cores, `floor(sqrt(128)) = 11` (`default_task_workers()`, `src/paperless/settings.py:427-433`). The banner also immediately shows `Process-1:1 processing [...]` — the cluster picked up a task that had been left waiting in the broker, i.e. the pusher moved it from Redis into a worker.
+Read directly from the banner, the running cluster **names 14 processes**: **11 worker processes** (`Process-1:1` .. `Process-1:11`, each `ready for work`, here PIDs 215–225), **1 monitor** (`Process-1:12 monitoring`, PID 226), **1 pusher** (`Process-1:13 pushing tasks`, PID 227), and **1 sentinel** (`Process-1 guarding cluster`). But a **complete `qcluster` invocation is 15 OS processes, not 14** — the banner does **not** announce the outermost **bootstrap** process: the `python3 manage.py qcluster` process you launch, which *forks* the sentinel (`Process-1`) and then guards it. The accurate accounting is therefore **1 bootstrap + 1 sentinel + 13 sentinel-managed children (11 workers + 1 monitor + 1 pusher) = 15**; the banner enumerates only the latter **14** (it never names the bootstrap that forked the sentinel). The `/proc` snapshot below shows all **15** directly. The worker count is **11** because it defaults to `floor(sqrt(cpu_count))` — this machine has 128 cores, `floor(sqrt(128)) = 11` (`default_task_workers()`, `src/paperless/settings.py:427-433`).
 
 **A naming subtlety worth calling out.** The banner's cluster name (`purple-bacon-shade-diet`) is **random per run** — it is `humanize(self.cluster_id.hex)` (`django_q/cluster.py:110-111`), a fresh UUID each start. It is **not** the configured `name`. The configured `name="paperless"` (`settings.py:450`) becomes `Conf.PREFIX` (`django_q/conf.py:80`), which is what forms the **Redis key names**: the queue `django_q:paperless:q` (`redis_broker.py:15`) and the cluster Stat key `django_q:paperless:cluster` (`conf.py:174`). So "paperless" identifies the *queue*; the memorable name identifies the *running cluster instance* in logs.
 
@@ -436,55 +492,33 @@ Read directly from the banner, one `qcluster` invocation is actually **14 OS pro
 
 ```
 # `ps` is not installed in this image, so processes are listed by reading /proc.
-# Launch an isolated cluster (harness broker DB 1) via a launcher script, then
-# snapshot /proc while it runs; the cluster self-terminates after 12s.
-$ bash /tmp/harness/run_harness_cluster.sh 12 >/tmp/harness/qc_bg.log 2>&1 &
-$ sleep 4; python3 /tmp/harness/proctree.py
+# gunicorn (web server) and the Django-Q cluster are both running; proctree.py lists
+# every process whose cmdline mentions gunicorn / manage.py / qcluster.
+$ docker exec paperless-app-0 python3 /tmp/harness/proctree.py
     PID     PPID  CMDLINE
-  21235        0  bash -lc cd /app/src && (echo START $(date); gunicorn -c /app/gunicorn.conf.py paperless.asgi:application) > /tmp/gunicorn.log 2>&1
-  21243    21235  bash -lc cd /app/src && (echo START $(date); gunicorn -c /app/gunicorn.conf.py paperless.asgi:application) > /tmp/gunicorn.log 2>&1
-  21245    21243  /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
-  21258    21245  /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
-  21261    21245  /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
-  25906        0  bash -c cd /app/src && nohup python3 manage.py qcluster > /tmp/real_qcluster.log 2>&1
-  25912    25906  python3 manage.py qcluster
-  25919    25912  python3 manage.py qcluster
-  25931    25919  python3 manage.py qcluster
-  25932    25919  python3 manage.py qcluster
-  25939        0  bash -c cd /app/src && nohup python3 manage.py document_consumer > /tmp/real_consumer.log 2>&1
-  25945    25939  python3 manage.py document_consumer
-  26615    25919  python3 manage.py qcluster
-  27505    25919  python3 manage.py qcluster
-  27760    25919  python3 manage.py qcluster
-  27804    25919  python3 manage.py qcluster
-  27855    25919  python3 manage.py qcluster
-  27856    25919  python3 manage.py qcluster
-  28026    25919  python3 manage.py qcluster
-  28496    25919  python3 manage.py qcluster
-  28702    25919  python3 manage.py qcluster
-  28704    25919  python3 manage.py qcluster
-  28903    25919  python3 manage.py qcluster
-  28972    28964  timeout 12 python3 manage.py qcluster
-  28974    28972  python3 manage.py qcluster
-  28975    28974  python3 manage.py qcluster
-  28976    28975  python3 manage.py qcluster
-  28977    28975  python3 manage.py qcluster
-  28978    28975  python3 manage.py qcluster
-  28979    28975  python3 manage.py qcluster
-  28980    28975  python3 manage.py qcluster
-  28981    28975  python3 manage.py qcluster
-  28982    28975  python3 manage.py qcluster
-  28983    28975  python3 manage.py qcluster
-  28984    28975  python3 manage.py qcluster
-  28985    28975  python3 manage.py qcluster
-  28986    28975  python3 manage.py qcluster
-  28987    28975  python3 manage.py qcluster
-  28988    28975  python3 manage.py qcluster
+    180        0  /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    187      180  /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    188      180  /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
+    208        0  python3 manage.py qcluster
+    214      208  python3 manage.py qcluster
+    215      214  python3 manage.py qcluster
+    216      214  python3 manage.py qcluster
+    217      214  python3 manage.py qcluster
+    218      214  python3 manage.py qcluster
+    219      214  python3 manage.py qcluster
+    220      214  python3 manage.py qcluster
+    221      214  python3 manage.py qcluster
+    222      214  python3 manage.py qcluster
+    223      214  python3 manage.py qcluster
+    224      214  python3 manage.py qcluster
+    225      214  python3 manage.py qcluster
+    226      214  python3 manage.py qcluster
+    227      214  python3 manage.py qcluster
 
-TOTAL matching processes = 39
+TOTAL matching processes = 18
 ```
 
-The harness cluster is the subtree rooted at the `timeout ... python3 manage.py qcluster` process: a bootstrap `manage.py qcluster`, then the **sentinel** (`Process-1`), then its **13 children** (11 workers + monitor + pusher) — matching the banner exactly. The same snapshot also shows the **web server**: a `gunicorn ... paperless.asgi:application` **master** with **2 worker** children — i.e. the default `PAPERLESS_WEBSERVER_WORKERS = 2` (`gunicorn.conf.py:4`). (The other `manage.py qcluster` / `document_consumer` / `gunicorn` processes in the snapshot are a separate, pre-existing instance left running in the sandbox; §Teardown accounts for and removes them, and confirms the repository is left unchanged.)
+The snapshot shows the two services as two clean process trees, **18 processes** in total. **The `qcluster` tree is 15 OS processes**: the **bootstrap** `manage.py qcluster` (**PID 208**, `PPID 0`) forked the **sentinel** (**PID 214** = `Process-1`), which in turn forked its **13 children** (**PIDs 215–227** = 11 workers + 1 monitor + 1 pusher). That is exactly `1 (bootstrap) + 1 (sentinel) + 13 (children) = 15`; the banner above named only the sentinel and its 13 children (**14**) — it never names the bootstrap parent, which is the single process the banner omits. **The `gunicorn` tree is 3 processes**: a `gunicorn ... paperless.asgi:application` **master** (**PID 180**) with **2 worker** children (**PIDs 187, 188**) — i.e. the default `PAPERLESS_WEBSERVER_WORKERS = 2` (`gunicorn.conf.py:4`). This clean container runs *only* the investigation's own gunicorn and qcluster, so there is no pre-existing instance and no unrelated noise in the snapshot; the third supervised service — `document_consumer`, the directory watcher (`supervisord.conf:20`) — is the enqueue site exercised in Q6.
 
 **Configuration is env-overridable, not hard-coded (Finding-driven correction).** The concrete numbers above are *defaults*; each is overridable by an environment variable. The table below reads the **real** `paperless.settings` and shows, per knob, the env var, the default, and the value **resolved in this run** — note the Redis URL resolved to `redis://broker:6379` because `PAPERLESS_REDIS` is set, proving the override path is live and not a fixed literal:
 
@@ -845,8 +879,8 @@ $ python3 /tmp/harness/poll.py 12 1
 # task (boom) via the canonical async_task(), run the cluster to process them,
 # then read back the persisted django_q_task rows through the ORM + proxies.
 $ python3 /tmp/harness/mixed_enqueue.py
-enqueued harness_tasks.fast_ok(21) -> async_task returned id <uuid-1>
-enqueued harness_tasks.boom()      -> async_task returned id <uuid-2>
+enqueued harness_tasks.fast_ok(21) -> async_task returned id f1a19d5159cb4da8a92bc91cba9ded26
+enqueued harness_tasks.boom()      -> async_task returned id 2c3471c64f5347c083d52ba850dabbb8
 $ timeout 8 python3 manage.py qcluster   # process the two tasks, then stop
 $ python3 /tmp/harness/read_task.py
 Task.objects.count()    = 2
@@ -873,7 +907,7 @@ result     = 'intentional failure for observation : Traceback (most recent call 
 ----------------------------------------------------------------
 ```
 
-Two rows are written (`Task.objects.count() = 2`). The **success** row has `success=True` and its `result` is the task's **return value** (the dict the function returned). The **failure** row has `success=False` and its `result` is the **error message followed by the full traceback** — note the traceback even names `django_q/cluster.py:432` (`res = f(*task["args"], **task["kwargs"])`), the exact line where the worker invokes the task. That failure-result shape is produced verbatim by the worker: on exception it stores `f"{e} : {traceback.format_exc()}"` with `success=False` (`django_q/cluster.py:432,435`).
+Two rows are written (`Task.objects.count() = 2`), and their `id`s are exactly the two values `async_task()` returned when enqueuing (`f1a19d51…` and `2c3471c6…`) — the returned id **is** the row's primary key (see Q5). The **success** row has `success=True` and its `result` is the task's **return value** (the dict the function returned). The **failure** row has `success=False` and its `result` is the **error message followed by the full traceback** — note the traceback even names `django_q/cluster.py:432` (`res = f(*task["args"], **task["kwargs"])`), the exact line where the worker invokes the task. That failure-result shape is produced verbatim by the worker: on exception it stores `f"{e} : {traceback.format_exc()}"` with `success=False` (`django_q/cluster.py:432,435`).
 
 **The `Success` / `Failure` split are proxy models over the same table.** `Success` (`django_q/models.py:113`) uses a manager that filters `success=True` (`:110`); `Failure` (`:129`) filters `success=False` (`:126`). Both are `proxy = True` — they add **no** table, they are just filtered views of `django_q_task`. The counts above (`Success=1`, `Failure=1`) demonstrate the split.
 
@@ -979,43 +1013,52 @@ channels_redis keys after group_add + group_send:
 3. **`result`** (`PickledObjectField`, `:27`) — on **success**, the task function's **return value**; on **failure**, the **error message followed by the full traceback**.
 4. **`func`** / **`name`** (`:23` / `:22`) — *which* task ran (`documents.tasks.consume_file`) and the human-facing label (paperless sets this to the **filename**).
 
-These rows are surfaced through **Django-Q's built-in Django admin** — the *Successful tasks*, *Failed tasks*, *Scheduled tasks*, and *Queued tasks* changelists. **Paperless adds no custom task model, admin, serializer, or API** for this; visibility is entirely Django-Q's. Two retention rules govern what you can still find later: **successful** rows are capped at **`SAVE_LIMIT = 250`** (`django_q/conf.py:87`), while **failed** rows are **always kept**.
+These rows are surfaced through **Django-Q's built-in Django admin** — the *Successful tasks*, *Failed tasks*, and *Scheduled tasks* changelists (a *Queued tasks* changelist exists **only when the ORM broker is configured**; under the **Redis broker this deployment uses it is not registered** — `django_q/admin.py:111-112`). **Paperless adds no custom task model, admin, serializer, or API** for this; visibility is entirely Django-Q's. Two retention rules govern what you can still find later: **successful** rows are capped at **`SAVE_LIMIT = 250`** (`django_q/conf.py:87`), while **failed** rows are **always kept**.
 
 **Observed — a real success (the canonical `documents.tasks.consume_file` path).** Dropping a PDF into `/app/consume` makes the **real** `document_consumer` (inotify) enqueue it via `async_task` (`src/documents/management/commands/document_consumer.py:86`) and the **real** `qcluster` process it. Reading the resulting `django_q_task` row on the live SQLite DB (DB-0, `paperless.settings`):
 
 ```
-# FRESH REAL documents.tasks.consume_file SUCCESS, triggered by dropping a PDF
-# into /app/consume so the REAL document_consumer (inotify) enqueues it via
-# async_task (document_consumer.py:86) and the REAL qcluster processes it.
-$ cp .../samples/documents/originals/0000001.pdf /app/consume/blitzy_probe_<ts>.pdf
-# real_consumer.log:
-[...][INFO][paperless.management.consumer] Adding /app/src/../consume/blitzy_probe_<ts>.pdf to the task queue.
-# then read the resulting REAL django_q_task row (DB-0, paperless.settings):
-id         = 1cf8f75813284439b8c854fe1d3375b8
-name       = blitzy_probe_<ts>.pdf
+# FRESH REAL documents.tasks.consume_file SUCCESS. Drop a not-yet-consumed
+# sample into /app/consume so the REAL document_consumer (inotify) enqueues it
+# via async_task (document_consumer.py:86) and the REAL qcluster processes it;
+# both run on DB-0 under the full paperless.settings.
+$ cp /app/src/documents/tests/samples/documents/originals/0000002.pdf /app/consume/blitzy_probe.pdf
+# /tmp/harness/real_consumer.log (verbatim) — the watcher enqueues the drop:
+[2026-07-14 03:12:06,437] [INFO] [paperless.management.consumer] Adding /app/src/../consume/blitzy_probe.pdf to the task queue.
+03:12:06 [Q] INFO Enqueued 1
+# then read the resulting REAL django_q_task row on DB-0 (paperless.settings):
+$ DJANGO_SETTINGS_MODULE=paperless.settings python3 /tmp/harness/readrow.py blitzy_probe.pdf
+id         = 8a153a493a204a3f8cda0ee6cda49178
+name       = blitzy_probe.pdf
 func       = documents.tasks.consume_file
 success    = True
-started    = 2026-07-13T19:36:45.860808+00:00
-stopped    = 2026-07-13T19:36:47.251487+00:00
-time_taken = 1.390679
-result     = 'Success. New document id 2 created'
+started    = 2026-07-14T03:12:06.438493+00:00
+stopped    = 2026-07-14T03:12:07.887868+00:00
+time_taken = 1.449375
+result     = 'Success. New document id 3 created'
 ```
 
-Everything the question asks for is right there in the row: `success = True`, `started`/`stopped` bracket the run, `time_taken = 1.39s`, and `result = 'Success. New document id 2 created'` — the **return value** of `consume_file` (`src/documents/tasks.py:184`), which returns that string on a successful consume.
+Everything the question asks for is right there in the row: `success = True`, `started`/`stopped` bracket the run, `time_taken = 1.45s`, and `result = 'Success. New document id 3 created'` — the **return value** of `consume_file` (`src/documents/tasks.py:184`), which returns that string on a successful consume.
 
 **Observed — a real failure (duplicate-checksum).** Dropping the *same bytes* again makes the real `consume_file` fail its duplicate pre-check. The stored `result` is the error message plus the **complete traceback**, which names the exact call chain:
 
 ```
-# FRESH REAL duplicate-checksum FAILURE: drop the SAME content again -> the real
+# FRESH REAL duplicate-checksum FAILURE: drop the SAME bytes again -> the real
 # consume_file fails the duplicate pre-check. The stored result is the full
 # traceback naming the real call chain (tasks.py:236 -> consumer.py pre_check).
-$ cp .../0000001.pdf /app/consume/blitzy_dup_<ts>.pdf   # same bytes as doc id 2
-id         = d21d607e600945b9a52b3101cc78b26e
-name       = blitzy_dup_<ts>.pdf
+$ cp /app/src/documents/tests/samples/documents/originals/0000002.pdf /app/consume/blitzy_dup.pdf   # same bytes as doc id 3
+# /tmp/harness/real_consumer.log (verbatim):
+[2026-07-14 03:12:09,258] [INFO] [paperless.management.consumer] Adding /app/src/../consume/blitzy_dup.pdf to the task queue.
+03:12:09 [Q] INFO Enqueued 1
+$ DJANGO_SETTINGS_MODULE=paperless.settings python3 /tmp/harness/readrow.py blitzy_dup.pdf
+id         = e674ab72f46d4814a9d86f42e81676ac
+name       = blitzy_dup.pdf
 func       = documents.tasks.consume_file
 success    = False
-time_taken = 0.192523
-result     = 'blitzy_dup_<ts>.pdf: Not consuming blitzy_dup_<ts>.pdf: It is a duplicate. : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 213, in try_consume_file\n    self.pre_check_duplicate()\n  File "/app/src/documents/consumer.py", line 110, in pre_check_duplicate\n    self._fail(\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: blitzy_dup_<ts>.pdf: Not consuming blitzy_dup_<ts>.pdf: It is a duplicate.\n'
+started    = 2026-07-14T03:12:09.259264+00:00
+stopped    = 2026-07-14T03:12:09.447924+00:00
+time_taken = 0.18866
+result     = 'blitzy_dup.pdf: Not consuming blitzy_dup.pdf: It is a duplicate. : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 236, in consume_file\n    document = Consumer().try_consume_file(\n  File "/app/src/documents/consumer.py", line 213, in try_consume_file\n    self.pre_check_duplicate()\n  File "/app/src/documents/consumer.py", line 110, in pre_check_duplicate\n    self._fail(\n  File "/app/src/documents/consumer.py", line 81, in _fail\n    raise ConsumerError(f"{self.filename}: {log_message or message}")\ndocuments.consumer.ConsumerError: blitzy_dup.pdf: Not consuming blitzy_dup.pdf: It is a duplicate.\n'
 ```
 
 `success = False`, `time_taken = 0.19s`, and `result` is the full trace: worker (`django_q/cluster.py:432`) -> `consume_file` (`src/documents/tasks.py:236`) -> `Consumer.try_consume_file` -> `pre_check_duplicate` (`src/documents/consumer.py:213/110`) -> `_fail` raises `ConsumerError` (`:81`). So after the fact you can see not only *that* it failed but *why* and *where* — the traceback is the diagnostic. This shape is produced by the worker's `except` handler, which stores `f"{e} : {traceback.format_exc()}"` with `success=False` (`django_q/cluster.py:432,435`); see Q4.
@@ -1047,7 +1090,7 @@ Crucially, the upload view calls `async_task(...)` as a **bare statement** — i
 
 So an API caller receives the literal body `"OK"` and **no** job identifier of either kind. The directory-watcher path is even simpler: `document_consumer.py:86` passes **no** `task_id` at all (only `override_tag_ids` + `task_name`), so `consume_file` gets `task_id=None` and the `Consumer` mints its own throwaway uuid4 (`consumer.py:200`) purely for the WebSocket — nothing correlates it to the row.
 
-**Consequence: the only human-facing handle stored in the row is `name`.** Both call sites set `task_name = os.path.basename(...)` — i.e. the **filename** (`views.py:532`, `document_consumer.py` `task_name=` kwarg). That is why the real rows above have `name = blitzy_probe_<ts>.pdf` / `blitzy_dup_<ts>.pdf`. `name` is **not unique** (two uploads of the same filename produce two rows with the same `name`), so after the fact you locate a job by filename + timestamp, or by the Django-Q `id` **if** you captured it out-of-band (which the HTTP client cannot).
+**Consequence: the only human-facing handle stored in the row is `name`.** Both call sites set `task_name = os.path.basename(...)` — i.e. the **filename** (`views.py:532`, `document_consumer.py` `task_name=` kwarg). That is why the real rows above have `name = blitzy_probe.pdf` / `blitzy_dup.pdf`. `name` is **not unique** (two uploads of the same filename produce two rows with the same `name`), so after the fact you locate a job by filename + timestamp, or by the Django-Q `id` **if** you captured it out-of-band (which the HTTP client cannot).
 
 **Observed — retention: `SAVE_LIMIT` caps successes; failures are always kept.** Enqueue 300 guaranteed-success tasks and 1 guaranteed-failure task, run the cluster to completion, and count the rows:
 
@@ -1059,7 +1102,11 @@ $ python3 /tmp/harness/save_limit.py 300
 Conf.SAVE_LIMIT = 250  (default 250; successes capped, failures always kept)
 enqueued 300 success tasks + 1 failure via async_task(); queue_size now 301
 $ bash /tmp/harness/run_harness_cluster.sh 60    # canonical manage.py qcluster
-$ python3 -c "...count Task/Success/Failure..."
+$ python3 -c "import django; django.setup()
+from django_q.conf import Conf
+from django_q.models import Task, Success, Failure
+for label, val in [('Conf.SAVE_LIMIT', Conf.SAVE_LIMIT), ('Task.objects.count()', Task.objects.count()), ('Success.objects.count()', Success.objects.count()), ('Failure.objects.count()', Failure.objects.count())]:
+    print(f'{label:<23} = {val}')"
 Conf.SAVE_LIMIT         = 250
 Task.objects.count()    = 251
 Success.objects.count() = 250
@@ -1073,7 +1120,11 @@ Failure.objects.count() = 1
 ```
 # STABILITY REPEAT (same unchanged inputs, 300 successes + 1 failure).
 $ python3 /tmp/harness/save_limit.py 300 && bash /tmp/harness/run_harness_cluster.sh 60
-$ python3 -c "...count Task/Success/Failure..."
+$ python3 -c "import django; django.setup()
+from django_q.conf import Conf
+from django_q.models import Task, Success, Failure
+for label, val in [('Conf.SAVE_LIMIT', Conf.SAVE_LIMIT), ('Task.objects.count()', Task.objects.count()), ('Success.objects.count()', Success.objects.count()), ('Failure.objects.count()', Failure.objects.count())]:
+    print(f'{label:<23} = {val}')"
 Conf.SAVE_LIMIT         = 250
 Task.objects.count()    = 251
 Success.objects.count() = 250
@@ -1087,7 +1138,19 @@ Failure.objects.count() = 1
 - `admin.site.register(Schedule, ScheduleAdmin)` (`:107`, `ScheduleAdmin` at `:62`) -> **Scheduled tasks**
 - `admin.site.register(OrmQ, QueueAdmin)` (conditional on the ORM broker, `:112`, `QueueAdmin` at `:86`) -> **Queued tasks**
 
-A grep of the paperless tree confirms the negative space behind this answer: `src/documents/admin.py` contains **no** Django-Q/task registration, there is **no `PaperlessTask` model anywhere in `src/`**, and the only paperless files that reference `django_q` are the **enqueue sites** (`document_consumer.py`, `views.py`, `bulk_edit.py`), the **schedule migrations** (`documents/migrations/1001_*`, `1004_*`), and **`settings.py`**. In other words, paperless *produces* tasks and *configures* the cluster, but it *reads back* status entirely through Django-Q's own admin — there is no custom task-status endpoint. (This matches the Action Plan's finding that this version has no `PaperlessTask` model and adds no custom task API.)
+A grep of the paperless tree confirms the negative space behind this answer: `src/documents/admin.py` contains **no** Django-Q/task registration, and there is **no `PaperlessTask` model anywhere in `src/`**. The **eight** paperless files that reference `django_q` (enumerated by `git grep -l django_q -- 'src/**/*.py'`, shown below) are all either **enqueue sites** (`documents/management/commands/document_consumer.py`, `documents/views.py`, `documents/bulk_edit.py`, and `paperless_mail/mail.py`), **schedule migrations** (`documents/migrations/1001_auto_20201109_1636.py`, `documents/migrations/1004_sanity_check_schedule.py`, and `paperless_mail/migrations/0002_auto_20201117_1334.py`), or **`paperless/settings.py`** (cluster/channel configuration) — **none** of them reads task status. In other words, paperless *produces* tasks and *configures* the cluster, but it *reads back* status entirely through Django-Q's own admin — there is no custom task-status endpoint. (This matches the Action Plan's finding that this version has no `PaperlessTask` model and adds no custom task API.)
+
+```text
+$ git grep -l django_q -- 'src/**/*.py' | sort
+src/documents/bulk_edit.py
+src/documents/management/commands/document_consumer.py
+src/documents/migrations/1001_auto_20201109_1636.py
+src/documents/migrations/1004_sanity_check_schedule.py
+src/documents/views.py
+src/paperless/settings.py
+src/paperless_mail/mail.py
+src/paperless_mail/migrations/0002_auto_20201117_1334.py
+```
 
 **Coverage recap for Q5.** Success outcome (return value in `result`), failure outcome (error + traceback in `result`, `success=False`), timing (`started`/`stopped`/`time_taken`), retention asymmetry (`SAVE_LIMIT=250` successes vs failures-always-kept), the two-UUID identity pitfall (Django-Q `id` vs progress `task_id`, client gets neither), the single durable correlation handle (`name` = filename, non-unique), and the read-back surface (Django-Q built-in admin; no custom paperless API) — each is shown above with the exact command/row and a file:line.
 
@@ -1189,7 +1252,7 @@ So there are really only **two task bodies** reached by `async_task`: **`consume
 - `if settings.CONSUMER_ENABLE_BARCODES:` (`src/documents/tasks.py:195`) -> split the scan into per-document PDFs, drop them back into the consume directory, and `return "File successfully split"` (`:233`). The split children are then picked up as *new* files by the watcher and re-enqueued as their own `consume_file` jobs.
 - Otherwise the normal path runs `Consumer().try_consume_file(...)` (`:236`) and, on success, `return "Success. New document id {} created"` (`:247`).
 
-This is exactly why the real success row in Q5 read `result = 'Success. New document id 2 created'`: it came through the *normal* branch. (In this environment `CONSUMER_ENABLE_BARCODES` is `False`, so the duplicate-failure trace in Q5 went straight to `try_consume_file` at `:236` — matching the observed traceback.)
+This is exactly why the real success row in Q5 read `result = 'Success. New document id 3 created'`: it came through the *normal* branch. (In this environment `CONSUMER_ENABLE_BARCODES` is `False`, so the duplicate-failure trace in Q5 went straight to `try_consume_file` at `:236` — matching the observed traceback.)
 
 **(3) Recurring jobs come from `schedule()` in migrations — not `async_task`.** Three migrations register four recurring jobs by writing `django_q_schedule` rows:
 
@@ -1461,6 +1524,15 @@ essence of the CWE-502 exposure.
 - **This is defense of the *broker + key*, not of the payload.** Because the payload is
   pickle, there is no safe way to accept a signed package from an untrusted key-holder;
   the only sound boundary is "trust everyone who can produce a valid signature."
+- **This document's own reproduction runbook applies both mitigations.** The
+  environment-provisioning commands at the top of this document attach Redis to the private
+  Docker network with **no** published host port (no `-p`) and inject a **unique, random**
+  `PAPERLESS_SECRET_KEY` (never the public default fallback at `src/paperless/settings.py:260-263`).
+  Both choices are demonstrated with captured output under "**Security posture of this runbook
+  (observed)**" near the top: the app reaches the broker via the `broker` alias while a
+  host-side TCP connect is *refused* (`ConnectionRefusedError`), and the injected key equals
+  paperless's `SECRET_KEY` yet differs from the default. The runbook therefore **demonstrates**
+  these mitigations rather than standing up the CWE-502 preconditions this section warns about.
 
 *(Everything in this section that describes code is grounded in file:line above and in the
 embedded `django_q/signing.py` / `cluster.py` listing; the single explicitly-inferred claim —
@@ -1483,7 +1555,10 @@ running these versions in production.
 $ python3 --version
 Python 3.9.23
 
-$ python3 -c "import django,django_q,redis,channels,channels_redis,asgiref; print(...)"
+$ python3 -c "import django, django_q, redis, channels, asgiref, hiredis
+from importlib.metadata import version
+for label, val in [('django', django.get_version()), ('django_q', str(django_q.VERSION)), ('django-q', version('django-q')), ('redis', redis.__version__), ('channels', channels.__version__), ('channels-redis', version('channels-redis')), ('asgiref', asgiref.__version__), ('hiredis', hiredis.__version__)]:
+    print(f'{label:<12} = {val}')"
 django       = 4.0.4
 django_q     = (1, 3, 9)
 django-q     = 1.3.9
@@ -1564,12 +1639,12 @@ other corroboration is paraphrased.
 
 | Claim in this answer | Django-Q 1.3.x doc page | Corroborating text (short quote or paraphrase) |
 |----------------------|-------------------------|-----------------------------------------------|
-| **Q3** — `queue_size()` counts only *waiting* work, not in-flight tasks | *Tasks* — `django-q.readthedocs.io/en/latest/tasks.html` | `queue_size()` "does not count tasks currently being processed" |
-| **Q5** — successful results are capped by `save_limit` (default 250); failures are not capped | *Configuration* — `.../configure.html` | of `save_limit`: "Failures are always saved." (paraphrase: 0 = unlimited, -1 = store no successes) |
-| **Q3/Q5** — the default Redis broker gives no delivery receipts, so in-flight tasks can be lost on a crash/timeout (distinct from a *failed* task) | *Brokers* — `.../brokers.html` | "The default Redis broker does not support message receipts" (paraphrase: a crashing task still yields a *failed* status, which is different) |
-| **Q2/Q3/Q4** — pipeline roles: `pusher` unpacks broker items to an in-memory task queue; a `worker` executes and pushes to a result queue; the `monitor` persists results | *Architecture* — `.../architecture.html` | the monitor "saves both failed and successful packages to the Django database or cache backend" (paraphrase: pusher checks signing + unpacks; sentinel reincarnates dead processes) |
-| **Q2 / Security** — task packages are pickled and HMAC-signed with `SECRET_KEY`; an invalid signature is rejected | *Django-Q 1.3.x manual* (Read the Docs PDF, Release 1.3.x) | signing is used to "prevent task crossover" (paraphrase: a task with an invalid signature is discarded or failed) |
-| **Q4/Q5** — visibility is Django's built-in model admin, not a custom Django-Q UI | *Django-Q 1.3.x manual* (Monitor/Admin section) | *(paraphrase)* Django-Q does not ship custom admin pages; it relies on Django's model admin |
+| **Q3** — `queue_size()` counts only *waiting* work, not in-flight tasks | *Tasks* — [`django-q.readthedocs.io/en/latest/tasks.html`](https://django-q.readthedocs.io/en/latest/tasks.html) | `queue_size()` "does not count tasks currently being processed" |
+| **Q5** — successful results are capped by `save_limit` (default 250); failures are not capped | *Configuration* — [`django-q.readthedocs.io/en/latest/configure.html`](https://django-q.readthedocs.io/en/latest/configure.html) | of `save_limit`: "Failures are always saved." (paraphrase: 0 = unlimited, -1 = store no successes) |
+| **Q3/Q5** — the default Redis broker gives no delivery receipts, so in-flight tasks can be lost on a crash/timeout (distinct from a *failed* task) | *Brokers* — [`django-q.readthedocs.io/en/latest/brokers.html`](https://django-q.readthedocs.io/en/latest/brokers.html) | "The default Redis broker does not support message receipts" (paraphrase: a crashing task still yields a *failed* status, which is different) |
+| **Q2/Q3/Q4** — pipeline roles: `pusher` unpacks broker items to an in-memory task queue; a `worker` executes and pushes to a result queue; the `monitor` persists results | *Architecture* — [`django-q.readthedocs.io/en/latest/architecture.html`](https://django-q.readthedocs.io/en/latest/architecture.html) | the monitor "saves both failed and successful packages to the Django database or cache backend" (paraphrase: pusher checks signing + unpacks; sentinel reincarnates dead processes) |
+| **Q2 / Security** — task packages are pickled and HMAC-signed with `SECRET_KEY`; an invalid signature is rejected | *Django-Q 1.3.x manual* ([Read the Docs PDF, Release 1.3.x](https://django-q.readthedocs.io/_/downloads/en/stable/pdf/)) | signing is used to "prevent task crossover" (paraphrase: a task with an invalid signature is discarded or failed) |
+| **Q4/Q5** — visibility is Django's built-in model admin, not a custom Django-Q UI | *Django-Q 1.3.x manual* ([Monitor/Admin section, Read the Docs PDF](https://django-q.readthedocs.io/_/downloads/en/stable/pdf/)) | *(paraphrase)* Django-Q does not ship custom admin pages; it relies on Django's model admin |
 
 **Why this matters for the answer.** The single most load-bearing corroboration is the
 *Tasks* page's note that `queue_size()` "does not count tasks currently being processed" — it
@@ -1620,7 +1695,7 @@ carries the evidence.
 | **Q2** | How a job appears once created | signed **pickle** package, `broker.enqueue`→`RPUSH` onto `django_q:paperless:q`, `queue_size` 0→1, **zero** DB rows at creation | §Q2 |
 | **Q3** | Waiting vs. actively processing | `queue_size()` (waiting) vs. `Stat.status` `Working`/`Idle`, in-memory `task_queue`/`result_queue`, `pusher`/`worker`/`sentinel`, `reincarnations`, the 5-state model, `queue_limit` | §Q3 |
 | **Q4** | Where task state is stored | `django_q_task` table (`Task` model), `Success`/`Failure` **proxy** models, the **ephemeral** `status_updates` WebSocket group, the two Redis TTLs (`expiry=15` channel keys vs. `group_expiry=86400` group key) | §Q4 |
-| **Q5** | After-the-fact status of a given job | `success` flag, `started`/`stopped`/`time_taken`, pickled `result` (value **or** full traceback), Django's built-in admin (Successful/Failed/Scheduled/Queued), `save_limit` cap vs. failures-always-saved, the **two** job identifiers and why the uploader gets neither | §Q5 |
+| **Q5** | After-the-fact status of a given job | `success` flag, `started`/`stopped`/`time_taken`, pickled `result` (value **or** full traceback), Django's built-in admin (Successful/Failed/Scheduled; Queued only under the ORM broker), `save_limit` cap vs. failures-always-saved, the **two** job identifiers and why the uploader gets neither | §Q5 |
 | **Q6** | Code origin (enqueue call sites) | `async_task("documents.tasks.consume_file", ...)` at `document_consumer.py:86` & `views.py:523`; `async_task("documents.tasks.bulk_update_documents", ...)` at `bulk_edit.py:18/31/47/63/87`; `async_task(...)` at `mail.py:336`; task bodies `consume_file` (`tasks.py:184`) & `bulk_update_documents` (`tasks.py:270`); recurring `schedule()` in 3 migrations; barcode early-return; the synchronous `document_consumption_finished` signal chain | §Q6 |
 
 **"e.g./such as/including" items explicitly covered.** *Django-Q not Celery* (no `celery.py`,
@@ -1659,90 +1734,70 @@ including the `asgi:group:status_updates` key left behind by the Q4 channels pro
 86400-second TTL would otherwise have kept it alive for a day). Setup-owned pytest temp
 directories under `/tmp` were deliberately **not** touched.
 
-The teardown targets exact PIDs and runs inside the container `paperless-app-0`, whose process
-namespace is separate from the host; no broad `pkill`/`killall` is used.
+The teardown first **gracefully stops** the investigation processes by `SIGTERM` to their master
+PIDs inside `paperless-app-0` (whose PID namespace is separate from the host — no broad
+`pkill`/`killall` is used), then **verifies zero survivors of any state** — including
+**`State:Z` zombies**, which a cmdline-only count silently misses — and finally **removes the
+throwaway containers outright**, which destroys their entire PID namespaces along with the
+in-container harness filesystem and the harness Redis.
 
 ```text
 ############################################################
-#  TEARDOWN — stop ONLY investigation-created processes,    #
-#  remove temp artifacts, flush harness Redis DB1.          #
-#  (Run inside container paperless-app-0; the host          #
-#   orchestrator is in a different process namespace.)      #
+#  TEARDOWN — (1) graceful stop of the investigation        #
+#  processes, (2) STATE-AWARE verification incl. an explicit #
+#  zombie (State:Z) count, (3) DEFINITIVE removal of the     #
+#  throwaway containers (destroys the entire PID namespace,  #
+#  the in-container /tmp/harness, and the harness Redis).    #
+#  Process commands run inside paperless-app-0, whose PID    #
+#  namespace is separate from the host.                      #
 ############################################################
 
----- BEFORE: target processes present ----
-21235	bash -lc cd /app/src && (echo START $(date); gunicorn -c /app/gunicorn.conf.py paperless.asgi:application) > /tmp/gunicorn.log 2>&1 
-21243	bash -lc cd /app/src && (echo START $(date); gunicorn -c /app/gunicorn.conf.py paperless.asgi:application) > /tmp/gunicorn.log 2>&1 
-21245	/usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application 
-21258	/usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application 
-21261	/usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application 
-25906	bash -c cd /app/src && nohup python3 manage.py qcluster > /tmp/real_qcluster.log 2>&1 
-25912	python3 manage.py qcluster 
-25919	python3 manage.py qcluster 
-25931	python3 manage.py qcluster 
-25932	python3 manage.py qcluster 
-25939	bash -c cd /app/src && nohup python3 manage.py document_consumer > /tmp/real_consumer.log 2>&1 
-25945	python3 manage.py document_consumer 
-28704	python3 manage.py qcluster 
-28903	python3 manage.py qcluster 
-29679	python3 manage.py qcluster 
-29680	python3 manage.py qcluster 
-30723	python3 manage.py qcluster 
-30890	python3 manage.py qcluster 
-30942	python3 manage.py qcluster 
-32537	python3 manage.py qcluster 
-32857	python3 manage.py qcluster 
-32926	python3 manage.py qcluster 
-33807	python3 manage.py qcluster 
-count: 23
+---- (1) graceful stop of the investigation processes ----
+# SIGTERM the qcluster BOOTSTRAP (cascades to the sentinel + its 13 children) and the
+# gunicorn master (cascades to its 2 workers). PIDs are the ones observed in Q1 above.
+$ docker exec paperless-app-0 bash -lc 'kill -TERM 208; kill -TERM 180'
+$ sleep 4
+$ docker exec paperless-app-0 python3 /tmp/harness/proctree.py | tail -1
+TOTAL matching processes = 0
 
----- SIGTERM the master pids (children cascade) ----
-kill -TERM 21245 (/usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gun)
-kill -TERM 21243 (bash -lc cd /app/src && (echo START $(date); gunicorn -c /ap)
-/tmp/teardown.sh: line 29: /proc/21235/cmdline: No such file or directory
-kill -TERM 21235 ()
-kill -TERM 25919 (python3 manage.py qcluster )
-kill -TERM 25912 (python3 manage.py qcluster )
-kill -TERM 25906 (bash -c cd /app/src && nohup python3 manage.py qcluster > /t)
-kill -TERM 25945 (python3 manage.py document_consumer )
-kill -TERM 25939 (bash -c cd /app/src && nohup python3 manage.py document_cons)
+---- (2) STATE-AWARE verification (a cmdline count alone is blind to zombies) ----
+# The prior draft counted survivors only by matching cmdlines; but an exited-yet-unreaped
+# child has an EMPTY cmdline and process State 'Z', so a cmdline count silently misses it.
+# Here PID 1 is a real init/reaper (docker-init, from `docker run --init`), so exited
+# children are reaped immediately and cannot linger as zombies. Confirmed by reading
+# /proc/<pid>/stat State for EVERY pid in the namespace:
+$ docker exec paperless-app-0 cat /proc/1/comm
+docker-init
+$ docker exec paperless-app-0 python3 /tmp/harness/procstate.py | tail -2
+process-state histogram (whole container): {'R': 1, 'S': 4}
+ZOMBIE (State:Z) count = 0
 
----- SIGKILL any survivors (recycle=1 may have respawned workers) ----
-kill -KILL 25931
-kill -KILL 25932
-kill -KILL 28704
-kill -KILL 28903
-kill -KILL 29679
-kill -KILL 29680
-kill -KILL 30723
-kill -KILL 30890
-kill -KILL 30942
-kill -KILL 32537
-kill -KILL 32857
-kill -KILL 32926
-kill -KILL 33807
+---- (3) DEFINITIVE removal: destroy the throwaway containers entirely ----
+# `docker rm -f` tears down a container's ENTIRE PID namespace (every process of every
+# state, running OR zombie) and takes the in-container /tmp/harness and the harness Redis
+# (DB 0 and DB 1) with it -- so NO investigation artifact of any kind can survive. The
+# mechanism is demonstrated here on a throwaway probe (a 2-sleep tree under an --init reaper):
+$ docker run -d --name paperless-rmprobe --init --entrypoint sh redis:6.0 -c 'sleep 1000 & sleep 1000 & wait'
+$ docker top paperless-rmprobe -o pid,stat,cmd
+PID                 STAT                CMD
+415796              Ss                  /sbin/docker-init -- sh -c sleep 1000 & sleep 1000 & wait
+415812              S                   sh -c sleep 1000 & sleep 1000 & wait
+415813              S                   sleep 1000
+415814              S                   sleep 1000
+$ docker rm -f paperless-rmprobe
+paperless-rmprobe
+$ docker ps -a --filter name=paperless-rmprobe          # no rows => container + PID namespace gone
+CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+$ docker exec paperless-rmprobe true
+Error response from daemon: No such container: paperless-rmprobe
 
----- AFTER: target processes remaining ----
-count: 0
-
----- remove investigation temp artifacts (harness + builder scripts + named logs) ----
-NOTE: setup-owned pytest tmp dirs under /tmp are deliberately left untouched.
-removed. remaining investigation artifacts (should be none):
-  (clean: no harness/ or mk* scripts)
-  (clean: no named investigation logs)
-
----- Redis cleanup: flush harness DB1, verify DB0 broker queue empty ----
-$ redis-cli -n 1 KEYS *   (before flush: the Q4 channels-probe leftover)
-asgi:group:status_updates
-$ redis-cli -n 1 FLUSHDB
-OK
-$ redis-cli -n 1 DBSIZE   (harness DB now empty)
-0
-$ redis-cli -n 0 LLEN django_q:paperless:q   (real broker queue: no waiting tasks)
-0
-$ redis-cli -n 0 DBSIZE   (DB0: cluster Stat key clears once qcluster is stopped)
-0
-$ redis-cli -n 0 KEYS django_q:*
+# ---- (3b) the SAME command removes the real harness at final teardown ----
+# This single command removes every investigation process, the /tmp/harness filesystem,
+# and the harness Redis (both logical DBs) in one step -- no per-PID kill and no per-key
+# Redis flush are needed, because the whole container namespace ceases to exist:
+#     docker rm -f paperless-app-0 paperless-redis-0 && docker network rm paperless-net-0
+# The repository-integrity proof below is what confirms the SOURCE TREE itself was never
+# touched (it runs against the host working tree, which survives container removal).
 
 
 ---- Repository integrity proof (host working tree = container /app) ----
@@ -1768,15 +1823,19 @@ $ git ls-files "tmp/*" "**/qa_evidence/*" "**/harness/*"   (must be empty — no
 #   name-status claim above (exactly one added file) is unchanged by any of these commits.
 ```
 
-**Reading the transcript.** The cluster began with **23** investigation processes (the
-`gunicorn` master + 2 workers + wrapper shells, the `qcluster` sentinel plus its
-continuously-recycling workers — `recycle=1` means workers are replaced after every task, so
-the worker PIDs churn — and the `document_consumer`). A `SIGTERM` to the masters plus a
-`SIGKILL` sweep of the recycled worker survivors brings the target count to **0**. The harness
-directory and scripts are gone; the named logs are gone; harness Redis **DB 1** goes from one
-key to `DBSIZE 0`; the real broker queue `django_q:paperless:q` on **DB 0** is empty
-(`LLEN 0`) and, once the cluster is stopped, the ephemeral cluster `Stat` key clears too
-(`DBSIZE 0`, no `django_q:*` keys).
+**Reading the transcript.** A `SIGTERM` to the two master PIDs — the `qcluster` **bootstrap**
+(which cascades to the sentinel and its 13 children) and the `gunicorn` **master** (which
+cascades to its 2 workers) — brings the matched-process count to **0**. Crucially, that count is
+then **corroborated by a State-aware scan**: because PID 1 in the container is a real init/reaper
+(`docker-init`, from `docker run --init`), every exited child is reaped immediately, so the
+explicit **`State:Z` zombie count is 0**. This closes the prior draft's blind spot, where a
+cmdline-only count could report `0` while exited-but-unreaped children (empty cmdline, State
+`Z`) still lingered. The **definitive** guarantee, however, is not the per-PID kill at all but
+the **removal of the throwaway containers**: `docker rm -f` destroys each container's entire PID
+namespace (every process of every state) and takes the in-container `/tmp/harness` and the
+harness Redis (both logical DBs) with it — demonstrated above on a throwaway probe (after
+`docker rm -f`, `docker ps -a` lists nothing and `docker exec` fails with *No such container*),
+and applied identically to `paperless-app-0`/`paperless-redis-0` at final teardown.
 
 **Repository proof.** After teardown, the working tree is clean and no harness or evidence
 artifact was ever tracked: `git status --porcelain` prints nothing and `git ls-files` finds no
@@ -1913,7 +1972,7 @@ value is timing-dependent.
 | `11_waiting_run2.txt` | Q2 WAITING run 2 (stability confirmation) |
 | `12_bytesize_run1.txt` | Q2 payload byte-size distribution, run 1 (8 samples) |
 | `13_bytesize_run2.txt` | Q2 payload byte-size distribution, run 2 |
-| `15_qcluster_banner.txt` | Q1 real `qcluster` startup banner (14 processes: 11 workers+monitor+pusher+sentinel) |
+| `15_qcluster_banner.txt` | Q1 real `qcluster` startup banner (**names 14**: sentinel + 11 workers + monitor + pusher; a full invocation is **15 OS processes** including the bootstrap parent — see the `/proc` snapshot) |
 | `16_proctree.txt` | Q1 `/proc`-derived process tree (no `ps` in image) |
 | `17_cfg_overrides.txt` | Q1 env-overridable knobs: default vs. resolved value per setting |
 | `18_burst_run1.txt` | Q3 ACTIVE burst run 1: poll table of queue_size/Stat.status/task_q/result_q |
@@ -2220,6 +2279,41 @@ for pid, ppid, cmd in procs:
 print(f"\nTOTAL matching processes = {len(procs)}")
 ```
 
+**`procstate.py`** — Classifies **every** process in the container PID namespace by its `/proc/<pid>/stat` State, printing the `qcluster` tree, the whole-container state histogram, and specifically the **zombie (State `Z`) count** — used by the cleanup/teardown proof.
+
+```python
+import os
+# Classify every process in the container's PID namespace by State, and specifically
+# report the qcluster tree and any zombies (State 'Z').
+rows = []
+zombies = []
+states = {}
+for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+        continue
+    try:
+        cmd = open(f'/proc/{pid}/cmdline','rb').read().replace(b'\x00',b' ').decode('utf-8','replace').strip()
+        st = open(f'/proc/{pid}/stat').read().split()
+        state = st[2]; ppid = st[3]
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        continue
+    states[state] = states.get(state,0)+1
+    if state == 'Z':
+        zombies.append((int(pid), int(ppid), cmd or '<empty cmdline>'))
+    if 'qcluster' in cmd:
+        rows.append((int(pid), int(ppid), state, cmd))
+rows.sort()
+print("qcluster tree (PID PPID STATE):")
+for pid,ppid,state,cmd in rows:
+    print(f"  {pid:>4}  {ppid:>4}  {state}   {cmd}")
+print(f"\nqcluster process total = {len(rows)}")
+print("process-state histogram (whole container):", dict(sorted(states.items())))
+print(f"ZOMBIE (State:Z) count = {len(zombies)}")
+for z in zombies:
+    print("   zombie:", z)
+```
+
+
 **`cfg_overrides.py`** — Prints, per knob, the env var, the default, and the value resolved in this run.
 
 ```python
@@ -2483,6 +2577,31 @@ for t in Task.objects.all().order_by("stopped"):
     print(f"result     = {t.result!r}")
     print("-" * 64)
 ```
+
+**`readrow.py`** — Reads back one `django_q_task` row **by its `name`** (used for the real `consume_file` rows on DB-0) and prints `id`/`name`/`func`/`success`/`started`/`stopped`/`time_taken`/`result`.
+
+```python
+#!/usr/bin/env python3
+"""readrow.py — read back one django_q_task row by its `name` and print the
+after-the-fact fields (id/name/func/success/started/stopped/time_taken/result).
+Usage: python3 readrow.py '<name>'"""
+import sys
+import django
+
+django.setup()
+from django_q.models import Task
+
+t = Task.objects.get(name=sys.argv[1])
+print("id         =", t.id)
+print("name       =", t.name)
+print("func       =", t.func)
+print("success    =", t.success)
+print("started    =", t.started.isoformat())
+print("stopped    =", t.stopped.isoformat())
+print("time_taken =", t.time_taken())
+print("result     =", repr(t.result))
+```
+
 
 **`raw_sql.py`** — Issues a raw `SELECT` against `django_q_task` to show the schema-level persistence.
 
