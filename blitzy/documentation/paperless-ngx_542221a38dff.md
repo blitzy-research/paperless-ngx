@@ -12,11 +12,11 @@ observed at runtime are explicitly labeled **(inferred)**.
 > **Task queue is django-q, not Celery.** Asynchronous work is dispatched with
 > `django_q.tasks.async_task` and scheduled work with `django_q.tasks.schedule`; both run in the
 > `qcluster` process. There is **no** `src/paperless/celery.py` at this commit (verified:
-> `ls src/paperless/celery.py` → *No such file or directory*).
+> `ls src/paperless/celery.py` → _No such file or directory_).
 >
 > **Version boundary.** The classifier here is the `FORMAT_VERSION = 7` variant
 > (`src/documents/classifier.py:63`). It has **no HMAC signing, no `StoragePath` classifier, and no
-> NLTK stemming**; those are features of *newer* paperless-ngx releases and are out of scope for this
+> NLTK stemming**; those are features of _newer_ paperless-ngx releases and are out of scope for this
 > commit.
 
 ---
@@ -44,11 +44,11 @@ application container (`pngx`) and a **Redis 6.0** broker container (`pngx-redis
 `docker/compose/docker-compose.sqlite.yml:28-29` (`broker: image: redis:6.0`). The three long-running
 programs match `docker/supervisord.conf` exactly:
 
-| Service | supervisord program | Command | Citation |
-|---|---|---|---|
-| Web server (ASGI) | `[program:gunicorn]` | `gunicorn -c … paperless.asgi:application` | `docker/supervisord.conf:10-11` |
-| Consume-dir watcher | `[program:consumer]` | `python3 manage.py document_consumer` | `docker/supervisord.conf:19-20` |
-| Worker + scheduler | `[program:scheduler]` | `python3 manage.py qcluster` | `docker/supervisord.conf:28-29` |
+| Service             | supervisord program   | Command                                    | Citation                        |
+| ------------------- | --------------------- | ------------------------------------------ | ------------------------------- |
+| Web server (ASGI)   | `[program:gunicorn]`  | `gunicorn -c … paperless.asgi:application` | `docker/supervisord.conf:10-11` |
+| Consume-dir watcher | `[program:consumer]`  | `python3 manage.py document_consumer`      | `docker/supervisord.conf:19-20` |
+| Worker + scheduler  | `[program:scheduler]` | `python3 manage.py qcluster`               | `docker/supervisord.conf:28-29` |
 
 The image does not ship supervisor, so the three programs were launched manually (out-of-repo helper
 scripts), which is behaviorally identical to the supervisord definitions above. The commands below are
@@ -56,12 +56,12 @@ the **exact, literal, runnable** contents of the two helper scripts — there ar
 placeholders. Three deliberate hardening choices are called out inline and are the only departures from
 a naive bring-up; each is disclosed here so the reader can reproduce or relax it knowingly:
 
-1. **Services run as non-root UID/GID 1000** — this *matches* the canonical `user=paperless` in every
+1. **Services run as non-root UID/GID 1000** — this _matches_ the canonical `user=paperless` in every
    `docker/supervisord.conf` program, and UID 1000 is the `paperless` user created by `Dockerfile:157-159`
    (in this image UID 1000 is `testuser`, the same uid/gid). Running non-root avoids root-owned runtime
    artifacts.
 2. **The web port is published to loopback only** (`127.0.0.1:8000`), not `0.0.0.0`. gunicorn still
-   binds `0.0.0.0:8000` *inside* the container (its canonical `gunicorn.conf.py` value); only the host
+   binds `0.0.0.0:8000` _inside_ the container (its canonical `gunicorn.conf.py` value); only the host
    publish is restricted.
 3. **A fresh, throwaway, test-only `PAPERLESS_SECRET_KEY` is injected** (generated with
    `python3 -c "import secrets; print(secrets.token_hex(24))"`). It is not a production credential and is
@@ -219,8 +219,7 @@ $ docker exec -u 1000:1000 pngx python3 /tmp/proc_snapshot.py
 (excluded transient inspection pids: self=903, exec-shell=0)
 ```
 
-**Reading the snapshot.** `PID 1` is the container's init (`sleep infinity`, the `--entrypoint /bin/bash
--c "sleep infinity"` process) and is the **only** process owned by root (`UID 0`); it is the container
+**Reading the snapshot.** `PID 1` is the container's init (`sleep infinity`, the `--entrypoint /bin/bash -c "sleep infinity"` process) and is the **only** process owned by root (`UID 0`); it is the container
 placeholder, not a paperless service. PIDs `467/468/469` are the three `setsid bash -c` wrappers from
 `start-services.sh` (their cmdlines carry the embedded newline from the script's line-continuation,
 shown faithfully). `PID 471` is the gunicorn master with workers `475`/`476`; `PID 473` is the single
@@ -229,7 +228,7 @@ shown faithfully). `PID 471` is the gunicorn master with workers `475`/`476`; `P
 UID 1000**, matching the canonical `user=paperless` in `docker/supervisord.conf`.
 
 **Redis broker live** (the broker that transports every django-q task between producer and worker).
-Liveness was proven both directly against the broker container and from *inside* the app container over
+Liveness was proven both directly against the broker container and from _inside_ the app container over
 the `pngx-net` network, using the runtime `PAPERLESS_REDIS` URL:
 
 ```text
@@ -311,28 +310,27 @@ Crucially, this scheduled run produced **no** `paperless.tasks` training line in
 branch (§4.3) returns before logging. This is the first live proof that a running scheduler alone does
 not train; the conditions in §4 must be met.
 
-
 ---
 
 ## 3. Q1 — The ingestion pipeline
 
-> *"Once the application is up and all of its services are running, I want to submit a test PDF and
+> _"Once the application is up and all of its services are running, I want to submit a test PDF and
 > observe how the ingestion pipeline actually behaves. As the document moves through the system, which
-> services are involved, and what sequence of events shows up in the logs?"*
+> services are involved, and what sequence of events shows up in the logs?"_
 
 ### 3.1 Which services are involved
 
-A single PDF submission is handled by a chain of cooperating services. The entry point only *enqueues*
+A single PDF submission is handled by a chain of cooperating services. The entry point only _enqueues_
 work; the actual processing happens in a separate worker process:
 
-| Order | Service (process) | Role | Logger namespace seen |
-|---|---|---|---|
-| 1 | **gunicorn** (web) *or* **document_consumer** (watcher) | Accepts the document and enqueues a django-q task | `[Q]` / `paperless.management.consumer` |
-| 2 | **Redis** broker | Transports the task from producer to worker | — |
-| 3 | **qcluster** (django-q worker) | Dequeues and executes `documents.tasks.consume_file` | `[Q]` |
-| 4 | `Consumer.try_consume_file()` (inside qcluster) | Parses/OCRs, thumbnails, stores the `Document` | `paperless.consumer`, `paperless.parsing[.tesseract]`, `paperless.classifier` |
-| 5 | Post-consumption signal handlers (inside qcluster) | Inbox tags, matching, admin log entry, search index | `paperless.handlers` |
-| 6 | SQLite DB + media dirs + Whoosh index | Durable storage of row, files, and full-text index | — |
+| Order | Service (process)                                       | Role                                                 | Logger namespace seen                                                         |
+| ----- | ------------------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------- |
+| 1     | **gunicorn** (web) _or_ **document_consumer** (watcher) | Accepts the document and enqueues a django-q task    | `[Q]` / `paperless.management.consumer`                                       |
+| 2     | **Redis** broker                                        | Transports the task from producer to worker          | —                                                                             |
+| 3     | **qcluster** (django-q worker)                          | Dequeues and executes `documents.tasks.consume_file` | `[Q]`                                                                         |
+| 4     | `Consumer.try_consume_file()` (inside qcluster)         | Parses/OCRs, thumbnails, stores the `Document`       | `paperless.consumer`, `paperless.parsing[.tesseract]`, `paperless.classifier` |
+| 5     | Post-consumption signal handlers (inside qcluster)      | Inbox tags, matching, admin log entry, search index  | `paperless.handlers`                                                          |
+| 6     | SQLite DB + media dirs + Whoosh index                   | Durable storage of row, files, and full-text index   | —                                                                             |
 
 **Attribution rule:** each log line is attributed by its `[name]`:
 `paperless.management.consumer` = the directory watcher; `[Q]` = django-q (enqueue/worker);
@@ -425,11 +423,11 @@ that accepts multipart uploads via `parser_classes = (parsers.MultiPartParser,)`
 `post()` (`views.py:497`) validates the payload with `serializer.is_valid(raise_exception=True)`
 (`views.py:500`), writes the bytes to a `paperless-upload-` scratch file under `SCRATCH_DIR`
 (`views.py:512-517`), mints a task id `task_id = str(uuid.uuid4())` (`views.py:521`), calls
-`async_task("documents.tasks.consume_file", …, task_id=task_id, task_name=…)` (`views.py:531`, `async_task`
+`async_task("documents.tasks.consume_file", …, task_id=task_id, task_name=…)` (`views.py:523-533`, `async_task`
 imported at `:28`), and returns `Response("OK")` (`views.py:535`) — HTTP **200** with the body literally
 `"OK"`. The `uuid4` `task_id` is threaded through to **both** subsystems: passing it as `task_id=` makes
 it the django-q task record's id (stored dash-stripped — the successful ingestion's row is
-`id=16bd776d8f844dc8a3db53a87ccbc853` in `django_q_task`, §5.3), and `Consumer` reuses the *same* value as
+`id=16bd776d8f844dc8a3db53a87ccbc853` in `django_q_task`, §5.3), and `Consumer` reuses the _same_ value as
 its Channels progress correlation id
 (`consumer.py:200`, echoed in the progress payload at `:66`). It is simply **not** returned in the
 response body. Handing the task to Redis is exactly why the sequence that follows spans multiple services.
@@ -484,41 +482,40 @@ surface described in §1). This is the complete, unedited block for the single s
 [2026-07-13 18:26:02,583] [INFO] [paperless.consumer] Document 2026-07-13 Q1 Ingestion Trace consumption finished
 ```
 
-
 ### 3.4 Per-line attribution and cause → effect
 
 Each captured line maps to a specific service and code location. `Consumer.try_consume_file()` is the
 orchestrator (`src/documents/consumer.py:180`); it inherits `LoggingMixin` and logs under
 `paperless.consumer` (`src/documents/consumer.py:52-54`).
 
-| Captured line | Service / logger | Emitting code | Why it fires (cause → effect) |
-|---|---|---|---|
-| `[Q] INFO Enqueued 1` | gunicorn → django-q | `views.py:523` | `async_task(...)` pushes the task to Redis; django-q logs the enqueue |
-| `[Q] … processing [q1_ingestion_trace.pdf]` | qcluster | django-q worker | worker dequeues the task named after the file's basename (`task_name`, `views.py:531`) |
-| `Consuming q1_ingestion_trace.pdf` (INFO) | `paperless.consumer` | `consumer.py:215` | first user-visible line after the existence/dir/MD5-duplicate pre-checks (`:211-213`) |
-| `Detected mime type: application/pdf` | `paperless.consumer` | `consumer.py:221` | `magic.from_file(...)` MIME sniff selects a parser |
-| `Parser: RasterisedDocumentParser` | `paperless.consumer` | `consumer.py:246` | mime→parser dispatch chose the raster/PDF parser |
-| `Parsing q1_ingestion_trace.pdf...` | `paperless.consumer` | `consumer.py:260` | parse stage begins (progress → 20, `:259`) |
-| `Calling OCRmyPDF with args: {…}` | `paperless.parsing.tesseract` | PDF parser | OCR runs even for text PDFs with `skip_text=True`, producing a **PDF/A archive** |
-| `Generating thumbnail for q1_ingestion_trace.pdf...` | `paperless.consumer` | `consumer.py:263` | thumbnail stage (progress → 70, `:264`) |
-| `Execute: convert … convert.png` / `optipng …` | `paperless.parsing[.tesseract]` | thumbnailer | ImageMagick renders page 1, optipng compresses it |
-| `Document classification model does not exist (yet)…` | `paperless.classifier` | `classifier.py:32-36` via `load_classifier()` (`consumer.py:292`) | no model exists on a fresh install, so **no automatic matching** happens |
-| `Saving record to database` | `paperless.consumer` | `consumer.py:387` (in `_store`, `:379`) | the `Document` row is created inside `transaction.atomic()` (`consumer.py:298`, `Document.objects.create` `:398`) |
-| `Deleting file …paperless-upload-a11g9fwy` | `paperless.consumer` | `consumer.py:349` | the scratch upload copy is removed after the row is saved |
-| `Document … consumption finished` (INFO) | `paperless.consumer` | `consumer.py:373` | end of `try_consume_file` (post-consume script `:371`, progress → 100 SUCCESS `:375`) |
+| Captured line                                         | Service / logger                | Emitting code                                                     | Why it fires (cause → effect)                                                                                     |
+| ----------------------------------------------------- | ------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `[Q] INFO Enqueued 1`                                 | gunicorn → django-q             | `views.py:523`                                                    | `async_task(...)` pushes the task to Redis; django-q logs the enqueue                                             |
+| `[Q] … processing [q1_ingestion_trace.pdf]`           | qcluster                        | django-q worker                                                   | worker dequeues the task named after the file's basename (`task_name`, `views.py:532`)                            |
+| `Consuming q1_ingestion_trace.pdf` (INFO)             | `paperless.consumer`            | `consumer.py:215`                                                 | first user-visible line after the existence/dir/MD5-duplicate pre-checks (`:211-213`)                             |
+| `Detected mime type: application/pdf`                 | `paperless.consumer`            | `consumer.py:221`                                                 | `magic.from_file(...)` MIME sniff selects a parser                                                                |
+| `Parser: RasterisedDocumentParser`                    | `paperless.consumer`            | `consumer.py:246`                                                 | mime→parser dispatch chose the raster/PDF parser                                                                  |
+| `Parsing q1_ingestion_trace.pdf...`                   | `paperless.consumer`            | `consumer.py:260`                                                 | parse stage begins (progress → 20, `:259`)                                                                        |
+| `Calling OCRmyPDF with args: {…}`                     | `paperless.parsing.tesseract`   | PDF parser                                                        | OCR runs even for text PDFs with `skip_text=True`, producing a **PDF/A archive**                                  |
+| `Generating thumbnail for q1_ingestion_trace.pdf...`  | `paperless.consumer`            | `consumer.py:263`                                                 | thumbnail stage (progress → 70, `:264`)                                                                           |
+| `Execute: convert … convert.png` / `optipng …`        | `paperless.parsing[.tesseract]` | thumbnailer                                                       | ImageMagick renders page 1, optipng compresses it                                                                 |
+| `Document classification model does not exist (yet)…` | `paperless.classifier`          | `classifier.py:32-36` via `load_classifier()` (`consumer.py:292`) | no model exists on a fresh install, so **no automatic matching** happens                                          |
+| `Saving record to database`                           | `paperless.consumer`            | `consumer.py:387` (in `_store`, `:379`)                           | the `Document` row is created inside `transaction.atomic()` (`consumer.py:298`, `Document.objects.create` `:398`) |
+| `Deleting file …paperless-upload-a11g9fwy`            | `paperless.consumer`            | `consumer.py:349`                                                 | the scratch upload copy is removed after the row is saved                                                         |
+| `Document … consumption finished` (INFO)              | `paperless.consumer`            | `consumer.py:373`                                                 | end of `try_consume_file` (post-consume script `:371`, progress → 100 SUCCESS `:375`)                             |
 
 **The silent stages between these lines (source-derived).** Several pipeline stages run but emit **no
 dedicated log line** on a stock install; they are therefore invisible in the capture above and are listed
 here as **(source-derived)** so the sequence is not mistaken for the whole story:
 
-| Silent stage | Code | Why it is silent here |
-|---|---|---|
-| `document_consumption_started` signal fan-out | `consumer.py:229` | notifies listeners ("about to do work"); no listener logs on a stock install |
-| pre-consume script hook | `consumer.py:235` (`run_pre_consume_script`, `:121`) | no `PAPERLESS_PRE_CONSUME_SCRIPT` configured → returns without logging |
-| text extraction | `consumer.py:271` (`document_parser.get_text()`) | the parser logs its own OCR lines; the `get_text()` call itself has no line |
-| date detection | `consumer.py:272-275` (`get_date()` / `parse_date`) | only logs (progress 90, `MESSAGE_PARSE_DATE`) when no date is embedded |
-| macOS "shadow" (`._`) file cleanup | `consumer.py:358-360` | only logs if a `._name` shadow file exists (none for a REST upload) |
-| post-consume script hook | `consumer.py:371` (`run_post_consume_script`, `:143`) | no `PAPERLESS_POST_CONSUME_SCRIPT` configured → returns without logging |
+| Silent stage                                  | Code                                                  | Why it is silent here                                                        |
+| --------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `document_consumption_started` signal fan-out | `consumer.py:229`                                     | notifies listeners ("about to do work"); no listener logs on a stock install |
+| pre-consume script hook                       | `consumer.py:235` (`run_pre_consume_script`, `:121`)  | no `PAPERLESS_PRE_CONSUME_SCRIPT` configured → returns without logging       |
+| text extraction                               | `consumer.py:271` (`document_parser.get_text()`)      | the parser logs its own OCR lines; the `get_text()` call itself has no line  |
+| date detection                                | `consumer.py:272-275` (`get_date()` / `parse_date`)   | only logs (progress 90, `MESSAGE_PARSE_DATE`) when no date is embedded       |
+| macOS "shadow" (`._`) file cleanup            | `consumer.py:358-360`                                 | only logs if a `._name` shadow file exists (none for a REST upload)          |
+| post-consume script hook                      | `consumer.py:371` (`run_post_consume_script`, `:143`) | no `PAPERLESS_POST_CONSUME_SCRIPT` configured → returns without logging      |
 
 **On WebSocket progress (source-derived).** The `Consumer` also emits progress updates
 `_send_progress(0→20→70→90→95→100)` (`consumer.py:202,259,264,274,294,375`). Each call ends in
@@ -581,17 +578,17 @@ no-op because there is no inbox tag to apply (0 inbox tags, 0 tags on the docume
 `set_document_type`, and `set_tags` ran but matched nothing (no rules defined), so they made no changes.
 
 **First file placement vs. later renames (a common point of confusion).** The **first** time the
-files are written and named happens *inside the consumer*: under `with FileLock(settings.MEDIA_LOCK):`
+files are written and named happens _inside the consumer_: under `with FileLock(settings.MEDIA_LOCK):`
 (`consumer.py:315`) it sets `document.filename = generate_unique_filename(document)` (`consumer.py:316`)
 and writes the original/thumbnail/archive. A **separate** handler,
 `update_filename_and_move_files` (`handlers.py:312`, also under a `FileLock` at `:325`), is a
 `post_save` handler that renames/moves files **later**, when a document's metadata changes (e.g. you
-edit its correspondent). It is *not* what places the file during initial ingestion.
+edit its correspondent). It is _not_ what places the file during initial ingestion.
 
 ### 3.6 The duplicate-rejection path (a re-upload of the same bytes)
 
-To show what happens when the *same* file is submitted again, the identical PDF was re-posted through
-the same REST endpoint. The entry point still returns `"OK"` (it only *enqueues*; it does not inspect
+To show what happens when the _same_ file is submitted again, the identical PDF was re-posted through
+the same REST endpoint. The entry point still returns `"OK"` (it only _enqueues_; it does not inspect
 content), but the **worker** rejects the task. Captured unedited (byte-offset deltas of
 `/app/logs/qcluster.log` and `/app/data/log/paperless.log`):
 
@@ -624,10 +621,9 @@ documents.consumer.ConsumerError: q1_ingestion_trace.pdf: Not consuming q1_inges
 ```
 
 **Cause → effect:** `pre_check_duplicate()` (`consumer.py:102`) computes the file's MD5
-(`hashlib.md5(...)`, `:104`) and queries `Document.objects.filter(Q(checksum=checksum) |
-Q(archive_checksum=checksum))` (`:106`); the match makes it call `_fail(...)` (`:110`), which raises
+(`hashlib.md5(...)`, `:104`) and queries `Document.objects.filter(Q(checksum=checksum) | Q(archive_checksum=checksum))` (`:106`); the match makes it call `_fail(...)` (`:110`), which raises
 `ConsumerError` (`:81`). django-q records the task as `Failed [...]`. This is the **canonical
-sequential** rejection path (the pre-check catches the duplicate *before* any DB write). There is also a
+sequential** rejection path (the pre-check catches the duplicate _before_ any DB write). There is also a
 distinct **concurrent-race** variant: if two identical files are consumed simultaneously, both may pass
 `pre_check_duplicate` before either commits, and the second `Document.objects.create(...)`
 (`consumer.py:398`, inside `transaction.atomic()` `:298`) then trips the database's uniqueness on
@@ -638,20 +634,19 @@ sequential path shown here is the one an ordinary re-upload hits).
 **Q1 answer in one sentence.** A REST upload (gunicorn) or a consume-directory drop
 (`document_consumer`) enqueues `documents.tasks.consume_file` to Redis; the `qcluster` django-q worker
 runs `Consumer.try_consume_file()`, which logs the ordered `paperless.consumer` sequence
-(*Consuming → Detected mime type → Parser → Parsing → OCR/thumbnail → classifier check → Saving record
-to database → consumption finished*), stores the `Document` transactionally, fans out to six
+(_Consuming → Detected mime type → Parser → Parsing → OCR/thumbnail → classifier check → Saving record
+to database → consumption finished_), stores the `Document` transactionally, fans out to six
 `paperless.handlers` signal handlers, and moves/renames the files — after which the worker logs
 `Processed [q1_ingestion_trace.pdf]`.
-
 
 ---
 
 ## 4. Q2 — Classifier retraining
 
-> *"I also want to upload a few more documents and watch how the system reacts after each one. Does
+> _"I also want to upload a few more documents and watch how the system reacts after each one. Does
 > the machine learning classifier retrain automatically on every upload, or only under certain
 > conditions, and what log messages make it clear when training is happening versus when the
-> classifier stays idle?"*
+> classifier stays idle?"_
 
 **Short answer:** No — the classifier does **not** retrain on every upload. **Consumption ≠ training.**
 Training is a **separate, scheduled (hourly), doubly-conditional** task. It runs only when (a) at least
@@ -670,7 +665,7 @@ inlined in §3.2) and its complete, unedited output:
 ```text
 $ TOKEN=$(cat /tmp/pngx-investigation/evidence/.drf_token)
 $ PLOG=/app/data/log/paperless.log ; MODEL=/app/data/classification_model.pickle
-$ for n in 2 3 4; do
+$ for n in 2 3 4 5; do
 >   echo "########## UPLOAD #${n} ##########"
 >   docker exec -u 1000:1000 pngx bash -lc "python3 /tmp/make_pdf.py /tmp/pngx-test/q2_doc_${n}.pdf 'Q2 Multi-Upload Doc ${n}'"
 >   docker cp pngx:/tmp/pngx-test/q2_doc_${n}.pdf /tmp/pngx-investigation/q2_doc_${n}.pdf >/dev/null 2>&1
@@ -711,15 +706,20 @@ REST response: "OK" [HTTP 200]
 --- paperless.log delta grep for training/tasks (expect NONE) ---
     (NONE — no training/classifier-task line in this upload's delta)
 --- model file after upload #4: ABSENT
+########## UPLOAD #5 ##########
+REST response: "OK" [HTTP 200]
+--- paperless.log delta grep for training/tasks (expect NONE) ---
+    (NONE — no training/classifier-task line in this upload's delta)
+--- model file after upload #5: ABSENT
 ```
 
-*(The `##########`, `---`, and `(NONE …)` lines are the harness's own `echo`/`printf` annotations; the
-`"OK" [HTTP 200]` and `ABSENT` tokens are the live REST response and file-test result.)* Across three
-additional uploads (documents `pk=2,3,4`, on top of the `pk=1` document from §3), **not one** produced
+_(The `##########`, `---`, and `(NONE …)` lines are the harness's own `echo`/`printf` annotations; the
+`"OK" [HTTP 200]` and `ABSENT` tokens are the live REST response and file-test result.)_ Across four
+additional uploads (documents `pk=2,3,4,5`, on top of the `pk=1` document from §3), **not one** produced
 a `paperless.tasks` or `Gathering data` line, and the model file remained **ABSENT** after every one.
 
-The single classifier-related line that *does* appear during a consumption is a per-document
-*classification attempt*, not training. Filtering one consumption's complete `paperless.log` delta to
+The single classifier-related line that _does_ appear during a consumption is a per-document
+_classification attempt_, not training. Filtering one consumption's complete `paperless.log` delta to
 classifier lines shows exactly one:
 
 ```text
@@ -728,7 +728,7 @@ $ docker exec pngx bash -lc "tail -c +$((POFF+1)) $PLOG" | grep -i classif
 ```
 
 **Cause → effect:** during consumption the consumer calls `load_classifier()`
-(`src/documents/consumer.py:292` → `src/documents/classifier.py:30`) to *suggest* a
+(`src/documents/consumer.py:292` → `src/documents/classifier.py:30`) to _suggest_ a
 correspondent/type/tags for the incoming document; because no model file exists it logs
 "…model does not exist (yet)…" (`classifier.py:32-36`) and returns `None`. That is a read/suggest step,
 not training. Training is an entirely separate task, `documents.tasks.train_classifier`
@@ -741,7 +741,7 @@ by itself produce a training log or a model file.
 `train_classifier()` is registered to run **hourly** by
 `src/documents/migrations/1001_auto_20201109_1636.py:10-14`
 (`schedule("documents.tasks.train_classifier", …, schedule_type=Schedule.HOURLY)`), which is the
-`id=1 … type=H` row shown in §2. To exercise the *same code path* deterministically (rather than
+`id=1 … type=H` row shown in §2. To exercise the _same code path_ deterministically (rather than
 waiting for the top of the hour), the investigation used the canonical manual trigger,
 `manage.py document_create_classifier`, whose `handle()` (`document_create_classifier.py:19`) calls the
 identical `train_classifier()` (`:20`). This is the real training entry point, not a bypass.
@@ -780,8 +780,8 @@ the real code path and are shown below with complete, unedited output.
 order: the **TRAINED** run first (after configuring one `MATCH_AUTO` correspondent), then three **IDLE**
 runs over unchanged data, then the **GUARD** branch (by temporarily removing the `MATCH_AUTO` flag),
 then the **ERROR** branch (by temporarily excluding every document from the training set). Two facts
-make each branch independent of capture order: the guard short-circuits *before* `load_classifier()`
-(`tasks.py:55`), and the error raises *before* the hash gate (`classifier.py:159`, ahead of
+make each branch independent of capture order: the guard short-circuits _before_ `load_classifier()`
+(`tasks.py:55`), and the error raises _before_ the hash gate (`classifier.py:159`, ahead of
 `:161-164`) — so a pre-existing model file cannot change either outcome's log output. Every state change
 used to reach the guard and error branches was **non-destructive and reversed** (no document was ever
 deleted); see the note in each branch. All captures use the byte-offset delta method from §3.3 (`wc -c`
@@ -789,7 +789,7 @@ before, `tail -c +OFFSET` after) for exact, complete new bytes.
 
 **Branch — TRAINED.** A `MATCH_AUTO` correspondent is created and assigned to one document. This ORM
 setup is a **non-canonical precondition** (it stands in for the point-and-click a user performs in the
-web UI); the *training trigger itself* remains the canonical task. Then the canonical manual trigger is
+web UI); the _training trigger itself_ remains the canonical task. Then the canonical manual trigger is
 run:
 
 ```text
@@ -831,7 +831,7 @@ model file yet and returns `None` (hence the first DEBUG line, `classifier.py:32
 (`classifier.py:68`). `train()` gathers the 5 non-inbox documents and — because there is 1 correspondent
 but 0 auto tags/types — trains only the correspondent sub-classifier (`classifier.py:226`; the tag/type
 branches log "There are no …"). This is the **first** run, so the hash gate `if self.data_hash and …`
-(`classifier.py:163-164`) is `False` *regardless of the data* (see §4.4); `train()` returns `True`,
+(`classifier.py:163-164`) is `False` _regardless of the data_ (see §4.4); `train()` returns `True`,
 `tasks.py:63` takes the `if` branch, logs the **INFO** line at `tasks.py:64-65`, and `classifier.save()`
 (`:67`) writes the model — a plain pickle of 159,935 bytes owned by the non-root `testuser` (UID 1000).
 
@@ -872,7 +872,7 @@ to `NO` at `:50`); it is nonetheless visible in the canonical `/app/data/log/pap
 configuration change was needed** to observe it. The model's MD5 is **identical** before and after all
 three runs, confirming a skipped run does not rewrite the model.
 
-*Attribution note — the interleaved `__paperless_write_test_NNNN__` lines.* These are **not** emitted by
+_Attribution note — the interleaved `__paperless_write_test_NNNN__` lines._ These are **not** emitted by
 the training task. Each `manage.py` invocation first runs Django's system checks, and `path_check()`
 writes a probe file named `__paperless_write_test_{os.getpid()}__` into the consume directory
 (`src/paperless/checks.py:29`) to verify it is writable, then deletes it. The separate
@@ -906,7 +906,7 @@ $ docker exec pngx bash -lc "wc -l < /app/data/log/paperless.log"     # line-cou
 three `.exists()` checks are all false, so `train_classifier` `return`s at `tasks.py:55` — before
 `load_classifier()`, before any `Gathering data` line, and before writing anything at all. The
 line-count is unchanged (**107 → 107**) and the byte-offset delta is **empty**: bounded, definitive proof
-that a stock install with no "Auto" rule logs *nothing* about training. The `MATCH_AUTO` flag was then
+that a stock install with no "Auto" rule logs _nothing_ about training. The `MATCH_AUTO` flag was then
 restored so the correspondent is auto-matching again.
 
 **Branch — ERROR (`MATCH_AUTO` entity exists, but no training data).** This branch was reached
@@ -931,14 +931,14 @@ $ docker exec -u 1000:1000 -w /app/src pngx python3 manage.py document_create_cl
 
 **Cause → effect:** the guard passes (ACME is `MATCH_AUTO` again), so `train()` runs, but the
 inbox-exclusion leaves it with no documents; `if not data:` raises
-`ValueError("No training data available.")` (`src/documents/classifier.py:159`) — note this is *before*
+`ValueError("No training data available.")` (`src/documents/classifier.py:159`) — note this is _before_
 the hash gate at `:161-164`, so a pre-existing model is irrelevant. The `except` at `tasks.py:71`
 catches it and logs the WARNING at `tasks.py:72`. The model file was **not** modified (its MD5 stayed
 `7701284a…`), and removing the temporary tag restored 5 eligible documents; a follow-up run then logged
 `Training data unchanged.` again — confirming the state was fully restored.
 
 **The `Gathering data from database…` line is not an outcome signal.** It appears in the TRAINED, IDLE
-**and** ERROR deltas above because `train()` logs it at its *start* (`classifier.py:123`), before it
+**and** ERROR deltas above because `train()` logs it at its _start_ (`classifier.py:123`), before it
 knows what will happen. The **outcome** is given solely by the terminal `paperless.tasks` line
 (`Saving updated classifier model …` / `Training data unchanged.` / `Classifier error: …`) — or, in the
 guard case, by the total absence of any line.
@@ -977,7 +977,7 @@ ls: cannot access 'src/documents/fixtures/': No such file or directory
 **Cause → effect:** with zero inbox tags (`Tag.objects.filter(is_inbox_tag=True).count()` → `0`, shown
 in §3.5), a newly consumed document is **not** excluded from the training set. That is why the TRAINED
 branch in §4.3 was reachable: all **five** freshly-consumed documents were eligible (none inbox-excluded)
-once a `MATCH_AUTO` entity existed. It is also why the ERROR branch in §4.3 had to *manufacture*
+once a `MATCH_AUTO` entity existed. It is also why the ERROR branch in §4.3 had to _manufacture_
 inbox-exclusion (temporarily inbox-tagging every document) to drive the training set to zero.
 
 ### 4.6 Frequency and stability
@@ -997,19 +997,19 @@ certain conditions**, and on a **schedule** (hourly), never as a side effect of 
 
 All four rows below were captured live in §4.3.
 
-| Outcome | Log line (verbatim) | Logger | Level | Emitted when |
-|---|---|---|---|---|
-| **TRAINED** | `Saving updated classifier model to …` | `paperless.tasks` | INFO | `classifier.train()` returned `True` (`tasks.py:63-65`, then `save()` `:67`) |
-| **IDLE / SKIPPED** | `Training data unchanged.` | `paperless.tasks` | DEBUG | SHA-1 hash gate hit (`tasks.py:69`; gate `classifier.py:163-164`) |
-| **ERROR** | `Classifier error: …` | `paperless.tasks` | WARNING | `train()` raised, e.g. no data (`tasks.py:72`; `ValueError` `classifier.py:159`) |
-| **(guard)** | *(no log at all)* | — | — | no `MATCH_AUTO` Tag/DocumentType/Correspondent (`tasks.py:49-55`) |
+| Outcome            | Log line (verbatim)                    | Logger            | Level   | Emitted when                                                                     |
+| ------------------ | -------------------------------------- | ----------------- | ------- | -------------------------------------------------------------------------------- |
+| **TRAINED**        | `Saving updated classifier model to …` | `paperless.tasks` | INFO    | `classifier.train()` returned `True` (`tasks.py:63-65`, then `save()` `:67`)     |
+| **IDLE / SKIPPED** | `Training data unchanged.`             | `paperless.tasks` | DEBUG   | SHA-1 hash gate hit (`tasks.py:69`; gate `classifier.py:163-164`)                |
+| **ERROR**          | `Classifier error: …`                  | `paperless.tasks` | WARNING | `train()` raised, e.g. no data (`tasks.py:72`; `ValueError` `classifier.py:159`) |
+| **(guard)**        | _(no log at all)_                      | —                 | —       | no `MATCH_AUTO` Tag/DocumentType/Correspondent (`tasks.py:49-55`)                |
 
 A `paperless.classifier` companion line, `Gathering data from database...` (`classifier.py:123`),
-precedes the trained, idle **and** error outcomes alike — it marks that `train()` *started*, not what it
+precedes the trained, idle **and** error outcomes alike — it marks that `train()` _started_, not what it
 decided. The outcome is therefore read from the **terminal `paperless.tasks` line**, not from this
 prefix: `Gathering …` → `Saving updated classifier model …` is a **trained** run; `Gathering …` →
 `Training data unchanged.` is an **idle** run; `Gathering …` → `Classifier error: …` is an **error**
-run; and *no line at all* is the **guard** case.
+run; and _no line at all_ is the **guard** case.
 
 ### 4.8 Version caveat
 
@@ -1020,22 +1020,21 @@ and `load()` (`:76-94`) `pickle.load`s them back after a bare version-integer ch
 signature, no `StoragePath` classifier, and no NLTK stemming** at this commit. Newer paperless-ngx
 releases add those; they are out of scope here.
 
-
 ---
 
 ## 5. Q3 — On-disk layout and database tables
 
-> *"After a document finishes processing, I want to see where it ends up on disk, what directory
+> _"After a document finishes processing, I want to see where it ends up on disk, what directory
 > structure and filename pattern paperless-ngx uses by default, and which database tables receive new
-> rows as part of ingestion."*
+> rows as part of ingestion."_
 
 ### 5.1 The default media tree
 
 Every consumed **OCR-processed (PDF) document** produces exactly **three** files, split across three
 fixed sub-directories of the media tree. The count is **parser-conditional**: `originals/` and
 `thumbnails/` are always written, but the `archive/` PDF/A is produced only when the parser performs OCR,
-so a text-only document (no OCR) yields just **two** files — demonstrated at runtime under *"Conditional
-archive"* below. All five documents in this investigation are PDFs, so each produced three files; listing
+so a text-only document (no OCR) yields just **two** files — demonstrated at runtime under _"Conditional
+archive"_ below. All five documents in this investigation are PDFs, so each produced three files; listing
 the tree after the five consumptions (pks 1–5):
 
 ```text
@@ -1089,7 +1088,7 @@ OCRmyPDF-produced **PDF/A** to archive (`consumer.py:327-337`). Taking `pk=1` as
 difference — original 1,587 bytes vs. archive 7,823 bytes — reflects that the archive is the OCR'd PDF/A
 copy (with an embedded text layer and PDF/A metadata), not the original. All files are owned by the
 non-root `testuser` (UID 1000), matching the services' run user. (The classifier model, when it exists,
-lives *outside* this tree at `MODEL_FILE = DATA_DIR/classification_model.pickle`,
+lives _outside_ this tree at `MODEL_FILE = DATA_DIR/classification_model.pickle`,
 `src/paperless/settings.py:74`.)
 
 **Conditional archive — a non-PDF (text) document produces only two files (captured).** The three-file
@@ -1207,7 +1206,7 @@ which is exactly what the listing in §5.1 shows.
 **Collision handling (inferred).** When two documents would resolve to the same filename,
 `generate_unique_filename()` (`src/documents/file_handling.py:81`) increments a counter and
 `generate_filename()` appends it via `counter_str = f"_{counter:02}" if counter else ""`
-(`src/documents/file_handling.py:186`), yielding `_01`, `_02`, etc. This is labeled *inferred*: under
+(`src/documents/file_handling.py:186`), yielding `_01`, `_02`, etc. This is labeled _inferred_: under
 the default pk-based scheme every id is already unique, so a collision is not naturally triggered by
 normal ingestion; the behavior is read from the code and corroborated by the official docs (§6).
 
@@ -1347,29 +1346,29 @@ The exact new rows in those three tables (queried with the same `mode=ro` connec
                stopped = '2026-07-13 18:26:02.608841'
 ```
 
-*Caveat on `documents_document.correspondent_id`:* the value `2` shown above is **not** what ingestion
+_Caveat on `documents_document.correspondent_id`:_ the value `2` shown above is **not** what ingestion
 wrote — at consumption time this column was `NULL`. It was set to the ACME correspondent (pk=2) later,
 during the Q2 TRAINED-branch setup (§4.3). Every other field above (`filename`, both checksums,
 `storage_type`, `mime_type`, `created`, `added`) is exactly as ingestion persisted it.
 
-| Table | Δ | The new row | Cause (code) |
-|---|---|---|---|
-| `documents_document` | +1 | the `Document` record (`id=1`, `filename=0000001.pdf`, checksums, `storage_type=unencrypted`) | `_store()` creates it inside `transaction.atomic()` (`consumer.py:298`) |
-| `django_admin_log` | +1 | an admin `LogEntry`, `action_flag=1` (ADDITION), `object_repr='2026-07-13 Q1 Ingestion Trace'`, authored by the `consumer` user (`user_id=1`) | `set_log_entry` handler (`handlers.py:413`) fetches `User…username="consumer"` (`:416`) then `LogEntry.objects.create(...)` (`:418`) |
-| `django_q_task` | +1 | the finished `consume_file` task result (`func=documents.tasks.consume_file`, `success=1`) | the django-q worker persists each finished task in its ORM result backend, sized by `Q_CLUSTER` (`settings.py:449-456`) |
+| Table                | Δ   | The new row                                                                                                                                   | Cause (code)                                                                                                                         |
+| -------------------- | --- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `documents_document` | +1  | the `Document` record (`id=1`, `filename=0000001.pdf`, checksums, `storage_type=unencrypted`)                                                 | `_store()` creates it inside `transaction.atomic()` (`consumer.py:298`)                                                              |
+| `django_admin_log`   | +1  | an admin `LogEntry`, `action_flag=1` (ADDITION), `object_repr='2026-07-13 Q1 Ingestion Trace'`, authored by the `consumer` user (`user_id=1`) | `set_log_entry` handler (`handlers.py:413`) fetches `User…username="consumer"` (`:416`) then `LogEntry.objects.create(...)` (`:418`) |
+| `django_q_task`      | +1  | the finished `consume_file` task result (`func=documents.tasks.consume_file`, `success=1`)                                                    | the django-q worker persists each finished task in its ORM result backend, sized by `Q_CLUSTER` (`settings.py:449-456`)              |
 
-**The relevant zero-change candidates** (present in both snapshots at the same count, so *not* written by
+**The relevant zero-change candidates** (present in both snapshots at the same count, so _not_ written by
 ingestion) confirm the answer is complete rather than cherry-picked:
 
 - `documents_document_tags` `0 → 0` — the Document↔Tag M2M (`src/documents/models.py:128`) gains nothing
   because on a fresh install there is no matching or inbox tag to apply (consistent with §3.5 and §4.5).
 - `documents_correspondent` `0 → 0`, `documents_documenttype` `0 → 0`, `documents_tag` `0 → 0`,
   `documents_log` `0 → 0` — ingestion creates no matcher entities or document-log rows on its own.
-- `django_q_ormq` `0 → 0` — the django-q *broker queue* table stays empty because the queued task is
+- `django_q_ormq` `0 → 0` — the django-q _broker queue_ table stays empty because the queued task is
   delivered through **Redis**, not the ORM broker, in this configuration.
 - `django_q_schedule` `4 → 4` — the four periodic schedules (including hourly `train_classifier`, §2)
   are unchanged by a document upload.
-- `sqlite_sequence` `16 → 16` — no *row* is added; only the stored `documents_document` counter *value*
+- `sqlite_sequence` `16 → 16` — no _row_ is added; only the stored `documents_document` counter _value_
   increments (this is how the next pk is allocated). A value change is not a row-count change, so it does
   not surface in the row-count diff (inferred from SQLite autoincrement semantics).
 
@@ -1379,7 +1378,6 @@ ingestion) confirm the answer is complete rather than cherry-picked:
 task — three rows in three tables. The database is the default SQLite file at `DATA_DIR/db.sqlite3`
 (`src/paperless/settings.py:300`).
 
-
 ---
 
 ## 6. Corroborating research
@@ -1387,31 +1385,31 @@ task — three rows in three tables. The database is the default SQLite file at 
 The following external sources **validate** — they do not replace — the runtime evidence captured in
 §§2–5. Every behavioral conclusion in this document was observed directly at runtime; the sources below
 are cited only to confirm that what was observed matches the project's own documentation and the
-experience of other users from this commit's era. Where a source describes a *newer* release, the
+experience of other users from this commit's era. Where a source describes a _newer_ release, the
 difference is flagged explicitly against commit `542221a38dff`.
 
 ### 6.1 Official documentation
 
-- **Hourly auto-retraining.** The official *Advanced Topics* page states that Paperless checks for
+- **Hourly auto-retraining.** The official _Advanced Topics_ page states that Paperless checks for
   changes and retrains automatically `(default: once each hour)`. This corroborates the observed
   `django_q_schedule` row (`id=1 … func=documents.tasks.train_classifier … type=H`, §2) and the
   "consumption ≠ training" result (§4.1).
-  Source: *Advanced Topics — Paperless-ngx* — <https://docs.paperless-ngx.com/advanced_usage/>
+  Source: _Advanced Topics — Paperless-ngx_ — <https://docs.paperless-ngx.com/advanced_usage/>
 - **Inbox exclusion from the training set.** The same page states that the Auto matching algorithm only
   takes into account documents that are **not** placed in the inbox. This corroborates the
   `.exclude(tags__is_inbox_tag=True)` query used by `DocumentClassifier.train()`
   (`src/documents/classifier.py:125-127`) and the manufactured edge case in §4.5.
-  Source: *Advanced Topics — Paperless-ngx* — <https://docs.paperless-ngx.com/advanced_usage/>
-- **Default filename = internal document id.** The *FAQ* states that "by default, paperless uses the
+  Source: _Advanced Topics — Paperless-ngx_ — <https://docs.paperless-ngx.com/advanced_usage/>
+- **Default filename = internal document id.** The _FAQ_ states that "by default, paperless uses the
   internal ID of each document as its filename." This corroborates the observed `0000001.pdf` → `pk=1`
   mapping (§5.2) and the default branch of `generate_filename()`
   (`src/documents/file_handling.py:190-193`).
-  Source: *FAQs — Paperless-ngx* — <https://docs.paperless-ngx.com/faq/>
-- **Archive PDF/A stored alongside the unmodified original.** The *Administration* page states that
+  Source: _FAQs — Paperless-ngx_ — <https://docs.paperless-ngx.com/faq/>
+- **Archive PDF/A stored alongside the unmodified original.** The _Administration_ page states that
   Paperless stores archived PDF/A documents "alongside your original documents," derived from originals
   that are always kept unmodified. This corroborates the `originals/` + `archive/` split observed in
   §5.1.
-  Source: *Administration — Paperless-ngx* — <https://docs.paperless-ngx.com/administration/>
+  Source: _Administration — Paperless-ngx_ — <https://docs.paperless-ngx.com/administration/>
 
 ### 6.2 Community corroboration (subordinate to the runtime evidence)
 
@@ -1421,63 +1419,61 @@ investigation captured at runtime in §4.3 — the same logger namespaces (`pape
 artifact of this environment. These threads are corroboration only; the primary evidence remains the
 runtime capture in §§3–5.
 
-- **The "idle / unchanged" skip sequence** — `[DEBUG] [paperless.classifier] Gathering data from
-  database...` immediately followed by `[DEBUG] [paperless.tasks] Training data unchanged.` — appears in
-  a real user's log in *Discussion #1809* (Oct 2022), which also shows the per-consumption
-  `[DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing
-  automatic matching.` line observed in §4.1; the same skip pair also appears in *Discussion #2472*
+- **The "idle / unchanged" skip sequence** — `[DEBUG] [paperless.classifier] Gathering data from database...` immediately followed by `[DEBUG] [paperless.tasks] Training data unchanged.` — appears in
+  a real user's log in _Discussion #1809_ (Oct 2022), which also shows the per-consumption
+  `[DEBUG] [paperless.classifier] Document classification model does not exist (yet), not performing automatic matching.` line observed in §4.1; the same skip pair also appears in _Discussion #2472_
   (Jan 2023).
-  Sources: *Discussion #1809 — "Document classification model does not exist (yet), not performing
-  automatic matching."* — <https://github.com/paperless-ngx/paperless-ngx/discussions/1809> ·
-  *Discussion #2472 — "Documents not consumed, stay queued, logs not helpful"* —
+  Sources: _Discussion #1809 — "Document classification model does not exist (yet), not performing
+  automatic matching."_ — <https://github.com/paperless-ngx/paperless-ngx/discussions/1809> ·
+  _Discussion #2472 — "Documents not consumed, stay queued, logs not helpful"_ —
   <https://github.com/paperless-ngx/paperless-ngx/discussions/2472>
 - **The "trained / saving" sequence** — the classifier's `N documents, N tag(s), …` →
   `Vectorizing data...` → `Training … classifier...` steps followed by
   `[INFO] [paperless.tasks] Saving updated classifier model to …classification_model.pickle...`, and
   then hourly `Gathering data from database...` → `Training data unchanged.` skips — appears in a real
-  user's log in *Issue #3531* (Jun 2023). This corroborates both the trained-branch and the
+  user's log in _Issue #3531_ (Jun 2023). This corroborates both the trained-branch and the
   idle-branch sequences captured in §4.3.
-  Source: *Issue #3531 — "[BUG] Documents not being processed anymore"* —
+  Source: _Issue #3531 — "[BUG] Documents not being processed anymore"_ —
   <https://github.com/paperless-ngx/paperless-ngx/issues/3531>
-- **`_01` / `_02` filename de-duplication.** The *paperless-ng 1.5.0* changelog documents that the
+- **`_01` / `_02` filename de-duplication.** The _paperless-ng 1.5.0_ changelog documents that the
   filename formatter will "append `_01`, `_02`, etc when it detects duplicate filenames." This
   corroborates the **inferred** collision-suffix behavior in §5.2 (`generate_unique_filename()`
   `src/documents/file_handling.py:81`; `counter_str` `:186`). Note the same changelog entry says the
-  formatter no longer embeds the document id — but that applies to the *custom* `PAPERLESS_FILENAME_FORMAT`
+  formatter no longer embeds the document id — but that applies to the _custom_ `PAPERLESS_FILENAME_FORMAT`
   scheme; with the format **unset** (the default at this commit) the filename remains the zero-padded
   pk, exactly as the FAQ states and as observed in §5.2.
-  Source: *Changelog — Paperless-ng 1.5.0* —
+  Source: _Changelog — Paperless-ng 1.5.0_ —
   <https://paperless-ngx.readthedocs.io/en/ng-1.5.0/changelog.html>
 - **OCRmyPDF → PDF/A alongside originals.** The same changelog's OCRmyPDF-integration entry documents
   that OCRmyPDF produces archived PDF/A versions and that Paperless stores those archived versions
   alongside the originals — corroborating the `archive/` tree observed beside `originals/` in §5.1.
-  Source: *Changelog — Paperless-ng 1.5.0* —
+  Source: _Changelog — Paperless-ng 1.5.0_ —
   <https://paperless-ngx.readthedocs.io/en/ng-1.5.0/changelog.html>
 
 ### 6.3 Version boundary (reaffirmed)
 
-Several search results describe features of *newer* paperless-ngx that **do not exist at commit
+Several search results describe features of _newer_ paperless-ngx that **do not exist at commit
 `542221a38dff`** and were therefore **not** used as evidence for any claim in this document:
 
 - **Newer scheduling mechanism.** Current docs expose a crontab-style
   `PAPERLESS_CLASSIFIER_TRAINING_SCHEDULE` (default `5 */1 * * *`). At this commit there is no such
   setting: the hourly cadence comes from the django-q `Schedule.HOURLY` row registered by migration
   `src/documents/migrations/1001_auto_20201109_1636.py` (§4.2), which is precisely the
-  `django_q_schedule` row observed in §2. *(Source: Configuration — Paperless-ngx —
-  <https://docs.paperless-ngx.com/configuration/> — describes a newer release.)*
+  `django_q_schedule` row observed in §2. _(Source: Configuration — Paperless-ngx —
+  <https://docs.paperless-ngx.com/configuration/> — describes a newer release.)_
 - **Newer classifier internals.** Third-party write-ups describe an HMAC-signed model, a `StoragePath`
   classifier, and NLTK stemming. None are present here: the classifier is `FORMAT_VERSION = 7`
   (`src/documents/classifier.py:63`) with plain `pickle` load/save (`:76-113`), no HMAC, no
-  `StoragePath` classifier, and no NLTK stemming. *(Source: DeepWiki — Document Classification —
+  `StoragePath` classifier, and no NLTK stemming. _(Source: DeepWiki — Document Classification —
   <https://deepwiki.com/paperless-ngx/paperless-ngx/4.3-document-classification> — describes a newer
-  release.)*
-- **A newer regression.** A 2024 discussion (#8132, v2.13.x) reports the classifier retraining *every*
+  release.)_
+- **A newer regression.** A 2024 discussion (#8132, v2.13.x) reports the classifier retraining _every_
   hour even with unchanged data — the opposite of the SHA-1-gated skip observed here (§4.3/§4.4). That
   is a later-version behavior change and is out of scope for this commit.
 - **Task system.** The task and scheduler layer at this commit is **django-q** (`qcluster`), never
   Celery.
 
-Because online tracebacks for paperless reference *different* source line numbers than this commit,
+Because online tracebacks for paperless reference _different_ source line numbers than this commit,
 **every** `file:line` citation in this document was verified live against the source at `542221a38dff`
 rather than copied from documentation, and the
 `Gathering data from database... → Training data unchanged.` skip was observed directly at runtime
@@ -1493,48 +1489,48 @@ so nothing is over-claimed:
 
 - `captured` = the exact command and its complete, unedited runtime output are shown;
 - `bounded` = proven by a runtime measurement (line counts / byte-offset deltas) rather than a raw block —
-  used only where the correct behavior is the *absence* of a log line, so there is no block to show;
+  used only where the correct behavior is the _absence_ of a log line, so there is no block to show;
 - `source-derived` = read from the code at this commit and labeled as such in-line (not observed in a log);
 - `non-canonical` = a precondition created via the ORM rather than the user-facing path (labeled in-line);
 - `inferred` = not exercised at runtime, deduced from code + documentation.
 
-| # | Sub-ask | Answered in | Evidence behind it | Evidence type |
-|---|---|---|---|---|
-| Q1a | Which services are involved | §3.1 | `/proc` process list + Redis `PING` (§2); per-line logger attribution (§3.4) | captured |
-| Q1b | The ordered sequence of events in the logs | §3.3 + §3.4 | complete byte-offset deltas of `gunicorn.log`, `qcluster.log`, `paperless.log` | captured |
-| Q1c | The silent (no-log) pipeline stages | §3.4 (silent-stage table) | derived from `consumer.py` (started signal, pre-consume, `get_text`, date parsing, shadow cleanup, post-consume) | source-derived |
-| Q1d | Post-consumption fan-out (the six handlers) | §3.5 | `django_admin_log` row (user `consumer`), Whoosh index hit, inbox-tag count | captured |
-| Q1e | Progress / status delivery | §3.1 diagram + §3.4 note | routed to the Channels `status_updates` group over WebSocket, not to the HTTP client | source-derived |
-| Q1f | Duplicate re-upload behavior (sequential) | §3.6 | worker `Not consuming …: It is a duplicate.` + django-q task `Failed` | captured |
-| Q1f′ | Concurrent-race duplicate variant | §3.6 | `UNIQUE constraint failed: documents_document.checksum` — not forced at runtime | source-derived |
-| Q2a | Does it retrain on *every* upload? (no) | §4.1 | several REST uploads (`OK` / HTTP 200), each with a bounded `paperless.log` delta showing **no** training line and the model file **absent** | captured |
-| Q2b | Only under certain conditions? | §4.2–§4.6 | hourly `django_q_schedule` row (§2); MATCH_AUTO guard; SHA-1 hash gate | captured |
-| Q2c | Guard branch (no MATCH_AUTO entity present) | §4.3 Branch 1 | training task triggered with zero MATCH_AUTO entities; `paperless.log` line-count `107 → 107`, zero-byte delta (guard returns before emitting anything) | bounded |
-| Q2d | "Training happening" log message | §4.3 Branch 2, §4.7 | `[INFO] [paperless.tasks] Saving updated classifier model to …` + 159 935-byte model file written | captured |
-| Q2e | Training precondition (a MATCH_AUTO entity) | §4.3 Branch 2 | `Correspondent 'ACME Corporation'` (`MATCH_AUTO`) created via ORM and assigned to a document | non-canonical |
-| Q2f | "Classifier idle" log message | §4.3 Branch 3, §4.7 | `[DEBUG] [paperless.tasks] Training data unchanged.`, stable across repeated runs (identical model MD5 `7701284a…`) | captured |
-| Q2g | Error branch (MATCH_AUTO set but no eligible data) | §4.3 Branch 4 | `[WARNING] [paperless.tasks] Classifier error: No training data available.` — reached non-destructively via inbox exclusion, state restored | captured |
-| Q3a | Where the document ends up on disk | §5.1 | `find` / `ls -l` of `/app/media/documents/{originals,archive,thumbnails}` | captured |
-| Q3b | Default directory structure | §5.1 | the three fixed subdirectories; `originals/` + `thumbnails/` always populated, `archive/` only for OCR-processed (PDF) documents | captured |
-| Q3c | Default filename pattern | §5.2 | ORM listing tying `pk=1…5` → `0000001.pdf … 0000005.pdf` | captured |
-| Q3c′ | Filename collision suffix (`_01`, `_02`) | §5.2 | `counter_str` in `generate_unique_filename()`; not triggered under the default pk scheme | inferred |
-| Q3d | Which DB tables receive new rows | §5.3 | exhaustive 26-table before/after snapshot via a read-only (`mode=ro`) helper, plus the exact changed rows | captured |
+| #    | Sub-ask                                            | Answered in               | Evidence behind it                                                                                                                                      | Evidence type  |
+| ---- | -------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| Q1a  | Which services are involved                        | §3.1                      | `/proc` process list + Redis `PING` (§2); per-line logger attribution (§3.4)                                                                            | captured       |
+| Q1b  | The ordered sequence of events in the logs         | §3.3 + §3.4               | complete byte-offset deltas of `gunicorn.log`, `qcluster.log`, `paperless.log`                                                                          | captured       |
+| Q1c  | The silent (no-log) pipeline stages                | §3.4 (silent-stage table) | derived from `consumer.py` (started signal, pre-consume, `get_text`, date parsing, shadow cleanup, post-consume)                                        | source-derived |
+| Q1d  | Post-consumption fan-out (the six handlers)        | §3.5                      | `django_admin_log` row (user `consumer`), Whoosh index hit, inbox-tag count                                                                             | captured       |
+| Q1e  | Progress / status delivery                         | §3.1 diagram + §3.4 note  | routed to the Channels `status_updates` group over WebSocket, not to the HTTP client                                                                    | source-derived |
+| Q1f  | Duplicate re-upload behavior (sequential)          | §3.6                      | worker `Not consuming …: It is a duplicate.` + django-q task `Failed`                                                                                   | captured       |
+| Q1f′ | Concurrent-race duplicate variant                  | §3.6                      | `UNIQUE constraint failed: documents_document.checksum` — not forced at runtime                                                                         | source-derived |
+| Q2a  | Does it retrain on _every_ upload? (no)            | §4.1                      | several REST uploads (`OK` / HTTP 200), each with a bounded `paperless.log` delta showing **no** training line and the model file **absent**            | captured       |
+| Q2b  | Only under certain conditions?                     | §4.2–§4.6                 | hourly `django_q_schedule` row (§2); MATCH_AUTO guard; SHA-1 hash gate                                                                                  | captured       |
+| Q2c  | Guard branch (no MATCH_AUTO entity present)        | §4.3 Branch 1             | training task triggered with zero MATCH_AUTO entities; `paperless.log` line-count `107 → 107`, zero-byte delta (guard returns before emitting anything) | bounded        |
+| Q2d  | "Training happening" log message                   | §4.3 Branch 2, §4.7       | `[INFO] [paperless.tasks] Saving updated classifier model to …` + 159 935-byte model file written                                                       | captured       |
+| Q2e  | Training precondition (a MATCH_AUTO entity)        | §4.3 Branch 2             | `Correspondent 'ACME Corporation'` (`MATCH_AUTO`) created via ORM and assigned to a document                                                            | non-canonical  |
+| Q2f  | "Classifier idle" log message                      | §4.3 Branch 3, §4.7       | `[DEBUG] [paperless.tasks] Training data unchanged.`, stable across repeated runs (identical model MD5 `7701284a…`)                                     | captured       |
+| Q2g  | Error branch (MATCH_AUTO set but no eligible data) | §4.3 Branch 4             | `[WARNING] [paperless.tasks] Classifier error: No training data available.` — reached non-destructively via inbox exclusion, state restored             | captured       |
+| Q3a  | Where the document ends up on disk                 | §5.1                      | `find` / `ls -l` of `/app/media/documents/{originals,archive,thumbnails}`                                                                               | captured       |
+| Q3b  | Default directory structure                        | §5.1                      | the three fixed subdirectories; `originals/` + `thumbnails/` always populated, `archive/` only for OCR-processed (PDF) documents                        | captured       |
+| Q3c  | Default filename pattern                           | §5.2                      | ORM listing tying `pk=1…5` → `0000001.pdf … 0000005.pdf`                                                                                                | captured       |
+| Q3c′ | Filename collision suffix (`_01`, `_02`)           | §5.2                      | `counter_str` in `generate_unique_filename()`; not triggered under the default pk scheme                                                                | inferred       |
+| Q3d  | Which DB tables receive new rows                   | §5.3                      | exhaustive 26-table before/after snapshot via a read-only (`mode=ro`) helper, plus the exact changed rows                                               | captured       |
 
 **Honest scope of the evidence.** All three questions are answered from runtime observation, and every
 code-level claim carries a `file:line` citation verified against the source at commit `542221a38dff`.
 Behavioral claims are backed by the exact command and its complete, unedited output **except** for the
 items explicitly labeled otherwise, both in the table above and in-line where they appear, namely:
 
-- the **guard** branch (Q2c) is proven by a *bounded* line-count / byte-delta rather than a raw block,
+- the **guard** branch (Q2c) is proven by a _bounded_ line-count / byte-delta rather than a raw block,
   because the correct behavior is that **no** log line is emitted — there is nothing to print;
 - the **silent Q1 stages** (Q1c) and the **WebSocket / Channels progress delivery** (Q1e) are
-  *source-derived* from `consumer.py` and the signal wiring, not read from a log line;
-- the **training precondition** — the `ACME` `MATCH_AUTO` correspondent (Q2e) — is a *non-canonical*
+  _source-derived_ from `consumer.py` and the signal wiring, not read from a log line;
+- the **training precondition** — the `ACME` `MATCH_AUTO` correspondent (Q2e) — is a _non-canonical_
   ORM setup used only to make the conditional training branch reachable, not the user-facing web path;
-- the **concurrent-race** duplicate variant (Q1f′) is *source-derived*: only the sequential
+- the **concurrent-race** duplicate variant (Q1f′) is _source-derived_: only the sequential
   duplicate-rejection path was forced at runtime;
 - the **filename collision suffix** (`_01`/`_02`, Q3c′) and the **`sqlite_sequence` value increment**
-  are *inferred* from the code and corroborated by the docs in §6, not exercised at runtime.
+  are _inferred_ from the code and corroborated by the docs in §6, not exercised at runtime.
 
 Nothing outside these clearly labeled items is presented as observed without its captured command and
 output.
