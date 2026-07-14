@@ -324,7 +324,7 @@ The upload endpoint is registered under the `/api/` prefix [src/paperless/urls.p
 
 ### Observed: exact command & complete response
 
-The upload is driven through the canonical entry point via a short Python script (`requests.post` to the real endpoint with HTTP Basic `admin:admin`). The script also (a) records the log file's byte length immediately before the upload and again at the instant the response returns — proving **no processing log is written yet** at that instant — and (b) subscribes to the Channels `status_updates` group first so it can capture the progress events (used in Q2a). Its complete output:
+The upload is driven through the canonical entry point via a self-contained Python script (`requests.post` to the real endpoint with HTTP Basic `admin:admin`). The script also (a) records the log file's byte length immediately before the upload and again at the instant the response returns — proving **no processing log is written yet** at that instant — and (b) subscribes to the Channels `status_updates` group first so it can capture the progress events (used in Q2a). Its complete output:
 
 ```console
 $ docker exec paperless-setup bash -lc 'cd /app/src && python3 /tmp/qa_run/capture_final.py'
@@ -344,7 +344,10 @@ RESPONSE_HEADERS:
   Vary: Accept, Accept-Language, Origin
   Allow: POST, OPTIONS
   X-Frame-Options: SAMEORIGIN
+  X-Api-Version: 2
+  X-Version: 1.7.0
   Content-Length: 4
+  Content-Language: en-us
   X-Content-Type-Options: nosniff
   Referrer-Policy: same-origin
   Cross-Origin-Opener-Policy: same-origin
@@ -354,18 +357,73 @@ The exact `capture_final.py` command (canonical POST via `requests`) is:
 
 ```python
 # /tmp/qa_run/capture_final.py  (temporary; removed at cleanup) — canonical entry point
-import os, sys, time, hashlib, requests
-sys.path.insert(0, "/app/src"); os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import os, sys, time, json, hashlib, threading, asyncio, requests
+
+# Django + Channels setup (needed to subscribe to the status_updates group canonically)
+sys.path.insert(0, "/app/src")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
 import django; django.setup()
-FIX, LOG = "/tmp/qa_run/ocr_test.pdf", "/app/data/log/paperless.log"
+from channels.layers import get_channel_layer
+
+FIX = "/tmp/qa_run/ocr_test.pdf"
+LOG = "/app/data/log/paperless.log"
+OUTDIR = "/tmp/qa_run/final"; os.makedirs(OUTDIR, exist_ok=True)
+
+# (a) fixture identity + log byte offset BEFORE the upload
+sha = hashlib.sha256(open(FIX, "rb").read()).hexdigest()
 before = os.path.getsize(LOG)
+print("byte_offset_before_upload", before)
+print("FIXTURE_SHA256", sha)
+print("log_bytes_before_upload", before)
+
+# (b) subscribe to the Channels 'status_updates' group FIRST (background thread),
+#     so the progress events (used in Q2a) are captured while the upload runs
+events = []
+def subscribe():
+    async def run():
+        layer = get_channel_layer()
+        channel = await layer.new_channel()
+        await layer.group_add("status_updates", channel)
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(layer.receive(channel), timeout=30.0)
+                except asyncio.TimeoutError:
+                    break
+                events.append(msg["data"])
+                if msg["data"].get("status") in ("SUCCESS", "FAILED"):
+                    break
+        finally:
+            await layer.group_discard("status_updates", channel)
+    asyncio.new_event_loop().run_until_complete(run())
+sub = threading.Thread(target=subscribe, daemon=True); sub.start()
+time.sleep(0.5)   # ensure the subscription is live before uploading
+
+# (c) canonical upload through the documented entry point
 T0 = time.time()
 r = requests.post("http://localhost:8000/api/documents/post_document/",
                   files={"document": ("ocr_test.pdf", open(FIX, "rb"), "application/pdf")},
                   auth=("admin", "admin"))
 T1 = time.time()
-print("HTTP_STATUS", r.status_code, "HTTP_BODY", repr(r.text), "TIME_TOTAL", round(T1 - T0, 3))
-print("log delta", os.path.getsize(LOG) - before)   # 0 => no processing log at the response instant
+after = os.path.getsize(LOG)
+print("T0_request_sent %.6f" % T0)
+print("T1_response_received %.6f" % T1)
+print("HTTP_STATUS", r.status_code)
+print("HTTP_BODY", repr(r.text))
+print("TIME_TOTAL %.3fs" % (T1 - T0))
+print("log_bytes_immediately_after_response", after, "delta", after - before)  # delta 0 => no processing log yet
+
+# (d) complete, unedited response headers
+print("RESPONSE_HEADERS:")
+for k, v in r.headers.items():
+    print("  %s: %s" % (k, v))
+
+# (e) wait for processing to finish; persist the captured progress events (Q2a)
+sub.join(timeout=40)
+with open(os.path.join(OUTDIR, "progress.txt"), "w") as fh:
+    for e in events:
+        fh.write(json.dumps(e) + "\n")
+    fh.write("PROGRESS_EVENT_COUNT %d\n" % len(events))
 ```
 
 Reading directly off the captured output:
@@ -461,7 +519,7 @@ The scratch paths (`/tmp/paperless/paperless-upload-pi00stla`, `/tmp/paperless/p
 
 ### Q2 (a) — Progress events broadcast over Channels/Redis
 
-Parallel to the file log, `Consumer._send_progress()` [src/documents/consumer.py:L56] publishes milestones to the Channels group `status_updates` [src/documents/consumer.py:L73-L76] using the STARTING/WORKING/SUCCESS constants [src/documents/consumer.py:L43-L49]. These were captured **canonically** by the same `capture_final.py` subscribing a listener to the `status_updates` group (backed by the default `channels-redis` layer) while the upload ran. The complete captured event stream (6 events) for this document:
+Parallel to the file log, `Consumer._send_progress()` [src/documents/consumer.py:L56] publishes milestones to the Channels group `status_updates` [src/documents/consumer.py:L73-L76]. Each event's `status` field is one of the `STARTING`/`WORKING`/`SUCCESS` string literals passed inline at the `_send_progress` call sites [src/documents/consumer.py:L202] [src/documents/consumer.py:L375], while its `message` field is one of the `MESSAGE_*` message-field constants [src/documents/consumer.py:L43-L49]. These were captured **canonically** by the same `capture_final.py` subscribing a listener to the `status_updates` group (backed by the default `channels-redis` layer) while the upload ran. The complete captured event stream (6 events) for this document:
 
 ```console
 $ docker exec paperless-setup bash -lc 'cat /tmp/qa_run/final/progress.txt'
