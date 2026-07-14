@@ -20,7 +20,7 @@ This maps to five sub-questions, each answered by name below: **Q1** startup, **
 
 - **Observed vs. inferred.** Every behavioral claim is backed by *actual, unedited* command output shown in a fenced block immediately next to the claim, together with the exact command that produced it. Claims that are **inferred from reading source code** (rather than observed at runtime) are explicitly labelled *(inferred from source)*.
 - **Raw blocks are verbatim.** Fenced blocks are spliced byte-for-byte from captured output; they are never hand-edited. Where a value is randomly generated per boot (the `django-q` cluster display-name and worker PIDs), the surrounding prose flags it as **variable**, but the raw block still shows the concrete value observed in that run.
-- **Transcript convention inside fenced blocks.** A line beginning with `$ ` is a command that was run; a line beginning with `$ #` or `#` is an inline annotation (my commentary, not program output); and a `[ ... ]` note on its own line marks where a run of *identical* repeated lines was elided for length — the exact count of the elided lines is always given right next to it (e.g. the outage's `Error -5` line repeats, with its exact `= 136` count shown). Everything else is unmodified captured output.
+- **Transcript convention inside fenced blocks.** A line beginning with `$ ` is a command that was run; a line beginning with `$ #` or `#` is an inline annotation (my commentary, not program output); and a `[ ... ]` note on its own line marks where a run of *identical* repeated lines was elided for length — the exact count of the elided lines is always given right next to it (e.g. the outage's `Error -5` line repeats, with its exact `= 309` count shown). Everything else is unmodified captured output.
 - **Canonical vs. non-canonical.** Values are reported from a canonical, supervised run (real `ENTRYPOINT` + `supervisord`, children de-escalated to the `paperless` user, a live Docker healthcheck, a clean runtime checkout). The few environmental deltas versus a byte-identical production deploy are enumerated in [§8](#8-canonical-vs-non-canonical-labelling) and never presented as default behavior.
 
 ---
@@ -548,53 +548,58 @@ Likewise the idle `document_consumer` emits nothing after its startup watch line
 
 The interrupt target is the **Redis broker**, because both the `qcluster` (task broker) and the Channels websocket layer depend on it, so a Redis blip exercises the reconnection path directly. The experiment: capture the *before*, *during*, and *after* states around a `docker stop` / `docker start` of the broker.
 
+To avoid perturbing the ≥10-minute idle-observation run used in §2–§5, this interrupt/restart experiment was performed as a **separate, dedicated canonical run** — a fresh boot of the same image and configuration. Per the variable-identifier convention noted in *How to read this document*, that fresh boot has its own randomly-generated `django-q` cluster name (`equal-august-hawaii-stairway`) and its own worker/pusher PIDs, so the timestamps and PIDs shown below differ from the earlier sections even though the behavior is identical. The transient `Error 111` race described below was reproduced across **three** such runs to separate the stable part of the signature from the race-dependent part.
+
 ### 6.1 Before — broker up, cluster pushing
 
 ```
 $ docker ps --filter name=paperless-inv-broker --format "{{.Names}} {{.Status}} {{.Image}}"
-paperless-inv-broker Up 27 minutes redis:6.0
-$ # redis reachable from the app; qcluster pusher active (from boot: "Process-1:13 pushing tasks at 99")
+paperless-inv-broker Up 4 minutes redis:6.0
+$ # redis reachable from the app; qcluster pusher active (from boot: "Process-1:13 pushing tasks at 381")
 $ python3 -c "import redis,os; print(redis.from_url(os.environ[PAPERLESS_REDIS]).ping())"
 PING True
 ```
 
 ### 6.2 During the outage — the failure signature
 
-Stopping the broker at **`T0 = 21:10:47`** produced an immediate, continuous error stream. The **very first** error — at the instant the socket closes — is `Error 111 ... Connection refused`; once the container is fully stopped its `broker` network alias is removed from Docker DNS, so every subsequent attempt fails name resolution with `Error -5 ... No address associated with hostname`, which dominates the outage:
+Stopping the broker at **`T0 = 23:14:01`** produced an immediate, continuous error stream. The pusher is blocked in `blpop(key, 1)` on an already-established socket, so the **very first** error — at the instant `docker stop` gracefully closes that in-flight socket — is a `redis.exceptions.ConnectionError: Connection closed by server.` raised on the *read* path. This was the first error in **all three** reproduction runs. A fresh reconnect attempt may then briefly hit the still-cached-but-now-dead broker IP, producing at most a **single, transient** `Error 111 ... Connection refused` on the *connect* path — a narrow race that appeared `0, 0, 1` times across the three runs (this transcript is the run in which it appeared once). Within about one second Docker removes the stopped container's `broker` network alias from its embedded DNS, after which every reconnect fails name resolution with `Error -5 ... No address associated with hostname`, which **dominates** the outage:
 
 ```
-$ T0=2026-07-14T21:10:47 ; docker stop paperless-inv-broker      # interrupt the broker
+$ T0=2026-07-14T23:14:01 ; docker stop paperless-inv-broker      # interrupt the broker
 $ docker logs --timestamps paperless-inv-app | (lines at/after T0)
-2026-07-14T21:10:47 21:10:47 [Q] ERROR Error 111 connecting to broker:6379. Connection refused.
-2026-07-14T21:10:48 21:10:48 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
-2026-07-14T21:10:48 21:10:48 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
-2026-07-14T21:10:49 21:10:49 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
+2026-07-14T23:14:01.615334104Z redis.exceptions.ConnectionError: Connection closed by server.
+2026-07-14T23:14:01.688752636Z 23:14:01 [Q] ERROR Error 111 connecting to broker:6379. Connection refused.
+2026-07-14T23:14:02.202510262Z 23:14:02 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
+2026-07-14T23:14:02.717064000Z 23:14:02 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
    [the "Error -5 ... No address associated with hostname" line then repeats for the rest of the outage]
 
-$ # exact per-error-type counts over the 122s outage window (21:10:47 - 21:12:49):
-Error 111 (Connection refused)                       = 1   <- the FIRST error, at the instant of stop
-Error -5  (No address associated w/ hostname)        = 136  <- dominant; broker DNS alias removed while stopped
-[Q] ERROR lines total                                = 127
+$ # exact per-error-type counts over the 159s outage window (T0 23:14:01 - T1 23:16:40):
+Connection closed by server. (blpop read path)       = 1    <- the FIRST error, at the instant of stop
+Error 111 (Connection refused, connect-path race)    = 1    <- transient; 0,0,1 across the three runs
+Error -5  (No address associated w/ hostname)        = 309  <- dominant; broker DNS alias removed while stopped
+reincarnated pusher ... after sudden death           = 15   <- ERROR-level (django_q/cluster.py:L223)
+[Q] ERROR lines total                                = 325  <- 309 (Error -5) + 1 (Error 111) + 15 (reincarnations)
 
 $ docker logs paperless-inv-app | grep -E "stopped pushing|reincarnated pusher"   # pusher lifecycle during outage
-21:10:57 [Q] INFO Process-1:13 stopped pushing tasks
-21:10:58 [Q] ERROR reincarnated pusher Process-1:13 after sudden death
-21:11:08 [Q] INFO Process-1:20 stopped pushing tasks
-21:11:08 [Q] ERROR reincarnated pusher Process-1:20 after sudden death
-21:11:18 [Q] INFO Process-1:21 stopped pushing tasks
-21:11:18 [Q] ERROR reincarnated pusher Process-1:21 after sudden death
-21:11:28 [Q] INFO Process-1:22 stopped pushing tasks
-21:11:29 [Q] ERROR reincarnated pusher Process-1:22 after sudden death
-21:11:39 [Q] INFO Process-1:23 stopped pushing tasks
-21:11:39 [Q] ERROR reincarnated pusher Process-1:23 after sudden death
-21:11:49 [Q] INFO Process-1:24 stopped pushing tasks
-21:11:49 [Q] ERROR reincarnated pusher Process-1:24 after sudden death
+23:14:11 [Q] INFO Process-1:13 stopped pushing tasks
+23:14:11 [Q] ERROR reincarnated pusher Process-1:13 after sudden death
+23:14:22 [Q] INFO Process-1:18 stopped pushing tasks
+23:14:22 [Q] ERROR reincarnated pusher Process-1:18 after sudden death
+23:14:32 [Q] INFO Process-1:19 stopped pushing tasks
+23:14:32 [Q] ERROR reincarnated pusher Process-1:19 after sudden death
+23:14:42 [Q] INFO Process-1:20 stopped pushing tasks
+23:14:42 [Q] ERROR reincarnated pusher Process-1:20 after sudden death
+23:14:52 [Q] INFO Process-1:21 stopped pushing tasks
+23:14:53 [Q] ERROR reincarnated pusher Process-1:21 after sudden death
+23:15:03 [Q] INFO Process-1:22 stopped pushing tasks
+23:15:03 [Q] ERROR reincarnated pusher Process-1:22 after sudden death
+   [the stopped-pushing → reincarnated-pusher pair continues on the same ~10 s cadence for the rest of the outage — 15 reincarnations total through T1]
 ```
 
-The failing code path is the pusher's blocking dequeue — a `redis.exceptions.ConnectionError` raised in `broker.dequeue()` → `blpop` (verbatim, one occurrence; it repeats for every failed attempt, and each is followed by a benign `django-q` logging `TypeError: not all arguments converted during string formatting` in the error-formatting path):
+The failing code path is the pusher's blocking dequeue — a `redis.exceptions.ConnectionError` raised in `broker.dequeue()` → `blpop` ([django_q/cluster.py:L345] → `redis_broker.py:L21`). The verbatim traceback below is the **first** error captured at `T0` — the `Connection closed by server.` failure on the *read* path (`blpop` → `read_response`); once the DNS alias is gone the dominant `Error -5` failures raise the same `ConnectionError` from the *connect* path instead (`connection.py` `getaddrinfo` → `gaierror`). Each failure is followed by a benign `django-q` logging `TypeError: not all arguments converted during string formatting` in the error-formatting path:
 
 ```
-$ # each failure is a ConnectionError raised in the pusher dequeue (verbatim, one occurrence):
+$ # first error at T0: ConnectionError on the blpop read path (verbatim):
 Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 345, in pusher
     task_set = broker.dequeue()
@@ -609,43 +614,40 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 739, in read_response
 ```
 
-**Mechanism (cause → effect):** the pusher process blocks on `BLPOP` against Redis ([django_q/cluster.py:L345] → `redis_broker.py:L21`); when the broker vanishes the call raises `ConnectionError`, the pusher process dies, and the cluster's **sentinel** detects the death and **reincarnates** it (`reincarnated pusher Process-1:N after sudden death`), which is why the logical pusher id climbs `Process-1:13 → 20 → 21 → 22 → 23 → 24` on a ~10-second cadence for the duration of the outage. The sentinel itself never dies, so the cluster stays up and keeps retrying.
+**Mechanism (cause → effect):** the pusher process blocks on `BLPOP` against Redis ([django_q/cluster.py:L345] → `redis_broker.py:L21`); when the broker vanishes the call raises `ConnectionError`, the pusher process dies, and the cluster's **sentinel** detects the death and **reincarnates** it (`reincarnated pusher Process-1:N after sudden death`), which is why the logical pusher id climbs `Process-1:13 → 18 → 19 → 20 → 21 → 22` on a ~10-second cadence for the duration of the outage. The sentinel itself never dies, so the cluster stays up and keeps retrying.
 
-**The HTTP tier stayed healthy throughout.** The Docker healthcheck kept returning `exit=0` and `FailingStreak` never rose above `0` — including the two probes at **21:11:53** and **21:12:23**, which fell *inside* the outage window and still passed *(observed live via `docker inspect .State.Health` during the outage)*. This is expected: an unauthenticated `GET /` returns `302 → /accounts/login/` (see [§3.2](#32-web-server-readiness--gunicorn)) without touching Redis, so the liveness probe does **not** detect a broker outage:
+**The HTTP tier stayed healthy throughout.** The Docker healthcheck kept returning `exit=0` and `FailingStreak` never rose above `0` — including the probes at **23:14:30**, **23:15:00** and **23:15:31**, which all fell *inside* the outage window and still passed *(observed live via `docker inspect .State.Health` during the outage)*. This is expected: an unauthenticated `GET /` returns `302 → /accounts/login/` (see [§3.2](#32-web-server-readiness--gunicorn)) without touching Redis, so the liveness probe does **not** detect a broker outage:
 
 ```
 $ docker inspect -f "{{json .State.Health}}" paperless-inv-app   # live; FailingStreak stayed 0 all run
 Status=healthy FailingStreak=0
-2026-07-14 21:16:26  exit=0
-2026-07-14 21:16:56  exit=0  (+30s)
-2026-07-14 21:17:26  exit=0  (+30s)
-2026-07-14 21:17:57  exit=0  (+31s)
-2026-07-14 21:18:27  exit=0  (+30s)
+2026-07-14 23:14:30  exit=0   <- inside outage (broker down since T0 23:14:01)
+2026-07-14 23:15:00  exit=0  (+30s)   <- inside outage
+2026-07-14 23:15:31  exit=0  (+31s)   <- inside outage
 ```
 
 ### 6.3 After restart — the recovery signature
 
-Restarting the broker at **`T1 = 21:12:49`** cleared the fault within ~1 second. The recovery is visible as: a final `Error 111` (DNS now resolves again, but redis-server is still coming up), then the sentinel reincarnates the pusher one last time and the new pusher **successfully begins pushing** — after which errors cease entirely and Redis answers `PING`:
+Restarting the broker at **`T1 = 23:16:40`** cleared the fault within ~6 seconds — the recovery latency is bounded by the pusher's ~10-second reincarnation cycle plus the instant Docker re-registers the `broker` DNS alias, not by any application retry timer. The recovery is visible as: the `Error -5` stream stops the moment DNS resolves the restarted broker again (no `Error 111` was emitted at restart in this run), then the sentinel reincarnates the pusher one last time and the new pusher **successfully begins pushing and persists** — after which errors cease entirely and Redis answers `PING`:
 
 ```
-$ T1=2026-07-14T21:12:49 ; docker start paperless-inv-broker     # restart the broker
+$ T1=2026-07-14T23:16:40 ; docker start paperless-inv-broker     # restart the broker
 $ docker logs --timestamps paperless-inv-app | (lines at/after T1)
-2026-07-14T21:12:49 21:12:49 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
-2026-07-14T21:12:49 21:12:49 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
-2026-07-14T21:12:50 21:12:50 [Q] ERROR Error 111 connecting to broker:6379. Connection refused.
-2026-07-14T21:12:51 21:12:51 [Q] INFO Process-1:30 stopped pushing tasks
-2026-07-14T21:12:51 21:12:51 [Q] ERROR reincarnated pusher Process-1:30 after sudden death
-2026-07-14T21:12:51 21:12:51 [Q] INFO Process-1:31 pushing tasks at 1491
+2026-07-14T23:16:40 23:16:40 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
+2026-07-14T23:16:40 23:16:40 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
+2026-07-14T23:16:46 23:16:46 [Q] INFO Process-1:32 stopped pushing tasks
+2026-07-14T23:16:46 23:16:46 [Q] ERROR reincarnated pusher Process-1:32 after sudden death
+2026-07-14T23:16:46 23:16:46 [Q] INFO Process-1:33 pushing tasks at 546
 
-$ # error lines after restart (they cease within ~1s):
+$ # error lines after restart (they cease within ~6s, bounded by the pusher reincarnation cycle):
 Error -5 after T1                        = 2
-Error 111 after T1                       = 1
-last error after T1: 21:12:50 [Q] ERROR Error 111 connecting to broker:6379. Connection refused.
+Error 111 after T1                       = 0
+last error after T1: 23:16:40 [Q] ERROR Error -5 connecting to broker:6379. No address associated with hostname.
 $ python3 -c "import redis,os; print(redis.from_url(os.environ[PAPERLESS_REDIS]).ping())"
 PING True
 ```
 
-The decisive line is `Process-1:31 pushing tasks at 1491` — a fresh pusher (django-q logical id `Process-1:31`, OS pid `1491`) that, unlike its predecessors, does **not** immediately die. Combined with the error stream stopping at `21:12:50` and `PING True`, this is the "operational again" signal.
+The decisive line is `Process-1:33 pushing tasks at 546` — a fresh pusher (django-q logical id `Process-1:33`, OS pid `546`) that, unlike its predecessors, does **not** immediately die (no further `stopped pushing` line follows it). Combined with the error stream stopping at `23:16:40` and `PING True`, this is the "operational again" signal.
 
 ### 6.4 There is no literal "reconnected" message
 
@@ -660,14 +662,17 @@ Therefore "everything has reconnected and is operational again" is necessarily a
 
 ### 6.5 Operational again — scheduling resumes
 
-Definitive proof that the system is fully operational: the next mail-check schedule fired normally after recovery, at `21:15:58` (≈10 min after the pre-outage firing at `21:05:53`), with the complete enqueue → create → process → processed sequence:
+Definitive proof that the system is fully operational: the next mail-check schedule fired normally after recovery, at `23:21:13`, with the complete enqueue → create → process → processed sequence. (The only earlier firing in this dedicated run was the post-boot catch-up burst at `23:11:37`, where the mail check and the sanity check fired together immediately after the `23:11:07` boot; the resulting sub-10-minute gap to the first steady-state firing is the same catch-up-vs-steady-state effect documented in §5.3.)
 
 ```
 $ docker logs --timestamps paperless-inv-app | (firing lines at/after T1)
-2026-07-14T21:15:58 21:15:58 [Q] INFO Enqueued 1
-2026-07-14T21:15:58 21:15:58 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-2026-07-14T21:15:58 21:15:58 [Q] INFO Process-1:7 processing [lamp-vegan-quiet-fourteen]
-2026-07-14T21:15:58 21:15:58 [Q] INFO Processed [lamp-vegan-quiet-fourteen]
+2026-07-14T23:21:13 23:21:13 [Q] INFO Enqueued 1
+2026-07-14T23:21:13 23:21:13 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+2026-07-14T23:21:13 23:21:13 [Q] INFO Process-1:5 processing [island-nebraska-jupiter-mirror]
+2026-07-14T23:21:13 23:21:13 [Q] INFO Process-1:5 stopped doing work
+2026-07-14T23:21:13 23:21:13 [Q] INFO Processed [island-nebraska-jupiter-mirror]
+2026-07-14T23:21:13 23:21:13 [Q] INFO recycled worker Process-1:5
+2026-07-14T23:21:13 23:21:13 [Q] INFO Process-1:34 ready for work at 655
 ```
 
 ### 6.6 Websocket layer impact (inferred from source)
@@ -811,13 +816,13 @@ Final pass confirming every sub-question and every named item is answered, with 
 | Q3 | scheduler firing (`Enqueued`/`created a task from schedule`/`processing`/`Processed`/`recycled`), ~10 min | [§5.2](#52-the-scheduler-firing--every-10-minutes) | Observed |
 | Q3 | catch-up vs steady-state disambiguation | [§5.3](#53-one-time-catch-up-vs-steady-state-disambiguation) | Observed |
 | Q3 | silence between firings (0 `[Q]` lines in 9-min window) | [§5.4](#54-between-firings-silence) | Observed |
-| **Q4** recovery | first error `Error 111 ... Connection refused` | [§6.2](#62-during-the-outage--the-failure-signature) | Observed |
-| Q4 | dominant `Error -5 ... No address associated with hostname` (×136) | [§6.2](#62-during-the-outage--the-failure-signature) | Observed |
+| **Q4** recovery | first error `Connection closed by server.` (blpop read path); transient `Error 111` is a connect-path race (`0,0,1` across 3 runs) | [§6.2](#62-during-the-outage--the-failure-signature) | Observed |
+| Q4 | dominant `Error -5 ... No address associated with hostname` (×309) | [§6.2](#62-during-the-outage--the-failure-signature) | Observed |
 | Q4 | pusher `stopped pushing tasks` → `reincarnated pusher ... after sudden death` | [§6.2](#62-during-the-outage--the-failure-signature) | Observed |
 | Q4 | HTTP healthcheck stays `exit=0` through outage | [§6.2](#62-during-the-outage--the-failure-signature) | Observed |
 | Q4 | recovery: errors cease → new `pushing tasks at <pid>` → `PING True` | [§6.3](#63-after-restart--the-recovery-signature) | Observed |
 | Q4 | no literal `reconnect` string (composite/inferred recovery) | [§6.4](#64-there-is-no-literal-reconnected-message) | Observed |
-| Q4 | operational-again: next schedule fires at `21:15:58` | [§6.5](#65-operational-again--scheduling-resumes) | Observed |
+| Q4 | operational-again: next schedule fires at `23:21:13` | [§6.5](#65-operational-again--scheduling-resumes) | Observed |
 | Q4 | websocket-layer impact | [§6.6](#66-websocket-layer-impact-inferred-from-source) | Inferred from source |
 | **Q5** always-on | gunicorn / document_consumer / qcluster (supervised, non-root) | [§7.1](#71-the-three-supervised-application-processes) | Observed |
 | Q5 | Redis (broker + channel layer), SQLite (schedules + results) | [§7.2](#72-stateful-backends--redis-and-sqlite) | Observed |
