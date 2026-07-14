@@ -46,11 +46,11 @@ Version: 3.5.3
 
 **Environment note (canonical-image gap corrected to match the production `Dockerfile`).** `src/documents/tasks.py` imports a barcode library **at module import time** — `from pyzbar import pyzbar` `[src/documents/tasks.py:25]` — which links the native `libzbar0` shared library. The production image installs `libzbar0` during build `[Dockerfile:74]`, but the pulled canonical image was missing it, so the three `documents.tasks.*` workers raised `ImportError: Unable to find zbar shared library` when Django Q tried to import the task module. This is an **environment provisioning gap in the pulled image, not a source issue**; it was corrected by installing the exact package the `Dockerfile` specifies (`apt-get install -y libzbar0` → `libzbar0:amd64 0.23.90-1+deb11u1`), restoring the canonical build. No source file was changed. All "clean" scheduler runs below were captured after this correction.
 
-**Observed** — the container's startup migration step is `docker-prepare.sh`'s `migrations()`, which runs `manage.py migrate` under a lock `[docker/docker-prepare.sh:38-46]` (called from the prepare `main` at `[docker/docker-prepare.sh:73]`):
+**Observed** — the container's startup migration step is `docker-prepare.sh`'s `migrations()`, which runs `manage.py migrate` under a lock `[docker/docker-prepare.sh:38-47]` (called from the prepare `main` at `[docker/docker-prepare.sh:73]`):
 
 ```bash
 # cont$ (cwd=/app)
-sed -n '38,46p' docker/docker-prepare.sh
+sed -n '38,47p' docker/docker-prepare.sh
 ```
 ```text
 migrations() {
@@ -731,7 +731,7 @@ for s in Schedule.objects.all():
     s.save()
 PY
 # step 2 — start the scheduler; let the sanity schedule fire (~30 s); then stop it:
-python3 manage.py qcluster > sanity_qc.log 2>&1 &  ; sleep 38 ; kill -TERM %1
+python3 manage.py qcluster > sanity_qc.log 2>&1 & sleep 38 ; kill -TERM %1
 # step 3 — the persisted Failure row, then the warning/info/clean return values via async_task:
 python3 - <<'PY'
 import os, time, glob, hashlib, django
@@ -952,7 +952,7 @@ from django.utils import timezone
 from datetime import timedelta
 from django_q.models import Schedule
 Schedule.objects.all().update(next_run=timezone.now() - timedelta(seconds=5))"   # all four due
-python3 manage.py qcluster > qc.log 2>&1 &   ; sleep 45 ; kill -TERM %1           # one pass, then stop
+python3 manage.py qcluster > qc.log 2>&1 & sleep 45 ; kill -TERM %1           # one pass, then stop
 cat qc.log
 ```
 
@@ -1461,7 +1461,7 @@ print("now =", now.isoformat())
 print("BEFORE: mail next_run=%s (overdue by 45 min = 4.5 intervals)"
       % Schedule.objects.get(func=MAIL).next_run.isoformat())
 PY
-python3 manage.py qcluster > qc_catchup.log 2>&1 &  ; sleep 40 ; kill -TERM %1
+python3 manage.py qcluster > qc_catchup.log 2>&1 & sleep 40 ; kill -TERM %1
 python3 - <<'PY'
 import django; django.setup()
 from django_q.models import Schedule, Task
@@ -1508,7 +1508,7 @@ A failed task is therefore **only** persisted as a `Failure` row (Section 3.3, S
 
 ### 8.1 Startup activities
 
-- **`migrate` seeds the schedule rows.** The four `django_q_schedule` rows come into existence only when migrations run, which the container does at startup via `migrations()` → `python3 manage.py migrate` `[docker/docker-prepare.sh:38-46]` (called from the prepare `main` at `[docker/docker-prepare.sh:73]`). This is a startup activity that *creates* the schedules; it does not *execute* the tasks.
+- **`migrate` seeds the schedule rows.** The four `django_q_schedule` rows come into existence only when migrations run, which the container does at startup via `migrations()` → `python3 manage.py migrate` `[docker/docker-prepare.sh:38-47]` (called from the prepare `main` at `[docker/docker-prepare.sh:73]`). This is a startup activity that *creates* the schedules; it does not *execute* the tasks.
 - **A conditional startup reindex.** `search_index()` runs `python3 manage.py document_index reindex` **only if** the stored index-version file is missing or does not match the expected version `[docker/docker-prepare.sh:49-56]` (called from the prepare `main` at `[docker/docker-prepare.sh:75]`):
 
 ```bash
@@ -1575,7 +1575,7 @@ for s in Schedule.objects.all():
     s.next_run = (now - timedelta(seconds=5)) if s.func == MAIL else (now + timedelta(days=10))
     s.save()
 PY
-python3 manage.py qcluster > qc_sched.log 2>&1 &  ; sleep 40 ; kill -TERM %1
+python3 manage.py qcluster > qc_sched.log 2>&1 & sleep 40 ; kill -TERM %1
 grep -E "running\.|Enqueued|created a task from schedule|processing \[" qc_sched.log
 ```
 
