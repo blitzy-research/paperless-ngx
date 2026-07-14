@@ -36,7 +36,7 @@ Plus the **authorization premise**: does visibility "shaped by sharing rules" (o
 ## 2. TL;DR — direct answers
 
 - **H3 — Unstable ordering on ties is the true root-cause *mechanism*, but at this commit the symptom does NOT reproduce during ordinary paged browsing on either default backend. [OBSERVED — HTTP negative + STATICALLY VERIFIED mechanism + OBSERVED — runtime demonstration]**
-  The list is ordered by the **non-unique** `Document.Meta.ordering = ("-created",)` (`src/documents/models.py:L208`) over a `created` field that is indexed but **not unique** and has **no secondary tiebreaker** (`src/documents/models.py:L152`) — the exact precondition for tie instability. However, driving the real HTTP API page-by-page over an unchanged, tie-heavy dataset was **12/12 clean on default SQLite and 12/12 clean on PostgreSQL** (§4.2, §4.5), both unfiltered and with a common filter enabled. The reason is a subtle interaction that we confirmed at runtime: on **SQLite** both independent page requests happen to use the *same* query plan, so they resolve the tie identically (§4.3–§4.4); on **PostgreSQL** the `Document.objects.distinct()` in `get_queryset()` forces a sort over **all** output columns — which includes the unique `id` — producing a **total order** `(created DESC, id, …)` that is deterministic even under forced parallelism and `VACUUM FULL` (§4.5). The H3 mechanism is therefore **real but latent** here: it surfaces only when the two independent page requests resolve ties under *different* orders, which we demonstrated with a controlled, read-only plan divergence on an isolated copy of the database — producing exactly **id `66`–`70` duplicated and id `51`–`55` missing with `count` constant** (§4.4). This is reported honestly per the "reproduce, don't stabilize" rule: we did not manufacture a stabilized variant and call the behavior deterministic, nor did we mutate the live database to force the artifact.
+  The list is ordered by the **non-unique** `Document.Meta.ordering = ("-created",)` (`src/documents/models.py:L208`) over a `created` field that is indexed but **not unique** and has **no secondary tiebreaker** (`src/documents/models.py:L152`) — the exact precondition for tie instability. However, driving the real HTTP API page-by-page over an unchanged, tie-heavy dataset was **12/12 clean on default SQLite and 12/12 clean on PostgreSQL** (§4.2, §4.5), both unfiltered and with a common filter enabled. The reason is a subtle interaction that we confirmed at runtime: on **SQLite** both independent page requests happen to use the *same* query plan, so they resolve the tie identically (§4.3–§4.4); on **PostgreSQL** the planner chose a `Sort+Unique` plan for the `Document.objects.distinct()` query in every configuration we tried, and that plan sorts over **all** output columns — including the unique `id` — so it *incidentally* yields the total order `(created DESC, id, …)`, stable even under forced parallelism and `VACUUM FULL` (§4.5). That total order is a property of the chosen plan, **not** a logical guarantee: a legitimate `HashAggregate` plan for the identical result orders only by `created` and, sliced across pages against `Sort+Unique`, reproduces the artifact on PostgreSQL too — **5 duplicates and 5 missing with `count` constant** (§4.5.1). The H3 mechanism is therefore **real but latent** here: it surfaces only when the two independent page requests resolve ties under *different* orders, which we demonstrated with a controlled, read-only plan divergence on an isolated copy of the database — producing exactly **id `66`–`70` duplicated and id `51`–`55` missing with `count` constant** on SQLite (§4.4), and 5 duplicates + 5 missing on PostgreSQL (§4.5.1). This is reported honestly per the "reproduce, don't stabilize" rule: we did not manufacture a stabilized variant and call the behavior deterministic, nor did we mutate the live database to force the artifact.
 
 - **H2 — Pagination does NOT happen before de-duplication; the framing is refuted. [OBSERVED — HTTP]**
   `DocumentViewSet.get_queryset()` returns `Document.objects.distinct()` (`src/documents/views.py:L198-199`), so `DISTINCT` is part of the **base queryset**. The SQL Django actually emitted for a live routed page-2 request (captured from PostgreSQL statement logs, §6) is a single statement `SELECT DISTINCT … ORDER BY "created" DESC LIMIT 15 OFFSET 25`, and `count` is `SELECT COUNT(*) FROM (SELECT DISTINCT …) subquery`. `DISTINCT` is applied to the row source **within the same statement** that carries `LIMIT/OFFSET` — de-duplication **precedes** the page slice.
@@ -47,7 +47,7 @@ Plus the **authorization premise**: does visibility "shaped by sharing rules" (o
 - **Authorization premise — does NOT reproduce; the instability is permission-independent here. [OBSERVED — HTTP + STATICALLY VERIFIED]**
   Every documents endpoint enforces only `permission_classes = (IsAuthenticated,)` (`src/documents/views.py:L183`); there are **no object-level permissions** and **no `django-guardian`** dependency at this commit (§7). Running the identical two-page sweep as a **superuser** and as a **non-staff** user returned **identical** `count` and identical page-1/page-2 id sets on both backends, with an empty symmetric difference (§7). The "sharing rules shape what you see" scenario is not present in this code; the list behavior depends on tie-ordering, not on who is looking.
 
-**One-line summary:** the ordering by a non-unique `-created` with no tiebreaker is the latent mechanism the user intuited (H3), but at commit `542221a38` the `.distinct()` side effect on PostgreSQL and single-plan stability on SQLite keep it from surfacing during ordinary browsing; H1 (fan-out) and H2 (dedup-before-pagination) are real but are *not* the cause; and the "sharing rules" premise does not exist in this code.
+**One-line summary:** the ordering by a non-unique `-created` with no tiebreaker is the latent mechanism the user intuited (H3), but at commit `542221a38` it stays latent during ordinary browsing only because *both* independent page requests happen to resolve ties identically — SQLite keeps both pages on one query plan, and PostgreSQL's planner happens to choose a `Sort+Unique` plan whose all-column sort incidentally breaks ties by `id`; **neither is a guarantee**, and a cross-plan divergence reproduces the duplicates-and-gaps artifact on *both* backends (§4.4 SQLite, §4.5.1 PostgreSQL); H1 (fan-out) and H2 (dedup-before-pagination) are real but are *not* the cause; and the "sharing rules" premise does not exist in this code.
 
 ---
 
@@ -148,6 +148,18 @@ body: {'detail': 'Authentication credentials were not provided.'}
 
 The failure only manifests when tied `created` values straddle a page boundary, so the dataset was seeded (through the real app, on the git-ignored database) larger than one page (`page_size = 25`) with deliberate ties, plus **disposable** local users. The seed creates **40 documents**: 20 at timestamp `D0 = 2026-07-13 12:00` (newest) and 20 at `D1 = 2026-07-12 12:00`, so the `D1` tie block straddles the 25/26 boundary. Tags: `invoice` on **30** documents (deliberately > 25, so *filtered* browsing also spans a page boundary), `invoice-paid` on 6, `inbox` on 12. Disposable users: `probe_admin` (superuser) and `probe_viewer` (non-staff), with an obviously-disposable password; both are **deleted during cleanup** (§12).
 
+The dataset is created by `seed_dataset.py` (reproduced in full in §A), run once per backend through the real app on the git-ignored database. It first clears existing documents, so it is idempotent, and it uses MD5 checksums (32 hex chars) so the *identical* script runs on both SQLite and PostgreSQL (whose `checksum` column is `varchar(32)`):
+
+```
+# SQLite (default backend):
+$ docker exec paperless-app bash -lc 'cd src && python /tmp/seed_dataset.py'
+
+# PostgreSQL (production backend) — identical script, identical dataset:
+$ docker exec -e PAPERLESS_DBHOST=paperless-postgres paperless-app bash -lc 'cd src && python /tmp/seed_dataset.py'
+```
+
+Its effect, confirmed independently read-only through the ORM (the three tags resolve to ids `4`/`5`/`6` on both backends in this environment, so the `tags__id__all=4` filter used later is the `invoice` tag):
+
 ```
 $ docker exec paperless-app bash -lc 'cd src && python manage.py shell -c "
 from documents.models import Document, Tag
@@ -224,7 +236,7 @@ DISTRIBUTION: 12/12 clean, 0/12 artifact
 
 ### 4.3 Why SQLite is coincidentally stable — and why the tie order is NOT guaranteed [OBSERVED — runtime]
 
-Both independent page requests are satisfied by the **same** plan (an index walk over `documents_document_created_bedd0818`), so they resolve the tie identically. Crucially — unlike PostgreSQL (§4.5) — SQLite's `DISTINCT` implementation for this query does **not** inject a total order over all columns: the effective tie order is a *plan artifact*. Replaying the **real** all-15-column `SELECT DISTINCT … ORDER BY created DESC` query two ways on an **isolated copy** of the live database (see §4.4 for the zero-mutation method) shows two different, equally-valid tie orders:
+Both independent page requests are satisfied by the **same** plan (an index walk over `documents_document_created_bedd0818`), so they resolve the tie identically. Crucially — unlike PostgreSQL's `Sort+Unique` plan (§4.5), which sorts by *all* output columns and so *incidentally* yields a total order — SQLite's index-walk plan for this query sorts by none of them, so the effective tie order is a pure *plan artifact* (neither backend's tie order is a logical guarantee; see §4.5.1 for the PostgreSQL cross-plan counterexample). Replaying the **real** all-15-column `SELECT DISTINCT … ORDER BY created DESC` query two ways on an **isolated copy** of the live database (see §4.4 for the zero-mutation method) shows two different, equally-valid tie orders:
 
 ```
 $ docker exec paperless-app bash -lc 'cd src && python /tmp/mechanism_distinct_sqlite.py'
@@ -267,17 +279,17 @@ single-plan B dups/missing: ([], [])
 cross-plan (A page1, B page2) dups/missing: ([66, 67, 68, 69, 70], [51, 52, 53, 54, 55])
 ```
 
-**Result [OBSERVED — runtime]:** when page 1 and page 2 resolve the `created` tie under different orders, ids `66`–`70` appear on **both** pages (duplicates) and ids `51`–`55` appear on **neither** (gaps), while `count` stays `40` — precisely the user's "same document twice / disappears then returns / total unchanged" symptom. This is the H3 mechanism, demonstrated without any mutation of the repository or the live database. It is **not** reached during ordinary browsing at this commit because (SQLite) both pages use one plan and (PostgreSQL) the order is total (§4.5); hence H3 is the real but **latent** root cause.
+**Result [OBSERVED — runtime]:** when page 1 and page 2 resolve the `created` tie under different orders, ids `66`–`70` appear on **both** pages (duplicates) and ids `51`–`55` appear on **neither** (gaps), while `count` stays `40` — precisely the user's "same document twice / disappears then returns / total unchanged" symptom. This is the H3 mechanism, demonstrated without any mutation of the repository or the live database. It is **not** reached during ordinary browsing at this commit because (SQLite) both pages happen to use one plan and (PostgreSQL) the planner happens to choose a `Sort+Unique` plan whose all-column sort makes the order *incidentally* total (§4.5) — neither of which is a guarantee (the identical cross-plan artifact is reproduced on PostgreSQL in §4.5.1); hence H3 is the real but **latent** root cause.
 
-### 4.5 PostgreSQL production backend — also stable, because `.distinct()` injects a total order [OBSERVED — HTTP + runtime]
+### 4.5 PostgreSQL production backend — stable *here*, but only because the planner chose `Sort+Unique`; the total order is **plan-dependent, not a logical guarantee** [OBSERVED — HTTP + runtime]
 
-A PostgreSQL 13 backend was stood up (the production path, selected when `PAPERLESS_DBHOST` is set, `src/paperless/settings.py:L304-318`), migrated, seeded with the identical dataset, and driven through the same real HTTP API on port 8001. **Unfiltered**, 12 identical sweeps:
+A PostgreSQL 13 backend was stood up (the production path, selected when `PAPERLESS_DBHOST` is set, `src/paperless/settings.py:L304-318`), migrated, seeded with the identical tie-inducing dataset, and driven through the same real HTTP API on port 8001. The server version and Django routing were confirmed on the canonical code path: `server_version = 13.23 (Debian 13.23-1.pgdg13+1)`, `connection.vendor = postgresql`, `ENGINE = django.db.backends.postgresql_psycopg2` (matches §9). The dataset is 40 documents with primary keys `1`–`40` (the autoincrement offset differs from the SQLite runtime's `31`–`70`; the offset is immaterial — what matters is the two 20-row `created` tie blocks straddling the 25-row page boundary: ids `1`–`20` at the newer timestamp, ids `21`–`40` at the older). **Unfiltered**, 12 identical sweeps:
 
 ```
 $ docker exec -e PROBE_BASE=http://127.0.0.1:8001 paperless-app bash -lc 'cd src && python /tmp/sweep.py "page_size=25&ordering=-created" 12 "PostgreSQL-unfiltered-default-created"'
 === SWEEP LABEL: PostgreSQL-unfiltered-default-created ===
 query: page_size=25&ordering=-created
-universe: count=40 n_ids=40 ids=[4041, 4042, 4043, 4044, 4045, 4046, 4047, 4048, 4049, 4050, 4051, 4052, 4053, 4054, 4055, 4056, 4057, 4058, 4059, 4060, 4061, 4062, 4063, 4064, 4065, 4066, 4067, 4068, 4069, 4070, 4071, 4072, 4073, 4074, 4075, 4076, 4077, 4078, 4079, 4080]
+universe: count=40 n_ids=40 ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
 sweep 01: count=40 pagesizes={1: 25, 2: 15} dups=[] missing=[] extra=[] CLEAN
 sweep 02: count=40 pagesizes={1: 25, 2: 15} dups=[] missing=[] extra=[] CLEAN
 sweep 03: count=40 pagesizes={1: 25, 2: 15} dups=[] missing=[] extra=[] CLEAN
@@ -299,7 +311,7 @@ Filtered (`invoice` tag id=4, 30 docs > 25) was likewise **12/12 clean**:
 $ docker exec -e PROBE_BASE=http://127.0.0.1:8001 paperless-app bash -lc 'cd src && python /tmp/sweep.py "page_size=25&ordering=-created&tags__id__all=4" 12 "PostgreSQL-filtered-invoice-tags__id__all"'
 === SWEEP LABEL: PostgreSQL-filtered-invoice-tags__id__all ===
 query: page_size=25&ordering=-created&tags__id__all=4
-universe: count=30 n_ids=30 ids=[4041, 4042, 4043, 4044, 4045, 4046, 4047, 4048, 4049, 4050, 4051, 4052, 4053, 4054, 4055, 4061, 4062, 4063, 4064, 4065, 4066, 4067, 4068, 4069, 4070, 4071, 4072, 4073, 4074, 4075]
+universe: count=30 n_ids=30 ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
 sweep 01: count=30 pagesizes={1: 25, 2: 5} dups=[] missing=[] extra=[] CLEAN
 sweep 02: count=30 pagesizes={1: 25, 2: 5} dups=[] missing=[] extra=[] CLEAN
 sweep 03: count=30 pagesizes={1: 25, 2: 5} dups=[] missing=[] extra=[] CLEAN
@@ -314,84 +326,108 @@ sweep 11: count=30 pagesizes={1: 25, 2: 5} dups=[] missing=[] extra=[] CLEAN
 sweep 12: count=30 pagesizes={1: 25, 2: 5} dups=[] missing=[] extra=[] CLEAN
 DISTRIBUTION: 12/12 clean, 0/12 artifact
 ```
- The reason is decisive and specific to this codebase: because `get_queryset()` applies `.distinct()`, the emitted query is `SELECT DISTINCT <all 15 columns> … ORDER BY created DESC`, and PostgreSQL's sort-based `DISTINCT` must sort by **every output column** — which includes the unique `id`. The `EXPLAIN` shows the unique `id` as the **second** sort key, so `(created DESC, id, …)` is already a **total order**:
+Why were the pages stable? Because the PostgreSQL planner chose a **`Sort+Unique`** plan for the routed `SELECT DISTINCT <all 15 columns> … ORDER BY created DESC` query. A sort-based `DISTINCT` detects duplicate rows by sorting on **every** output column — which includes the unique `id` — so *that plan's* `Sort Key` is `created DESC, id, …`, and it therefore resolves every `created` tie by ascending `id`. The real 15-column routed query and its plan, under **default** configuration (all 15 columns written out verbatim — no placeholder — so the command is copy-paste executable):
 
 ```
-$ docker exec paperless-postgres psql -U paperless -d paperless -c "EXPLAIN SELECT DISTINCT <15 cols> FROM documents_document ORDER BY created DESC LIMIT 25 OFFSET 25;"
+$ docker exec paperless-postgres psql -U paperless -d paperless -c 'EXPLAIN SELECT DISTINCT "id","correspondent_id","title","document_type_id","content","mime_type","checksum","archive_checksum","created","modified","storage_type","added","filename","archive_filename","archive_serial_number" FROM documents_document ORDER BY created DESC LIMIT 25 OFFSET 0;'
                                                                                                       QUERY PLAN
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=76.46..77.06 rows=15 width=1234)
-   ->  Unique  (cost=75.46..77.06 rows=40 width=1234)
-         ->  Sort  (cost=75.46..75.56 rows=40 width=1234)
+ Limit  (cost=2.46..3.46 rows=25 width=1246)
+   ->  Unique  (cost=2.46..4.06 rows=40 width=1246)
+         ->  Sort  (cost=2.46..2.56 rows=40 width=1246)
                Sort Key: created DESC, id, correspondent_id, title, document_type_id, content, mime_type, checksum, archive_checksum, modified, storage_type, added, filename, archive_filename, archive_serial_number
-               ->  Seq Scan on documents_document  (cost=0.00..74.40 rows=40 width=1234)
+               ->  Seq Scan on documents_document  (cost=0.00..1.40 rows=40 width=1246)
 (5 rows)
 ```
 
-> In the `psql` commands above and below, `<15 cols>` denotes exactly the 15 `documents_document` columns enumerated verbatim in the routed `SELECT DISTINCT …` of §6 (`id, correspondent_id, title, document_type_id, content, mime_type, checksum, archive_checksum, created, modified, storage_type, added, filename, archive_filename, archive_serial_number`); the full list appears in every plan's `Sort Key` line, so the plan output is complete and unedited.
+> The 15 columns are exactly the `documents_document` columns of the routed `SELECT DISTINCT …` in §6 (`id, correspondent_id, title, document_type_id, content, mime_type, checksum, archive_checksum, created, modified, storage_type, added, filename, archive_filename, archive_serial_number`) and appear in full on the `Sort Key` line, so the plan output is complete and unedited. (`ANALYZE documents_document` was run first so the estimates are deterministic on the static 40-row table; the cost/width/`rows` figures are planner statistics, while the **material, reproducible facts are the node types — `Sort`+`Unique` — and the `Sort Key`**, which are stable regardless of the statistics state.)
 
-Because `id` is unique, `(created DESC, id)` breaks every `created` tie deterministically, so independent page requests cannot disagree. This holds even under the most adversarial conditions we could force. **Forcing genuine 4-worker parallel execution** (on a 4000-document dataset with two large tie blocks; GUCs applied one-per-statement) still preserves the total order via `Gather Merge`, and a 15-rep tie-boundary probe deep inside a tie block found **0/15** artifacts:
+**The critical correction — this supersedes the earlier claim that `.distinct()` "injects a total order" as a plan-independent logical guarantee.** The total order `(created DESC, id, …)` seen above is a property of the **`Sort+Unique` plan the planner chose**, *not* a logical property of the SQL. The query's only ordering contract is `ORDER BY created DESC`; PostgreSQL explicitly leaves rows tied on `created` in an **unspecified** order (References). `Sort+Unique` makes the order total only incidentally, because *its* implementation sorts by all output columns. PostgreSQL is free to satisfy the identical `DISTINCT` result set with a **hash-based** plan whose only sort key is `created DESC` — a *partial* order that leaves ties in an arbitrary hash sequence. This is not hypothetical: it is a real, reachable PostgreSQL plan, demonstrated at runtime immediately below using the same read-only cross-plan method as §4.4. When two independent page requests resolve the tie under *different* plans, PostgreSQL produces the duplicates-and-gaps artifact exactly as SQLite does — which is why AAP §0.4.4 correctly describes PostgreSQL ordering as "explicitly non-deterministic on ties," and why the earlier "logical guarantee" framing was wrong.
+
+#### 4.5.1 Cross-plan counterexample on PostgreSQL — the total order is plan-dependent [OBSERVED — runtime]
+
+The routed `SELECT DISTINCT <15 cols> … ORDER BY created DESC` and the semantically **identical** `GROUP BY <15 cols> … ORDER BY created DESC` return the same 40-row result set (deduplicate, then order by `created`). PostgreSQL plans them differently, and the two plans emit tied rows in **different** orders:
+
+- **PLAN S (`Sort+Unique`)** — the plan the planner chose for the real `DISTINCT` query in *every* configuration tried (default; `SET enable_sort=off`; `enable_seqscan=off`; `enable_indexscan=off`; `enable_incremental_sort=off`; `jit=off`). Sorts by all 15 columns ⇒ tie order = ascending `id` ⇒ **total** order.
+- **PLAN H (`HashAggregate`)** — a legitimate plan PostgreSQL selects for the identical `GROUP BY` result (here under `SET enable_sort=off`; PostgreSQL reduces `GROUP BY <15 cols>` to `Group Key: id` by functional dependency, since `id` is the primary key). Its only ordering step is `Sort Key: created DESC` — a **partial** order — over hash-emitted rows ⇒ tie order = an arbitrary hash permutation.
 
 ```
-$ docker exec paperless-postgres psql -U paperless -d paperless -c "EXPLAIN ANALYZE SELECT DISTINCT <15 cols> FROM documents_document ORDER BY created DESC LIMIT 25 OFFSET 1000;"
-                                                                         QUERY PLAN
+$ docker exec paperless-postgres psql -U paperless -d paperless -c 'SET enable_sort=off; EXPLAIN SELECT "id","correspondent_id","title","document_type_id","content","mime_type","checksum","archive_checksum","created","modified","storage_type","added","filename","archive_filename","archive_serial_number" FROM documents_document GROUP BY "id","correspondent_id","title","document_type_id","content","mime_type","checksum","archive_checksum","created","modified","storage_type","added","filename","archive_filename","archive_serial_number" ORDER BY created DESC LIMIT 25 OFFSET 0;'
+                                       QUERY PLAN
+-----------------------------------------------------------------------------------------
+ Limit  (cost=10000000002.96..10000000003.03 rows=25 width=1246)
+   ->  Sort  (cost=10000000002.96..10000000003.06 rows=40 width=1246)
+         Sort Key: created DESC
+         ->  HashAggregate  (cost=1.50..1.90 rows=40 width=1246)
+               Group Key: id
+               ->  Seq Scan on documents_document  (cost=0.00..1.40 rows=40 width=1246)
+ JIT:
+   Functions: 6
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+(9 rows)
+```
+
+The two plans' emitted id-orders over the identical 40 rows (extracting the leading `id` column; `D0` = ids `1`–`20` at the newer timestamp, `D1` = ids `21`–`40`). PLAN H was **stable across 3 identical runs** — it is deterministic *for this build and data*, but it is emphatically **not** the `id`-ordered total order of PLAN S:
+
+```
+PLAN S (Sort+Unique) full order : 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 | 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+PLAN H (HashAggregate) full order: 9 12 14 3 17 7 4 19 20 10 13 1 5 18 2 16 15 6 11 8 | 30 34 40 32 35 38 26 39 24 36 25 31 29 21 37 28 22 33 27 23
+   (within each created tie-block the ids are a hash permutation, NOT id-ordered)
+```
+
+Simulating offset paging over the identical, unchanged 40-row table — page 1 = `[0:25]`, page 2 = `[25:50]` — first with both pages on the same plan (control), then the **cross-plan** case (page 1 served by PLAN H, page 2 served by PLAN S):
+
+```
+CONTROL    (S page1 + S page2, same plan): duplicates=[]                  missing=[]                  distinct_served=40  count=40  -> CLEAN
+CROSS-PLAN (H page1 + S page2):            duplicates=[30, 32, 34, 35, 40] missing=[21, 22, 23, 24, 25] distinct_served=35  count=40  -> HAUNTED
+   H page1 = 9 12 14 3 17 7 4 19 20 10 13 1 5 18 2 16 15 6 11 8 30 34 40 32 35
+   S page2 = 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+```
+
+**Result [OBSERVED — runtime]:** when page 1 and page 2 resolve the `created` tie under different (both legitimate) PostgreSQL plans, ids `30, 32, 34, 35, 40` appear on **both** pages and ids `21`–`25` appear on **neither**, while `count` stays `40` — the user's exact "same document twice / disappears then returns / total unchanged" symptom, reproduced on PostgreSQL. This is precisely the counterexample the QA review flagged (`HashAggregate` page 1 + `Sort+Unique` page 2 ⇒ 5 duplicates + 5 missing, `count` constant), and it refutes the "logical total order" thesis.
+
+**Honest scope of this counterexample.** On PG 13.23 the planner robustly chose `Sort+Unique` for the *real* `DISTINCT` query in every configuration attempted, so the live HTTP API stayed stable (the 12/12 clean sweeps above, and `page1=[1..25]`, `page2=[26..40]`, `dups=[]` over HTTP) — we could **not** force the live `DISTINCT` path onto `HashAggregate` [OBSERVED]. The `HashAggregate` plan is reached via the functionally-equivalent `GROUP BY` formulation, which is the same read-only, cross-plan technique §4.4 uses for SQLite: it proves the tie order is a *plan artifact*, not a logical guarantee. Had the planner chosen a hash-based `DISTINCT` (hashing all 15 columns rather than reducing to `Group Key: id`), the tie order would likewise be a hash permutation, not `id`-ordered. The mechanism is therefore **real but latent** on PostgreSQL at this commit — latent because the planner currently prefers `Sort+Unique` for this query shape, not because the SQL guarantees a total order.
+
+The `Sort+Unique` stability is also robust to the two conditions the user's "nobody is editing anything" scenario implies — **parallel execution** and **heap maintenance** — but *only* because both keep the query on a **sort-based** plan whose `Sort Key` still includes the unique `id`. Forcing parallelism (aggressive planner GUCs, one session) yields a `Gather Merge` over per-worker `Sort` nodes whose `Sort Key` is still `created DESC, id, …`, so the merged output stays the same total order. (The worker count tracks table size: this 40-row / single-page table launches one worker; a larger table launches more, with an identical `Sort Key` — the tie order does not depend on the worker count.)
+
+```
+$ docker exec paperless-postgres psql -U paperless -d paperless -c "SET max_parallel_workers_per_gather=4; SET parallel_setup_cost=0; SET parallel_tuple_cost=0; SET min_parallel_table_scan_size=0; SET force_parallel_mode=on; EXPLAIN ANALYZE SELECT DISTINCT "id","correspondent_id","title","document_type_id","content","mime_type","checksum","archive_checksum","created","modified","storage_type","added","filename","archive_filename","archive_serial_number" FROM documents_document ORDER BY created DESC LIMIT 25 OFFSET 0;"
+                                                                                                         QUERY PLAN
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=186.12..187.43 rows=25 width=1226) (actual time=4.702..6.331 rows=25 loops=1)
-   ->  Unique  (cost=133.89..342.83 rows=4000 width=1226) (actual time=4.389..6.303 rows=1025 loops=1)
-         ->  Gather Merge  (cost=133.89..192.83 rows=4000 width=1226) (actual time=4.388..6.100 rows=1025 loops=1)
-               Workers Planned: 4
-               Workers Launched: 4
-               ->  Sort  (cost=133.83..136.33 rows=1000 width=1226) (actual time=0.509..0.517 rows=205 loops=5)
+ Limit  (cost=1.80..2.96 rows=25 width=1246) (actual time=2.767..4.319 rows=25 loops=1)
+   ->  Unique  (cost=1.80..3.66 rows=40 width=1246) (actual time=2.766..4.315 rows=25 loops=1)
+         ->  Gather Merge  (cost=1.80..2.16 rows=40 width=1246) (actual time=2.765..4.302 rows=25 loops=1)
+               Workers Planned: 1
+               Workers Launched: 1
+               ->  Sort  (cost=1.79..1.85 rows=24 width=1246) (actual time=0.063..0.064 rows=12 loops=2)
                      Sort Key: created DESC, id, correspondent_id, title, document_type_id, content, mime_type, checksum, archive_checksum, modified, storage_type, added, filename, archive_filename, archive_serial_number
-                     Sort Method: quicksort  Memory: 659kB
+                     Sort Method: quicksort  Memory: 35kB
                      Worker 0:  Sort Method: quicksort  Memory: 25kB
-                     Worker 1:  Sort Method: quicksort  Memory: 25kB
-                     Worker 2:  Sort Method: quicksort  Memory: 25kB
-                     Worker 3:  Sort Method: quicksort  Memory: 25kB
-                     ->  Parallel Seq Scan on documents_document  (cost=0.00..84.00 rows=1000 width=1226) (actual time=0.003..0.131 rows=800 loops=5)
- Planning Time: 0.839 ms
- Execution Time: 6.467 ms
-(15 rows)
-
-$ docker exec -e PROBE_BASE=http://127.0.0.1:8001 paperless-app bash -lc 'cd src && python /tmp/boundary_probe.py "page_size=25&ordering=-created" 40 15 "PG-forced-parallel-4workers"'
-=== BOUNDARY PROBE: PG-forced-parallel-4workers ===
-query=page_size=25&ordering=-created pages=40/41 reps=15
-rep 01: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 02: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 03: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 04: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 05: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 06: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 07: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 08: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 09: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 10: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 11: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 12: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 13: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 14: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-rep 15: count=4000 |pN|=25 |pN+1|=25 boundary_overlap(dups)=[] clean
-distinct page40 id-sets across 15 reps: 1 (1 => stable, >1 => run-to-run variation)
-distinct page41 id-sets across 15 reps: 1
-DISTRIBUTION: 0/15 reps showed a boundary duplicate
+                     ->  Parallel Seq Scan on documents_document  (cost=0.00..1.24 rows=24 width=1246) (actual time=0.003..0.006 rows=20 loops=2)
+ Planning Time: 0.797 ms
+ Execution Time: 4.414 ms
+(12 rows)
 ```
 
-**Running `VACUUM FULL` between the two page fetches** (heap reorganization — the realistic "nobody is editing anything" maintenance trigger — while still forced-parallel) was also **0/8**:
+Under that forced-parallel plan the full emitted order is unchanged — the total order, page 1 = `[1..25]`, page 2 = `[26..40]`, zero duplicates (leading `id` column extracted):
 
 ```
-=== VACUUM-between-pages probe pages=40/41 reps=8 (forced-parallel) ===
-rep 01: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 02: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 03: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 04: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 05: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 06: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 07: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-rep 08: |pN|=25 |pN+1|=25 boundary_overlap=[] clean
-DISTRIBUTION: 0/8 showed a boundary duplicate
+$ docker exec paperless-postgres psql -U paperless -d paperless -A -t -F'|' -c "SET max_parallel_workers_per_gather=4; SET parallel_setup_cost=0; SET force_parallel_mode=on; SELECT DISTINCT "id","correspondent_id","title","document_type_id","content","mime_type","checksum","archive_checksum","created","modified","storage_type","added","filename","archive_filename","archive_serial_number" FROM documents_document ORDER BY created DESC LIMIT 40 OFFSET 0;" | cut -d'|' -f1 | tr '\n' ' '
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
 ```
 
-The total order `(created DESC, id, …)` is a logical property independent of physical heap layout, so even `VACUUM FULL` cannot destabilize it. **This means the `.distinct()` added to collapse H1 fan-out (§5) has the side effect of stabilizing pagination on PostgreSQL** — an important, non-obvious finding: at this commit, the H3 mechanism is latent on the production backend too.
+Running `VACUUM FULL` (heap reorganization — the realistic "nobody is editing anything" maintenance trigger) between page fetches likewise leaves the pages unchanged, because `Sort+Unique` re-sorts by `id` regardless of the physical heap order:
+
+```
+$ docker exec paperless-postgres psql -U paperless -d paperless -c "VACUUM FULL documents_document;"
+VACUUM
+$ # page 1 (LIMIT 25 OFFSET 0), leading id column:
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+$ # page 2 (LIMIT 25 OFFSET 25), leading id column:
+26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+```
+
+But note precisely what this robustness does and does **not** establish. Parallelism and `VACUUM FULL` cannot destabilize the order *while the query stays on a sort-based plan* (`Sort+Unique` / parallel `Gather Merge`), because such plans carry `id` in the `Sort Key`. It is **not** a plan-independent guarantee: §4.5.1 exhibits a legitimate `HashAggregate` plan for the identical result whose only sort key is `created DESC`, whose tie order is a hash permutation, and which — sliced across pages against `Sort+Unique` — reproduces the duplicates-and-gaps artifact. So the `.distinct()` that collapses H1 fan-out (§5) *incidentally* stabilizes pagination on PostgreSQL **only for as long as the planner keeps choosing `Sort+Unique` for this query shape** — which it did in every configuration we tried, but which the SQL does not guarantee. The H3 mechanism is therefore **latent, not absent**, on the production backend: exactly as AAP §0.4.4 states, PostgreSQL ordering is "explicitly non-deterministic on ties."
 
 ---
 
@@ -445,7 +481,16 @@ Yes: the backend query **can** produce duplicate rows via M2M JOIN fan-out (36 �
 Because `.distinct()` lives in `get_queryset()` (`src/documents/views.py:L198-199`), it is part of the base queryset, and `StandardPagination` (`src/documents/views.py:L182`; defined `src/paperless/views.py:L8-11`) slices that already-`DISTINCT` queryset. Rather than a non-routed `APIRequestFactory` call, we captured the SQL Django **actually emitted for a live routed request** by enabling PostgreSQL statement logging and issuing a real authenticated `GET /api/documents/?page=2` through the HTTP API:
 
 ```
-$ docker exec paperless-postgres psql -U paperless -d paperless -c "ALTER SYSTEM SET log_statement='all'; SELECT pg_reload_conf();"
+# ALTER SYSTEM must be its OWN statement: two statements in one `psql -c` run as a
+# single implicit transaction, and ALTER SYSTEM cannot run inside a transaction block
+# (it errors "ALTER SYSTEM cannot run inside a transaction block"). Split into two -c calls:
+$ docker exec paperless-postgres psql -U paperless -d paperless -c "ALTER SYSTEM SET log_statement='all';"
+ALTER SYSTEM
+$ docker exec paperless-postgres psql -U paperless -d paperless -c "SELECT pg_reload_conf();"
+ pg_reload_conf
+----------------
+ t
+(1 row)
 $ docker exec -e PROBE_BASE=http://127.0.0.1:8001 paperless-app bash -lc 'cd src && python3 -c "
 import urllib.request, base64, json, os
 url = os.environ[\"PROBE_BASE\"] + \"/api/documents/?page=2&page_size=25&ordering=-created\"
@@ -557,9 +602,9 @@ Each `404` body is the DRF pagination default `{"detail":"Invalid page."}` (`con
 ## 9. Database note — SQLite and PostgreSQL both stable canonically at this commit
 
 - **SQLite (default backend) [OBSERVED — HTTP + runtime].** Repeated identical sweeps were 12/12 clean unfiltered and filtered (§4.2). Both independent page requests use the same index-walk plan (`SCAN TABLE documents_document USING INDEX documents_document_created_bedd0818`, §4.3), so they resolve the tie identically. SQLite's `DISTINCT` for this query does **not** inject a total order; the tie order is a *plan artifact* (index walk → descending `id`; forced sort → ascending `id`, §4.3). The order within a tie is therefore not guaranteed — it is only *coincidentally* stable because ordinary browsing keeps both pages on the same plan. A cross-plan divergence produces the artifact (§4.4).
-- **PostgreSQL (production backend) [OBSERVED — HTTP + runtime].** Selected when `PAPERLESS_DBHOST` is set (`postgresql_psycopg2`, `src/paperless/settings.py:L310`, branch `L304-318`). Repeated identical sweeps were 12/12 clean unfiltered and filtered (§4.5). PostgreSQL documents that the order of rows tied on all `ORDER BY` expressions is unspecified and must not be relied upon (see References); a *bare* `ORDER BY created` would indeed be free to differ per plan/heap/parallelism. **However**, the query this application actually issues is `SELECT DISTINCT <all 15 columns> … ORDER BY created DESC`, and PostgreSQL's sort-based `DISTINCT` sorts by every output column, placing the unique `id` as the second sort key. That makes the effective order the **total** order `(created DESC, id, …)`, which we observed to be deterministic even under forced 4-worker parallelism and `VACUUM FULL` between page fetches (§4.5). No probabilistic "the norm / at least as likely" claim is made: the actual observed distribution on PostgreSQL at this commit is **0 artifacts** across every sweep and adversarial probe.
+- **PostgreSQL (production backend) [OBSERVED — HTTP + runtime].** Selected when `PAPERLESS_DBHOST` is set (`postgresql_psycopg2`, `src/paperless/settings.py:L310`, branch `L304-318`). Repeated identical sweeps were 12/12 clean unfiltered and filtered (§4.5). PostgreSQL documents that the order of rows tied on all `ORDER BY` expressions is unspecified and must not be relied upon (see References); a *bare* `ORDER BY created` would be free to differ per plan/heap/parallelism. For the routed `SELECT DISTINCT <all 15 columns> … ORDER BY created DESC`, PostgreSQL's planner chose a **`Sort+Unique`** plan in every configuration we tried; that plan sorts by every output column, placing the unique `id` second, so the *effective* order was the **total** order `(created DESC, id, …)` — stable even under forced parallelism and `VACUUM FULL` between page fetches (§4.5). But this is a **property of the chosen plan, not a logical guarantee**: a legitimate `HashAggregate` plan for the identical result orders only by `created` (a *partial* order) and, sliced across pages against `Sort+Unique`, reproduces the artifact — 5 duplicates + 5 missing, `count` constant (§4.5.1). The observed **0-artifact** distribution therefore reflects the planner's *current* preference for `Sort+Unique` on this query shape, **not** a guarantee that ties are broken; no probabilistic "the norm / at least as likely" claim is made in either direction.
 
-The prior version of this document asserted the artifact was "the norm on PostgreSQL" and "at least as likely" in production; that comparative-likelihood language was unsupported and is retracted. The supported statements are (a) PostgreSQL guarantees no order among rows tied on the ordering expressions, and (b) at this commit the `.distinct()` in `get_queryset()` incidentally converts the effective ordering into a total order, which is why the observed PostgreSQL distribution is 0 artifacts.
+Two earlier framings are retracted here. First, the assertion that the artifact was "the norm on PostgreSQL" and "at least as likely" in production — that comparative-likelihood language was unsupported. Second, and more importantly, the claim that `.distinct()` *guarantees* a total order on PostgreSQL: that is **also retracted**, because the total order is a property of the `Sort+Unique` plan the planner happened to choose, not a logical property of the SQL. The supported statements are: (a) PostgreSQL guarantees no order among rows tied on the `ORDER BY` expressions (References); (b) at this commit the planner chose a `Sort+Unique` plan for the `DISTINCT` query in every configuration tried, which *incidentally* makes the effective order total, which is why the observed PostgreSQL distribution is 0 artifacts; and (c) that stability is **plan-contingent** — a `HashAggregate` plan for the identical result is non-total and reproduces the artifact (§4.5.1), consistent with AAP §0.4.4 that PostgreSQL ordering is "explicitly non-deterministic on ties."
 
 ---
 
@@ -567,14 +612,14 @@ The prior version of this document asserted the artifact was "the norm on Postgr
 
 > **Reference-only. No source file was modified as part of this investigation** (see §12). These are the standard fixes for the documented Django/DRF failure mode, offered for the reader's benefit; they are also what would make the H3 mechanism impossible rather than merely latent.
 
-The root-cause mechanism (H3) is an ordering with no unique final key. Any of the following removes the ambiguity for *all* code paths and backends:
+The root-cause mechanism (H3) is an ordering with no unique final key. The following remediations remove that ambiguity; they differ in **which code paths** they cover — the default ordering only, versus explicit `?ordering=` requests as well:
 
-1. **Append a unique tiebreaker to the model ordering** (smallest change): `ordering = ("-created", "-id")` in `Document.Meta` (`src/documents/models.py:L207-208`). `id` is a monotonic integer PK (`DEFAULT_AUTO_FIELD`, `src/paperless/settings.py:L320`) and an allowed ordering field (`src/documents/views.py:L188`). This guarantees a total order regardless of query plan, backend, `.distinct()`, or `?ordering=` override.
+1. **Append a unique tiebreaker to the model ordering** (smallest change): `ordering = ("-created", "-id")` in `Document.Meta` (`src/documents/models.py:L207-208`). `id` is a monotonic integer PK (`DEFAULT_AUTO_FIELD`, `src/paperless/settings.py:L320`) and an allowed ordering field (`src/documents/views.py:L188`). On the **default** ordering path (no `?ordering=` supplied) this guarantees a total order regardless of query plan, backend, or `.distinct()`. It does **not**, however, cover an explicit `?ordering=` override: DRF's `OrderingFilter` (`src/documents/views.py:L184`) **replaces** the model's `Meta.ordering` with the requested field(s) rather than appending to it, so a model-level `-id` tiebreaker never reaches that path. A real `?ordering=title` request over the HTTP API emitted `... ORDER BY "documents_document"."title" ASC LIMIT 25` [OBSERVED — HTTP + PostgreSQL statement log, `log_statement=all`] — the model's `-created`/`-id` absent entirely — so ties on `title` would stay unstable. Covering the explicit-ordering path requires option 2 or option 4 below.
 2. **A stable-ordering filter** that appends `pk` whenever the requested ordering is not already unique — mirroring Django admin's `_get_deterministic_ordering`, which appends the primary key for exactly this reason (Django #17198). This also fixes explicit `?ordering=` requests, not just the default.
 3. **Add `.distinct()`/dedup discipline** to the fan-out filters (e.g. `InboxFilter`, `src/documents/filters.py:L63-66`) for tidiness. Note this addresses **H1**, not the paging mechanism — the base `get_queryset().distinct()` already collapses fan-out before pagination (§6).
 4. **Switch the list to `CursorPagination`.** Per DRF's documentation, `CursorPagination` guarantees a client "will never see the same item twice" while paging, but it **requires an ordering that is an unchanging, unique or nearly-unique, and indexed field (or fields)** — e.g. a monotonically increasing `created`/`id` — and it replaces page-number navigation with opaque cursors. It does not "automatically order on a unique field"; the developer must supply a suitable ordering. Adopting it would require the Angular `Results<T>` page-number model (`src-ui/src/app/data/results.ts:L1-5`, `getLastPage()` at `document-list-view.service.ts:L276-277`) to follow `next`/`previous` cursor links instead of computing `ceil(count / page_size)`.
 
-Options 1 and 2 are the minimal, backend-independent fixes; both were corroborated by the confirmation that a total order (as PostgreSQL's `.distinct()` already produces, §4.5) yields 0 artifacts.
+Options 1 and 2 are the minimal, backend-independent fixes — option 1 stabilizes the **default** ordering, while option 2 (or option 4) also covers explicit `?ordering=` requests — and the unique tiebreaker they rely on was **confirmed at runtime** to be a genuine (not plan-contingent) total order. Requesting `?ordering=-created,-id` over the real HTTP API was **3/3 clean on PostgreSQL** — every document served exactly once — and, unlike the bare `-created`, the `Sort Key` carries **both** keys (`created DESC, id DESC`) even under the `HashAggregate` plan (`EXPLAIN` with `SET enable_sort=off`, §4.5.1), so the order is total **regardless of query plan or backend**. That is exactly the property the bare `-created` lacks (§4.5.1): appending a unique key removes the ambiguity outright, rather than relying on the planner's incidental preference for `Sort+Unique`.
 
 ---
 
@@ -591,26 +636,32 @@ Categories are consistent with the labels defined at the top and reconcile to th
 | 5 | SQLite serves the order via one plan for both pages; `DISTINCT` does not inject a total order (tie order is a plan artifact) | OBSERVED — runtime | `EXPLAIN QUERY PLAN` + PLAN A≠PLAN B, §4.3 |
 | 6 | Cross-plan divergence on an isolated copy yields dups `[66-70]`, gaps `[51-55]`, `count` constant; live DB byte-identical before/after | OBSERVED — runtime | §4.4 (sha256 `41cc808f…` unchanged) |
 | 7 | 12/12 identical sweeps clean on PostgreSQL, unfiltered AND filtered | OBSERVED — HTTP | §4.5 |
-| 8 | `.distinct()` makes the PostgreSQL order total `(created DESC, id, …)`; stable under forced 4-worker parallel (0/15) and `VACUUM FULL` (0/8) | OBSERVED — HTTP + runtime | `EXPLAIN`/`EXPLAIN ANALYZE` + probes, §4.5 |
-| 9 | H3 mechanism is real but latent at this commit (surfaces only under plan divergence / a non-total order) | OBSERVED — runtime + INFERRED | §4.3–§4.5 synthesis |
+| 8 | On PostgreSQL the planner chose `Sort+Unique` for the `DISTINCT` query in every configuration tried, *incidentally* yielding the total order `(created DESC, id, …)`; stable under forced parallelism (`Gather Merge`) and `VACUUM FULL`. This is **plan-contingent, NOT a logical guarantee** — a `HashAggregate` plan for the identical result orders only by `created` (non-total), and a cross-plan slice yields **5 duplicates + 5 missing, `count` constant** | OBSERVED — HTTP + runtime | `EXPLAIN` (`Sort+Unique` §4.5 and `HashAggregate` §4.5.1) + parallel/`VACUUM` §4.5 + cross-plan §4.5.1 |
+| 9 | H3 mechanism is real but latent at this commit (surfaces only when two page requests resolve ties under *different* orders); demonstrated on BOTH backends | OBSERVED — runtime + INFERRED | §4.3–§4.5.1 synthesis (SQLite cross-plan §4.4, PostgreSQL cross-plan §4.5.1) |
 | 10 | Filters fan out (36 raw → 30 distinct); collapsed by base `.distinct()` | OBSERVED — runtime + HTTP | §5.1, §5.2 |
 | 11 | De-dup precedes pagination (`DISTINCT … LIMIT/OFFSET` one statement; `COUNT(*)` over DISTINCT subquery) | OBSERVED — HTTP (routed SQL) | §6 |
 | 12 | Superuser and non-staff see identical `count`/pages (empty symmetric difference); anonymous `401` | OBSERVED — HTTP | §7 |
 | 13 | Only `IsAuthenticated`; no object-level perms; no `django-guardian` | STATICALLY VERIFIED + OBSERVED — runtime | `src/documents/views.py:L183`; `pip show`/grep §7 |
 | 14 | Angular navigates by page number; total pages `= ceil(count/page_size)` | STATICALLY VERIFIED | `results.ts:L1-5`; `abstract-paperless-service.ts:L41,44,48`; `document-list-view.service.ts:L93-94,L140-143,L149,L158-161,L276-277`; template `L95-96` |
-| 15 | PostgreSQL guarantees no order among rows tied on the ordering expressions | STATICALLY VERIFIED (external docs) + INFERRED for the bare-ORDER-BY case | PostgreSQL docs (References); not reached here because `.distinct()` makes the order total |
+| 15 | PostgreSQL guarantees no order among rows tied on the ordering expressions; this is **reachable** for this query, not merely theoretical | STATICALLY VERIFIED (external docs) + OBSERVED (§4.5.1) | PostgreSQL docs (References); confirmed at runtime via the `HashAggregate` cross-plan (§4.5.1), whose tie order is a non-total hash permutation |
 | 16 | Any action that leaves `currentPage` out of range (filter shrink, page-size increase, or a persisted out-of-range page on a plain load) triggers the `404 → page 1` reset; a late `404` on that path renders a persistent `undefined: I` banner over an empty grid while `count` stays correct (pre-existing frontend defect, orthogonal to H1/H2/H3) | OBSERVED — HTTP + UI; mechanism INFERRED | §8 note; network log (3×`404` on stale page + reset `200`), `{"detail":"Invalid page."}`; `document-list-view.service.ts:L135,L158,L162-181`; `document.service.ts:L16-24` |
+| 17 | DRF `OrderingFilter` **replaces** (does not append to) the model `Meta.ordering` on an explicit `?ordering=` request — `?ordering=title` emits `ORDER BY "documents_document"."title" ASC` with no `created`/`id` term — so a model-level `-id` tiebreaker (remediation option 1) cannot stabilize the explicit-ordering path; only options 2/4 do | OBSERVED — HTTP + runtime | §10 item 1; routed `?ordering=title` vs `?ordering=-created` page-slice SQL, PostgreSQL statement log (`log_statement=all`) |
 
 ---
 
 ## 12. Repository-integrity proof and complete cleanup
 
-All observation tooling was temporary and confined to scratch paths and the git-ignored runtime trees (`data/`, `media/`, `*.log`, `src-ui/dist/`). No existing repository file was modified; the only net-new path is this answer document. The complete, captured cleanup:
+All observation tooling was temporary and confined to scratch paths and the git-ignored runtime trees (`data/`, `media/`, `*.log`, `src-ui/dist/`). No existing repository source file was modified; the only change to the repository is this answer document — a new path relative to the source baseline `542221a38`. The complete, captured cleanup:
 
 ```
-### [1] SQLite live DB sha256 immediately before cleanup mutations
-41cc808f7ceea56f5d8bd9539ca661c0f10fd17b7acda75997a96a6d6b415cf1
-    (== the pre-experiment checksum -> all HTTP sweeps, the mechanism demo, H1, and auth were READ-ONLY)
+### [1] SQLite runtime DB is git-ignored; the HTTP list path is read-only (checksum unchanged across a page sweep)
+sha256 before a page-1 + page-2 GET sweep: 2c557ebc87b375f16997e1d9ed959f9952d737a6f560633a7c71d256beffd8b3
+sha256 after  the same GET sweep:          2c557ebc87b375f16997e1d9ed959f9952d737a6f560633a7c71d256beffd8b3
+    (identical -> the HTTP sweeps, the mechanism demo, H1, and auth are READ-ONLY GETs. The tie dataset lives only
+     in the git-ignored runtime DB (data/db.sqlite3), seeded via the Appendix-A script; it is disposable and not a
+     tracked file. This checksum is the ids-1-40 re-seed used for the PostgreSQL re-verification (§4.5); it differs
+     from the ids-31-70 snapshot captured in §4.4 (sha256 41cc808f) because the git-ignored DB was re-seeded between
+     runs — each is read-only within its own run, and neither is a tracked repository file.)
 
 ### [2] Stop the two investigation runservers (SQLite 127.0.0.1:8000, PostgreSQL 127.0.0.1:8001)
     (ps/pkill are absent in the container; processes were located via /proc/<pid>/cmdline and stopped with the kill builtin)
@@ -633,7 +684,8 @@ confirmed: paperless-postgres gone
 
 ### [7] Repository integrity — git state (tracked files only; runtime data is git-ignored)
 -- git status --porcelain --
-    (empty — no tracked file modified except the net-new answer document, shown below)
+ M blitzy/documentation/paperless-ngx_542221a38dff.md
+    (the only tracked change is this answer document; no source file modified — see the source-dir diff below)
 -- branch --
 blitzy-e58dd14a-bc36-4f2f-912f-3f73de6974de
 -- gitignore coverage of runtime artifacts --
@@ -642,20 +694,20 @@ blitzy-e58dd14a-bc36-4f2f-912f-3f73de6974de
   ignored: src-ui/dist
 ```
 
-The 12 read-only source references cited in this document were verified byte-identical to the baseline throughout (`git diff --quiet HEAD -- <file>` for each of `src/documents/views.py`, `src/paperless/views.py`, `src/documents/models.py`, `src/documents/filters.py`, `src/paperless/settings.py`, `src/paperless/urls.py`, `src/manage.py`, `src-ui/src/app/data/results.ts`, `src-ui/src/app/services/rest/abstract-paperless-service.ts`, `src-ui/src/app/services/document-list-view.service.ts`, `src-ui/src/app/components/document-list/document-list.component.html`, `docs/api.rst` — all unmodified). The provided-environment containers `paperless-app` and `paperless-redis` were left running; only the `paperless-postgres` container this investigation added was removed.
+The 13 read-only source references cited in this document were verified byte-identical to the baseline throughout (`git diff --quiet HEAD -- <file>` for each of `src/documents/views.py`, `src/paperless/views.py`, `src/documents/models.py`, `src/documents/filters.py`, `src/paperless/settings.py`, `src/paperless/urls.py`, `src/manage.py`, `src-ui/src/app/data/results.ts`, `src-ui/src/app/services/rest/abstract-paperless-service.ts`, `src-ui/src/app/services/document-list-view.service.ts`, `src-ui/src/app/services/rest/document.service.ts`, `src-ui/src/app/components/document-list/document-list.component.html`, `docs/api.rst` — all unmodified). The provided-environment containers `paperless-app` and `paperless-redis` were left running; only the `paperless-postgres` container this investigation added was removed.
 
-**Baseline vs. delivery snapshot [OBSERVED — runtime].** During the investigation the working tree is clean and `HEAD` is the investigated **source baseline** `542221a38`, with this answer document still untracked:
+**Delivery snapshot [OBSERVED — runtime].** This answer document is the only change to the repository; every tracked source file is byte-identical to the baseline. Immediately before committing these corrections the working tree carries only the document itself (modified), atop the investigation's earlier `docs:` commits over the source baseline `542221a38`:
 
 ```
 $ git rev-parse --short HEAD
-542221a38
-$ git status --porcelain -uall
-?? blitzy/documentation/paperless-ngx_542221a38dff.md
-$ git diff --name-only HEAD
-        (empty — no tracked file was modified)
+8d0863902
+$ git status --porcelain
+ M blitzy/documentation/paperless-ngx_542221a38dff.md
+$ git diff --name-only HEAD -- src/ src-ui/ docs/
+        (empty — no tracked source file was modified)
 ```
 
-This is the **pre-commit snapshot**; committing this document (a `docs:` commit) advances `HEAD` to that new commit atop `542221a38`, at which point the file is tracked and the working tree is again clean. No remediation was applied.
+This is the **pre-commit snapshot**; committing these corrections (a `docs:` commit) advances `HEAD` to a new commit atop the prior `docs:` history over `542221a38`, at which point the working tree is clean again. The source tree is never touched, and no remediation was applied.
 
 ---
 
@@ -718,5 +770,53 @@ for s in range(1, n + 1):
 print(f"DISTRIBUTION: {clean}/{n} clean, {n-clean}/{n} artifact")
 ```
 
-The remaining harnesses — `seed_dataset.py` (tie-inducing seed), `mechanism_distinct_sqlite.py` (read-only isolated-copy plan-divergence demo), `h1_fanout.py`, `auth_compare.py` (two-page superuser-vs-non-staff comparison), `boundary_probe.py` (parallel tie-boundary probe), and the `VACUUM FULL`-between-pages probe — followed the same shape (authenticated `urllib` HTTP against the loopback `runserver`, or read-only SQL on an isolated copy). All were removed at cleanup (§12); the repository retains only this document.
+The tie-inducing seed `seed_dataset.py` (idempotent — clears documents then rebuilds the fixed 40-document dataset: 20 at `D0`, 20 at `D1` straddling the 25-row boundary, with the `invoice`/`invoice-paid`/`inbox` tags and the two disposable users; MD5 checksums keep `checksum` within `varchar(32)` so the identical script runs on both SQLite and PostgreSQL). Verified against a scratch copy of the DB; its printed output is the §3.5 verification block:
 
+```python
+import os, sys, django, hashlib, datetime as dt
+sys.path.insert(0, os.getcwd())                       # run from `cd src` so `paperless` is importable
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+os.environ.setdefault("PAPERLESS_DISABLE_DBHANDLER", "true")
+django.setup()
+from documents.models import Document, Tag
+from django.contrib.auth.models import User
+from django.db.models import Count
+
+Document.objects.all().delete()                       # idempotent: rebuild the fixed dataset
+invoice,      _ = Tag.objects.get_or_create(name="invoice")       # reused if present, else created
+invoice_paid, _ = Tag.objects.get_or_create(name="invoice-paid")
+inbox,        _ = Tag.objects.get_or_create(name="inbox")
+
+D0 = dt.datetime(2026, 7, 13, 12, 0, tzinfo=dt.timezone.utc)      # newest, 20 docs
+D1 = dt.datetime(2026, 7, 12, 12, 0, tzinfo=dt.timezone.utc)      # 20 docs; tie block straddles 25/26
+docs = []
+for i, cr in enumerate([D0]*20 + [D1]*20, start=1):
+    docs.append(Document.objects.create(
+        title=f"DOC-{i:03d}", content=f"content for document {i}",
+        mime_type="application/pdf",
+        checksum=hashlib.md5(f"doc-{i}".encode()).hexdigest(),    # 32 hex chars -> fits varchar(32) on PostgreSQL
+        created=cr, storage_type=Document.STORAGE_TYPE_UNENCRYPTED,
+    ))
+d0, d1 = docs[:20], docs[20:]
+for d in d0[:15] + d1[:15]: d.tags.add(invoice)       # 30 (> 25, so filtered browsing also spans a boundary)
+for d in d0[:3]  + d1[:3]:  d.tags.add(invoice_paid)  # 6  (overlaps invoice -> the H1 JOIN fan-out)
+for d in d0[:6]  + d1[:6]:  d.tags.add(inbox)         # 12
+
+for uname, is_super, is_staff in [("probe_admin", True, True), ("probe_viewer", False, False)]:
+    User.objects.filter(username=uname).delete()      # disposable; removed at cleanup (§12)
+    u = User.objects.create_user(uname, password="probe-disposable-pw")
+    u.is_superuser, u.is_staff = is_super, is_staff; u.save()
+
+print("total docs:", Document.objects.count())
+print("created distribution:", list(Document.objects.values("created").annotate(n=Count("id")).order_by("-created")))
+for t in Tag.objects.all(): print(f"  tag {t.name!r} (id={t.id}) on {t.documents.count()} docs")
+```
+
+The remaining harnesses are small scripts of the same shape — authenticated `urllib` HTTP against the loopback `runserver`, or a read-only Django-ORM / SQL query — each invoked verbatim (with its complete, unedited output) at the point in the document where it is used:
+
+- `mechanism_distinct_sqlite.py` — the read-only isolated-copy plan-divergence demo (§4.4): copies the live SQLite file to a scratch path and replays the real `DISTINCT` query under two plans (a `NOT INDEXED` query hint vs. the default), never writing to the live database. The specific ids it reports track the live DB's autoincrement state (an immaterial offset, noted in §3.5); the artifact *shape* — five duplicates and five gaps straddling the 25-row boundary with `count` constant — is what it demonstrates.
+- `h1_fanout.py` — the H1 fan-out measurement (§5.1): compares the pre-`.distinct()` JOIN row count (`.count()` ⇒ 36) with the de-duplicated count (`.distinct().count()` ⇒ 30) and prints both compiled SQL strings via the Django ORM.
+- `user_attrs.py` — (§7) prints the `is_superuser` / `is_staff` / `is_active` / groups / permissions of `probe_admin` and `probe_viewer`.
+- `auth_compare.py` — (§7) runs the identical two-page sweep as the superuser and the non-staff user against a given `PROBE_BASE`, then reports each user's `count`, whether the two id sets are identical, their symmetric difference, and the anonymous status code. (The SQLite invocation additionally prints each user's combined page-1+page-2 id totals; the PostgreSQL block elides those two summary lines for brevity — the harness is the same.)
+
+The PostgreSQL cross-plan counterexample (§4.5.1) and the forced-parallel / `VACUUM FULL` robustness checks (§4.5) are **not** separate harnesses: each was captured with an inline `docker exec … psql` command shown verbatim in place. All temporary scripts and the isolated SQLite copy were removed at cleanup (§12); the repository retains only this document.
