@@ -20,7 +20,7 @@ Every behavioral claim below is paired with **the exact command that produced it
 
 ### 0.1 Engine identity — Django-Q, **not** Celery (state this first)
 
-At this commit the background-task engine is **Django-Q** (`python3 manage.py qcluster`), **not** Celery. Evidence: `requirements.txt` pins `django-q==1.3.9` [requirements.txt:37] and `django==4.0.4` [requirements.txt:38], and the file contains **no** `celery` dependency. (Paperless-NGX's "transition to Celery for background tasks" landed later, in the 1.10.0 release; this commit is from April 2022 and predates it.) Consequently, any `celery.py` / `celery worker` patterns in newer paperless-ngx documentation do **not** apply here. All periodic and reconnection behavior documented below is produced by the Django-Q cluster.
+At this commit the background-task engine is **Django-Q** (`python3 manage.py qcluster`), **not** Celery. Evidence: `requirements.txt` pins `django-q==1.3.9` [requirements.txt:37] and `django==4.0.4` [requirements.txt:38], and the file contains **no** `celery` dependency. (Paperless-NGX's "transition to Celery for background tasks" landed later, in the **1.10.0** release — the official release notes list *"Feature: Transition to celery for background tasks"* (PR #1648) at <https://github.com/paperless-ngx/paperless-ngx/releases/tag/v1.10.0>; this commit is from April 2022 and predates it.) Consequently, any `celery.py` / `celery worker` patterns in newer paperless-ngx documentation do **not** apply here. All periodic and reconnection behavior documented below is produced by the Django-Q cluster.
 
 ### 0.2 Provenance (image, containers, versions, git state)
 
@@ -90,6 +90,27 @@ set -eu
 IMG=paperless-ngx-ready:542221a38dff
 C=pngx-obs
 
+# Idempotent teardown on ANY exit (success or failure) so this procedure never leaves a
+# live runtime behind. `docker rm -f` also stops the container, so a single call suffices.
+cleanup() { docker rm -f "$C" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+# Collision-safe: remove any stale container of the same name left by a prior run first.
+docker rm -f "$C" >/dev/null 2>&1 || true
+
+# Bounded poller: retry `<cmd...>` up to <tries> times, 0.5 s apart, until it succeeds. It is
+# silent on success (so every observed output below is byte-for-byte unchanged) and, on
+# timeout, returns non-zero -> `set -e` aborts the script -> the EXIT trap tears the container
+# down. This is what makes each readiness gate below both deterministic and self-cleaning.
+poll() {
+  tries=$1; what=$2; shift 2; i=0
+  while [ "$i" -lt "$tries" ]; do
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    i=$((i + 1)); sleep 0.5
+  done
+  echo "TIMED OUT after $tries tries waiting for: $what" >&2; return 1
+}
+
 # 1) Spawn a throwaway container (sleeps; we drive it with `docker exec`)
 docker run -d --name "$C" --entrypoint /bin/sleep -w /app "$IMG" infinity
 
@@ -111,7 +132,10 @@ docker exec "$C" bash -c '
 docker exec "$C" bash -c '
   redis-server --daemonize yes --bind 127.0.0.1 --protected-mode yes --port 6379 \
     --save "" --appendonly no --dir /tmp --pidfile /tmp/redis6379.pid
-  sleep 1; redis-cli -p 6379 ping                       # -> PONG
+'
+poll 20 "redis PONG" docker exec "$C" redis-cli -p 6379 ping   # wait for the broker to accept
+docker exec "$C" bash -c '
+  redis-cli -p 6379 ping                                # -> PONG
   redis-cli -p 6379 CONFIG GET bind                     # -> bind 127.0.0.1
   redis-cli -p 6379 CONFIG GET protected-mode           # -> protected-mode yes
 '
@@ -129,7 +153,10 @@ docker exec -d -e HOME=/home/paperless -e PAPERLESS_REDIS=redis://localhost:6379
   -w /app/src "$C" bash -c 'exec supervisord -c /app/docker/supervisord.conf \
     > /tmp/paperless_obs/run.log 2>&1'
 
-# supervisord writes its own pidfile -> use it for a clean numeric-PID stop later
+# supervisord writes its own pidfile asynchronously -> WAIT for it to exist and be non-empty
+# before reading it (reading it too early is the race that made the original snippet fail),
+# then capture the numeric PID for a clean numeric-PID stop later.
+poll 40 "supervisord pidfile" docker exec "$C" bash -c 'test -s /var/run/supervisord/supervisord.pid'
 SUP_PID=$(docker exec "$C" cat /var/run/supervisord/supervisord.pid)
 
 # 5b) Write the three tiny active-assertion helpers (temporary; removed at cleanup).
@@ -174,7 +201,13 @@ PYEOF
 
 # 6) OBSERVE the idle steady state. Each command's actual output is shown in the noted Q-section.
 E="-u paperless -e HOME=/home/paperless -e PYTHONPATH=/app/src -e PAPERLESS_REDIS=redis://localhost:6379 -w /app/src"
+# Wait until all three supervised programs are ready before observing: Django-Q printed its
+# one-time readiness banner, and gunicorn answers HTTP 200 on the REST API.
+poll 60 "Django-Q readiness banner" docker exec "$C" grep -q 'running\.' /tmp/paperless_obs/run.log
+poll 60 "gunicorn HTTP 200" docker exec $E "$C" bash -c 'python3 /tmp/q4helpers/assert_http.py | grep -q HTTP_STATUS=200'
 docker exec "$C" sed -n '1,20p' /tmp/paperless_obs/run.log                            # startup banner        -> Q1.4
+# The first scheduler pass fires ~30 s after the banner; wait for it to land before grepping.
+poll 120 "first scheduler pass" docker exec "$C" grep -q 'created a task from schedule' /tmp/paperless_obs/run.log
 docker exec "$C" grep -nE 'created a task from schedule' /tmp/paperless_obs/run.log   # ~30s pass + mail cadence -> Q3.3/Q3.4
 docker exec "$C" bash -c 'timeout 4 redis-cli -p 6379 monitor | grep "cluster:"'      # 0.5s heartbeat SETs   -> Q3.2
 # Idle process tree (ps/pgrep absent in this image -> walk /proc); -> Q5.1:
@@ -198,6 +231,9 @@ docker exec "$C" bash -c 'date +%s.%N; redis-server --daemonize yes \
   --dir /tmp --pidfile /tmp/redis6379.pid; sleep 1; redis-cli -p 6379 ping'   # record RESTART_TS
 
 # 8) AFTER-restart active assertions via the REAL entry points (output -> Q4.3).
+# The guard must reincarnate the pusher and reconnect to the restarted broker first; wait for
+# a real broker round-trip to succeed before capturing the shown assertion.
+poll 24 "broker operational again" docker exec $E "$C" bash -c 'python3 /tmp/q4helpers/assert_broker.py 81 | grep -q "BROKER_RESULT=9.0"'
 docker exec $E "$C" python3 /tmp/q4helpers/assert_broker.py 81                 # -> BROKER_RESULT=9.0
 docker exec $E "$C" python3 /tmp/q4helpers/assert_channels.py channels-ok-after-recovery  # -> CHANNELS_RECV
 docker exec $E "$C" python3 /tmp/q4helpers/assert_http.py                      # -> HTTP_STATUS=200
@@ -210,10 +246,13 @@ docker exec "$C" bash -c 'k=$(redis-cli -p 6379 --scan --pattern "django_q:paper
 
 # 9) Graceful stop by explicit numeric PID (never a broad pkill)
 docker exec "$C" bash -c "kill -TERM $SUP_PID"    # supervisord stops all 3 programs
+# Wait for supervisord (and thus all three programs) to actually exit before tearing down.
+poll 60 "supervisord exit" docker exec "$C" bash -c "kill -0 $SUP_PID 2>/dev/null && exit 1 || exit 0"
 
 # 10) Cleanup: stop Redis, remove the container, verify host clean
 docker exec "$C" bash -c 'redis-cli -p 6379 shutdown nosave 2>/dev/null || true'
 docker stop "$C" && docker rm "$C"
+trap - EXIT                                        # success path: disarm the idempotent trap
 docker ps -a --format '{{.Names}}' | grep -q "$C" && echo LEFTOVER || echo "container removed - clean"
 ```
 
@@ -413,6 +452,7 @@ Line meanings and sources:
 - `Process-1 created a task from schedule [<name>]` — the scheduler created the task instance from the named schedule [django_q/cluster.py:669].
 - `Process-1:N processing [<task-id>]` — a worker picked the task up [django_q/cluster.py:420].
 - `Processed [<task-id>]` — the monitor recorded successful completion [django_q/cluster.py:392].
+- The bracketed `<task-id>` in the two lines above is a **humanized, randomly-generated identifier assigned per task instance**: Django-Q sets each task's `name` to `tag[0]` from `uuid()` [django_q/tasks.py:38-44] — the humanized form of a fresh random `uuid4()` [django_q/humanhash.py:358-359]. It therefore **varies for every task and every run** (e.g. `moon-uncle-cardinal-music` in Q3.3 below), while the surrounding log-line *structure* — `<name> processing [<task-id>]` [django_q/cluster.py:420] and `Processed [<task-id>]` [django_q/cluster.py:392] — is invariant.
 
 **Canonical body execution.** Because this ran on the full canonical dependency set, the task **bodies executed for real** — task instances reach `Processed [...]` and, e.g., `sanity_check` emits its own `paperless.sanity_checker` line `Sanity checker detected no issues.` [src/documents/sanity_checker.py:27]. (In a *minimal* dependency environment lacking the heavy imports `pdf2image`/`pikepdf`/`pyzbar` [src/documents/tasks.py:23-25], the task modules are not importable and the bodies would fail while the **scheduling** lines — `Enqueued` / `created a task from schedule` / `processing` — remain identical; that failure mode is a **non-canonical environment artifact**, not present here.)
 
@@ -810,7 +850,7 @@ Sources: `stopping.` [django_q/cluster.py:87]; `stopping cluster processes` [dja
 ### Q5.3 gunicorn, document_consumer, Redis, supervisord, database
 
 - **gunicorn** (web/ASGI) stays up continuously under supervisord [docker/supervisord.conf:10-11]: a master plus **2** workers (`workers = 2`), bind `0.0.0.0:8000`, `timeout = 120` [gunicorn.conf.py:3-6]. It serves the REST API and the Channels websocket used for live status but performs no background work at idle.
-- **document_consumer** (inotify watcher) stays up continuously [docker/supervisord.conf:19-20]. It watches the consumption directory using **event-driven inotify** and is therefore **silent at idle** (its only line is the startup message in Q1.6). It switches to periodic polling **only** if `PAPERLESS_CONSUMER_POLLING > 0`, a **commented** default (`#PAPERLESS_CONSUMER_POLLING=10`) [paperless.conf.example:60], so by default there is no polling activity.
+- **document_consumer** (inotify watcher) stays up continuously [docker/supervisord.conf:19-20]. It watches the consumption directory using **event-driven inotify** and is therefore **silent at idle** (its only line is the startup message in Q1.6). It switches to periodic polling **only** if `PAPERLESS_CONSUMER_POLLING > 0`: the command branches on `if settings.CONSUMER_POLLING == 0 and INotify:` → `handle_inotify(...)`, `else: handle_polling(...)` [src/documents/management/commands/document_consumer.py:178-181], and that setting's runtime default is **0** — `CONSUMER_POLLING = int(os.getenv("PAPERLESS_CONSUMER_POLLING", 0))` [src/paperless/settings.py:478] — matching the **commented** example (`#PAPERLESS_CONSUMER_POLLING=10`) [paperless.conf.example:60], so by default there is no polling activity.
 - **Redis** must run continuously for idle operation because it is used simultaneously as the **Django-Q broker** — `Q_CLUSTER["redis"]` [src/paperless/settings.py:456] — and the **Channels websocket layer backend** — `CHANNEL_LAYERS` → `channels_redis.core.RedisChannelLayer` [src/paperless/settings.py:178-187]. This shared role is exactly why interrupting Redis (Q4) exercises the reconnection path.
 - **supervisord** runs in the foreground (`nodaemon=true` [docker/supervisord.conf:2]) and supervises the three programs above, piping each program's stdout/stderr to the container's streams [docker/supervisord.conf:14-17]. It is the mechanism that keeps everything "ready".
 - **Database:** the default is **SQLite**; PostgreSQL is used **only** when `PAPERLESS_DBHOST` is set [paperless.conf.example:11-16], which also gates the `wait_for_postgres` startup step [docker/docker-prepare.sh:67-69]. Idle behavior does not require PostgreSQL.
@@ -852,7 +892,7 @@ Sources: `stopping.` [django_q/cluster.py:87]; `stopping cluster processes` [dja
 
 ## Coverage summary (Q1–Q5)
 
-- **Q1 — up & ready:** canonical path (entrypoint → `gosu paperless docker-prepare.sh` `do_work` body 66-79 → supervisord → 3 programs) **actually executed** via the repository's own `docker/wait-for-redis.py` gate and `docker/supervisord.conf` (supervisord spawns/​reaps all three as `paperless`); the clean Django-Q readiness banner (`Q Cluster <id> running.`) shown from an isolated single-stream capture, with the supervisord stdout/stderr interleave caveat labeled; gunicorn readiness proven by live HTTP 200 (its `when_ready` line captured separately, labeled). Environment-specific values (random cluster id, CPU-derived 11 workers) labeled.
+- **Q1 — up & ready:** canonical path (entrypoint → `gosu paperless docker-prepare.sh` `do_work` body 66-79 → supervisord → 3 programs) **actually executed** via the repository's own `docker/wait-for-redis.py` gate and `docker/supervisord.conf` (supervisord spawns/reaps all three as `paperless`); the clean Django-Q readiness banner (`Q Cluster <id> running.`) shown from an isolated single-stream capture, with the supervisord stdout/stderr interleave caveat labeled; gunicorn readiness proven by live HTTP 200 (its `when_ready` line captured separately, labeled). Environment-specific values (random cluster id, CPU-derived 11 workers) labeled.
 - **Q2 — idle background activity:** the three supervised programs, and the four scheduled tasks by name with frequency + meaning + citation, verified against the live `Schedule` rows and shown firing on the first pass; canonical body execution noted, with the minimal-env body-failure mode labeled non-canonical.
 - **Q3 — periodic health logs:** three signals separated — one-time readiness banner; **silent 0.5 s heartbeat DIRECTLY measured** via `redis-cli monitor` (eight consecutive SET ops, seven 0.501 s deltas, each `EX 3`); **~30 s scheduler tick measured and stable across 3 starts** (29 s / 30 s / 30 s); most-frequent visible idle line = the 10-minute mail check, with **three firings measured in each of two independent runs** (both clean gaps `10 m 01 s`; first gap short and explained) and 0–30 s jitter attributed to the scheduler tick; worker-recycle lines labeled normal.
 - **Q4 — operational again:** live Redis interrupted (`redis-cli shutdown nosave` at `19:22:04.633`) and restarted (`19:22:39.815`); **BEFORE** baseline active assertions (HTTP 200, Channels, broker `math.sqrt(16)`→`4.0`); **DURING** the `≈1.99 lines/s` errno-111 burst (**70 lines / 35.18 s**, exact count + derived rate, source = guard `Stat.save`) and the **complete 89-line** `--- Logging error ---` block (with `Call stack:`/`Message:`/`Arguments:`); **AFTER** recovery confirmed by burst cessation (**bounded 0 errors** after the last), the sticking `reincarnated pusher … after sudden death` → `pushing tasks at <pid>` sequence, and **decisive active round-trips** (broker `math.sqrt(81)`→`9.0`, Channels, HTTP 200, 3-program liveness, heartbeat resumed). Explicitly: **no literal "reconnected" banner**, and `pushing tasks at` alone is **not** reconnection proof (it recurs during the outage).
