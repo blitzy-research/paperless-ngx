@@ -4,7 +4,7 @@
 - **Commit under evaluation:** `542221a38dff06361e07976452f9aea24d210542`
 - **Investigation type:** Read-only. No source file was modified. The only artifact produced is this document. All runtime observation was performed inside a throwaway container and against throwaway SQLite/Redis data and temporary observation scripts, all of which were removed afterward (see the closing **Appendix — Cleanup & integrity proof**, which shows the exact teardown commands and their complete output).
 - **Canonical environment:** Every runtime observation below was produced inside the user-provided canonical Docker image `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01` (Image ID `sha256:6e699f225ced…`), whose interpreter is **Python 3.9.23** and whose source tree is mounted at `/app` (working dir) with the Django project under `/app/src`. Where a command was run on the host (for example, `git`/`docker` calls that the image does not carry), that is stated explicitly.
-- **Evidence discipline:** Every behavioral claim is paired with (a) the exact command run, including the working directory, (b) the complete, unedited output observed, and (c) `file:line` citations. Output blocks are labeled **Observed** (produced at runtime) or **Inferred** (derived from reading source / authoritative docs, when a value cannot be produced at runtime). Where an output block is a deliberately filtered view (for example, a `grep` over a long captured log), the exact filtering command is shown so the command and its output match precisely. The only mechanical redaction applied is that two long persisted tracebacks are shown truncated **and are explicitly marked `…<truncated>`**; nothing else is elided.
+- **Evidence discipline:** Every behavioral claim is paired with (a) the exact command run, including the working directory, (b) the complete, unedited output observed, and (c) `file:line` citations. Output blocks are labeled **Observed** (produced at runtime) or **Inferred** (derived from reading source / authoritative docs, when a value cannot be produced at runtime). Where an output block is a deliberately filtered view (for example, a `grep` over a long captured log), the exact filtering command is shown so the command and its output match precisely. **No output is elided anywhere.** In particular, the two long persisted tracebacks in Section 7.2 are shown **complete and unedited** — both as the exact persisted `row.result` value (the Python `repr` string as stored in the `django_q_task` row, one physical line with `\n` frame separators) and, for readability, in expanded multi-line form beneath the matrix.
 - **Reproduction context:** commands prefixed `# host$` were run on the host repository checkout at `/tmp/blitzy/paperless-ngx/blitzy-…` (abbreviated `<repo>`); commands prefixed `# cont$ (cwd=…)` were run inside the canonical image container (named `blitzy_inv` here) with the stated working directory.
 
 ---
@@ -199,7 +199,31 @@ django_q in INSTALLED_APPS = True
 
 The database defaults to SQLite at `DATA_DIR/db.sqlite3`, switching to PostgreSQL only when `PAPERLESS_DBHOST` is set `[src/paperless/settings.py:297-311]`. The scheduler process is `python3 manage.py qcluster` `[docker/supervisord.conf:28-29]`, run alongside `gunicorn` `[docker/supervisord.conf:10-11]` and the document `consumer` `[docker/supervisord.conf:19-20]` under supervisord.
 
-**Observed** — a Redis broker was started as an observation aid (the image ships no `redis-server`; a host Redis on `localhost:6379` served the container via `--network host`), then the scheduler was launched. Its complete startup/lifecycle banner (with all four schedules due after seeding, so all four fired and all four succeeded post-`libzbar0`) is in **Section 6**; the cluster was stopped cleanly at the end of each observation.
+**Observed** — the exact bring-up commands. A Redis broker was started as an observation aid (the canonical image ships no `redis-server`; a host Redis on `localhost:6379` served the container via `--network host`). The canonical container was launched, the `libzbar0` gap corrected, the environment pointed at throwaway data dirs, migrations applied (seeding the four schedules), and the scheduler started:
+
+```bash
+# host$ (cwd=<repo>) — start the observation Redis broker
+redis-server --daemonize yes --save '' --appendonly no
+redis-cli ping                       # -> PONG
+
+# host$ (cwd=<repo>) — launch the canonical image with host networking (so it reaches the host Redis)
+docker run -d --name blitzy_inv --network host --entrypoint /bin/bash \
+  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01 \
+  -c 'sleep infinity'
+
+# cont$ — correct the libzbar0 provisioning gap to match the production Dockerfile:74
+apt-get update && apt-get install -y libzbar0     # -> libzbar0:amd64 0.23.90-1+deb11u1
+
+# cont$ (cwd=/app/src) — point at throwaway dirs, apply migrations (seeds 4 Schedule rows), start scheduler
+export DJANGO_SETTINGS_MODULE=paperless.settings
+export PAPERLESS_DATA_DIR=/tmp/sdata PAPERLESS_MEDIA_ROOT=/tmp/smedia PAPERLESS_CONSUMPTION_DIR=/tmp/sconsume
+export PAPERLESS_REDIS=redis://localhost:6379 PAPERLESS_TASK_WORKERS=1
+mkdir -p /tmp/sdata /tmp/smedia /tmp/sconsume
+python3 manage.py migrate            # applies django_q.0013/0014, documents.1001/1004, paperless_mail.0002
+python3 manage.py qcluster           # the scheduler + worker (SIGTERM to stop)
+```
+
+Its complete startup/lifecycle banner (with all four schedules due after seeding, so all four fired and all four succeeded post-`libzbar0`) is in **Section 6**; the cluster was stopped cleanly at the end of each observation.
 
 ---
 
@@ -306,32 +330,72 @@ CONSTANTS: MINUTES='I' HOURLY='H' DAILY='D' WEEKLY='W' MONTHLY='M'
 
 To observe the **actual** interval each `schedule_type` produces, a throwaway observation script (removed in cleanup) forced all four `next_run` values to `now − 5s`, started `qcluster`, let the scheduler make one pass (which recomputes each `next_run`), then printed the `next_run` values before and after. This was repeated on **two independent, unchanged runs (A and B)**; the per-schedule deltas are identical on both, satisfying the two-run stability requirement.
 
-**Observed — Run A:**
-```text
---- BEFORE (all forced due; next_run = now-5s) ---
-H train_classifier       next_run=2026-07-13T17:52:46.069994+00:00
-D index_optimize         next_run=2026-07-13T17:52:46.069994+00:00
-W sanity_check           next_run=2026-07-13T17:52:46.069994+00:00
-I process_mail_accounts  next_run=2026-07-13T17:52:46.069994+00:00
---- AFTER (post scheduler pass) ---
-H train_classifier       next_run=2026-07-13T18:52:46.069994+00:00   (+1 hour)
-D index_optimize         next_run=2026-07-14T17:52:46.069994+00:00   (+1 day)
-W sanity_check           next_run=2026-07-20T17:52:46.069994+00:00   (+7 days)
-I process_mail_accounts  next_run=2026-07-13T18:02:46.069994+00:00   (+10 minutes)
+**Producing command** — a small self-contained driver (`timing_run.py`, removed in cleanup) forced every `next_run` to `now − 5s`, flushed the broker, started the **real** `qcluster`, let it make one pass, then printed each `next_run` before and after with the computed delta. It was run **twice, back-to-back, on fresh migrations** (Runs A and B):
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379)
+cat > timing_run.py <<'PY'
+import os, sys, time, subprocess, signal, django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+import redis
+from django.utils import timezone
+from datetime import timedelta
+from django_q.models import Schedule
+
+label = sys.argv[1]
+redis.Redis(host="localhost", port=6379).flushall()   # isolate this run's queue
+now = timezone.now()
+baseline = now - timedelta(seconds=5)                  # force every schedule due
+Schedule.objects.all().update(next_run=baseline)
+print("=== Run %s ===" % label)
+print("--- BEFORE (all forced due; next_run = now-5s) ---")
+for s in Schedule.objects.all().order_by("id"):
+    print(s.schedule_type, s.func.split(".")[-1].ljust(22), "next_run=" + s.next_run.isoformat())
+p = subprocess.Popen(["python3", "manage.py", "qcluster"],       # start the REAL scheduler
+                     stdout=open("qc_%s.log" % label, "w"), stderr=subprocess.STDOUT,
+                     preexec_fn=os.setsid)
+time.sleep(42); os.killpg(os.getpgid(p.pid), signal.SIGTERM); time.sleep(2)   # one pass, then stop
+def ann(d):
+    s = d.total_seconds()
+    if abs(s - 3600)   < 120:  return "(+1 hour)"
+    if abs(s - 86400)  < 600:  return "(+1 day)"
+    if abs(s - 604800) < 3600: return "(+7 days)"
+    if abs(s - 600)    < 60:   return "(+10 minutes)"
+    return "(+%.0fs)" % s
+print("--- AFTER (post scheduler pass) ---")
+for s in Schedule.objects.all().order_by("id"):
+    print(s.schedule_type, s.func.split(".")[-1].ljust(22),
+          "next_run=" + s.next_run.isoformat(), "  " + ann(s.next_run - baseline))
+PY
+for L in A B; do python3 manage.py migrate >/dev/null 2>&1; python3 timing_run.py $L; done
 ```
 
-**Observed — Run B (independent, unchanged):**
+**Observed** — the complete, unedited output of the two back-to-back runs:
 ```text
+=== Run A ===
 --- BEFORE (all forced due; next_run = now-5s) ---
-H train_classifier       next_run=2026-07-13T17:53:44.899831+00:00
-D index_optimize         next_run=2026-07-13T17:53:44.899831+00:00
-W sanity_check           next_run=2026-07-13T17:53:44.899831+00:00
-I process_mail_accounts  next_run=2026-07-13T17:53:44.899831+00:00
+H train_classifier       next_run=2026-07-14T02:06:02.791395+00:00
+D index_optimize         next_run=2026-07-14T02:06:02.791395+00:00
+W sanity_check           next_run=2026-07-14T02:06:02.791395+00:00
+I process_mail_accounts  next_run=2026-07-14T02:06:02.791395+00:00
 --- AFTER (post scheduler pass) ---
-H train_classifier       next_run=2026-07-13T18:53:44.899831+00:00   (+1 hour)
-D index_optimize         next_run=2026-07-14T17:53:44.899831+00:00   (+1 day)
-W sanity_check           next_run=2026-07-20T17:53:44.899831+00:00   (+7 days)
-I process_mail_accounts  next_run=2026-07-13T18:03:44.899831+00:00   (+10 minutes)
+H train_classifier       next_run=2026-07-14T03:06:02.791395+00:00   (+1 hour)
+D index_optimize         next_run=2026-07-15T02:06:02.791395+00:00   (+1 day)
+W sanity_check           next_run=2026-07-21T02:06:02.791395+00:00   (+7 days)
+I process_mail_accounts  next_run=2026-07-14T02:16:02.791395+00:00   (+10 minutes)
+
+=== Run B ===
+--- BEFORE (all forced due; next_run = now-5s) ---
+H train_classifier       next_run=2026-07-14T02:06:50.981493+00:00
+D index_optimize         next_run=2026-07-14T02:06:50.981493+00:00
+W sanity_check           next_run=2026-07-14T02:06:50.981493+00:00
+I process_mail_accounts  next_run=2026-07-14T02:06:50.981493+00:00
+--- AFTER (post scheduler pass) ---
+H train_classifier       next_run=2026-07-14T03:06:50.981493+00:00   (+1 hour)
+D index_optimize         next_run=2026-07-15T02:06:50.981493+00:00   (+1 day)
+W sanity_check           next_run=2026-07-21T02:06:50.981493+00:00   (+7 days)
+I process_mail_accounts  next_run=2026-07-14T02:16:50.981493+00:00   (+10 minutes)
 ```
 
 | `schedule_type` | Task | Run A delta | Run B delta | Stable? |
@@ -341,7 +405,7 @@ I process_mail_accounts  next_run=2026-07-13T18:03:44.899831+00:00   (+10 minute
 | `W` WEEKLY | sanity_check | +7 days | +7 days | ✅ |
 | `I` MINUTES=10 | process_mail_accounts | +10 minutes | +10 minutes | ✅ |
 
-The `next_run` recomputation is performed by the scheduler when it "created a task from schedule" (visible in both run logs), so these deltas are produced by Django Q's real scheduler pass — they are not read from the model. (In Runs A and B the three `documents.tasks.*` workers were still failing on the `libzbar0` import described above, which does **not** affect `next_run` advancement because the scheduler recomputes `next_run` at enqueue time, before the worker runs; the fully clean all-success scheduler pass is shown in Section 6.)
+The `next_run` recomputation is performed by the scheduler when it "created a task from schedule" (visible in each run's `qc_*.log`), so these deltas are produced by Django Q's real scheduler pass — they are not read from the model. `next_run` is recomputed at enqueue time (before the worker runs), so the advancement is independent of whether a task's worker later succeeds or fails; the fully clean all-success scheduler pass is shown in **Section 6**.
 
 ### 2.3 Exhaustiveness proof
 
@@ -431,52 +495,191 @@ Checks 1–11 run per `Document` inside the loop; check 12 runs after the loop, 
 
 ### 3.2 Log output — all twelve branches plus the clean case, each exercised at runtime
 
-Each branch was provoked with an isolated synthetic fixture (a throwaway `MEDIA_ROOT` at `/tmp/smedia` and throwaway DB rows, all removed in cleanup). Fixtures that require an *unreadable* file were run as the non-root `testuser` (uid 1000), because root bypasses `chmod` permission bits. The driver created exactly one offending `Document` (or orphan file) per branch, called `check_sanity()` + `log_messages()`, captured the line, then reset state before the next branch. **Observed** (complete output, one block, in branch order):
+Each branch was provoked with an isolated synthetic fixture (a throwaway `MEDIA_ROOT` at `/tmp/smedia` and throwaway DB rows, all removed in cleanup). Fixtures that require an *unreadable* file were run as the non-root `testuser` (uid 1000), because root bypasses `chmod` permission bits. The driver created exactly one offending `Document` (or orphan file) per branch, called `check_sanity()` + `log_messages()`, captured the line, then reset state before the next branch.
+
+> **Methodology note — non-canonical controlled fixture.** This block calls `check_sanity()` + `log_messages()` **directly** in a throwaway process — a deliberately *bypassing* entry point, chosen so each of the twelve branches can be isolated one at a time from a synthetic fixture. It is therefore **non-canonical** by the evidence rules and is used here only to enumerate the per-branch log lines. The *canonical* entry points that drive the identical `check_sanity()` code path unmodified are exercised separately: the `document_sanity_checker` management command (§3.3a), the scheduler-triggered `sanity_check()` dispatch (§3.3b), and the clean weekly scheduler pass (§6).
+
+**Observed** (complete output, one block, in branch order; `document N` numbering reflects the auto-increment PKs on the fresh throwaway DB):
 
 ```bash
-# cont$ (cwd=/app/src, MEDIA_ROOT=/tmp/smedia, run as testuser for unreadable cases)
-#   for each branch: build one fixture -> check_sanity().log_messages() -> reset
-python3 <throwaway sanity-branch driver>
+# cont$ (cwd=/app/src, run as testuser; env: DJANGO_SETTINGS_MODULE=paperless.settings,
+#        PAPERLESS_DATA_DIR=/tmp/sdata, PAPERLESS_MEDIA_ROOT=/tmp/smedia, PAPERLESS_CONSUMPTION_DIR=/tmp/sconsume)
+python3 manage.py migrate >/dev/null && echo MIGRATE_OK    # fresh DB => deterministic PKs
+# For each branch: build exactly one offending fixture -> check_sanity().log_messages() -> reset.
+python3 - <<'PY'
+import os, hashlib, logging, django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+from django.conf import settings
+from documents.models import Document
+from documents.sanity_checker import check_sanity
+
+# capture only the file-handler lines (avoid console double-print via root propagation)
+logging.getLogger("paperless").propagate = False
+
+ORIG = settings.ORIGINALS_DIR
+ARCH = settings.ARCHIVE_DIR
+THUMB = settings.THUMBNAIL_DIR
+LOGF = os.path.join(settings.LOGGING_DIR, "paperless.log")
+
+def md5(b):
+    return hashlib.md5(b).hexdigest()
+
+def reset():
+    Document.objects.all().delete()
+    for d in (ORIG, ARCH, THUMB):
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            try: os.chmod(p, 0o644)
+            except OSError: pass
+            try: os.remove(p)
+            except (IsADirectoryError, OSError): pass
+    # remove stray files directly under MEDIA_ROOT (except never-created lock)
+    for f in os.listdir(settings.MEDIA_ROOT):
+        p = os.path.join(settings.MEDIA_ROOT, f)
+        if os.path.isfile(p):
+            try: os.remove(p)
+            except OSError: pass
+
+def mk(content="valid content", checksum=None, archive_checksum=None, archive_filename=None):
+    if checksum is None:
+        checksum = md5(os.urandom(16))
+    return Document.objects.create(
+        content=content, mime_type="application/pdf", checksum=checksum,
+        archive_checksum=archive_checksum, archive_filename=archive_filename,
+        storage_type=Document.STORAGE_TYPE_UNENCRYPTED)
+
+def w(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+def valid_source(doc, data=b"orig"):
+    w(doc.source_path, data)
+    Document.objects.filter(pk=doc.pk).update(checksum=md5(data))
+    doc.refresh_from_db()
+
+def valid_thumb(doc):
+    w(doc.thumbnail_path, b"PNGTHUMB")
+
+def run(header):
+    pos = os.path.getsize(LOGF) if os.path.exists(LOGF) else 0
+    msgs = check_sanity()
+    msgs.log_messages()
+    for h in logging.getLogger("paperless").handlers:
+        try: h.flush()
+        except Exception: pass
+    new = ""
+    if os.path.exists(LOGF):
+        with open(LOGF, "r", errors="replace") as f:
+            f.seek(pos)
+            new = f.read()
+    print("\n===== " + header + " =====")
+    print(new.rstrip("\n"))
+
+# CLEAN
+reset(); d = mk(content="valid content"); valid_thumb(d)
+w(d.source_path, b"orig-clean"); Document.objects.filter(pk=d.pk).update(checksum=md5(b"orig-clean"))
+run("CLEAN: valid document, no issues")
+
+# BRANCH 1 thumbnail-missing
+reset(); d = mk(); valid_source(d, b"o1")   # source valid, NO thumbnail
+run("BRANCH 1 thumbnail-missing (ERROR)")
+
+# BRANCH 2 thumbnail-unreadable
+reset(); d = mk(); valid_source(d, b"o2"); valid_thumb(d); os.chmod(d.thumbnail_path, 0o000)
+run("BRANCH 2 thumbnail-unreadable (ERROR)")
+
+# BRANCH 3 original-missing
+reset(); d = mk(); valid_thumb(d)           # thumbnail valid, NO source
+run("BRANCH 3 original-missing (ERROR)")
+
+# BRANCH 4 original-unreadable
+reset(); d = mk(); valid_thumb(d); valid_source(d, b"o4"); os.chmod(d.source_path, 0o000)
+run("BRANCH 4 original-unreadable (ERROR)")
+
+# BRANCH 5 original-checksum-mismatch
+reset(); d = mk(checksum="cd26d9e10ce691cc69aa2b90dcebbdac"); valid_thumb(d); w(d.source_path, b"o5-mismatch")
+run("BRANCH 5 original-checksum-mismatch (ERROR)")
+
+# BRANCH 6 archive-checksum-without-filename
+reset(); d = mk(archive_checksum="63f74c1201867136ed98ba4413db6584", archive_filename=None)
+valid_thumb(d); valid_source(d, b"o6")
+run("BRANCH 6 archive-checksum-without-filename (ERROR)")
+
+# BRANCH 7 archive-filename-without-checksum
+reset(); d = mk(archive_checksum=None, archive_filename="a7.pdf"); valid_thumb(d); valid_source(d, b"o7")
+run("BRANCH 7 archive-filename-without-checksum (ERROR)")
+
+# BRANCH 8 archive-version-missing
+reset(); d = mk(archive_checksum="7a2eaadc1ca240425c0e1cf1f3792463", archive_filename="a8.pdf")
+valid_thumb(d); valid_source(d, b"o8")       # NO archive file written
+run("BRANCH 8 archive-version-missing (ERROR)")
+
+# BRANCH 9 archive-unreadable
+reset(); d = mk(archive_checksum=md5(b"a9data"), archive_filename="a9.pdf")
+valid_thumb(d); valid_source(d, b"o9"); w(d.archive_path, b"a9data"); os.chmod(d.archive_path, 0o000)
+run("BRANCH 9 archive-unreadable (ERROR)")
+
+# BRANCH 10 archive-checksum-mismatch
+reset(); d = mk(archive_checksum="63f74c1201867136ed98ba4413db6584", archive_filename="a10.pdf")
+valid_thumb(d); valid_source(d, b"o10"); w(d.archive_path, b"a10-actual-bytes")
+run("BRANCH 10 archive-checksum-mismatch (ERROR)")
+
+# BRANCH 11 no-content
+reset(); d = mk(content=""); valid_thumb(d); valid_source(d, b"o11")
+run("BRANCH 11 no-content (INFO)")
+
+# BRANCH 12 orphaned-file
+reset(); w(os.path.join(ORIG, "orphan_blitzy.pdf"), b"orphan")
+run("BRANCH 12 orphaned-file (WARNING)")
+
+print("\n===== ALL SANITY BRANCHES EXERCISED =====")
+reset()
+PY
 ```
 ```text
+MIGRATE_OK
+
 ===== CLEAN: valid document, no issues =====
-[2026-07-13 18:06:19,461] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
+[2026-07-14 01:31:47,075] [INFO] [paperless.sanity_checker] Sanity checker detected no issues.
 
 ===== BRANCH 1 thumbnail-missing (ERROR) =====
-[2026-07-13 18:06:19,471] [ERROR] [paperless.sanity_checker] Thumbnail of document 26 does not exist.
+[2026-07-14 01:31:47,130] [ERROR] [paperless.sanity_checker] Thumbnail of document 2 does not exist.
 
 ===== BRANCH 2 thumbnail-unreadable (ERROR) =====
-[2026-07-13 18:06:19,481] [ERROR] [paperless.sanity_checker] Cannot read thumbnail file of document 27: [Errno 13] Permission denied: '/tmp/smedia/documents/thumbnails/0000027.png'
+[2026-07-14 01:31:47,141] [ERROR] [paperless.sanity_checker] Cannot read thumbnail file of document 3: [Errno 13] Permission denied: '/tmp/smedia/documents/thumbnails/0000003.png'
 
 ===== BRANCH 3 original-missing (ERROR) =====
-[2026-07-13 18:06:19,490] [ERROR] [paperless.sanity_checker] Original of document 28 does not exist.
+[2026-07-14 01:31:47,149] [ERROR] [paperless.sanity_checker] Original of document 4 does not exist.
 
 ===== BRANCH 4 original-unreadable (ERROR) =====
-[2026-07-13 18:06:19,498] [ERROR] [paperless.sanity_checker] Cannot read original file of document 29: [Errno 13] Permission denied: '/tmp/smedia/documents/originals/0000029.pdf'
+[2026-07-14 01:31:47,160] [ERROR] [paperless.sanity_checker] Cannot read original file of document 5: [Errno 13] Permission denied: '/tmp/smedia/documents/originals/0000005.pdf'
 
 ===== BRANCH 5 original-checksum-mismatch (ERROR) =====
-[2026-07-13 18:06:19,507] [ERROR] [paperless.sanity_checker] Checksum mismatch of document 30. Stored: cd26d9e10ce691cc69aa2b90dcebbdac, actual: 0b744563be36b7a48a74c50ca8cb6086.
+[2026-07-14 01:31:47,168] [ERROR] [paperless.sanity_checker] Checksum mismatch of document 6. Stored: cd26d9e10ce691cc69aa2b90dcebbdac, actual: 257c5c498592ef22ef62fc1c208f72fb.
 
 ===== BRANCH 6 archive-checksum-without-filename (ERROR) =====
-[2026-07-13 18:06:19,516] [ERROR] [paperless.sanity_checker] Document 31 has an archive file checksum, but no archive filename.
+[2026-07-14 01:31:47,178] [ERROR] [paperless.sanity_checker] Document 7 has an archive file checksum, but no archive filename.
 
 ===== BRANCH 7 archive-filename-without-checksum (ERROR) =====
-[2026-07-13 18:06:19,525] [ERROR] [paperless.sanity_checker] Document 32 has an archive file, but its checksum is missing.
+[2026-07-14 01:31:47,189] [ERROR] [paperless.sanity_checker] Document 8 has an archive file, but its checksum is missing.
 
 ===== BRANCH 8 archive-version-missing (ERROR) =====
-[2026-07-13 18:06:19,533] [ERROR] [paperless.sanity_checker] Archived version of document 33 does not exist.
+[2026-07-14 01:31:47,201] [ERROR] [paperless.sanity_checker] Archived version of document 9 does not exist.
 
 ===== BRANCH 9 archive-unreadable (ERROR) =====
-[2026-07-13 18:06:19,542] [ERROR] [paperless.sanity_checker] Cannot read archive file of document 34: [Errno 13] Permission denied: '/tmp/smedia/documents/archive/a9.pdf'
+[2026-07-14 01:31:47,210] [ERROR] [paperless.sanity_checker] Cannot read archive file of document 10: [Errno 13] Permission denied: '/tmp/smedia/documents/archive/a9.pdf'
 
 ===== BRANCH 10 archive-checksum-mismatch (ERROR) =====
-[2026-07-13 18:06:19,551] [ERROR] [paperless.sanity_checker] Checksum mismatch of archived document 35. Stored: 63f74c1201867136ed98ba4413db6584, actual: 7a2eaadc1ca240425c0e1cf1f3792463.
+[2026-07-14 01:31:47,220] [ERROR] [paperless.sanity_checker] Checksum mismatch of archived document 11. Stored: 63f74c1201867136ed98ba4413db6584, actual: a9cc07f23d67a1f6435cc86fd630b928.
 
 ===== BRANCH 11 no-content (INFO) =====
-[2026-07-13 18:06:19,560] [INFO] [paperless.sanity_checker] Document 36 has no content.
+[2026-07-14 01:31:47,231] [INFO] [paperless.sanity_checker] Document 12 has no content.
 
 ===== BRANCH 12 orphaned-file (WARNING) =====
-[2026-07-13 18:06:19,564] [WARNING] [paperless.sanity_checker] Orphaned file in media dir: /tmp/smedia/documents/originals/orphan_blitzy.pdf
+[2026-07-14 01:31:47,235] [WARNING] [paperless.sanity_checker] Orphaned file in media dir: /tmp/smedia/documents/originals/orphan_blitzy.pdf
 
 ===== ALL SANITY BRANCHES EXERCISED =====
 ```
@@ -504,7 +707,78 @@ python3 manage.py document_sanity_checker ; echo "command exit=$?"
 command exit=0
 ```
 
-**Observed — (b) real scheduled dispatch** (not a direct function call): the `sanity_check` `Schedule` row was forced due and a live `qcluster` picked it up, ran it through the broker→worker path, and the raised `SanityCheckFailedException` was persisted as a **`Failure`** row. The complete scheduler+worker log and the persisted record:
+**Observed — (b) real scheduled dispatch** (not a direct function call): the `sanity_check` `Schedule` row was forced due and a live `qcluster` picked it up, ran it through the broker→worker path, and the raised `SanityCheckFailedException` was persisted as a **`Failure`** row.
+
+**Producing command** — create one file-missing document, park **only** the `sanity_check` schedule due, start the real `qcluster` for one pass, then read back the persisted `Failure` row and (via `async_task` through the same live worker) the three non-error return values. Django Q assigns task IDs, cluster names, and timestamps randomly, so those differ per run; the structure and messages are stable:
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379, fresh `manage.py migrate` applied)
+# step 1 — one file-missing document + park ONLY sanity_check due:
+python3 - <<'PY'
+import hashlib, django
+django.setup()
+from django.utils import timezone
+from datetime import timedelta
+from django_q.models import Schedule
+from documents.models import Document
+Document.objects.all().delete()
+Document.objects.create(content="x", mime_type="application/pdf",
+    checksum=hashlib.md5(b"broken").hexdigest(),
+    storage_type=Document.STORAGE_TYPE_UNENCRYPTED)      # no thumbnail/source files -> 2 errors
+now = timezone.now(); SAN = "documents.tasks.sanity_check"
+for s in Schedule.objects.all():
+    s.next_run = (now - timedelta(seconds=5)) if s.func == SAN else (now + timedelta(days=10))
+    s.save()
+PY
+# step 2 — start the scheduler; let the sanity schedule fire (~30 s); then stop it:
+python3 manage.py qcluster > sanity_qc.log 2>&1 &  ; sleep 38 ; kill -TERM %1
+# step 3 — the persisted Failure row, then the warning/info/clean return values via async_task:
+python3 - <<'PY'
+import os, time, glob, hashlib, django
+django.setup()
+from django.conf import settings
+from django_q.tasks import async_task
+from django_q.models import Task, Failure
+from documents.models import Document
+def md5(b): return hashlib.md5(b).hexdigest()
+ORIG, THUMB = settings.ORIGINALS_DIR, settings.THUMBNAIL_DIR
+def clean_media():
+    Document.objects.all().delete()
+    for d in (ORIG, THUMB, settings.ARCHIVE_DIR):
+        os.makedirs(d, exist_ok=True)
+        for f in glob.glob(os.path.join(d, "*")):
+            try: os.remove(f)
+            except IsADirectoryError: pass
+    for f in os.listdir(settings.MEDIA_ROOT):
+        p = os.path.join(settings.MEDIA_ROOT, f)
+        if os.path.isfile(p):
+            try: os.remove(p)
+            except OSError: pass
+def w(p, b):
+    os.makedirs(os.path.dirname(p), exist_ok=True); open(p, "wb").write(b)
+def valid(doc, data=b"orig"):
+    w(doc.source_path, data); Document.objects.filter(pk=doc.pk).update(checksum=md5(data)); doc.refresh_from_db()
+    w(doc.thumbnail_path, b"PNG")
+def read(tid):
+    for _ in range(60):
+        r = Task.objects.filter(id=tid).first()
+        if r: return r
+        time.sleep(0.5)
+for r in Failure.objects.filter(func="documents.tasks.sanity_check"):
+    print("sanity_check Failure rows = 1"); print("  id            =", r.id)
+    print("  func          =", r.func);     print("  success       =", r.success)
+    print("  attempt_count =", r.attempt_count); print("  result        =", repr(r.result))
+clean_media(); w(os.path.join(ORIG, "orphan_blitzy.pdf"), b"orphan")
+print("warning condition -> RETURNED:", repr(read(async_task("documents.tasks.sanity_check")).result))
+clean_media(); d = Document.objects.create(content="", mime_type="application/pdf",
+    checksum=md5(b"info-doc"), storage_type=Document.STORAGE_TYPE_UNENCRYPTED); valid(d, b"info-doc")
+print("info condition    -> RETURNED:", repr(read(async_task("documents.tasks.sanity_check")).result))
+clean_media()
+print("clean condition   -> RETURNED:", repr(read(async_task("documents.tasks.sanity_check")).result))
+PY
+```
+
+The complete scheduler+worker log and the persisted record, from one such run:
 
 ```text
 # qcluster log (scheduler creates the task; worker logs the two errors, then Fails it)
@@ -536,10 +810,10 @@ sanity_check Failure rows = 1
 
 So the command path is safe for interactive/manual use (never raises), while the scheduled path deliberately fails the task on errors so the failure is recorded in `django_q_task`.
 
-The three **non-error** severities were also confirmed through the scheduled `sanity_check()` return value (warning/info/clean conditions), matching the source strings above:
+The three **non-error** severities were also confirmed through the `sanity_check()` return value (warning/info/clean conditions), each dispatched via `async_task` through the same live `qcluster` worker — a controlled dispatch through the identical broker→worker path the schedule uses — matching the source strings above:
 
 ```text
-# scheduled sanity_check() return value by condition
+# sanity_check() return value by condition (dispatched via async_task through the live worker)
 warning condition -> RETURNED: 'Sanity check exited with warnings. See log.'
 info condition    -> RETURNED: 'Sanity check exited with infos. See log.'
 clean condition   -> RETURNED: 'No issues detected.'
@@ -668,6 +942,19 @@ Both govern *newly-arriving files in the consume directory*; they are unrelated 
 These were observed applying in the `migrate` output (see the environment section: `django_q.0013/0014`, `documents.1001`, `documents.1004`, `paperless_mail.0002`, all `OK`).
 
 **Execution** — a single `qcluster` process performs both worker execution and schedule dispatch, backed by Redis. It is configured by `Q_CLUSTER` `[src/paperless/settings.py:449-457]`, with `"django_q"` in `INSTALLED_APPS` `[src/paperless/settings.py:110]`, and is launched as the supervisord `scheduler` program `[docker/supervisord.conf:28-29]`.
+
+**Producing command** — force all four schedules due, start the real `qcluster`, capture its banner and first scheduler cycle, then stop it after the pass. The cluster name, worker PIDs, task names, and timestamps are assigned per run and therefore vary:
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379, fresh `manage.py migrate` applied)
+python3 -c "import django; django.setup()
+from django.utils import timezone
+from datetime import timedelta
+from django_q.models import Schedule
+Schedule.objects.all().update(next_run=timezone.now() - timedelta(seconds=5))"   # all four due
+python3 manage.py qcluster > qc.log 2>&1 &   ; sleep 45 ; kill -TERM %1           # one pass, then stop
+cat qc.log
+```
 
 **Observed** — the complete, unedited `qcluster` startup and its first scheduler cycle in the canonical image **after the `libzbar0` correction** (all four schedules were forced due, so all four fired and all four succeeded):
 ```text
@@ -827,6 +1114,8 @@ Conf.SAVE_LIMIT     = 250
 
 Failure behavior is **task-specific**, because two of the four tasks catch their own exceptions and therefore persist as **Success** even when their inner work fails. This was established by dispatching each task through the **real broker→worker path** (`async_task` with a live `qcluster`, seeded `Schedule` rows parked 10 years out so only the driver's dispatches ran) and recording the persisted `django_q_task` row. A throwaway driver (removed in cleanup) provoked each case with an isolated fixture; a fake in-process IMAP server on `127.0.0.1:1143` (accepts the connection, rejects `LOGIN`) produced a *post-connect* `MailError`, while port `1` produced a *pre-connect* `ConnectionRefusedError`.
 
+> **Methodology note — non-canonical controlled dispatch.** Each case is enqueued with `async_task(...)` (a **direct programmatic dispatch**) rather than by waiting for the task's natural `Schedule` timer, so that all five cases can be provoked deterministically in one short run. `async_task` is the *same* enqueue call Django Q's scheduler makes internally when a `Schedule` comes due, so the broker→worker→persist path exercised here is identical to a scheduled fire — only the **trigger** is non-canonical. The fully canonical schedule-triggered path (a `Schedule` row coming due, the scheduler enqueuing it) is shown separately: for the failure case in §3.3b (the scheduled `sanity_check` `Failure` row) and for the success case in §6 and §8.3. The fake IMAP server and the read-only `INDEX_DIR` are synthetic fixtures, labeled as such.
+
 | Task | Fixture | Inner exception | Caught by task? | Persisted row |
 |---|---|---|---|---|
 | `index_optimize` | normal | none | n/a (no try/except) | **Success**, result `None` |
@@ -835,44 +1124,292 @@ Failure behavior is **task-specific**, because two of the four tasks catch their
 | `process_mail_accounts` | fake IMAP rejects `LOGIN` | `MailError` (post-connect) | **Yes** — `except MailError` `[paperless_mail/tasks.py:16-17]` | **Success**, `'No new documents were added.'` |
 | `process_mail_accounts` | port `1` (refused) | `ConnectionRefusedError` (pre-connect, in `get_mailbox`/`MailBox` `[mail.py:98,159]`) | **No** — not a `MailError` | **Failure** |
 
-**Observed** — the complete driver output (two long tracebacks are shown truncated exactly as captured, marked `…<truncated for width>`):
+**Producing command** — a self-contained driver (`fail_matrix_full.py`, removed in cleanup) parks all seeded schedules 10 years out (so only its own dispatches run), starts a fake in-process IMAP server, then `async_task`-dispatches each of the five cases through the live `qcluster` and reads back the persisted `django_q_task` row. The cluster's own log is directed to a separate file so the block below is exactly the driver's stdout:
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379)
+python3 manage.py migrate >/dev/null && echo MIGRATE_OK      # fresh DB
+python3 manage.py qcluster > qc_fm.log 2>&1 &                # scheduler/worker; its log kept separate
+sleep 8
+python3 - <<'PY'
+import os, sys, time, socket, threading, glob, django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+django.setup()
+from django.utils import timezone
+from datetime import timedelta
+from django.conf import settings
+from django_q.tasks import async_task
+from django_q.models import Task, Schedule
+from paperless_mail.models import MailAccount
+from documents.models import Tag
+
+INDEX_DIR = settings.INDEX_DIR
+
+# Park all seeded schedules 10 years out so ONLY the driver dispatches run
+Schedule.objects.all().update(next_run=timezone.now() + timedelta(days=3650))
+
+def wait_row(tid, secs=40):
+    for _ in range(secs * 2):
+        r = Task.objects.filter(id=tid).first()
+        if r:
+            return r
+        time.sleep(0.5)
+    return None
+
+def ensure_empty_writable_index():
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    os.chmod(INDEX_DIR, 0o755)
+    for f in glob.glob(os.path.join(INDEX_DIR, "*")):
+        try:
+            os.remove(f)
+        except IsADirectoryError:
+            pass
+
+def start_fake_imap(port=1143):
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(5)
+    def handle(conn):
+        conn.sendall(b"* OK fake IMAP ready\r\n")
+        buf = b""
+        while True:
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                return
+            if not data:
+                return
+            buf += data
+            while b"\r\n" in buf:
+                line, buf = buf.split(b"\r\n", 1)
+                parts = line.decode(errors="replace").split()
+                if not parts:
+                    continue
+                tag = parts[0]
+                cmd = parts[1].upper() if len(parts) > 1 else ""
+                if cmd == "CAPABILITY":
+                    conn.sendall(b"* CAPABILITY IMAP4rev1 LOGIN\r\n" + (tag + " OK done\r\n").encode())
+                elif cmd == "LOGIN":
+                    conn.sendall((tag + " NO [AUTHENTICATIONFAILED] login rejected\r\n").encode())
+                elif cmd == "LOGOUT":
+                    conn.sendall(b"* BYE\r\n" + (tag + " OK\r\n").encode())
+                    return
+                else:
+                    conn.sendall((tag + " OK done\r\n").encode())
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+    return srv
+
+rows = []
+def show(case, tid, expected):
+    r = wait_row(tid)
+    rows.append(r)
+    print("\nCASE: " + case)
+    print("  async_task returned id = " + str(tid))
+    if r is None:
+        print("  NO ROW")
+        return r
+    if r.success:
+        print("  row.func = %s | row.success = %s  | attempt_count = %s | result = %r" % (r.func, r.success, r.attempt_count, r.result))
+    else:
+        print("  row.func = %s | row.success = %s | attempt_count = %s" % (r.func, r.success, r.attempt_count))
+        print("  row.result = %r" % (r.result,))
+    print("  EXPECTED: " + expected)
+    return r
+
+# CASE 1: index_optimize (normal, writable empty index)
+ensure_empty_writable_index()
+show("index_optimize (normal)", async_task("documents.tasks.index_optimize"),
+     "Success - index_optimize [tasks.py:32-35] has NO try/except; nothing fails here")
+
+# CASE 2: index_optimize (read-only INDEX_DIR -> uncaught PermissionError)
+ensure_empty_writable_index()
+os.chmod(INDEX_DIR, 0o555)
+show("index_optimize (read-only INDEX_DIR)", async_task("documents.tasks.index_optimize"),
+     "Failure - uncaught PermissionError from create_in/commit propagates to Django Q")
+os.chmod(INDEX_DIR, 0o755)
+
+# CASE 3: train_classifier (one auto-tag, zero docs -> caught ValueError)
+Tag.objects.all().delete()
+Tag.objects.create(name="auto-fixture-tag", matching_algorithm=Tag.MATCH_AUTO)
+show("train_classifier (internal ValueError caught)", async_task("documents.tasks.train_classifier"),
+     "Success - classifier.train() raises ValueError(No training data available.) [classifier.py:159],\n            caught by except Exception -> logger.warning -> returns None")
+
+# CASE 4: process_mail_accounts (fake IMAP rejects LOGIN -> caught MailError)
+start_fake_imap(1143)
+time.sleep(1)
+MailAccount.objects.all().delete()
+MailAccount.objects.create(name="fake-imap", imap_server="127.0.0.1", imap_port=1143,
+    imap_security=MailAccount.ImapSecurity.NONE, username="u", password="p", character_set="UTF-8")
+show("process_mail_accounts (MailError caught)", async_task("paperless_mail.tasks.process_mail_accounts"),
+     "Success - login failure -> MailError [mail.py] caught by except MailError, loop continues")
+
+# CASE 5: process_mail_accounts (port 1 refused -> uncaught ConnectionRefusedError)
+MailAccount.objects.all().delete()
+MailAccount.objects.create(name="refused", imap_server="127.0.0.1", imap_port=1,
+    imap_security=MailAccount.ImapSecurity.SSL, username="u", password="p", character_set="UTF-8")
+show("process_mail_accounts (ConnectionRefused propagates)", async_task("paperless_mail.tasks.process_mail_accounts"),
+     "Failure - ConnectionRefusedError raised in get_mailbox()/MailBox() [mail.py:92-98] is NOT a MailError")
+
+total = len(rows)
+succ = sum(1 for r in rows if r and r.success)
+fail = sum(1 for r in rows if r and not r.success)
+print("\nSUMMARY of django_q Task rows created this run:")
+print("  Task total = %d | success=True = %d | success=False = %d   (all attempt_count = 1)" % (total, succ, fail))
+
+print("\n========== FULL RESULT: index_optimize (read-only INDEX_DIR) ==========")
+print(rows[1].result if rows[1] else "NO ROW")
+print("\n========== FULL RESULT: process_mail_accounts (ConnectionRefused) ==========")
+print(rows[4].result if rows[4] else "NO ROW")
+PY
+```
+
+**Observed** — the driver's complete, unedited stdout. Both long tracebacks are shown **in full** — as the exact persisted `row.result` repr inside each failing CASE (one physical line, `\n` frame separators, as stored in `django_q_task`), and again in expanded multi-line form after the summary:
 ```text
+MIGRATE_OK
+
 CASE: index_optimize (normal)
-  async_task returned id = 42c8a21157284a26aafe82089cf73b60
+  async_task returned id = 27ef4434820d42079f4e6c6910644272
   row.func = documents.tasks.index_optimize | row.success = True  | attempt_count = 1 | result = None
   EXPECTED: Success - index_optimize [tasks.py:32-35] has NO try/except; nothing fails here
 
 CASE: index_optimize (read-only INDEX_DIR)
-  async_task returned id = 3f2e387aa7404e9fb3d66f5fe5b17d9e
+  async_task returned id = 40ec998bf1fb48f29a950c4030c63847
   row.func = documents.tasks.index_optimize | row.success = False | attempt_count = 1
-  row.result = '[Errno 13] Permission denied: \'/tmp/sdata/index/_MAIN_0.toc.1783966858.7626867\' : Traceback (most recent call last):\n  File ".../django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 33, in index_optimize\n    ix = index.open_index()\n  File "/app/src/documents/index.py", line 61, in open_index\n    return create_in(settings.INDEX_DIR, get_schema())\n  File "/usr/local/lib/python3 …<truncated for width>
+  row.result = '[Errno 13] Permission denied: \'/tmp/sdata/index/_MAIN_0.toc.1783995328.8774266\' : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/documents/tasks.py", line 33, in index_optimize\n    ix = index.open_index()\n  File "/app/src/documents/index.py", line 61, in open_index\n    return create_in(settings.INDEX_DIR, get_schema())\n  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 102, in create_in\n    return FileIndex.create(storage, schema, indexname)\n  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 425, in create\n    TOC.create(storage, schema, indexname)\n  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 611, in create\n    toc.write(storage, indexname)\n  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 676, in write\n    stream = storage.create_file(tempfilename)\n  File "/usr/local/lib/python3.9/site-packages/whoosh/filedb/filestore.py", line 490, in create_file\n    fileobj = open(path, mode)\nPermissionError: [Errno 13] Permission denied: \'/tmp/sdata/index/_MAIN_0.toc.1783995328.8774266\'\n'
   EXPECTED: Failure - uncaught PermissionError from create_in/commit propagates to Django Q
 
 CASE: train_classifier (internal ValueError caught)
-  async_task returned id = 4ec4d2dd91844979a39256cad358b28a
-  row.func = documents.tasks.train_classifier | row.success = True | attempt_count = 1 | result = None
-  EXPECTED: Success - classifier.train() raises ValueError('No training data available.') [classifier.py:159],
+  async_task returned id = c0673dc19f3245b49b718ecd34ae89bc
+  row.func = documents.tasks.train_classifier | row.success = True  | attempt_count = 1 | result = None
+  EXPECTED: Success - classifier.train() raises ValueError(No training data available.) [classifier.py:159],
             caught by except Exception -> logger.warning -> returns None
 
 CASE: process_mail_accounts (MailError caught)
-  async_task returned id = 2f0f6d44018a4f0b9cf6e38aa67e9887
-  row.func = paperless_mail.tasks.process_mail_accounts | row.success = True | attempt_count = 1
-  row.result = 'No new documents were added.'
-  EXPECTED: Success - login failure -> MailError [mail.py] caught by `except MailError`, loop continues
+  async_task returned id = ca95e4e539a34209b0c476d63262aa37
+  row.func = paperless_mail.tasks.process_mail_accounts | row.success = True  | attempt_count = 1 | result = 'No new documents were added.'
+  EXPECTED: Success - login failure -> MailError [mail.py] caught by except MailError, loop continues
 
 CASE: process_mail_accounts (ConnectionRefused propagates)
-  async_task returned id = 2dd2be05be2e431ebb41a20a8df7eed6
+  async_task returned id = ba21470dbe224d5ba04329083d0ad4f8
   row.func = paperless_mail.tasks.process_mail_accounts | row.success = False | attempt_count = 1
-  row.result = '[Errno 111] Connection refused : Traceback (most recent call last):\n  File ".../django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/paperless_mail/tasks.py", line 15, in process_mail_accounts\n    total_new_documents += MailAccountHandler().handle_mail_account(account)\n  File "/app/src/paperless_mail/mail.py", line 159, in handle_mail_account\n    with get_mailbox( …<truncated for width>
+  row.result = '[Errno 111] Connection refused : Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker\n    res = f(*task["args"], **task["kwargs"])\n  File "/app/src/paperless_mail/tasks.py", line 15, in process_mail_accounts\n    total_new_documents += MailAccountHandler().handle_mail_account(account)\n  File "/app/src/paperless_mail/mail.py", line 159, in handle_mail_account\n    with get_mailbox(\n  File "/app/src/paperless_mail/mail.py", line 98, in get_mailbox\n    mailbox = MailBox(server, port)\n  File "/usr/local/lib/python3.9/site-packages/imap_tools/mailbox.py", line 297, in __init__\n    super().__init__()\n  File "/usr/local/lib/python3.9/site-packages/imap_tools/mailbox.py", line 35, in __init__\n    self.client = self._get_mailbox_client()\n  File "/usr/local/lib/python3.9/site-packages/imap_tools/mailbox.py", line 303, in _get_mailbox_client\n    return imaplib.IMAP4_SSL(self._host, self._port, self._keyfile, self._certfile, self._ssl_context,\n  File "/usr/local/lib/python3.9/imaplib.py", line 1333, in __init__\n    IMAP4.__init__(self, host, port, timeout)\n  File "/usr/local/lib/python3.9/imaplib.py", line 205, in __init__\n    self.open(host, port, timeout)\n  File "/usr/local/lib/python3.9/imaplib.py", line 1346, in open\n    IMAP4.open(self, host, port, timeout)\n  File "/usr/local/lib/python3.9/imaplib.py", line 315, in open\n    self.sock = self._create_socket(timeout)\n  File "/usr/local/lib/python3.9/imaplib.py", line 1336, in _create_socket\n    sock = IMAP4._create_socket(self, timeout)\n  File "/usr/local/lib/python3.9/imaplib.py", line 305, in _create_socket\n    return socket.create_connection(address)\n  File "/usr/local/lib/python3.9/socket.py", line 856, in create_connection\n    raise err\n  File "/usr/local/lib/python3.9/socket.py", line 844, in create_connection\n    sock.connect(sa)\nConnectionRefusedError: [Errno 111] Connection refused\n'
   EXPECTED: Failure - ConnectionRefusedError raised in get_mailbox()/MailBox() [mail.py:92-98] is NOT a MailError
 
 SUMMARY of django_q Task rows created this run:
   Task total = 5 | success=True = 3 | success=False = 2   (all attempt_count = 1)
+
+========== FULL RESULT: index_optimize (read-only INDEX_DIR) ==========
+[Errno 13] Permission denied: '/tmp/sdata/index/_MAIN_0.toc.1783995328.8774266' : Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker
+    res = f(*task["args"], **task["kwargs"])
+  File "/app/src/documents/tasks.py", line 33, in index_optimize
+    ix = index.open_index()
+  File "/app/src/documents/index.py", line 61, in open_index
+    return create_in(settings.INDEX_DIR, get_schema())
+  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 102, in create_in
+    return FileIndex.create(storage, schema, indexname)
+  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 425, in create
+    TOC.create(storage, schema, indexname)
+  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 611, in create
+    toc.write(storage, indexname)
+  File "/usr/local/lib/python3.9/site-packages/whoosh/index.py", line 676, in write
+    stream = storage.create_file(tempfilename)
+  File "/usr/local/lib/python3.9/site-packages/whoosh/filedb/filestore.py", line 490, in create_file
+    fileobj = open(path, mode)
+PermissionError: [Errno 13] Permission denied: '/tmp/sdata/index/_MAIN_0.toc.1783995328.8774266'
+
+
+========== FULL RESULT: process_mail_accounts (ConnectionRefused) ==========
+[Errno 111] Connection refused : Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker
+    res = f(*task["args"], **task["kwargs"])
+  File "/app/src/paperless_mail/tasks.py", line 15, in process_mail_accounts
+    total_new_documents += MailAccountHandler().handle_mail_account(account)
+  File "/app/src/paperless_mail/mail.py", line 159, in handle_mail_account
+    with get_mailbox(
+  File "/app/src/paperless_mail/mail.py", line 98, in get_mailbox
+    mailbox = MailBox(server, port)
+  File "/usr/local/lib/python3.9/site-packages/imap_tools/mailbox.py", line 297, in __init__
+    super().__init__()
+  File "/usr/local/lib/python3.9/site-packages/imap_tools/mailbox.py", line 35, in __init__
+    self.client = self._get_mailbox_client()
+  File "/usr/local/lib/python3.9/site-packages/imap_tools/mailbox.py", line 303, in _get_mailbox_client
+    return imaplib.IMAP4_SSL(self._host, self._port, self._keyfile, self._certfile, self._ssl_context,
+  File "/usr/local/lib/python3.9/imaplib.py", line 1333, in __init__
+    IMAP4.__init__(self, host, port, timeout)
+  File "/usr/local/lib/python3.9/imaplib.py", line 205, in __init__
+    self.open(host, port, timeout)
+  File "/usr/local/lib/python3.9/imaplib.py", line 1346, in open
+    IMAP4.open(self, host, port, timeout)
+  File "/usr/local/lib/python3.9/imaplib.py", line 315, in open
+    self.sock = self._create_socket(timeout)
+  File "/usr/local/lib/python3.9/imaplib.py", line 1336, in _create_socket
+    sock = IMAP4._create_socket(self, timeout)
+  File "/usr/local/lib/python3.9/imaplib.py", line 305, in _create_socket
+    return socket.create_connection(address)
+  File "/usr/local/lib/python3.9/socket.py", line 856, in create_connection
+    raise err
+  File "/usr/local/lib/python3.9/socket.py", line 844, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [Errno 111] Connection refused
 ```
 
 The corresponding worker log lines confirm the caught-vs-uncaught split: the classifier logged `[WARNING] [paperless.tasks] Classifier error: No training data available.` and the mail login-reject logged `[ERROR] [paperless.mail.tasks] Error while processing mail account …` — **yet both tasks were `Processed` (Success)** — while the read-only-index and connection-refused cases logged `[Q] ERROR Failed […]`.
 
 **Is a failed task re-run? — Observed: no.** With the default `MAX_ATTEMPTS=0` and the Redis broker (no delivery receipts), a task that raises is recorded once as a `Failure` and is **not** re-run. This was confirmed with a short `retry`/`timeout` (`timeout=5, retry=15`) so any redelivery would occur well within the observation window:
+
+**Producing command** — relaunch the cluster with `PAPERLESS_WORKER_TIMEOUT=5` (so `retry = timeout + 10 = 15` `[src/paperless/settings.py:444-446]`), then dispatch (A) the read-only-`INDEX_DIR` `index_optimize` and (B) a synthetic `time.sleep(30)` payload, sampling the persisted rows over time. Task IDs and cluster-assigned worker names differ per run; the counts and states are stable:
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379, fresh `manage.py migrate` applied)
+export PAPERLESS_WORKER_TIMEOUT=5                          # => Conf.TIMEOUT=5, Conf.RETRY=15
+python3 manage.py qcluster > qc_to.log 2>&1 &
+sleep 8
+python3 - <<'PY'
+import os, time, glob, django
+django.setup()
+from django.conf import settings
+from django_q.conf import Conf
+from django_q.tasks import async_task
+from django_q.models import Task, Schedule
+from django.utils import timezone
+from datetime import timedelta
+Schedule.objects.all().update(next_run=timezone.now() + timedelta(days=3650))   # only our dispatches run
+print("Conf.TIMEOUT =", Conf.TIMEOUT, "| Conf.RETRY =", Conf.RETRY, "| Conf.MAX_ATTEMPTS =", Conf.MAX_ATTEMPTS)
+# PART A: exception failure is not re-run
+ix = settings.INDEX_DIR; os.makedirs(ix, exist_ok=True)
+for f in glob.glob(os.path.join(ix, "*")):
+    try: os.remove(f)
+    except IsADirectoryError: pass
+os.chmod(ix, 0o555)
+tidA = async_task("documents.tasks.index_optimize"); t0 = time.time()
+print("enqueued index_optimize (read-only INDEX_DIR), id=%s" % tidA)
+time.sleep(3); rA = Task.objects.filter(id=tidA).first()
+print("T+~1s : success=%s attempt_count=%s name=%s" % (rA and rA.success, rA and rA.attempt_count, rA and rA.name))
+while time.time() - t0 < 23: time.sleep(1)
+print("T+~23s: success=%s attempt_count=%s  (rows with this id = %d)   # elapsed PAST retry=15s" % (
+    rA and rA.success, rA and rA.attempt_count, Task.objects.filter(id=tidA).count()))
+os.chmod(ix, 0o755)
+# PART B: worker timeout via synthetic time.sleep(30)
+print(""); tidB = async_task("time.sleep", 30); t0 = time.time()
+print("enqueued time.sleep(30), id=%s   # timeout=5" % tidB)
+for target in (8, 16, 24):
+    while time.time() - t0 < target: time.sleep(1)
+    r = Task.objects.filter(id=tidB).first()
+    print("T+~%02ds: %s ; total Task rows = %d" % (
+        target, "no persisted row yet" if r is None else "row PRESENT", Task.objects.count()))
+PY
+# Part A's "Failed [...] count" and Part B's "reincarnated worker" line come from the cluster log:
+grep -c "Failed \[" qc_to.log ; grep "reincarnated worker" qc_to.log
+```
 
 **Observed — Part A (exception failure is not re-run):**
 ```text
@@ -904,6 +1441,37 @@ A timed-out worker is "reincarnated" (`timeout` machinery), and because Redis `b
 ### 7.4 Missed schedules — `catch_up=False`, overdue by multiple intervals
 
 With `catch_up: False` `[src/paperless/settings.py:451]`, a schedule missed while the cluster was down is **not** replayed slot-by-slot; it runs **once** at restart and then resumes normal future scheduling. This was observed directly by parking the mail schedule **45 minutes in the past (4.5 × its 10-minute interval)** and starting the cluster:
+
+**Producing command** — park the mail schedule 45 min overdue (the other three far in the future), start the cluster for one pass, then read the mail schedule's `next_run` and how many `process_mail_accounts` rows were created. Task/cluster names and timestamps differ per run:
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379, fresh `manage.py migrate` applied)
+python3 - <<'PY'
+import django; django.setup()
+from django.utils import timezone
+from datetime import timedelta
+from django_q.conf import Conf
+from django_q.models import Schedule
+now = timezone.now(); MAIL = "paperless_mail.tasks.process_mail_accounts"
+for s in Schedule.objects.all():
+    s.next_run = (now - timedelta(minutes=45)) if s.func == MAIL else (now + timedelta(days=10))
+    s.save()
+print("Conf.CATCH_UP =", Conf.CATCH_UP)
+print("now =", now.isoformat())
+print("BEFORE: mail next_run=%s (overdue by 45 min = 4.5 intervals)"
+      % Schedule.objects.get(func=MAIL).next_run.isoformat())
+PY
+python3 manage.py qcluster > qc_catchup.log 2>&1 &  ; sleep 40 ; kill -TERM %1
+python3 - <<'PY'
+import django; django.setup()
+from django_q.models import Schedule, Task
+MAIL = "paperless_mail.tasks.process_mail_accounts"
+print("AFTER:  mail next_run=%s (=> a future slot)" % Schedule.objects.get(func=MAIL).next_run.isoformat())
+print("process_mail_accounts task rows created this pass =", Task.objects.filter(func=MAIL).count(),
+      "(1 => fired ONCE, not once-per-missed-slot)")
+PY
+grep "created a task from schedule\|Processed" qc_catchup.log
+```
 
 **Observed** — overdue-by-4.5-intervals fires exactly once:
 ```text
@@ -992,6 +1560,24 @@ So `index_reindex` has **no `Schedule` row**; the only *automatic, non-scheduled
 ### 8.3 Strictly scheduled
 
 The four `Schedule` rows fire **only** via the `qcluster` scheduler loop — never at import or process start. This was observed directly: on a second cluster run in which only one schedule (`process_mail_accounts`) had been forced into the past, only that schedule fired; the three future-dated schedules did **not** fire.
+
+**Producing command** — park **only** the mail schedule due (the other three far in the future), start the cluster, and capture the banner and first scheduler pass. Cluster/task names and timestamps differ per run:
+
+```bash
+# cont$ (cwd=/app/src, run as testuser; Redis up on :6379, fresh `manage.py migrate` applied)
+python3 - <<'PY'
+import django; django.setup()
+from django.utils import timezone
+from datetime import timedelta
+from django_q.models import Schedule
+now = timezone.now(); MAIL = "paperless_mail.tasks.process_mail_accounts"
+for s in Schedule.objects.all():
+    s.next_run = (now - timedelta(seconds=5)) if s.func == MAIL else (now + timedelta(days=10))
+    s.save()
+PY
+python3 manage.py qcluster > qc_sched.log 2>&1 &  ; sleep 40 ; kill -TERM %1
+grep -E "running\.|Enqueued|created a task from schedule|processing \[" qc_sched.log
+```
 
 **Observed** — a run where only the mail schedule was due (note start at `18:09:28`, fire at `18:09:58` = +30 s scheduler cadence):
 ```text
