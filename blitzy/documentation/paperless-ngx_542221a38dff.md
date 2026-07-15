@@ -440,11 +440,12 @@ $ docker exec pngx_qa bash -lc "grep -nE 'qa_run2_20260714_213727' /tmp/obs/qclu
 ```
 
 Reading that log against the source: `Process-1:1 processing [...]` is the worker loop
-(`django_q/cluster.py:419`); `Consuming …` is `Consumer.try_consume_file` starting
+(`django_q/cluster.py:420`); `Consuming …` is `Consumer.try_consume_file` starting
 (`documents/consumer.py`); the three `paperless.handlers` lines are emitted by `set_correspondent`,
 `set_document_type`, and `set_tags` (`documents/signals/handlers.py`); `consumption finished` is logged
 right after `document_consumption_finished.send` returns; and `Processed [<name>]` is the **monitor**
-process persisting the result row (`django_q/cluster.py:388`).
+process logging success (`django_q/cluster.py:392`) after it has persisted the result row via `save_task`
+(`django_q/cluster.py:384` → `Task.objects.create`, `django_q/cluster.py:506`).
 
 **All six** post-consume handlers are verified by their database postconditions on the single resulting
 document (`documents/apps.py:22-27` order shown in brackets):
@@ -846,7 +847,8 @@ gunicorn master=192
 
 Redis is used simultaneously as the **Django-Q broker** (`Q_CLUSTER["redis"]`) and the **Channels
 layer** backing WebSocket fan-out (`CHANNEL_LAYERS[...]["BACKEND"] =
-channels_redis.core.RedisChannelLayer`, `paperless/settings.py:178-182`). Both point at the same server:
+channels_redis.core.RedisChannelLayer`, `paperless/settings.py:178-187`, which also tunes the layer with
+`capacity: 2000` and `expiry: 15` at `settings.py:183-184`). Both point at the same server:
 
 ```console
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
@@ -1735,8 +1737,12 @@ $ docker exec pngx_qa sed -n '329,349p' /app/src/paperless_mail/mail.py
                 )
 ```
 
-The canonical entry chain is the seeded schedule's callable `process_mail_account`
-(`src/paperless_mail/tasks.py:25`) → `MailAccountHandler.handle_mail_account` (`mail.py:151`, does
+The seeded schedule's canonical callable is the **plural** `process_mail_accounts`
+(`src/paperless_mail/tasks.py:11`), which loops over every configured `MailAccount` and returns a summary
+string (e.g. `'No new documents were added.'`). The reproduction below drives the **single-account
+convenience wrapper** `process_mail_account` (`src/paperless_mail/tasks.py:25`) for the one QA account (it
+returns `None` — see the `RETURN` line below); both converge on the identical chain →
+`MailAccountHandler.handle_mail_account` (`mail.py:151`, does
 `get_mailbox(...)` + `M.login(account.username, account.password)`) → `handle_mail_rule` (`mail.py:187`,
 does `M.folder.set(rule.folder)` then `M.fetch(criteria=AND(**criterias), mark_seen=False, …)`,
 `mail.py:222`) → `handle_message` (`mail.py:272`) → the enqueue at `mail.py:336`. For
@@ -1751,7 +1757,7 @@ $ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; \
 ACCT id=1 security=1(No encryption) host=127.0.0.1:10143 user=qauser
 RULE id=1 folder=INBOX maximum_age=0 action=3(Mark as read, don't process read mails)
 BEFORE  LLEN(django_q:paperless:q)=0  tasks=18  documents=6
->>> invoking canonical scheduled callable: process_mail_account('qa_mail')
+>>> invoking single-account convenience wrapper: process_mail_account('qa_mail')
 [2026-07-14 22:49:50,506] [INFO] [paperless_mail] Rule qa_mail.qa_rule: Consuming attachment qa_mail_attachment.txt from mail PaperlessQA live mail ingestion test from qa-sender@example.test
 22:49:50 [Q] INFO Enqueued 1
 RETURN process_mail_account = None
@@ -1812,7 +1818,7 @@ different task.
 
 **The `MARK_READ` post-consume action is observable too.** The rule's default action
 (`MailAction.MARK_READ`, `models.py:150`) runs `get_rule_action(rule).post_consume(...)` in
-`handle_mail_rule` (`mail.py:258`) *after* enqueue, storing `\Seen` on the processed message so it is not
+`handle_mail_rule` (`mail.py:259`) *after* enqueue, storing `\Seen` on the processed message so it is not
 re-fetched. Re-querying the mailbox with the real client shows the message is now seen:
 
 ```console
@@ -2331,8 +2337,10 @@ the host (see [§2.1](#21-disclosed-environment-posture-deviations-from-producti
 
 ### 12.3 The repository is byte-for-byte unchanged except the single document
 
-Finally, the sole-file proof. The working tree differs from `HEAD` in **exactly one** path — the answer
-document — and the `blitzy/screenshots/` directory that the earlier review flagged is gone:
+Finally, the sole-file proof. This block was captured **during authoring**, while the answer document was
+still an uncommitted working-tree modification; at that point the working tree differed from `HEAD` in
+**exactly one** path — the answer document — and the `blitzy/screenshots/` directory that the earlier
+review flagged is gone:
 
 ```console
 $ git rev-parse --abbrev-ref HEAD && git rev-parse HEAD
@@ -2354,6 +2362,14 @@ blitzy/documentation/paperless-ngx_542221a38dff.md
 $ git status --porcelain | grep '^??' || echo "no untracked files"
 no untracked files
 ```
+
+> **Authoring-time snapshot.** The `HEAD` shown above (`d68342db3…`) is the mid-authoring commit at the
+> moment of capture; it advances by one commit each time this document is revised, so a later reader will
+> observe a different `HEAD`. Likewise, `git status --porcelain` shows the document as a pending ` M` only
+> while it is uncommitted — once the document is committed it becomes tracked and `git status --porcelain`
+> is **empty**. The durable, always-reproducible invariant is therefore not the exact `HEAD` hash but the
+> *delta from the base commit*: `git diff --name-status 542221a38dff..HEAD` yields exactly one line —
+> `A blitzy/documentation/paperless-ngx_542221a38dff.md` — with **no source file modified**.
 
 The only change this task introduces to the repository is the addition/modification of this one Markdown
 document; every temporary artifact used to produce it lived outside the tracked tree (in the now-deleted
@@ -2397,7 +2413,7 @@ directly below. This table is the single consolidated index:
 | `ws_capture.py` | 56 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q6 authenticated WebSocket status capture (real session login → `sessionid` cookie → `ws/status/`) |
 | `imap_server.py` | 180 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 real minimal IMAP4 server (Twisted) — one plaintext account, one RFC822 message with a `.txt` attachment |
 | `rest_upload.py` | 56 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 REST upload driver — browser-canonical session + CSRF auth against `POST /api/documents/post_document/` |
-| `mail_run.py` | 70 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 mail driver — creates a `MailAccount`/`MailRule` and runs the real `process_mail_accounts` → `handle_message` fetch |
+| `mail_run.py` | 70 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 mail driver — creates a `MailAccount`/`MailRule` and invokes the single-account convenience wrapper `process_mail_account` (same `handle_mail_account`→`handle_message` chain as the seeded plural `process_mail_accounts`) to fetch |
 | `bulk_edit.py` | 47 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 bulk-edit driver — session + CSRF auth against `POST /api/documents/bulk_edit/` (JSON body) |
 
 Total: **473 lines** across nine scripts. `penv`, `pp.sh`, and `launch.sh` appear in
@@ -2766,7 +2782,7 @@ print("RULE id=%s folder=%s maximum_age=%s action=%s(%s)" % (
 print("BEFORE  LLEN(%s)=%d  tasks=%d  documents=%d"
       % (QKEY, r.llen(QKEY), Task.objects.count(), Document.objects.count()))
 
-print(">>> invoking canonical scheduled callable: process_mail_account('qa_mail')")
+print(">>> invoking single-account convenience wrapper: process_mail_account('qa_mail')")
 ret = process_mail_account("qa_mail")
 print("RETURN process_mail_account =", repr(ret))
 
