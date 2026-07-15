@@ -1059,6 +1059,8 @@ child peak(in win)  : 24.57 MiB   childPeakDelta=+24.57
 
 **observed (runtime).** 6 × 16 MiB text in ONE long-lived process. Per-doc RSS-after **plateaus** at `~+86 MiB` (doc0 `+86.20` → doc5 `+86.81`, not climbing); each transient stage-peak is `~+161 MiB` (freed before the next). After the loop, `malloc_trim(0)` reclaims `+46.9 MiB` of arena pages, leaving `+39.6 MiB` one-time cold working set; `gc.garbage == 0`. RSS-after does not climb ⇒ arena retention + warm-up, **not** a growing leak.
 
+**Note — reproduction variance (transparency, `observed (runtime)`).** The *pre-trim* per-document RSS-after plateau magnitude (`~+86 MiB` in the two runs below) is a function of transient glibc arena state and is expected to vary run-to-run and host-to-host — an independent reproduction on a different allocator state observed a wider `~+86–104 MiB` band, and the size-scaling runs in §9.5B likewise show the pre-trim retained figure moving between runs (`+85.52` vs `+86.43` at 16 MiB). What is **stable and decision-relevant** is the *post-trim* residual (`+39.63 / +39.64 MiB` here), together with `gc.garbage == 0` and the `objects delta = +15781` (identical across both runs below). Because the excess pre-trim RSS is fully reclaimed by `malloc_trim(0)` down to that stable residual, a higher pre-trim plateau *reinforces* the arena-retention determination (§6.3) rather than contradicting it; `~+86 MiB` is this run's observed plateau, **not** a universal invariant.
+
 ```bash
 DX drv_largeloop.py 6 16
 ```
@@ -1250,7 +1252,7 @@ INTERPRETATION (observed, NON-DEFAULT): recycle=100 -> 1 worker PID(s) handled a
 
 ### 9.11 Canonical directory watcher (#2)
 
-**observed (runtime).** The real `document_consumer --oneshot` management command scans `CONSUMPTION_DIR` and enqueues `consume_file` via `async_task` (`document_consumer.py:46,86`); a real recycle=1 cluster then consumes. The watcher process allocates only `+0.29–0.45 MiB` (a thin enqueue shim — `_consume` opens the file just to test readability at `:62`, it does not read bytes), and 2/2 Documents are created end-to-end by the recycled worker.
+**observed (runtime).** The real `document_consumer --oneshot` management command scans `CONSUMPTION_DIR` and enqueues `consume_file` via `async_task` (`document_consumer.py:46,86`); a real recycle=1 cluster then consumes. The watcher process allocates only `+0.29–0.45 MiB` (a thin enqueue shim — `_consume` opens the file at `:67` just to test readability (readability-retry block `:62-71`), it does not read bytes), and 2/2 Documents are created end-to-end by the recycled worker.
 
 ```bash
 DXI drv_watcher.py 2
@@ -1385,7 +1387,7 @@ GET http://127.0.0.1:8021/api/documents/1/metadata/  (curl -H 'Authorization: To
 POST http://127.0.0.1:8021/api/documents/post_document/  upload=8.01 MiB (real gunicorn+curl)
   upload: http=200  worker RSS before=83.93 peak=170.25 after=99.15 VmHWM=166.79 MiB
   (serialisers.py:451 document.file.read() reads WHOLE upload into memory + magic.from_buffer;
-   PostDocumentView.post writes a temp file + async_task(consume_file) [views.py:519])
+   PostDocumentView.post writes a temp file + async_task(consume_file) [views.py:523])
 
 ephemeral token DELETED; gunicorn stopped
 ```
@@ -1413,7 +1415,7 @@ GET http://127.0.0.1:8022/api/documents/1/metadata/  (curl -H 'Authorization: To
 POST http://127.0.0.1:8022/api/documents/post_document/  upload=8.01 MiB (real gunicorn+curl)
   upload: http=200  worker RSS before=85.18 peak=172.72 after=101.58 VmHWM=168.63 MiB
   (serialisers.py:451 document.file.read() reads WHOLE upload into memory + magic.from_buffer;
-   PostDocumentView.post writes a temp file + async_task(consume_file) [views.py:519])
+   PostDocumentView.post writes a temp file + async_task(consume_file) [views.py:523])
 
 ephemeral token DELETED; gunicorn stopped
 ```
@@ -3297,7 +3299,7 @@ else:
           f"{'is non-decreasing -> memory accumulates within the reused worker' if grew else ''}.")
 ```
 
-#### `drv_watcher.py` — SHA-256 `03d6577b325e629e05492e9dd02b9c0b8450b588aa1e51da03713303e34f4eb6` (95 lines)
+#### `drv_watcher.py` — SHA-256 `e63f0cce523ba0e6b7aa56a2de68d6d673e163d18b18e6d2aacb8884ce140de2` (95 lines)
 
 ```python
 """
@@ -3307,7 +3309,7 @@ CONSUMPTION_DIR and calls the real _consume() (document_consumer.py:46) ->
 async_task("documents.tasks.consume_file", ...) (document_consumer.py:86). A REAL
 django-q cluster (recycle=1) then consumes the enqueued file. Measures the watcher
 process's own RSS (thin enqueue shim: _consume opens the file only to test
-readability at document_consumer.py:62, it does NOT read bytes) and confirms the
+readability at document_consumer.py:67, it does NOT read bytes) and confirms the
 Document is created end-to-end by the recycled worker.
 
 Usage: <n_files>
@@ -3492,7 +3494,7 @@ print("recycle=1 scheduled-task worker exit releases them. This CORRECTS the pri
 print("non-recycled mail process' conclusion.")
 ```
 
-#### `drv_metadata.py` — SHA-256 `f21f121b38c7d12f31334bfc32f7023022334bc6139c5e80e944c58c0ac65707` (141 lines)
+#### `drv_metadata.py` — SHA-256 `c007c5d319d27407a3ed92d89c48f6e1ca8aaa063d1dc117e799263996db22ce` (141 lines)
 
 ```python
 """
@@ -3627,7 +3629,7 @@ stop["go"] = False; th.join(timeout=1)
 after = worker_rss(); hwm = worker_hwm()
 print(f"  upload: http={resp}  worker RSS before={before:.2f} peak={peak['v']:.2f} after={after:.2f} VmHWM={hwm:.2f} MiB")
 print(f"  (serialisers.py:451 document.file.read() reads WHOLE upload into memory + magic.from_buffer;")
-print(f"   PostDocumentView.post writes a temp file + async_task(consume_file) [views.py:519])")
+print(f"   PostDocumentView.post writes a temp file + async_task(consume_file) [views.py:523])")
 
 # teardown
 gproc.send_signal(signal.SIGTERM)
