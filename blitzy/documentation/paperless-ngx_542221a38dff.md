@@ -16,7 +16,7 @@
 The four sub-questions, answered up front; each is proven in detail in the correspondingly-named section below.
 
 - **P1 — How do I see that OCR started, and what does the processing state look like (text-free image)?**
-  Ingestion is **asynchronous**: the HTTP upload returns `Response("OK")` in ~0.03 s (before any OCR), and all OCR work happens in a **django-q background worker**. You watch OCR through two real signals: (a) the **WebSocket progress stream** broadcast to the Channels group `"status_updates"`, which for the observed successful image consumes walked the sequence `STARTING/new_file@0%` → **`WORKING/parsing_document@20%` (the parsing/OCR-phase checkpoint)** → `WORKING/generating_thumbnail@70%` → `WORKING/parse_date@90%` → `WORKING/save_document@95%` → `SUCCESS/finished@100%`; and (b) the worker's DEBUG log line **`Calling OCRmyPDF with args: {…}`** from logger `paperless.parsing.tesseract`, which is the definitive *engine-call* signal (it fires a fraction of a second after the 20% checkpoint, inside `parse()`). The `document_id` field is `null` in the progress payloads until the terminal `SUCCESS` — but that is a property of how the payload is built, **not** proof that no row exists during processing: an independent DB poll shows the committed row appears *after* the 95% event and just *before* the 100% event.
+  Ingestion is **asynchronous**: the HTTP upload returns `Response("OK")` in ~0.03 s (before any OCR), and all OCR work happens in a **django-q background worker**. You watch OCR through two real signals: (a) the **WebSocket progress stream** broadcast to the Channels group `"status_updates"`, which for the observed successful image consumptions followed the sequence `STARTING/new_file@0%` → **`WORKING/parsing_document@20%` (the parsing/OCR-phase checkpoint)** → `WORKING/generating_thumbnail@70%` → `WORKING/parse_date@90%` → `WORKING/save_document@95%` → `SUCCESS/finished@100%`; and (b) the worker's DEBUG log line **`Calling OCRmyPDF with args: {…}`** from logger `paperless.parsing.tesseract`, which is the definitive *engine-call* signal (it fires a fraction of a second after the 20% checkpoint, inside `parse()`). The `document_id` field is `null` in the progress payloads until the terminal `SUCCESS` — but that is a property of how the payload is built, **not** proof that no row exists during processing: an independent DB poll shows the committed row appears *after* the 95% event and just *before* the 100% event.
 
 - **P2 — Does an image that already shows text skip OCR?**
   **No.** For **any image (non-PDF) input, OCR always runs** (_observed_ for both a text-free and a text-bearing image; the _inferred-from-code_ reason is that the parser unconditionally sets `original_has_text = False` for images, so the `skip_noarchive` early-exit can never fire for an image). The pipeline shape and the progress/log signature are **identical** to the text-free case, so _you cannot tell "the image had visible text" from the output shape_. The only artifact that distinguishes "text produced by OCR" from "a page that already had a text layer" is the **ocrmypdf sidecar marker `[OCR skipped on page(s) …]`** — observed present for a text-layer PDF and absent for images.
@@ -172,27 +172,36 @@ docker exec -d paperless-app bash -lc 'cd /app/src && exec python3 manage.py qcl
 Django version 4.0.4, using settings 'paperless.settings'
 Starting development server at http://0.0.0.0:8000/
 
-# API reachable:
-$ TOKEN=$(docker exec paperless-app bash -lc "curl -s -X POST -d 'username=admin&password=adminpass' http://localhost:8000/api/token/ | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"token\"])'")
-$ docker exec paperless-app bash -lc "curl -s -o /dev/null -w 'GET /api/ -> HTTP %{http_code}\n' -H \"Authorization: Token $TOKEN\" http://localhost:8000/api/"
+# API reachable — credentials and token are read from mode-0600 curl config
+# files (curl -K <file>), so they never appear in process argv:
+$ docker exec paperless-app bash -lc '
+    umask 077
+    printf "request = POST\nurl = \"http://localhost:8000/api/token/\"\ndata = \"username=admin&password=adminpass\"\n" > /tmp/obs/mint.cfg'
+$ docker exec paperless-app bash -lc '
+    umask 077
+    tok=$(curl -s -K /tmp/obs/mint.cfg | python3 -c "import sys,json;print(json.load(sys.stdin)[\"token\"])")
+    printf "header = \"Authorization: Token %s\"\n" "$tok" > /tmp/obs/auth.cfg
+    echo "token length: ${#tok} (value not printed)"'
+token length: 40 (value not printed)
+$ docker exec paperless-app bash -lc "curl -s -o /dev/null -w 'GET /api/ -> HTTP %{http_code}\n' -K /tmp/obs/auth.cfg http://localhost:8000/api/"
 GET /api/ -> HTTP 200
 ```
 
 - **Redis broker** (`redis:7-alpine`) — backs both django-q and the Channels channel layer.
 - **django-q worker** — `python3 manage.py qcluster` (`"django_q"` in `INSTALLED_APPS` — `src/paperless/settings.py:L110`; `Q_CLUSTER` config — `src/paperless/settings.py:L449`). This is the process that executes `consume_file` and performs OCR.
 - **Database** — SQLite at `/tmp/pl/data/db.sqlite3`, reset to a **clean slate** (0 documents) before observation.
-- **API token** — obtained via `POST /api/token/` (`username=admin`) into a shell variable `$TOKEN`; sent as `Authorization: Token $TOKEN` on every upload/GET. The literal token value is never printed in this document.
+- **API token** — obtained via `POST /api/token/` (`username=admin`) and stored, together with the login credentials, in **mode-0600 `curl` config files**: `/tmp/obs/mint.cfg` holds the token-mint POST body, and `/tmp/obs/auth.cfg` holds the `Authorization: Token …` header. Every upload/GET reads the header with `curl -K /tmp/obs/auth.cfg`, so **the token is never passed on the command line** and never printed in this document.
 
-> **Security note.** The token is kept in a shell variable and never emitted. Redis, the SQLite DB, and the HTTP/WS ports are bound only to the disposable observation containers on a private Docker network; they are not exposed to untrusted clients.
+> **Security note.** The login credentials and the API token live only in mode-0600 files read via `curl -K`; they are therefore **not passed in process argv** (i.e. not exposed via `/proc/<pid>/cmdline` to other local users) and are never emitted to this document. This was verified at runtime — the in-flight argv of an authenticated request is exactly `curl -s -K /tmp/obs/auth.cfg <url>`, with no `Authorization` header and no token literal present (the older `-H "Authorization: Token <token>"` form, by contrast, would place the secret directly in argv). Redis, the SQLite DB, and the HTTP/WS ports are bound only to the disposable observation containers on a private Docker network; they are not exposed to untrusted clients.
 
 ### 2.6 How progress was captured (two methods, both real)
 
-Progress is broadcast by the worker to the Channels group `"status_updates"` over the configured Redis channel layer (`src/documents/consumer.py:L73-L74`). Two real capture methods were used; both are published in full in the **Appendix (§12)** so the exact commands, secure temp handling, and cleanup are auditable.
+Progress is broadcast by the worker to the Channels group `"status_updates"` over the configured Redis channel layer (`src/documents/consumer.py:L73-L74`). Two real capture methods were used; both are published in full in the **Appendix (§13)** so the exact commands, secure temp handling, and cleanup are auditable.
 
 1. **Channel-layer subscriber (`sub.py`) — a PRIVILEGED internal probe.** It joins the *same* `"status_updates"` group the browser's `StatusConsumer` joins (`src/paperless/consumers.py:L16-L19`) via the app's configured Redis channel layer, and logs each broadcast verbatim with wall-clock + monotonic timestamps. It is the exact same Channels mechanism the app uses — **not** a mock. It **bypasses** `StatusConsumer`'s authentication gate (`src/paperless/consumers.py:L13-L15`), so it is privileged instrumentation for observation, not a method a normal WebSocket client could use.
-2. **Authenticated WebSocket client (`ws_probe.py`) — the browser-equivalent path.** It connects to the real WebSocket route `ws/status/` (`src/paperless/urls.py:L137`) with a genuine logged-in session cookie and receives the same payloads the browser front-end does. This is used in §4.8 to demonstrate the practical, non-privileged observation method.
+2. **Authenticated WebSocket client (`ws_probe.py`) — the real authenticated route, entered via PRIVILEGED session injection.** It connects to the real WebSocket route `ws/status/` (`src/paperless/urls.py:L137`) presenting a valid `sessionid` cookie — the *same* cookie mechanism the browser front-end uses — and traverses `StatusConsumer`'s authentication gate (`src/paperless/consumers.py:L13-L15`) to receive the identical payloads. **It does *not* perform an HTTP form login, however: it obtains the cookie by minting a Django session row directly in the session store (`SessionStore`),** so the *cookie acquisition* is privileged instrumentation, not the unprivileged browser login flow. It is used in §4.8 to demonstrate two things at runtime: that the authenticated route delivers the live stream, and that the auth gate rejects an unauthenticated client.
 
-**Component-level probes (labeled NON-CANONICAL):** to expose the ocrmypdf **sidecar file** (which the canonical async path deletes on cleanup) and to exercise `skip_noarchive`, two throwaway scripts (`probe_sidecar.py`, `probe_skip.py`, §12) called the **real** `RasterisedDocumentParser.parse(...)` directly (no mocks). All such output is explicitly labeled **_component-level probe (NON-CANONICAL)_**. Every probe **copies the fixture into a private `tempfile.mkdtemp()` directory and parses only the copy**, so repository fixtures are never touched (proven in §11).
+**Component-level probes (labeled NON-CANONICAL):** to expose the ocrmypdf **sidecar file** (which the canonical async path deletes on cleanup) and to exercise `skip_noarchive`, two throwaway scripts (`probe_sidecar.py`, `probe_skip.py`, §13) called the **real** `RasterisedDocumentParser.parse(...)` directly (no mocks). All such output is explicitly labeled **_component-level probe (NON-CANONICAL)_**. Every probe **copies the fixture into a private `tempfile.mkdtemp()` directory and parses only the copy**, so repository fixtures are never touched (proven in §11).
 
 **Temporary-artifact hygiene:** every scratch item (scripts, scratch media, SQLite DB, media/consume dirs) lives **outside** the repository tree — under `/tmp` on the host and inside the disposable containers. The repository working tree is left pristine except for this one document — proven in §11.
 
@@ -259,7 +268,7 @@ Two complete, independent runs were captured (run A → document id 1; run B →
 ```bash
 docker exec paperless-app bash -lc "curl -s -o /tmp/obs/p1a_body.txt \
   -w 'HTTP_CODE=%{http_code}\nTIME_TOTAL=%{time_total}s\n' \
-  -H \"Authorization: Token $TOKEN\" \
+  -K /tmp/obs/auth.cfg \
   -F document=@/app/src/paperless_tesseract/tests/samples/no-text-alpha.png \
   http://localhost:8000/api/documents/post_document/"
 docker exec paperless-app bash -lc 'echo -n "body="; cat /tmp/obs/p1a_body.txt'
@@ -290,16 +299,16 @@ docker exec paperless-app bash -lc 'cd /app/src && python3 manage.py shell -c \
 
 ### 4.3 "During" state — the live progress stream (full, unedited payloads)
 
-This is the complete `"status_updates"` broadcast for run A, captured by the channel-layer subscriber (`sub.py`, §12). The first line is the subscriber's own readiness marker; the rest are the verbatim worker broadcasts. **All seven payload keys are present in every event**, and `task_id` is constant across the task:
+This is the complete `"status_updates"` broadcast for run A, captured by the channel-layer subscriber (`sub.py`, §13). The first line is the subscriber's own readiness marker; the rest are the verbatim worker broadcasts. **All seven payload keys are present in every event**, and `task_id` is constant across the task:
 
 ```json
 {"event": "subscriber_ready", "group": "status_updates"}
-{"recv_wall": "2026-07-14 20:51:55.212", "recv_mono_s": 1.936, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
-{"recv_wall": "2026-07-14 20:51:55.233", "recv_mono_s": 1.956, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
-{"recv_wall": "2026-07-14 20:51:57.389", "recv_mono_s": 4.112, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}}
-{"recv_wall": "2026-07-14 20:52:05.105", "recv_mono_s": 11.828, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}}
-{"recv_wall": "2026-07-14 20:52:05.121", "recv_mono_s": 11.844, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}}
-{"recv_wall": "2026-07-14 20:52:05.193", "recv_mono_s": 11.916, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 1}}
+{"recv_wall": "2026-07-15 01:11:33.504", "recv_mono_s": 2.22, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
+{"recv_wall": "2026-07-15 01:11:33.526", "recv_mono_s": 2.243, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
+{"recv_wall": "2026-07-15 01:11:35.771", "recv_mono_s": 4.488, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}}
+{"recv_wall": "2026-07-15 01:11:43.610", "recv_mono_s": 12.326, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}}
+{"recv_wall": "2026-07-15 01:11:43.637", "recv_mono_s": 12.354, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}}
+{"recv_wall": "2026-07-15 01:11:43.687", "recv_mono_s": 12.403, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 1}}
 ```
 
 Reading this as the "processing state":
@@ -320,26 +329,27 @@ Two "during-state" facts:
 
 ### 4.4 "During" state — measuring the DB directly (the 95% → commit → 100% window)
 
-To see *when the committed row actually appears* — rather than inferring it from the payload field — an independent, **read-only** SQLite poller (`poll_db.py`, §12) sampled `COUNT(*)` and `MAX(id)` every 25 ms from a separate connection while run A executed. It prints a line only when the value changes.
+To see *when the committed row actually appears* — rather than inferring it from the payload field — an independent, **read-only** SQLite poller (`poll_db.py`, §13) sampled `COUNT(*)` and `MAX(id)` every 25 ms from a separate connection across run A and the subsequent pre-run-B cleanup. It prints a line only when the value changes, so the three lines below are the three transitions it saw: empty → run A's committed row → empty again (the latter is the ORM deletion of id 1 performed just before run B, §4.7).
 
 **Output (observed):**
 
 ```json
-{"mono_s": 0.0, "wall": "20:51:52.544", "count": 0, "max_id": null}
-{"mono_s": 12.637, "wall": "20:52:05.181", "count": 1, "max_id": 1}
+{"mono_s": 0.0, "wall": "01:11:30.433", "count": 0, "max_id": null}
+{"mono_s": 13.238, "wall": "01:11:43.671", "count": 1, "max_id": 1}
+{"mono_s": 42.092, "wall": "01:12:12.525", "count": 0, "max_id": null}
 ```
 
 Line up the wall-clock times with the stream (§4.3) and the worker log (§4.5):
 
 | Wall clock (this run) | Event                                                    | Source        |
 | --------------------- | -------------------------------------------------------- | ------------- |
-| 20:51:52 – 20:52:05.1 | DB `count = 0` (through STARTING, 20%, 70%, 90%)          | poller        |
-| 20:52:05.121          | `WORKING/save_document@95%`                              | stream        |
-| 20:52:05.121          | worker log `Saving record to database`                   | worker log    |
-| **20:52:05.181**      | **DB `count` becomes 1 (`max_id = 1`) — committed row visible** | **poller**    |
-| 20:52:05.193          | `SUCCESS/finished@100%` (first event with `document_id=1`) | stream        |
+| 01:11:30 – 01:11:43.6 | DB `count = 0` (through STARTING, 20%, 70%, 90%)          | poller        |
+| 01:11:43.637          | `WORKING/save_document@95%`                              | stream        |
+| 01:11:43.638          | worker log `Saving record to database`                   | worker log    |
+| **01:11:43.671**      | **DB `count` becomes 1 (`max_id = 1`) — committed row visible** | **poller**    |
+| 01:11:43.687          | `SUCCESS/finished@100%` (first event with `document_id=1`) | stream        |
 
-So the committed row became visible to an independent connection at **20:52:05.181** — **after** the 95% `save_document` event and **~12 ms before** the terminal `finished@100%` event. This matches the source (_inferred from code_): `_store(...)` runs `Document.objects.create(...)` (`consumer.py:L398`) inside `with transaction.atomic():` (`consumer.py:L298`); the commit happens when that block exits, *after* the 95% send (`consumer.py:L294`) and *before* the final 100% send (`consumer.py:L375`). The correct statement of the "during" state is therefore: **no row exists during the OCR/parse phase (0–70%); the row is created and committed in the persistence step around 95%; the terminal 100% event follows the commit.**
+So the committed row became visible to an independent connection at **01:11:43.671** — **after** the 95% `save_document` event (01:11:43.637) and **~16 ms before** the terminal `finished@100%` event (01:11:43.687). This matches the source (_inferred from code_): `_store(...)` runs `Document.objects.create(...)` (`consumer.py:L398`) inside `with transaction.atomic():` (`consumer.py:L298`); the commit happens when that block exits, *after* the 95% send (`consumer.py:L294`) and *before* the final 100% send (`consumer.py:L375`). The correct statement of the "during" state is therefore: **no row exists during the OCR/parse phase (0–70%); the row is created and committed in the persistence step around 95%; the terminal 100% event follows the commit.**
 
 ### 4.5 "During" state — the worker log proves OCR is actively running
 
@@ -355,32 +365,32 @@ docker exec paperless-app bash -lc \
 **Output (observed) — run A slice:**
 
 ```
-[2026-07-14 20:51:55,215] [INFO] [paperless.consumer] Consuming no-text-alpha.png
-[2026-07-14 20:51:55,216] [DEBUG] [paperless.consumer] Detected mime type: image/png
-[2026-07-14 20:51:55,217] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
-[2026-07-14 20:51:55,232] [DEBUG] [paperless.consumer] Parsing no-text-alpha.png...
-[2026-07-14 20:51:55,349] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/pl/scratch/paperless-upload-sqseq4pf: 'dpi'
-[2026-07-14 20:51:55,350] [DEBUG] [paperless.parsing.tesseract] Estimated DPI 35 based on image width 297
-[2026-07-14 20:51:55,350] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /tmp/pl/scratch/paperless-upload-sqseq4pf for compatibility with img2pdf
-[2026-07-14 20:51:55,356] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-sqseq4pf', 'output_file': '/tmp/pl/scratch/paperless-ynev8grp/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-ynev8grp/sidecar.txt', 'image_dpi': 35}
-[2026-07-14 20:51:56,370] [DEBUG] [paperless.parsing.tesseract] Using text from sidecar file
-[2026-07-14 20:51:56,371] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
-[2026-07-14 20:51:56,371] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/pl/scratch/paperless-upload-sqseq4pf: 'dpi'
-[2026-07-14 20:51:56,371] [DEBUG] [paperless.parsing.tesseract] Estimated DPI 35 based on image width 297
-[2026-07-14 20:51:56,372] [DEBUG] [paperless.parsing.tesseract] Fallback: Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-sqseq4pf', 'output_file': '/tmp/pl/scratch/paperless-ynev8grp/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-ynev8grp/sidecar-fallback.txt', 'image_dpi': 35}
-[2026-07-14 20:51:57,372] [DEBUG] [paperless.parsing.tesseract] Using text from sidecar file
-[2026-07-14 20:51:57,373] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/pl/scratch/paperless-upload-sqseq4pf, the content will be empty.
-[2026-07-14 20:51:57,373] [DEBUG] [paperless.consumer] Generating thumbnail for no-text-alpha.png...
-[2026-07-14 20:51:57,948] [DEBUG] [paperless.parsing.tesseract] Execute: optipng -silent -o5 /tmp/pl/scratch/paperless-ynev8grp/convert.png -out /tmp/pl/scratch/paperless-ynev8grp/thumb_optipng.png
-[2026-07-14 20:52:05,121] [DEBUG] [paperless.consumer] Saving record to database
-[2026-07-14 20:52:05,140] [DEBUG] [paperless.consumer] Deleting file /tmp/pl/scratch/paperless-upload-sqseq4pf
-[2026-07-14 20:52:05,166] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/pl/scratch/paperless-ynev8grp
-[2026-07-14 20:52:05,167] [INFO] [paperless.consumer] Document 2026-07-14 no-text-alpha consumption finished
+[2026-07-15 01:11:33,506] [INFO] [paperless.consumer] Consuming no-text-alpha.png
+[2026-07-15 01:11:33,506] [DEBUG] [paperless.consumer] Detected mime type: image/png
+[2026-07-15 01:11:33,507] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
+[2026-07-15 01:11:33,520] [DEBUG] [paperless.consumer] Parsing no-text-alpha.png...
+[2026-07-15 01:11:33,619] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/pl/scratch/paperless-upload-4jy6ecz2: 'dpi'
+[2026-07-15 01:11:33,620] [DEBUG] [paperless.parsing.tesseract] Estimated DPI 35 based on image width 297
+[2026-07-15 01:11:33,620] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /tmp/pl/scratch/paperless-upload-4jy6ecz2 for compatibility with img2pdf
+[2026-07-15 01:11:33,646] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-4jy6ecz2', 'output_file': '/tmp/pl/scratch/paperless-tpzt0pbv/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-tpzt0pbv/sidecar.txt', 'image_dpi': 35}
+[2026-07-15 01:11:34,772] [DEBUG] [paperless.parsing.tesseract] Using text from sidecar file
+[2026-07-15 01:11:34,773] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+[2026-07-15 01:11:34,773] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/pl/scratch/paperless-upload-4jy6ecz2: 'dpi'
+[2026-07-15 01:11:34,773] [DEBUG] [paperless.parsing.tesseract] Estimated DPI 35 based on image width 297
+[2026-07-15 01:11:34,774] [DEBUG] [paperless.parsing.tesseract] Fallback: Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-4jy6ecz2', 'output_file': '/tmp/pl/scratch/paperless-tpzt0pbv/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-tpzt0pbv/sidecar-fallback.txt', 'image_dpi': 35}
+[2026-07-15 01:11:35,752] [DEBUG] [paperless.parsing.tesseract] Using text from sidecar file
+[2026-07-15 01:11:35,752] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/pl/scratch/paperless-upload-4jy6ecz2, the content will be empty.
+[2026-07-15 01:11:35,752] [DEBUG] [paperless.consumer] Generating thumbnail for no-text-alpha.png...
+[2026-07-15 01:11:36,383] [DEBUG] [paperless.parsing.tesseract] Execute: optipng -silent -o5 /tmp/pl/scratch/paperless-tpzt0pbv/convert.png -out /tmp/pl/scratch/paperless-tpzt0pbv/thumb_optipng.png
+[2026-07-15 01:11:43,638] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-15 01:11:43,657] [DEBUG] [paperless.consumer] Deleting file /tmp/pl/scratch/paperless-upload-4jy6ecz2
+[2026-07-15 01:11:43,669] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/pl/scratch/paperless-tpzt0pbv
+[2026-07-15 01:11:43,669] [INFO] [paperless.consumer] Document 2026-07-15 no-text-alpha consumption finished
 ```
 
 Concrete OCR signals visible here (all **_observed_**):
 
-- **`Calling OCRmyPDF with args: {…}`** is the engine-call signal at 20:51:55,356 — ~124 ms after the 20% checkpoint (20:51:55.233). The arg dict reflects the resolved settings: `'skip_text': True` (from `OCR_MODE='skip'`, built at `parsers.py:L157-L158`), `'language': 'eng'`, `'output_type': 'pdfa'`, `'clean': True`.
+- **`Calling OCRmyPDF with args: {…}`** is the engine-call signal at 01:11:33,646 — ~120 ms after the 20% checkpoint (01:11:33.526). The arg dict reflects the resolved settings: `'skip_text': True` (from `OCR_MODE='skip'`, built at `parsers.py:L157-L158`), `'language': 'eng'`, `'output_type': 'pdfa'`, `'clean': True`.
 - For this alpha PNG the DPI probe failed, so paperless fell back to an A4-based estimate (`Estimated DPI 35 based on image width 297`) and stripped the alpha layer for `img2pdf` (`Removing alpha layer …` — `parsers.py:L191-L201`). This alpha strip happens on the worker's *scratch copy* (`/tmp/pl/scratch/paperless-upload-…`), not on the repository fixture.
 - The first OCR pass produced no text → a **force-OCR fallback** (`Fallback: Calling OCRmyPDF with args: {… 'force_ocr': True …}`); it also produced no text → the empty-content last-resort warning. (This empty-text outcome is the P4 case; §7.)
 
@@ -417,28 +427,44 @@ Run B's complete stream (**_observed_**):
 
 ```json
 {"event": "subscriber_ready", "group": "status_updates"}
-{"recv_wall": "2026-07-14 20:53:12.262", "recv_mono_s": 1.873, "payload": {"filename": "no-text-alpha.png", "task_id": "d3faf291-727f-44f8-b38e-8d0d87d1d96c", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
-{"recv_wall": "2026-07-14 20:53:12.285", "recv_mono_s": 1.896, "payload": {"filename": "no-text-alpha.png", "task_id": "d3faf291-727f-44f8-b38e-8d0d87d1d96c", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
-{"recv_wall": "2026-07-14 20:53:14.650", "recv_mono_s": 4.261, "payload": {"filename": "no-text-alpha.png", "task_id": "d3faf291-727f-44f8-b38e-8d0d87d1d96c", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}}
-{"recv_wall": "2026-07-14 20:53:22.839", "recv_mono_s": 12.45, "payload": {"filename": "no-text-alpha.png", "task_id": "d3faf291-727f-44f8-b38e-8d0d87d1d96c", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}}
-{"recv_wall": "2026-07-14 20:53:22.858", "recv_mono_s": 12.469, "payload": {"filename": "no-text-alpha.png", "task_id": "d3faf291-727f-44f8-b38e-8d0d87d1d96c", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}}
-{"recv_wall": "2026-07-14 20:53:22.922", "recv_mono_s": 12.533, "payload": {"filename": "no-text-alpha.png", "task_id": "d3faf291-727f-44f8-b38e-8d0d87d1d96c", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 2}}
+{"recv_wall": "2026-07-15 01:12:15.778", "recv_mono_s": 2.249, "payload": {"filename": "no-text-alpha.png", "task_id": "94e26c8d-b716-4cde-8b8a-3fddd42c856a", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
+{"recv_wall": "2026-07-15 01:12:15.798", "recv_mono_s": 2.269, "payload": {"filename": "no-text-alpha.png", "task_id": "94e26c8d-b716-4cde-8b8a-3fddd42c856a", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
+{"recv_wall": "2026-07-15 01:12:17.987", "recv_mono_s": 4.458, "payload": {"filename": "no-text-alpha.png", "task_id": "94e26c8d-b716-4cde-8b8a-3fddd42c856a", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}}
+{"recv_wall": "2026-07-15 01:12:25.689", "recv_mono_s": 12.16, "payload": {"filename": "no-text-alpha.png", "task_id": "94e26c8d-b716-4cde-8b8a-3fddd42c856a", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}}
+{"recv_wall": "2026-07-15 01:12:25.710", "recv_mono_s": 12.181, "payload": {"filename": "no-text-alpha.png", "task_id": "94e26c8d-b716-4cde-8b8a-3fddd42c856a", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}}
+{"recv_wall": "2026-07-15 01:12:25.765", "recv_mono_s": 12.237, "payload": {"filename": "no-text-alpha.png", "task_id": "94e26c8d-b716-4cde-8b8a-3fddd42c856a", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 2}}
 ```
 
-Run B's worker log confirms the identical OCR path (key lines, **_observed_**):
+Run B's **complete** worker log (the *same* `grep -E "paperless.consumer|paperless.parsing.tesseract"` command as run A) confirms the identical OCR path (**_observed_**):
 
 ```
-[2026-07-14 20:53:12,264] [INFO] [paperless.consumer] Consuming no-text-alpha.png
-[2026-07-14 20:53:12,409] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-mfmpd7nw', 'output_file': '/tmp/pl/scratch/paperless-d_2zjawf/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-d_2zjawf/sidecar.txt', 'image_dpi': 35}
-[2026-07-14 20:53:13,605] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
-[2026-07-14 20:53:14,626] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/pl/scratch/paperless-upload-mfmpd7nw, the content will be empty.
-[2026-07-14 20:53:22,906] [INFO] [paperless.consumer] Document 2026-07-14 no-text-alpha consumption finished
+[2026-07-15 01:12:15,780] [INFO] [paperless.consumer] Consuming no-text-alpha.png
+[2026-07-15 01:12:15,781] [DEBUG] [paperless.consumer] Detected mime type: image/png
+[2026-07-15 01:12:15,782] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
+[2026-07-15 01:12:15,796] [DEBUG] [paperless.consumer] Parsing no-text-alpha.png...
+[2026-07-15 01:12:15,892] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/pl/scratch/paperless-upload-8oewijjw: 'dpi'
+[2026-07-15 01:12:15,893] [DEBUG] [paperless.parsing.tesseract] Estimated DPI 35 based on image width 297
+[2026-07-15 01:12:15,893] [INFO] [paperless.parsing.tesseract] Removing alpha layer from /tmp/pl/scratch/paperless-upload-8oewijjw for compatibility with img2pdf
+[2026-07-15 01:12:15,899] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-8oewijjw', 'output_file': '/tmp/pl/scratch/paperless-2wr5f0y9/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-2wr5f0y9/sidecar.txt', 'image_dpi': 35}
+[2026-07-15 01:12:16,971] [DEBUG] [paperless.parsing.tesseract] Using text from sidecar file
+[2026-07-15 01:12:16,972] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+[2026-07-15 01:12:16,972] [WARNING] [paperless.parsing.tesseract] Error while getting DPI from image /tmp/pl/scratch/paperless-upload-8oewijjw: 'dpi'
+[2026-07-15 01:12:16,972] [DEBUG] [paperless.parsing.tesseract] Estimated DPI 35 based on image width 297
+[2026-07-15 01:12:16,973] [DEBUG] [paperless.parsing.tesseract] Fallback: Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-8oewijjw', 'output_file': '/tmp/pl/scratch/paperless-2wr5f0y9/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-2wr5f0y9/sidecar-fallback.txt', 'image_dpi': 35}
+[2026-07-15 01:12:17,969] [DEBUG] [paperless.parsing.tesseract] Using text from sidecar file
+[2026-07-15 01:12:17,969] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/pl/scratch/paperless-upload-8oewijjw, the content will be empty.
+[2026-07-15 01:12:17,969] [DEBUG] [paperless.consumer] Generating thumbnail for no-text-alpha.png...
+[2026-07-15 01:12:18,557] [DEBUG] [paperless.parsing.tesseract] Execute: optipng -silent -o5 /tmp/pl/scratch/paperless-2wr5f0y9/convert.png -out /tmp/pl/scratch/paperless-2wr5f0y9/thumb_optipng.png
+[2026-07-15 01:12:25,710] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-15 01:12:25,734] [DEBUG] [paperless.consumer] Deleting file /tmp/pl/scratch/paperless-upload-8oewijjw
+[2026-07-15 01:12:25,741] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/pl/scratch/paperless-2wr5f0y9
+[2026-07-15 01:12:25,742] [INFO] [paperless.consumer] Document 2026-07-15 no-text-alpha consumption finished
 ```
 
 **What is stable vs. what changes across runs A and B (_observed_):**
 
 - **Stable:** the *ordered* `(status, message, current_progress)` sequence — `STARTING/new_file/0 → WORKING/parsing_document/20 → WORKING/generating_thumbnail/70 → WORKING/parse_date/90 → WORKING/save_document/95 → SUCCESS/finished/100` — was byte-for-byte identical in both runs, as was the OCR path in the worker log.
-- **Changes every run:** the `task_id` (`fdf2508d-…` vs `d3faf291-…`), the wall-clock timestamps, the per-step durations (`recv_mono_s`: e.g. the 70% step at 4.112 s vs 4.261 s; the 100% step at 11.916 s vs 12.533 s), the worker's scratch temp paths (`paperless-upload-sqseq4pf` vs `-mfmpd7nw`), and the terminal `document_id` (auto-increment PK `1` then `2`). Only the *ordering* is a stable claim; the identifiers and timings are not.
+- **Changes every run:** the `task_id` (`45765b00-952b-4c56-bc25-e6e259c69954` in run A vs `94e26c8d-b716-4cde-8b8a-3fddd42c856a` in run B), the wall-clock timestamps, the per-step durations (`recv_mono_s`: e.g. the 70% step at 4.488 s vs 4.458 s; the 100% step at 12.403 s vs 12.237 s), the worker's scratch temp paths (`paperless-upload-4jy6ecz2`/`paperless-tpzt0pbv` vs `paperless-upload-8oewijjw`/`paperless-2wr5f0y9`), and the terminal `document_id` (auto-increment PK `1` then `2`). Only the *ordering* is a stable claim; the identifiers and timings are not.
 
 **A note on the alpha PNG's stored checksum (_observed_).** The stored `checksum` is **not** the md5 of the file you upload, because the parser rewrites the working copy to strip the alpha layer before storing:
 
@@ -476,7 +502,7 @@ docker exec paperless-app bash -lc 'cd /app/src && DJANGO_SETTINGS_MODULE=paperl
 UNAUTH: connection REJECTED -> InvalidStatusCode: server rejected WebSocket connection: HTTP 403
 ```
 
-**Authenticated connection (browser-equivalent) receives the live stream (_observed_).** `ws_probe.py` (§12) mints a real DB session for `admin`, connects with that `sessionid` cookie, and prints each frame; meanwhile `simple.jpg` was uploaded to drive the worker. The frames are the raw 7-key payloads `StatusConsumer` forwards (`consumers.py:L33`):
+**Authenticated connection receives the live stream (_observed_).** `ws_probe.py` (§13) obtains a session by **minting a Django session row directly via `SessionStore` for `admin` (privileged session injection — not an HTTP form login)**, connects to `ws/status/` with that `sessionid` cookie, and prints each frame; meanwhile `simple.jpg` was uploaded to drive the worker. The cookie is presented to — and accepted by — the same `StatusConsumer` auth gate the browser hits, so the *frames* are exactly what a logged-in browser receives; only the cookie's *acquisition* is privileged. The frames are the raw 7-key payloads `StatusConsumer` forwards (`consumers.py:L33`):
 
 ```
 AUTH: connection ACCEPTED
@@ -505,7 +531,7 @@ WS_FRAME {"filename": "simple.jpg", "task_id": "7176f6c6-de76-4e95-8b8c-21e95685
 
 ```bash
 docker exec paperless-app bash -lc "curl -s -w 'HTTP %{http_code} in %{time_total}s\n' \
-  -H \"Authorization: Token $TOKEN\" \
+  -K /tmp/obs/auth.cfg \
   -F document=@/app/src/paperless_tesseract/tests/samples/simple.png \
   http://localhost:8000/api/documents/post_document/"
 ```
@@ -564,7 +590,7 @@ Because images force `original_has_text = False`, **this early-exit can never fi
 
 Since the pipeline shape is identical, **you cannot tell "the image had visible text" from the output shape.** The distinguishing artifact lives inside ocrmypdf's **sidecar text file**, which `extract_text(...)` inspects: it treats the text as usable only when `"[OCR skipped on page" not in text` (`parsers.py:L104`), logging `Using text from sidecar file` (`parsers.py:L107`) when the marker is absent versus `Incomplete sidecar file: discarding.` (`parsers.py:L110`) when it is present.
 
-The canonical async path deletes the sidecar on cleanup, so a **_component-level probe (NON-CANONICAL)_** (`probe_sidecar.py`, §12) called the real parser on a **private `/tmp` copy** of `simple.png` and read the sidecar before cleanup.
+The canonical async path deletes the sidecar on cleanup, so a **_component-level probe (NON-CANONICAL)_** (`probe_sidecar.py`, §13) called the real parser on a **private `/tmp` copy** of `simple.png` and read the sidecar before cleanup.
 
 **Command (observed):**
 
@@ -603,8 +629,8 @@ The input path is `/tmp/probe-in-zltlyks7/simple.png` (a private copy — the re
 **Command (observed):**
 
 ```bash
-docker exec paperless-app bash -lc "curl -s -H \"Authorization: Token $TOKEN\" http://localhost:8000/api/documents/2/ | python3 -m json.tool"
-docker exec paperless-app bash -lc "curl -s -H \"Authorization: Token $TOKEN\" http://localhost:8000/api/documents/3/ | python3 -m json.tool"
+docker exec paperless-app bash -lc "curl -s -K /tmp/obs/auth.cfg http://localhost:8000/api/documents/2/ | python3 -m json.tool"
+docker exec paperless-app bash -lc "curl -s -K /tmp/obs/auth.cfg http://localhost:8000/api/documents/3/ | python3 -m json.tool"
 ```
 
 **`GET /api/documents/2/` — text-free image (full, unedited body):**
@@ -650,9 +676,9 @@ docker exec paperless-app bash -lc "curl -s -H \"Authorization: Token $TOKEN\" h
 **Command (observed) — fetches both and compares:**
 
 ```bash
-docker exec paperless-app bash -lc "cd /app/src && TOK=$TOKEN python3 -c \"
+docker exec paperless-app bash -lc "cd /app/src && python3 -c \"
 import os, json, urllib.request
-tok=os.environ['TOK']
+tok=open('/tmp/obs/auth.cfg').read().split()[-1].strip(chr(34))  # token read from mode-0600 file, never in argv/env
 def get(i):
     r=urllib.request.Request(f'http://localhost:8000/api/documents/{i}/', headers={'Authorization':'Token '+tok})
     return json.load(urllib.request.urlopen(r))
@@ -701,13 +727,13 @@ The relevant last-resort logic in `parse(...)` (_inferred from code_): after OCR
 The warning was captured live in the run-A worker log (§4.5), **_observed_**:
 
 ```
-[2026-07-14 20:51:57,373] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/pl/scratch/paperless-upload-sqseq4pf, the content will be empty.
+[2026-07-15 01:11:35,752] [WARNING] [paperless.parsing.tesseract] No text was found in /tmp/pl/scratch/paperless-upload-4jy6ecz2, the content will be empty.
 ```
 
 And the same run still reached the terminal success event (from the run-A stream, §4.3), **_observed_**:
 
 ```json
-{"recv_wall": "2026-07-14 20:52:05.193", "recv_mono_s": 11.916, "payload": {"filename": "no-text-alpha.png", "task_id": "fdf2508d-b07f-4759-8bbc-b6117d886bab", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 1}}
+{"recv_wall": "2026-07-15 01:11:43.687", "recv_mono_s": 12.403, "payload": {"filename": "no-text-alpha.png", "task_id": "45765b00-952b-4c56-bc25-e6e259c69954", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 1}}
 ```
 
 **Before/during/after for the weak-OCR case — all from run A (all _observed_):**
@@ -764,36 +790,130 @@ libmagic mime: application/pdf
 size: 128 bytes
 ```
 
-**Upload + result (observed):** before `Document.objects.count()` = `2`.
+**Upload through the canonical endpoint (observed).** As with every upload, the POST returns *immediately* with body `"OK"` and HTTP `200` — the failure happens later, inside the worker, and is **not** reflected in the HTTP response. This is precisely why the worker/stream (not the HTTP reply) is where a hard failure must be observed. Before the upload, `Document.objects.count()` = `2`.
 
 ```bash
-docker exec paperless-app bash -lc "curl -s -w 'HTTP %{http_code}\n' -H \"Authorization: Token $TOKEN\" \
+docker exec paperless-app bash -lc "curl -s -w '\nHTTP %{http_code}\n' -K /tmp/obs/auth.cfg \
   -F document=@/tmp/obs/corrupt.pdf http://localhost:8000/api/documents/post_document/"
 ```
 
-Captured `"status_updates"` stream (**_observed_**):
+**POST response (observed) — the endpoint accepts the file and returns OK even though the consume will fail:**
+
+```
+"OK"
+HTTP 200
+```
+
+Captured `"status_updates"` stream (subscriber attached *before* the upload; **_observed_**):
 
 ```json
 {"event": "subscriber_ready", "group": "status_updates"}
-{"recv_wall": "2026-07-14 20:55:28.799", "recv_mono_s": 1.91, "payload": {"filename": "corrupt.pdf", "task_id": "31d22d96-d611-4e52-b2d2-0fbeb2c19eb4", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
-{"recv_wall": "2026-07-14 20:55:28.819", "recv_mono_s": 1.93, "payload": {"filename": "corrupt.pdf", "task_id": "31d22d96-d611-4e52-b2d2-0fbeb2c19eb4", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
-{"recv_wall": "2026-07-14 20:55:29.218", "recv_mono_s": 2.329, "payload": {"filename": "corrupt.pdf", "task_id": "31d22d96-d611-4e52-b2d2-0fbeb2c19eb4", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "InputFileError: ", "document_id": null}}
+{"recv_wall": "2026-07-15 01:43:35.451", "recv_mono_s": 1.249, "payload": {"filename": "corrupt.pdf", "task_id": "c8e09d4b-c632-473a-9af2-6733b6c6521a", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
+{"recv_wall": "2026-07-15 01:43:35.472", "recv_mono_s": 1.269, "payload": {"filename": "corrupt.pdf", "task_id": "c8e09d4b-c632-473a-9af2-6733b6c6521a", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
+{"recv_wall": "2026-07-15 01:43:35.893", "recv_mono_s": 1.69, "payload": {"filename": "corrupt.pdf", "task_id": "c8e09d4b-c632-473a-9af2-6733b6c6521a", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "InputFileError: ", "document_id": null}}
 ```
 
-After: `Document.objects.count()` = `2` (**unchanged — no row created**). The worker log (**_observed_**):
+After the consume, `Document.objects.count()` = `2` (**unchanged — no row created**).
+
+**Complete worker-log traceback (observed).** Captured by recording the log line count immediately before the upload and slicing exactly the lines the corrupt consume appended, so the trace is contiguous and unedited (this is the reproducible command that produced the block below):
+
+```bash
+docker exec paperless-app bash -lc '
+  LOG=/tmp/pl/log/paperless.log
+  before=$(wc -l < "$LOG")
+  curl -s -o /dev/null -K /tmp/obs/auth.cfg -F document=@/tmp/obs/corrupt.pdf \
+    http://localhost:8000/api/documents/post_document/
+  sleep 3                                   # let the worker finish the (failing) consume
+  sed -n "$((before+1)),\$p" "$LOG"'
+```
 
 ```
-[2026-07-14 20:55:28,802] [INFO] [paperless.consumer] Consuming corrupt.pdf
-[2026-07-14 20:55:29,218] [ERROR] [paperless.consumer] Error while consuming document corrupt.pdf: InputFileError: 
+[2026-07-15 01:43:35,454] [INFO] [paperless.consumer] Consuming corrupt.pdf
+[2026-07-15 01:43:35,454] [DEBUG] [paperless.consumer] Detected mime type: application/pdf
+[2026-07-15 01:43:35,455] [DEBUG] [paperless.consumer] Parser: RasterisedDocumentParser
+[2026-07-15 01:43:35,471] [DEBUG] [paperless.consumer] Parsing corrupt.pdf...
+[2026-07-15 01:43:35,497] [WARNING] [paperless.parsing.tesseract] Error while getting text from PDF document with pdfminer.six
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 120, in extract_text
+    stripped = post_process_text(pdfminer_extract_text(pdf_file))
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/high_level.py", line 157, in extract_text
+    for page in PDFPage.get_pages(
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfpage.py", line 151, in get_pages
+    doc = PDFDocument(parser, password=password, caching=caching)
+  File "/usr/local/lib/python3.9/site-packages/pdfminer/pdfdocument.py", line 752, in __init__
+    raise PDFSyntaxError("No /Root object! - Is this really a PDF?")
+pdfminer.pdfparser.PDFSyntaxError: No /Root object! - Is this really a PDF?
+[2026-07-15 01:43:35,584] [DEBUG] [paperless.parsing.tesseract] Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-0zmgd22s', 'output_file': '/tmp/pl/scratch/paperless-nyldl1pk/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-nyldl1pk/sidecar.txt'}
+[2026-07-15 01:43:35,774] [WARNING] [paperless.parsing.tesseract] Encountered an error while running OCR: . Attempting force OCR to get the text.
+[2026-07-15 01:43:35,775] [DEBUG] [paperless.parsing.tesseract] Fallback: Calling OCRmyPDF with args: {'input_file': '/tmp/pl/scratch/paperless-upload-0zmgd22s', 'output_file': '/tmp/pl/scratch/paperless-nyldl1pk/archive-fallback.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'force_ocr': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/pl/scratch/paperless-nyldl1pk/sidecar-fallback.txt'}
+[2026-07-15 01:43:35,870] [DEBUG] [paperless.parsing.tesseract] Deleting directory /tmp/pl/scratch/paperless-nyldl1pk
+[2026-07-15 01:43:35,892] [ERROR] [paperless.consumer] Error while consuming document corrupt.pdf: InputFileError: 
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
+    return PdfInfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/pdfinfo/info.py", line 901, in __init__
+    with Pdf.open(infile) as pdf:
+  File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
+    pdf = Pdf._open(
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.tn67ogte/origin.pdf: unable to find trailer dictionary while recovering damaged file
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 261, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 370, in run_pipeline
+    pdfinfo = get_pdfinfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 174, in get_pdfinfo
     raise InputFileError() from e
 ocrmypdf.exceptions.InputFileError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 163, in get_pdfinfo
+    return PdfInfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/pdfinfo/info.py", line 901, in __init__
+    with Pdf.open(infile) as pdf:
+  File "/usr/local/lib/python3.9/site-packages/pikepdf/_methods.py", line 923, in open
+    pdf = Pdf._open(
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.ifvge210/origin.pdf: unable to find trailer dictionary while recovering damaged file
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/src/paperless_tesseract/parsers.py", line 298, in parse
+    ocrmypdf.ocr(**args)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/api.py", line 337, in ocr
+    return run_pipeline(options=options, plugin_manager=plugin_manager, api=True)
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_sync.py", line 370, in run_pipeline
+    pdfinfo = get_pdfinfo(
+  File "/usr/local/lib/python3.9/site-packages/ocrmypdf/_pipeline.py", line 174, in get_pdfinfo
     raise InputFileError() from e
 ocrmypdf.exceptions.InputFileError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 310, in parse
     raise ParseError(f"{e.__class__.__name__}: {str(e)}")
 documents.parsers.ParseError: InputFileError: 
 ```
 
-This is the failure path (_inferred from code_, matching the traceback): an unrecoverable OCR error becomes a `ParseError` (`parsers.py:L310`/`L314`), caught by the consumer (`consumer.py:L278`) → `_fail(...)` (`consumer.py:L280`) which sends `FAILED@100%` (`consumer.py:L79`) and raises `ConsumerError` (`consumer.py:L81`), aborting the consume so **no `Document` is written.** Note the sequence stopped at `20 → FAILED` (no 70/90/95), because the failure occurred during `parse()`.
+Reading the trace as cause → effect (the trace itself is **_observed_**; the routing after the raise is corroborated by the cited source lines):
+
+- `pdfminer.six` fails first with `PDFSyntaxError: No /Root object! - Is this really a PDF?` — the born-digital text probe in `extract_text` (`parsers.py:L120`). This is caught and logged as a *warning* only; the parser proceeds to OCR.
+- The primary `ocrmypdf.ocr(**args)` call (with `skip_text`) raises `InputFileError`, because `pikepdf` cannot find the PDF trailer (`parse` → `parsers.py:L261`).
+- The parser catches that and retries with `force_ocr` (the `Fallback: Calling OCRmyPDF with args:` line — `parsers.py:L298`), which raises `InputFileError` a second time.
+- The parser converts the OCR failure into a `ParseError` (`parsers.py:L310`), which `Consumer.try_consume_file` receives at the `document_parser.parse(...)` call site (`consumer.py:L261`).
+
+From there the failure path is: the `ParseError` is caught by the consumer's handler (`consumer.py:L278`) → `_fail(...)` (`consumer.py:L280`) sends `FAILED@100%` (`consumer.py:L79`) and raises `ConsumerError` (`consumer.py:L81`), aborting the consume so **no `Document` is written** (_inferred from code_ for the handler routing; the terminal `FAILED@100%` event, the empty-detail `InputFileError:` message, and the unchanged row count are **_observed_** above). Note the stream stopped at `20 → FAILED` (no 70/90/95): the failure occurred *during* `parse()`, before the thumbnail/date/save checkpoints.
+
+**Stability (Rule 1).** This corrupt-input consume was run twice; both runs produced the identical error chain (`PDFSyntaxError` → primary `InputFileError` → force-OCR `InputFileError` → `ParseError: InputFileError:`), the same early-terminating `0 → 20 → FAILED` progress stream (no 70/90/95 events), and no row. Only the ephemeral identifiers differed between runs (e.g. `task_id`, wall-clock timestamps, and the scratch paths `paperless-upload-0zmgd22s`/`paperless-nyldl1pk` in the run shown here vs. `paperless-upload-_7v33hfx`/`paperless-ji8u9dnx` in the other).
 
 ### 7.4 The key P4 distinction — bounded to what was observed
 
@@ -816,11 +936,13 @@ Count was `4` before and `4` after — no row created, and this was **not** a `P
 
 Beyond these two observed cases, the source has several more `_fail` paths that also prevent creation (**_inferred from code_**): a missing file (`pre_check_file_exists` → `consumer.py:L95`), an unsupported MIME type (`_fail(MESSAGE_UNSUPPORTED_TYPE)` → `consumer.py:L225`), and a failing pre-consume script (`run_pre_consume_script` → `consumer.py:L121-L141`) — all *before* `_store`; and any exception inside the storage `transaction.atomic()` block rolls the row back (`consumer.py:L362-L367`). Conversely, the post-consume script runs *after* the row is committed (`consumer.py:L371`), so a failure there would leave a row in place. So the correct, bounded statement is: **an empty OCR result returns normally and creates a document; a hard `ParseError` (observed) and a duplicate (observed) — among other `_fail` conditions — do not.**
 
+One nuance on the duplicate case: the outcome above is a *sequential* duplicate, rejected cleanly at `pre_check_duplicate` *before* the 20% parsing event. A *concurrent* duplicate — the same bytes POSTed twice before either consume commits — behaves differently: **both** POSTs pass the pre-check and run OCR to 95%, then the loser fails at the database insert with a raw `UNIQUE constraint failed: documents_document.checksum` at `FAILED@100%` (still no row for the loser). That concurrent-race behavior was **_observed_** and is documented, with its full stream and traceback, as an operational caveat in §12.1.
+
 ---
 
 ## 8. Supporting evidence — the digital-PDF skip contrast (why images differ from PDFs)
 
-This section substantiates the §5.2 claim that images can _never_ early-exit, by contrasting them with a **text-layer PDF** that _can_. It also exhibits the literal `[OCR skipped on page(s) …]` sidecar marker. Cases (b)/(c) override `OCR_MODE='skip_noarchive'` and are therefore **NON-CANONICAL**; case (a) uses the canonical default `skip`. The full script is `probe_skip.py` (§12); it parses **private `/tmp` copies** of the fixtures.
+This section substantiates the §5.2 claim that images can _never_ early-exit, by contrasting them with a **text-layer PDF** that _can_. It also exhibits the literal `[OCR skipped on page(s) …]` sidecar marker. Cases (b)/(c) override `OCR_MODE='skip_noarchive'` and are therefore **NON-CANONICAL**; case (a) uses the canonical default `skip`. The full script is `probe_skip.py` (§13); it parses **private `/tmp` copies** of the fixtures.
 
 **Command (observed):**
 
@@ -910,12 +1032,82 @@ The runtime findings were cross-checked against version-appropriate external sou
 
 ## 11. Repository integrity note
 
-The investigation was **read-only** with respect to the source tree. All observation scaffolding (scripts, scratch media, the SQLite DB, media/consume dirs) lives **outside** the repository — under `/tmp` on the host and inside the disposable containers — and none of it is committed. Repository integrity is proven in this section (§11).
+The investigation was **read-only** with respect to the source tree. All observation scaffolding (scripts, scratch media, the SQLite DB, media/consume dirs) lives **outside** the repository — under `/tmp` on the host and inside the disposable containers — and none of it is committed. This section states the repository-integrity facts **exactly as observed**, including one that is easy to get wrong: the provided *ready* image does **not** ship with a pristine `/app` checkout.
 
-**Repository fixtures were never modified (_observed_).** The canonical upload path never touches a fixture (the server copies the uploaded bytes into its own `SCRATCH_DIR` temp file — `views.py:L512-L518` — and the alpha-strip rewrites *that* scratch copy, not the fixture), and every component probe parses a private `/tmp` copy. Verified after all runs and probes, inside the observation container's `/app` checkout:
+**The definitive read-only proof — the destination repository (_observed_).** The single artifact this task produces is this document. Relative to the source pin `542221a38dff06361e07976452f9aea24d210542` (an ancestor of the delivery commit), the sole delta in the destination repository is this one new file, and the working tree is clean at delivery:
 
 ```bash
-docker exec paperless-app bash -lc 'cd /app && git status --porcelain'   # (empty output)
+$ git rev-parse --abbrev-ref HEAD
+blitzy-2d7c5fb9-6420-4f89-9285-98269fdc35bb
+
+# Sole delta from the source pin — exactly one added file:
+$ git diff --name-status 542221a38dff06361e07976452f9aea24d210542 HEAD -- .
+A	blitzy/documentation/paperless-ngx_542221a38dff.md
+
+# Working tree clean at delivery (no other modified or untracked files):
+$ git status --porcelain
+                                              # (empty)
+```
+
+No existing source, test, dependency, or configuration file was modified, created, or deleted — the one delta is the deliverable itself. This is the constraint that actually matters, and it holds.
+
+**A caveat that must be stated honestly: the provided `paperless-ngx-ready:local` image's `/app` is _not_ clean as shipped (_observed_).** Running the source-tree status check inside a *fresh* container of the named ready image shows a pre-existing modification to a tracked fixture — this is **not** produced by this investigation (see the root-cause explanation below), but the earlier version of this section wrongly claimed the checkout was empty, so the accurate result is recorded here.
+
+First, a real gotcha when checking as `root`: `git` refuses the repo with a **fatal** error and prints **nothing** to stdout, so an empty status here must **not** be read as "clean":
+
+```bash
+$ docker run --rm --user root --entrypoint bash paperless-ngx-ready:local -lc 'cd /app && git status --porcelain'
+fatal: detected dubious ownership in repository at '/app'
+To add an exception for this directory, call:
+
+	git config --global --add safe.directory /app
+```
+
+After adding the exception, the *true* status of the ready image is **dirty** — one tracked fixture differs from its pinned blob:
+
+```bash
+$ docker run --rm --user root --entrypoint bash paperless-ngx-ready:local -lc '
+    git config --global --add safe.directory /app >/dev/null 2>&1
+    cd /app
+    git rev-parse HEAD
+    git status --porcelain
+    git diff --stat'
+542221a38dff06361e07976452f9aea24d210542
+ M src/paperless_tesseract/tests/samples/simple-alpha.png
+ .../tests/samples/simple-alpha.png | Bin 8404 -> 6910 bytes
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+```
+
+The working copy of `simple-alpha.png` has md5 `aa4e9abd6b0984532663b7291bbbd460`, whereas the pinned blob at commit `542221a38dff` is `129177c72aa2654d7b1bb84377c1c054`. The **base** image (`ghcr.io/scaleapi/swe-atlas:…qna_1.01`), by contrast, ships a **clean** `/app` — the fixture there matches the pin exactly:
+
+```bash
+$ docker run --rm --user root --entrypoint bash \
+    ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01 -lc '
+    git config --global --add safe.directory /app >/dev/null 2>&1
+    cd /app && git status --porcelain && md5sum src/paperless_tesseract/tests/samples/simple-alpha.png'
+                                              # (porcelain empty — CLEAN)
+129177c72aa2654d7b1bb84377c1c054  src/paperless_tesseract/tests/samples/simple-alpha.png
+```
+
+The ready image's dirty fixture is trivially restorable to the pin, confirming it is a tracked-file modification and not an untracked leftover:
+
+```bash
+$ ... cd /app && git checkout -- src/paperless_tesseract/tests/samples/simple-alpha.png ; git status --porcelain
+                                              # checkout exit 0; porcelain now empty (clean)
+                                              # simple-alpha.png md5 back to 129177c72aa2654d7b1bb84377c1c054 (= pinned)
+```
+
+**Root cause of the dirty ready image — _observed_ behavior, _inferred_ mechanism from the cited source.** The dirty fixture is a side effect of a **build-time test run baked into the ready image**, *not* of this investigation:
+
+- The canonical **upload** path never touches a fixture: the server copies the uploaded bytes into its own `SCRATCH_DIR` temp file (`views.py:L512-L518`) and the parser's alpha-strip rewrites *that scratch copy* — `background.save(input_file, format=im.format)` with `input_file` pointing into `/tmp/pl/scratch` (`parsers.py:L191-L201`). This is why every upload in this investigation left all fixtures byte-identical (next block).
+- The parser's alpha-strip, however, rewrites **whatever path it is handed, in place**. The test `paperless_tesseract/tests/test_parser.py::test_image_simple_alpha` calls the parser with the **fixture path itself** (`src/paperless_tesseract/tests/samples/simple-alpha.png`) rather than a copy, so running that test mutates the tracked fixture on disk (RGBA → RGB, `8404 → 6910` bytes). The ready image was built after such a run, baking the modification in.
+- This is a genuine test-hygiene defect in the source tree (`parsers.py:L191-L201` mutating its input in place + `test_parser.py` passing a tracked path). **It is deliberately _not_ fixed here:** the AAP places the entire source tree out of scope — §0.3.2 "*Any modification to the source repository … No fixes, refactors, or 'improvements' to `parsers.py` … No … tests*" and §0.8.2 "*source repository is strictly read-only; the only write is the answer document*". The correct action under the read-only mandate is to **document** the defect (done here) and to run observations from a **source-clean** checkout (the base image, or the ready image after `git checkout --`), which is what was done.
+
+**This investigation's own fixtures are byte-identical to the pin (_observed_).** Every fixture actually consumed/probed here was verified unchanged, both by md5 and by `git status`, inside a source-clean `/app`:
+
+```bash
+docker exec paperless-app bash -lc 'git config --global --add safe.directory /app >/dev/null 2>&1
+  cd /app && git status --porcelain'                        # (empty — clean)
 docker exec paperless-app bash -lc 'cd /app && md5sum \
   src/paperless_tesseract/tests/samples/no-text-alpha.png \
   src/paperless_tesseract/tests/samples/simple.png \
@@ -930,37 +1122,324 @@ e8c17675174950020835add3f444f08c  src/paperless_tesseract/tests/samples/no-text-
 9c9691e51741c1f4f41a20896af31770  src/paperless_tesseract/tests/samples/multi-page-digital.pdf
 ```
 
-The `git status` inside `/app` is empty and the fixture md5s are identical to their pre-run values — so **no source file (including no test fixture) was modified** in the observation environment.
+Each md5 equals the pinned git-blob md5 at `542221a38dff` (verified with `git cat-file -p HEAD:<path> | md5sum`), so **none of the fixtures this investigation touched was modified.**
 
-**The destination repository working tree (_observed_).**
-
-```bash
-$ git rev-parse --abbrev-ref HEAD
-blitzy-2d7c5fb9-6420-4f89-9285-98269fdc35bb
-
-$ git status --porcelain
- M blitzy/documentation/paperless-ngx_542221a38dff.md
-```
-
-The only change is this single deliverable document. No existing source file was modified, created, or deleted — satisfying the hard read-only constraint.
-
-**Temporary-artifact cleanup (_observed_).** After the investigation, all observation infrastructure was removed and the removal verified — the disposable containers, the private Docker network, **and the anonymous Redis data volume** (so no `dump.rdb` remnant is left behind):
+**Temporary-artifact cleanup — targeted and non-destructive (_observed_).** Cleanup removes **only** this investigation's own containers, network, and volume. It must **not** use a global prune: `docker volume prune -f` deletes *all* unused local volumes on the host, which in shared infrastructure can destroy unrelated data (this host had two unrelated anonymous volumes present). The safe pattern resolves the exact Redis volume by inspection and removes only that resource:
 
 ```bash
-docker rm -f paperless-app paperless-redis
+# 1) Identify the exact anonymous volume backing our Redis container (do NOT guess or prune globally):
+docker inspect paperless-redis \
+  --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
+#   e.g. ddbc3fec508ef56201e560fbf6dda8cc136604ab282741100240501dd6fcfe95 -> /data
+
+# 2) Remove our containers together with their anonymous volumes (-v scopes deletion to THESE containers):
+docker rm -f -v paperless-app paperless-redis
+
+# 3) If the anonymous volume outlived the container, remove it BY NAME (never `volume prune`):
+docker volume rm ddbc3fec508ef56201e560fbf6dda8cc136604ab282741100240501dd6fcfe95 2>/dev/null || true
+
+# 4) Remove only our private network:
 docker network rm paperless-net
-docker volume prune -f          # removes the anonymous redis data volume
-# verification (all three should show no project artifacts):
-docker ps -a         --filter name=paperless   # (no rows)
-docker network ls    --filter name=paperless-net # (no rows)
-docker volume ls -q                              # (project volume gone)
+
+# verification (each should show no project artifacts; unrelated volumes remain untouched):
+docker ps -a      --filter name=paperless        # (no rows)
+docker network ls --filter name=paperless-net    # (no rows)
+docker volume ls -q | grep -x ddbc3fec508ef56201e560fbf6dda8cc136604ab282741100240501dd6fcfe95  # (gone)
 ```
 
-The observation scripts under `/tmp/obs` and all scratch data under `/tmp/pl` are inside those disposable containers and vanish with them; nothing observation-related remains in the repository tree or in Docker state.
+The observation scripts under `/tmp/obs` and all scratch data under `/tmp/pl` live inside those disposable containers and vanish with them; nothing observation-related remains in the repository tree, and no unrelated Docker volume is affected.
 
 ---
 
-## 12. Appendix — observation scripts (published for auditability)
+## 12. Observed edge cases & operational caveats (remediation out of scope per read-only AAP)
+
+While driving the canonical asynchronous path repeatedly to answer P1–P4, four operational behaviors surfaced that are *adjacent to* — but not part of — the four OCR questions. They are recorded here as **observed** runtime facts, each with the command that produced it, the complete captured output, and the source `file:line` that produces the behavior. **Remediation of every item in this section is explicitly out of scope.** The AAP mandates a strictly read-only investigation: *"No existing file may be edited, created, or deleted except the single answer document"* and *"No fixes, refactors, or 'improvements' to `parsers.py`, `consumer.py`, `tasks.py`, `views.py`, or settings"* [AAP §0.3.2], reinforced by *"source repository is strictly read-only … No dependency, schema, or configuration file in the repository may be changed"* [AAP §0.8.2]. Each caveat therefore ends with the specific reason its source is left unchanged. `[observed]` marks facts captured at runtime; `[inferred]` marks statements derived from reading the cited code.
+
+### 12.1 Concurrent duplicate upload surfaces a raw SQLite `UNIQUE constraint` string over the WebSocket (MAJOR)
+
+**What was observed.** When the *same* new file bytes are POSTed twice **concurrently** (before either consume has committed), both tasks pass the duplicate pre-check, both run OCR to completion, and then the first to reach the database commits normally while the second fails the `checksum` uniqueness constraint. The loser's `status_updates` payload carries the **raw** database error string `UNIQUE constraint failed: documents_document.checksum` as its user-facing `message`.
+
+Command (real canonical upload path — two concurrent authenticated POSTs of one fresh OCR-able text image `race2.png`):
+
+```bash
+curl -s -o /dev/null -w "A:HTTP %{http_code}\n" -K /tmp/obs/auth.cfg \
+     -F document=@/tmp/obs/race2.png http://localhost:8000/api/documents/post_document/ &
+curl -s -o /dev/null -w "B:HTTP %{http_code}\n" -K /tmp/obs/auth.cfg \
+     -F document=@/tmp/obs/race2.png http://localhost:8000/api/documents/post_document/ &
+wait
+# both return: HTTP 200  (endpoint enqueues and returns immediately — see §4.2)
+```
+
+Complete `status_updates` capture (run 1; the two `task_id`s interleave — `subscriber_ready` + 12 progress payloads):
+
+```json
+{"event": "subscriber_ready", "group": "status_updates"}
+{"recv_wall": "2026-07-15 02:04:08.261", "recv_mono_s": 1.16, "payload": {"filename": "race2.png", "task_id": "115a2697-c227-438b-a3d3-39f67c73e1df", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:08.275", "recv_mono_s": 1.173, "payload": {"filename": "race2.png", "task_id": "e4172b46-3e96-4234-a181-2dfba600f14a", "current_progress": 0, "max_progress": 100, "status": "STARTING", "message": "new_file", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:08.293", "recv_mono_s": 1.192, "payload": {"filename": "race2.png", "task_id": "e4172b46-3e96-4234-a181-2dfba600f14a", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:08.313", "recv_mono_s": 1.212, "payload": {"filename": "race2.png", "task_id": "115a2697-c227-438b-a3d3-39f67c73e1df", "current_progress": 20, "max_progress": 100, "status": "WORKING", "message": "parsing_document", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:09.502", "recv_mono_s": 2.401, "payload": {"filename": "race2.png", "task_id": "e4172b46-3e96-4234-a181-2dfba600f14a", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:09.516", "recv_mono_s": 2.415, "payload": {"filename": "race2.png", "task_id": "115a2697-c227-438b-a3d3-39f67c73e1df", "current_progress": 70, "max_progress": 100, "status": "WORKING", "message": "generating_thumbnail", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:10.066", "recv_mono_s": 2.965, "payload": {"filename": "race2.png", "task_id": "e4172b46-3e96-4234-a181-2dfba600f14a", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:10.082", "recv_mono_s": 2.981, "payload": {"filename": "race2.png", "task_id": "e4172b46-3e96-4234-a181-2dfba600f14a", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:10.112", "recv_mono_s": 3.011, "payload": {"filename": "race2.png", "task_id": "115a2697-c227-438b-a3d3-39f67c73e1df", "current_progress": 90, "max_progress": 100, "status": "WORKING", "message": "parse_date", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:10.152", "recv_mono_s": 3.051, "payload": {"filename": "race2.png", "task_id": "115a2697-c227-438b-a3d3-39f67c73e1df", "current_progress": 95, "max_progress": 100, "status": "WORKING", "message": "save_document", "document_id": null}}
+{"recv_wall": "2026-07-15 02:04:10.171", "recv_mono_s": 3.069, "payload": {"filename": "race2.png", "task_id": "e4172b46-3e96-4234-a181-2dfba600f14a", "current_progress": 100, "max_progress": 100, "status": "SUCCESS", "message": "finished", "document_id": 4}}
+{"recv_wall": "2026-07-15 02:04:10.214", "recv_mono_s": 3.113, "payload": {"filename": "race2.png", "task_id": "115a2697-c227-438b-a3d3-39f67c73e1df", "current_progress": 100, "max_progress": 100, "status": "FAILED", "message": "UNIQUE constraint failed: documents_document.checksum", "document_id": null}}
+```
+
+Reading (cause → effect):
+
+- **[observed]** Both tasks emit `STARTING/new_file@0` then `WORKING/parsing_document@20` — i.e. **both pass the duplicate pre-check** and enter OCR. The pre-check hashes the bytes and looks for an existing row whose `checksum`/`archive_checksum` matches [src/documents/consumer.py:L102-L106], invoked once per task at [src/documents/consumer.py:L213], *before* parsing.
+- **[observed]** Both run OCR through `generating_thumbnail@70`, `parse_date@90`, `save_document@95`.
+- **[observed]** The winner `e4172b46…` emits `SUCCESS/finished@100` with `document_id: 4`; the loser `115a2697…` emits `FAILED@100` whose `message` is the literal `UNIQUE constraint failed: documents_document.checksum` and whose `document_id` is `null`.
+- **[inferred]** The check-then-insert is **not atomic across workers**: nothing holds a cross-task lock between the L213 pre-check and the L398 insert, so two concurrent tasks both see "no duplicate", both OCR, and the second `Document.objects.create(…)` [src/documents/consumer.py:L398] — whose `checksum=` is computed at [src/documents/consumer.py:L402] — violates the `unique=True` constraint on `Document.checksum` [src/documents/models.py:L135-L139].
+
+Loser's complete worker-log traceback (command: `docker exec paperless-app sed -n '29,75p' /tmp/pl/log/paperless.log`):
+
+```
+[2026-07-15 02:04:10,144] [DEBUG] [paperless.consumer] Saving record to database
+[2026-07-15 02:04:10,163] [ERROR] [paperless.consumer] The following error occured while consuming race2.png: UNIQUE constraint failed: documents_document.checksum
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/utils.py", line 89, in _execute
+    return self.cursor.execute(sql, params)
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/sqlite3/base.py", line 477, in execute
+    return Database.Cursor.execute(self, query, params)
+sqlite3.IntegrityError: UNIQUE constraint failed: documents_document.checksum
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/src/documents/consumer.py", line 301, in try_consume_file
+    document = self._store(text=text, date=date, mime_type=mime_type)
+  File "/app/src/documents/consumer.py", line 398, in _store
+    document = Document.objects.create(
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/manager.py", line 85, in manager_method
+    return getattr(self.get_queryset(), name)(*args, **kwargs)
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/query.py", line 514, in create
+    obj.save(force_insert=True, using=self.db)
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/base.py", line 806, in save
+    self.save_base(
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/base.py", line 857, in save_base
+    updated = self._save_table(
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/base.py", line 1000, in _save_table
+    results = self._do_insert(
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/base.py", line 1041, in _do_insert
+    return manager._insert(
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/manager.py", line 85, in manager_method
+    return getattr(self.get_queryset(), name)(*args, **kwargs)
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/query.py", line 1434, in _insert
+    return query.get_compiler(using=using).execute_sql(returning_fields)
+  File "/usr/local/lib/python3.9/site-packages/django/db/models/sql/compiler.py", line 1621, in execute_sql
+    cursor.execute(sql, params)
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/utils.py", line 67, in execute
+    return self._execute_with_wrappers(
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/utils.py", line 80, in _execute_with_wrappers
+    return executor(sql, params, many, context)
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/utils.py", line 89, in _execute
+    return self.cursor.execute(sql, params)
+  File "/usr/local/lib/python3.9/site-packages/django/db/utils.py", line 91, in __exit__
+    raise dj_exc_value.with_traceback(traceback) from exc_value
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/utils.py", line 89, in _execute
+    return self.cursor.execute(sql, params)
+  File "/usr/local/lib/python3.9/site-packages/django/db/backends/sqlite3/base.py", line 477, in execute
+    return Database.Cursor.execute(self, query, params)
+django.db.utils.IntegrityError: UNIQUE constraint failed: documents_document.checksum
+```
+
+- **[observed]** The failure is caught by the consumer's generic `except Exception` and routed through `_fail(...)`, which is what broadcasts the raw message over the channel (`[ERROR] … The following error occured while consuming race2.png: UNIQUE constraint failed: documents_document.checksum`). The exception chain is `_store` [src/documents/consumer.py:L301] → `Document.objects.create` [src/documents/consumer.py:L398] → Django ORM → `sqlite3.IntegrityError` → `django.db.utils.IntegrityError`.
+
+**Stability (Rule 1).** A second run with a fresh image (`race3.png`, unique token `PQFUSL`) reproduced the identical pattern — exactly one `SUCCESS/finished` and exactly one `FAILED` carrying `UNIQUE constraint failed: documents_document.checksum`, with two of each intermediate `WORKING` checkpoint. Observed across **2/2** runs. (The sequential-duplicate case behaves differently and *is* handled gracefully: a duplicate detected by the pre-check exits early with `MESSAGE_DOCUMENT_ALREADY_EXISTS` and unlinks its temp at [src/documents/consumer.py:L109]; the raw-constraint leak is specific to the concurrent window.)
+
+**Why the source is left unchanged.** Hardening this — catching `IntegrityError` and remapping it to a friendly "duplicate" message, or serializing the check-and-insert — would require editing `documents/consumer.py`, which the AAP forbids: *"No fixes, refactors, or 'improvements' to … `consumer.py`"* and *"No existing file may be edited"* [AAP §0.3.2]. Recorded here as observed behavior only.
+
+### 12.2 Failed consumes leave the upload temp file behind in `SCRATCH_DIR` (MINOR)
+
+**What was observed.** A *successful* consume deletes its upload temp file; a *failed* consume does not. After the investigation's failure-path runs, `SCRATCH_DIR` retained seven `paperless-upload-*` files — one per failed consume — while every successful consume's temp file was already gone.
+
+Command:
+
+```bash
+docker exec paperless-app ls -la /tmp/pl/scratch/
+```
+
+Complete output:
+
+```
+total 40
+drwxr-xr-x 1 root root 4096 Jul 15 02:05 .
+drwxr-xr-x 1 root root 4096 Jul 14 19:01 ..
+-rw------- 1 root root  128 Jul 15 01:43 paperless-upload-0zmgd22s
+-rw------- 1 root root 2860 Jul 15 01:57 paperless-upload-2cc259_h
+-rw------- 1 root root  128 Jul 15 01:14 paperless-upload-_7v33hfx
+-rw------- 1 root root 1265 Jul 15 02:05 paperless-upload-htqgflui
+-rw------- 1 root root 2860 Jul 15 01:57 paperless-upload-lpj992y0
+-rw------- 1 root root 1264 Jul 15 02:04 paperless-upload-nji43879
+-rw------- 1 root root  128 Jul 15 01:42 paperless-upload-zmg990v3
+```
+
+Reading:
+
+- **[observed]** Seven files remain: three 128-byte files (the `corrupt.pdf` `ParseError` runs of §7.3), two 2860-byte files (the random-noise `SubprocessOutputError` runs), and two ~1264-byte files (the two duplicate-race losers of §12.1). No temp file remains for any *successful* consume (e.g. run A/B of §4, ids 1–2).
+- **[observed + source-confirmed]** The upload temp is created via `tempfile.NamedTemporaryFile(dir=settings.SCRATCH_DIR, …)` [src/documents/views.py:L510-L514] and is deleted by `os.unlink(self.path)` at [src/documents/consumer.py:L350]. That unlink sits **inside** the `try: with transaction.atomic():` block, *after* `_store(...)` [src/documents/consumer.py:L301] and `document.save()` [src/documents/consumer.py:L346], under the comment *"Delete the file only if it was successfully consumed"*.
+- **[inferred]** Any exception before L350 — a `ParseError` caught at [src/documents/consumer.py:L278], or the `IntegrityError`/`SubprocessOutputError` caught by the generic `except Exception` at [src/documents/consumer.py:L362] — routes through `_fail(...)` and **never reaches L350**, so the upload temp survives. (The parser's own working directory *is* cleaned in its `finally` — e.g. the observed `Deleting directory …/paperless-q6s9pk4v` in §12.1's run; it is specifically the *upload* temp that leaks.)
+
+**Why the source is left unchanged.** A fix (e.g. unlinking `self.path` in a `finally`) would edit `documents/consumer.py`, forbidden by [AAP §0.3.2]. Observed-only.
+
+### 12.3 django-q logs a Redis outage with a broken log call (secondary `TypeError`), then self-recovers (MINOR)
+
+**What was observed.** Stopping the Redis container while the worker idles produces two stacked signatures in the qcluster log: (1) the real `redis.exceptions.ConnectionError` from the broker dequeue loop, and (2) a **secondary** `TypeError: not all arguments converted during string formatting` raised *inside Python's logging machinery*, because django-q 1.3.9's error-logging call passes a stray second positional argument to `logger.error(...)`. When Redis returns, django-q reincarnates its pusher and resumes with no manual intervention.
+
+Command:
+
+```bash
+docker stop  paperless-redis        # simulate broker outage; observe /tmp/rt_qcluster.log
+docker start paperless-redis        # restore
+```
+
+Complete first `--- Logging error ---` block (it repeats once per dequeue cycle; captured verbatim from `/tmp/rt_qcluster.log`):
+
+```
+--- Logging error ---
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 559, in connect
+    sock = self._connect()
+  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 584, in _connect
+    for res in socket.getaddrinfo(self.host, self.port, self.socket_type,
+  File "/usr/local/lib/python3.9/socket.py", line 966, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno -5] No address associated with hostname
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 345, in pusher
+    task_set = broker.dequeue()
+  File "/usr/local/lib/python3.9/site-packages/django_q/brokers/redis_broker.py", line 21, in dequeue
+    task = self.connection.blpop(self.list_key, 1)
+  File "/usr/local/lib/python3.9/site-packages/redis/client.py", line 1900, in blpop
+    return self.execute_command('BLPOP', *keys)
+  File "/usr/local/lib/python3.9/site-packages/redis/client.py", line 898, in execute_command
+    conn = self.connection or pool.get_connection(command_name, **options)
+  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 1192, in get_connection
+    connection.connect()
+  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 563, in connect
+    raise ConnectionError(self._error_message(e))
+redis.exceptions.ConnectionError: Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 1083, in emit
+    msg = self.format(record)
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 927, in format
+    return fmt.format(record)
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 663, in format
+    record.message = record.getMessage()
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 367, in getMessage
+    msg = msg % self.args
+TypeError: not all arguments converted during string formatting
+Call stack:
+  File "/app/src/manage.py", line 11, in <module>
+    execute_from_command_line(sys.argv)
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/__init__.py", line 446, in execute_from_command_line
+    utility.execute()
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/__init__.py", line 440, in execute
+    self.fetch_command(subcommand).run_from_argv(self.argv)
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/base.py", line 414, in run_from_argv
+    self.execute(*args, **cmd_options)
+  File "/usr/local/lib/python3.9/site-packages/django/core/management/base.py", line 460, in execute
+    output = self.handle(*args, **options)
+  File "/usr/local/lib/python3.9/site-packages/django_q/management/commands/qcluster.py", line 22, in handle
+    q.start()
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 78, in start
+    self.sentinel.start()
+  File "/usr/local/lib/python3.9/multiprocessing/process.py", line 121, in start
+    self._popen = self._Popen(self)
+  File "/usr/local/lib/python3.9/multiprocessing/context.py", line 224, in _Popen
+    return _default_context.get_context().Process._Popen(process_obj)
+  File "/usr/local/lib/python3.9/multiprocessing/context.py", line 277, in _Popen
+    return Popen(process_obj)
+  File "/usr/local/lib/python3.9/multiprocessing/popen_fork.py", line 19, in __init__
+    self._launch(process_obj)
+  File "/usr/local/lib/python3.9/multiprocessing/popen_fork.py", line 71, in _launch
+    code = process_obj._bootstrap(parent_sentinel=child_r)
+  File "/usr/local/lib/python3.9/multiprocessing/process.py", line 315, in _bootstrap
+    self.run()
+  File "/usr/local/lib/python3.9/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 168, in __init__
+    self.start()
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 173, in start
+    self.guard()
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 281, in guard
+    self.reincarnate(self.pusher)
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 222, in reincarnate
+    self.pusher = self.spawn_pusher()
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 201, in spawn_pusher
+    return self.spawn_process(pusher, self.task_queue, self.event_out, self.broker)
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 197, in spawn_process
+    p.start()
+  File "/usr/local/lib/python3.9/multiprocessing/process.py", line 121, in start
+    self._popen = self._Popen(self)
+  File "/usr/local/lib/python3.9/multiprocessing/context.py", line 224, in _Popen
+    return _default_context.get_context().Process._Popen(process_obj)
+  File "/usr/local/lib/python3.9/multiprocessing/context.py", line 277, in _Popen
+    return Popen(process_obj)
+  File "/usr/local/lib/python3.9/multiprocessing/popen_fork.py", line 19, in __init__
+    self._launch(process_obj)
+  File "/usr/local/lib/python3.9/multiprocessing/popen_fork.py", line 71, in _launch
+    code = process_obj._bootstrap(parent_sentinel=child_r)
+  File "/usr/local/lib/python3.9/multiprocessing/process.py", line 315, in _bootstrap
+    self.run()
+  File "/usr/local/lib/python3.9/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 347, in pusher
+    logger.error(e, traceback.format_exc())
+Message: ConnectionError('Error -5 connecting to paperless-redis:6379. No address associated with hostname.')
+Arguments: ('Traceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 559, in connect\n    sock = self._connect()\n  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 584, in _connect\n    for res in socket.getaddrinfo(self.host, self.port, self.socket_type,\n  File "/usr/local/lib/python3.9/socket.py", line 966, in getaddrinfo\n    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):\nsocket.gaierror: [Errno -5] No address associated with hostname\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 345, in pusher\n    task_set = broker.dequeue()\n  File "/usr/local/lib/python3.9/site-packages/django_q/brokers/redis_broker.py", line 21, in dequeue\n    task = self.connection.blpop(self.list_key, 1)\n  File "/usr/local/lib/python3.9/site-packages/redis/client.py", line 1900, in blpop\n    return self.execute_command(\'BLPOP\', *keys)\n  File "/usr/local/lib/python3.9/site-packages/redis/client.py", line 898, in execute_command\n    conn = self.connection or pool.get_connection(command_name, **options)\n  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 1192, in get_connection\n    connection.connect()\n  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 563, in connect\n    raise ConnectionError(self._error_message(e))\nredis.exceptions.ConnectionError: Error -5 connecting to paperless-redis:6379. No address associated with hostname.\n',)
+```
+
+Steady-state heartbeat while Redis was down — this exact line was logged 54× in the outage capture, once per dequeue attempt across the ~14 s outage (verbatim contiguous sample):
+
+```
+02:07:24 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:25 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:25 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:26 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:26 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:27 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:27 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+```
+
+Recovery (complete, verbatim from `/tmp/rt_qcluster.log`):
+
+```
+02:07:37 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:38 [Q] ERROR Error -5 connecting to paperless-redis:6379. No address associated with hostname.
+02:07:38 [Q] ERROR Error 111 connecting to paperless-redis:6379. Connection refused.
+02:07:44 [Q] INFO Process-1:29 stopped pushing tasks
+02:07:44 [Q] ERROR reincarnated pusher Process-1:29 after sudden death
+02:07:44 [Q] INFO Process-1:30 pushing tasks at 2198
+```
+
+Reading (cause → effect):
+
+- **[observed + source-confirmed]** The real error originates in the pusher's dequeue: `task_set = broker.dequeue()` [django_q/cluster.py:L345] → `self.connection.blpop(self.list_key, 1)` [django_q/brokers/redis_broker.py:L21] → `socket.gaierror: [Errno -5]` (DNS gone because the container stopped) → `redis.exceptions.ConnectionError`.
+- **[observed + source-confirmed]** django-q's handler logs it with `logger.error(e, traceback.format_exc())` [django_q/cluster.py:L347] — passing the traceback string as a *second positional* argument. Python's logging then evaluates `msg = msg % self.args` [logging/__init__.py:L367] with `msg` being the exception (which contains no `%` placeholders) against a non-empty args tuple → `TypeError: not all arguments converted during string formatting`. The `--- Logging error ---` wrapper means the record is still emitted and the worker is **not** crashed by the `TypeError`.
+- **[observed]** On `docker start paperless-redis` the worker self-heals with no intervention: `Process-1:29 stopped pushing tasks` → `reincarnated pusher Process-1:29 after sudden death` → `Process-1:30 pushing tasks at 2198`. A subsequent smoke upload (`simple.jpg`) consumed cleanly (DB count 4→5, new `document_id` 6), confirming full recovery.
+
+**Why the source is left unchanged.** This defect lives in the pinned third-party dependency `django-q==1.3.9` (`django_q/cluster.py`), not in repository source. The AAP forbids dependency changes — *"No packages are added, upgraded, or removed"* [AAP §0.4.2] and *"No dependency … file in the repository may be changed"* [AAP §0.8.2] — and editing an installed package is equally out of bounds. Observed-only.
+
+### 12.4 Pre-existing dependency advisories are neither introduced nor remediated by this work (INFO)
+
+**What was confirmed.** The pinned dependency set carries known security advisories that **pre-exist** this investigation and are unrelated to it. This task introduces **no dependency delta** whatsoever: as proven in §11, the only change the destination repository carries versus the pinned commit `542221a38dff` is the single added answer document — `git diff --name-status 542221a38dff HEAD -- .` reports exactly `A blitzy/documentation/paperless-ngx_542221a38dff.md` and nothing else, and no entry in `requirements.txt` (or any manifest) is added, upgraded, or removed.
+
+**Why the source is left unchanged.** Advisory remediation would require upgrading pinned packages, which the AAP explicitly forbids: *"No dependencies are added, upgraded, or removed in the repository; the pinned versions are reproduced only to build a faithful runtime for observation"* [AAP §0.4.2], reinforced by [AAP §0.8.2]. These advisories are therefore neither introduced by, nor in scope for, this documentation task; they are noted here solely to avoid misattribution.
+
+---
+
+## 13. Appendix — observation scripts (published for auditability)
 
 These are the exact scripts used above. Each uses secure temp handling (`tempfile.mkdtemp` / `mktemp -d`), passes arguments as arrays / via `-F`/`-c` rather than shell-interpolated user data, copies trusted fixtures rather than mutating them, and cleans up with `finally`/`trap`.
 
@@ -1088,7 +1567,7 @@ for fixture, mime, mode, label in CASES:
         parser.cleanup(); shutil.rmtree(workdir, ignore_errors=True)
 ```
 
-**`ws_probe.py` — authenticated WebSocket client (browser-equivalent) and unauth check:**
+**`ws_probe.py` — authenticated WebSocket client (real `ws/status/` route entered via privileged `SessionStore` session injection, not an HTTP login) and unauth check:**
 
 ```python
 import sys, json, asyncio
