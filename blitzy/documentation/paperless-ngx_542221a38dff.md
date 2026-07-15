@@ -6,9 +6,11 @@
 
 **Reported symptoms:** (a) importing documents sometimes consumes far more memory than expected during metadata handling; (b) behaviour is **inconsistent** (varies by document source / processing stage); (c) spikes are **disproportionate to document size** (mostly small text documents); (d) memory is **not always released to the OS** in a timely manner even after processing completes.
 
-**Methodology contract.** This is a **run-first** investigation. Every quantitative claim is accompanied by the exact command and its **complete, unedited** output (§9 Captured Evidence) and the full **harness source** (§10) with SHA-256 hashes, so every measurement reproduces (the classifier-model files are **placed input artifacts** whose provenance and size-reproduction are detailed in §2 and §9.0). Every statement is labelled **`observed (runtime)`** or **`inferred (from reading code)`**. All runtime measurement was performed inside the canonical **Python 3.9** Docker container (the application cannot run on the host's Python 3.13 — Django 4.0.4 / scikit-learn 1.0.2 predate 3.12+). No source file was modified; the only artifact added to the repository is this document. All temporary measurement scripts lived outside the tracked tree (host and container `/tmp/memharness`) and are removed on completion.
+**Methodology contract.** This is a **run-first** investigation. Every quantitative claim is accompanied by the exact command and its output in **§9 (Captured Evidence)** and the full **harness source** (§10) with SHA-256 hashes, so every measurement reproduces (the classifier-model files are **placed input artifacts** whose provenance and size-reproduction are detailed in §2 and §9.0). Outputs are reproduced **verbatim** except for a single, uniform, explicitly disclosed normalization documented at the head of §9 — terminal ANSI color escape codes and Django's one-time `migrate` thumbnail banner are stripped, and in the OCR-retry case (§9.24) long repetitive per-page `ocrmypdf` debug is elided behind an explicit marker. **No measurement value is ever altered.** The only presentation choice is that, for a few long per-document tables, the first run (`_a`) is shown in full and the identical-input second run (`_b`) is represented by its summary lines (also disclosed at the head of §9); no shown line is edited. Every material statement is labelled **`observed (runtime)`** or **`inferred (from reading code)`**. All runtime measurement was performed inside the canonical **Python 3.9** Docker container (the application cannot run on the host's Python 3.13 — Django 4.0.4 / scikit-learn 1.0.2 predate 3.12+). No source file was modified; the only artifact added to the repository is this document. All temporary measurement scripts lived outside the tracked tree (host and container `/tmp/memharness`) and are removed on completion.
 
 **Units.** All memory values use binary units: **MiB** = 1024×1024 bytes, **KiB** = 1024 bytes, read from `/proc/<pid>/status` (`VmRSS` = current resident set, `VmHWM` = peak resident set) and from `tracemalloc` (Python-heap only). RSS deltas are written `+X.XX MiB`.
+
+**Reading guide & evidence discipline (how to verify every claim).** This report is deliberately **answer-first**: §1 states the direct answer, §4–§8 organize the findings by objective, and **§9 (Captured Evidence) holds, for every quantitative claim, the exact command immediately followed by its complete output** — §9 *is* the adjacent evidence. To keep the synthesis readable rather than duplicating ~90 output blocks inline, **each behavioral claim in §1 and §4–§8 carries (i) an inline `observed (runtime)` or `inferred (from reading code)` label and (ii) a `(§9.x)` cross-reference to the subsection whose command+output backs it.** Concretely: a claim tagged `observed (runtime) (§9.4)` is verifiable by reading the command and unedited output in §9.4. Statements in **§2 (Environment)** are configuration facts (each labelled at point of use), and statements in **§3 (Methodology)** describe the *measurement method itself* — where §3 cites a code-level fact (e.g., which functions spawn subprocesses, which entry points are canonical) that fact is **`inferred (from reading code)`**, and every *runtime value* the method produces is labelled where it is reported in §9. Table rows in §5 carry an explicit `observed`/`inferred` column. This convention resolves the two evidence-discipline requirements — adjacency (via the §9 cross-reference that points at the adjacent command+output) and per-statement observed/inferred labelling — without altering the run-first structure.
 
 ---
 
@@ -28,7 +30,7 @@ Point by point, mapped to the user's questions:
 
 **Why it looks "inconsistent" and "disproportionate."** The per-consume cost is dominated by **which parser runs** and **whether a classifier model exists**, not by the document's byte size. A 21-byte text file costs `+8.3–8.5 MiB` end-to-end with no model, but `+64.29 MiB` the moment a trained model is present (`load_classifier` `+52.02 MiB` of that); the same class of tiny file through the OCR parser spawns child processes peaking `+48–80 MiB` (mode `skip`) or `+124–125 MiB` (mode `force`/`redo`); enabling barcode separation adds `~14 MiB` of transient PIL images **per page**. Because the task worker is **recycled after every task** (`Q_CLUSTER["recycle"] = 1`, `settings.py:452`), each document is a *fresh process* that pays these fixed costs anew and releases them at exit — which is exactly why the same input can look different by source/stage. `observed (runtime)` (§9.3, §9.5, §9.8, §9.10, §9.15)
 
-**Which process releases memory, and which does not.** For the **consume** path the "not released" symptom does **not** apply in the default configuration: with `recycle:1`, running 6 consumes produced **6 distinct worker PIDs**, each returning its `~78 MiB` peak to the OS at process exit (§9.10A). The genuine "not released promptly" candidates are the **long-lived** processes that are *not* recycled per unit of work: the **gunicorn web worker** retains a one-time `+12.7 MiB` pikepdf/qpdf cost after the first metadata request and `+15–16 MiB` of upload residue after an 8 MiB upload (§9.13); the **email** path, by contrast, is a Django-Q **scheduled** task (`Schedule.MINUTES`, migration `0002`) and therefore *is* recycled like any other task (§9.12) — correcting a prior description of mail as a long-lived non-recycled process.
+**Which process releases memory, and which does not.** For the **consume** path the "not released" symptom does **not** apply in the default configuration: with `recycle:1`, running 6 consumes produced **6 distinct worker PIDs**, each returning its `~78 MiB` peak to the OS at process exit (§9.10A). The genuine "not released promptly" candidates are the **long-lived** processes that are *not* recycled per unit of work: the **gunicorn web worker** retains a one-time `+12.7 MiB` pikepdf/qpdf cost after the first metadata request and `+15–16 MiB` of upload residue after an 8 MiB upload (§9.13); the **email** path, by contrast, is a Django-Q **scheduled** task (`Schedule.MINUTES`, migration `0002`) and therefore *is* recycled like any other task (§9.12) — correcting a prior description of mail as a long-lived non-recycled process. `observed (runtime)` (§9.10, §9.12, §9.13)
 
 ---
 
@@ -38,8 +40,13 @@ All measurements were taken inside the canonical container; the harness (§10) p
 
 | Property | Value |
 |---|---|
-| Image reference | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01` |
-| Image Id | `sha256:6e699f225ced49182033cf995daf2a07d3628fe29bb573f5aa4c4188c253969f` |
+| Base image (parent) | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01` |
+| Base image Id | `sha256:6e699f225ced49182033cf995daf2a07d3628fe29bb573f5aa4c4188c253969f` |
+| **Base image alone is NOT runnable** | The parent image **cannot import the ingestion pipeline**: `import documents.tasks` fails with pyzbar `ImportError: Unable to find zbar shared library`, and `pdftoppm`/`pngquant`/`gettext`/`curl` are **absent**. All measurements therefore required the prepared runtime below. `observed (runtime)` (§9.0) |
+| Prepared runtime — system packages added (apt) | `libzbar0 0.23.90-1+deb11u1` (**critical**: `pyzbar` in `documents/tasks.py` fails to import without it), `poppler-utils 20.09.0-3.1+deb11u2` (`pdftoppm`), `pngquant 2.13.1-1`, `gettext 0.21-4`, `curl 7.74.0-1.3+deb11u16` |
+| Prepared runtime — database & dirs | migrated **SQLite** at `/app/data/db.sqlite3` (`migrate`); runtime dirs `/app/{data,media,consume,export,static}` + `/tmp/paperless`, all owned by `testuser` (uid 1000) |
+| Derived image (packages baked) | `paperless-ngx-setup:local`, Id `sha256:d769966f2f8ea5dfe0e732052af76766e04072d87d8dbe9110006d60c755a459` — imports the pipeline cleanly (`DERIVED_IMPORT_OK`, §9.0) |
+| Runtime actually used for all §9 measurements | container `paperless_app` (created from the base image, then the five apt packages installed at runtime + DB migrated + runtime dirs created), which imports the pipeline cleanly (`RUNNING_APP_IMPORT_OK`, §9.0) |
 | OS / libc | Debian 11.11 (bullseye), glibc **2.31-13+deb11u13** |
 | Kernel / CPUs | 6.6.122+ / `nproc` = 128 |
 | Python | 3.9.23 |
@@ -50,6 +57,8 @@ All measurements were taken inside the canonical container; the harness (§10) p
 | Search / web | Whoosh 2.7.4, gunicorn 20.1.0, channels 3.0.4 |
 | Relevant settings (observed) | `DEBUG=False`; `Q_CLUSTER = {recycle:1, timeout:1800, workers:11(=⌊√128⌋? see note), name:"paperless"}`; `TASK_WORKERS=11`; `CONSUMER_ENABLE_BARCODES=False`; `OCR_MODE="skip"`; `PAPERLESS_TIKA_ENABLED=False` |
 | Run identity | container `paperless_app`, user `testuser` (uid 1000) |
+
+> **Reproducibility disclosure (required preparation on top of the base image).** The named base/parent image is **not** self-sufficient for the ingestion pipeline: a fresh run of it fails to `import documents.tasks` because the **`zbar` shared library is absent** (`pyzbar` → `ImportError: Unable to find zbar shared library`) and the `pdftoppm`/`pngquant`/`gettext`/`curl` binaries are missing. To reproduce every §9 measurement, prepare the runtime by installing the five apt packages listed above, running Django `migrate` to create the SQLite DB, and creating the runtime directories owned by `testuser`. The **derived image `paperless-ngx-setup:local`** bakes exactly this preparation; the running `paperless_app` container is the base image with the same preparation applied at runtime. Both import the pipeline cleanly. The base-image failure, the derived-image success, and the running-container success are all captured with their commands and unedited output in **§9.0**. `observed (runtime)`
 
 > **Note on `workers`.** `settings.py` computes `TASK_WORKERS = ⌊√cores⌋` for ≥4 cores; on 128 cores that is 11 (`√128 ≈ 11.31`). django-q reads this into `Conf.WORKERS` at import time. The harness pins `workers=1` for the cluster experiments (§9.10) purely to make one worker PID identifiable; this does not change per-task memory behaviour, only concurrency.
 
@@ -77,25 +86,27 @@ The size of both artifacts is reproduced from first principles in **§9.0** by e
 
 **Pre-existing tooling note (disclosure).** `pip check` inside the image reports three **pre-existing** dev-tooling conflicts unrelated to this investigation and not introduced by it: `pipenv` wants `packaging>=22` (image has 21.3) and `setuptools>=67` (image has 62.1.0); `virtualenv` wants `filelock>=3.16.1` (image has 3.6.0). None affect the runtime ingestion stack (Django/django-q/scikit-learn/pikepdf/Whoosh), whose versions match `requirements.txt` exactly. `observed (runtime)`
 
+**Pre-existing pinned-stack security advisories (platform technical debt, disclosure only).** Advisory review of the frozen `requirements.txt` stack surfaces legacy-stack concerns that predate and are unrelated to this report: **Django 4.0.4** (CVE-2022-34265, SQL-injection via `Trunc`/`Extract` `kind`/`lookup_name`), **Pillow 9.1.0** (CVE-2023-50447, arbitrary code execution via `ImageMath.eval`), and **pdfminer.six 20220319** (CMap `pickle`-deserialization exposure). These are **inherited from the pinned image and `requirements.txt`** — the canonical stack this diagnostic was required to measure — and are called out purely as **platform technical debt to track**. Consistent with the read-only, documentation-only scope of this task (AAP §0.5.2, §0.6.2: *"New dependencies to add: none… Dependencies to update: none"*), **no package was added, updated, or removed** for this investigation, and none of these advisories bears on the memory findings (the classifier loads **no** external/untrusted pickle — every model is trained locally from synthetic fixtures, §9.0/§2). `inferred (from reading dependency manifests + public advisories)`
+
 ---
 
 ## 3. Methodology
 
-Three complementary lenses were sampled at instrumented points because **no single tool suffices** — a decision grounded in research (§11 References):
+Three complementary lenses were sampled at instrumented points because **no single tool suffices** — a decision grounded in research (§11 References). *(Labelling: the lens descriptions and the method rules in this section define the measurement method; where they assert how the product code or a profiling tool behaves the fact is `inferred (from reading code)`, and every runtime **value** the method produces is labelled `observed (runtime)` at its point of use in §9.)*
 
 1. **RSS from `/proc/<pid>/status`** — `VmRSS` (current resident) and `VmHWM` (peak resident). This is the only lens that sees **native** (C-extension) allocations from scikit-learn, NumPy, Pillow, pikepdf/qpdf, and OCR subprocesses. `VmHWM ≥ VmRSS` by definition; the harness asserts `peak ≥ current` in every sample (metric-integrity check, §9.1). A background thread samples RSS every 3 ms to capture transient **peaks** (`memlib.PeakSampler`). `inferred (from reading code)` for the mechanism; `observed (runtime)` for the values.
 2. **`tracemalloc`** — Python-heap block attribution by **file:line**, snapshots diffed with `compare_to(prev,'lineno')`, filtered to paperless source frames. It **cannot** see native allocations — the central reason RSS is sampled in parallel. `inferred` for the limitation (per docs.python.org); `observed` for the deltas.
 3. **`gc`** — `gc.collect()`, `len(gc.get_objects())` trend, and `gc.garbage` (uncollectable cycles). Plus `sys.getrefcount` and `weakref` for object-lifetime proofs.
 
-**Native-vs-Python attribution rule.** A delta visible in **RSS but absent from `tracemalloc`** is a **native** allocation (labelled as such). A delta present in **both** is a Python-heap allocation attributable to a file:line.
+**Native-vs-Python attribution rule** *(methodology).* A delta visible in **RSS but absent from `tracemalloc`** is a **native** allocation (labelled as such). A delta present in **both** is a Python-heap allocation attributable to a file:line.
 
-**Normal-vs-problem discriminator.** After a unit of work completes and references are dropped: (a) `gc.garbage` non-empty ⇒ uncollectable cycle (problem); (b) `tracemalloc` growth across **identical** iterations ⇒ Python reference retention (problem); (c) RSS falls after `ctypes.CDLL("libc.so.6").malloc_trim(0)` ⇒ glibc **arena retention** (normal). The harness records `malloc_trim` **reclaimed** *and* **residual** (unreclaimed) so retained memory is fully accounted.
+**Normal-vs-problem discriminator** *(methodology).* After a unit of work completes and references are dropped: (a) `gc.garbage` non-empty ⇒ uncollectable cycle (problem); (b) `tracemalloc` growth across **identical** iterations ⇒ Python reference retention (problem); (c) RSS falls after `ctypes.CDLL("libc.so.6").malloc_trim(0)` ⇒ glibc **arena retention** (normal). The harness records `malloc_trim` **reclaimed** *and* **residual** (unreclaimed) so retained memory is fully accounted.
 
-**Child-process accounting.** The OCR parser and barcode scanner spawn subprocesses (`ocrmypdf`/`gs`/`tesseract`, `pdftoppm`). `memlib.ChildPeakSampler` walks `/proc` descendants of the harness PID and reports **child** RSS separately from **self** RSS, so OCR memory is never mis-attributed to the Python heap.
+**Child-process accounting** *(methodology; the subprocess-spawning is `inferred (from reading code)`, child RSS values are `observed (runtime)` in §9.8/§9.16).* The OCR parser and barcode scanner spawn subprocesses (`ocrmypdf`/`gs`/`tesseract`, `pdftoppm`). `memlib.ChildPeakSampler` walks `/proc` descendants of the harness PID and reports **child** RSS separately from **self** RSS, so OCR memory is never mis-attributed to the Python heap.
 
-**Canonical entry points only.** Ingestion is driven through the real code paths: `documents.tasks.consume_file` → `Consumer().try_consume_file()` (direct and via the real Django-Q cluster), the directory-watcher management command `document_consumer --oneshot`, the scheduled `paperless_mail.tasks.process_mail_accounts`, the `document_importer`/`document_exporter` commands, and the REST endpoints through a **real gunicorn** server hit with `curl`. Any value from a bypass, fallback, or synthetic stand-in is labelled **non-canonical**.
+**Canonical entry points only** *(the entry-point set is `inferred (from reading code)`; each is exercised at runtime in the referenced §9 subsection).* Ingestion is driven through the real code paths: `documents.tasks.consume_file` → `Consumer().try_consume_file()` (direct and via the real Django-Q cluster), the directory-watcher management command `document_consumer --oneshot`, the scheduled `paperless_mail.tasks.process_mail_accounts`, the `document_importer`/`document_exporter` commands, and the REST endpoints through a **real gunicorn** server hit with `curl`. Any value from a bypass, fallback, or synthetic stand-in is labelled **non-canonical**.
 
-**Repetition discipline.** Every quantitative claim was run **≥ 2×** on identical input; both values are shown side by side in §9. Cold (first-run) costs are separated from steady-state.
+**Repetition discipline.** Nearly every quantitative claim was run **≥ 2×** on identical input, with both values shown side by side in §9. **Five conditions are single captures**, labelled inline and enumerated in the **§9.25 repetition & duration ledger**: `stages_present_tm`, `clf_split_large`, `clf_cold_small`, `clf_coldtm_small`, and `batch_present`'s cold floor — each **bound to a placed classifier-model artifact whose exact bytes are not byte-reproducible** (§9.0 facts (1)/(3)), and two of them (`stages_present_tm`, `clf_coldtm_small`) additionally being tracemalloc **attribution diagnostics** whose RSS is profiler-inflated. In every one of these cases the *decisive, model-independent* conclusion is separately confirmed **≥2×** by a companion run (`stages_present_a/_b`, `clf_split_small_a/_b`, `batch_absent_a/_b`). Cold (first-run) costs are separated from steady-state.
 
 ---
 
@@ -120,6 +131,8 @@ Stage decomposition of `Consumer.try_consume_file()` for `simple.txt` (21 bytes)
 
 **Corrected attributions (vs. a naive reading):** `pre_check_duplicate` allocates via `hashlib.md5(f.read())` (a whole-file read), **not** via libmagic; `_store` allocates via ORM object creation/save and a *second* `hashlib.md5`, not merely "MD5." `observed (runtime)` (§9.3).
 
+**Secondary allocation site — `parse_date` → lazy `import dateparser` (`parsers.py:221`).** Reached from `consumer.py:273-275` only when the parser supplied no date; the import fires **only** when `DATE_REGEX` (`parsers.py:30`) matches a date-shaped token. For the canonical `simple.txt` (no date-shaped text) this stage is `≈+0.00 MiB` (≤`+0.15` sampling noise) — matching the §9.2/§9.3 stage tables. But for a document containing date-shaped text it is a **fixed, content-pattern-triggered cold cost**: `+2.44/+2.62 MiB` (~0.30 s) for a clean month-year that parses, and `+29.39/+29.47 MiB` (~3.0 s) for an ambiguous numeric token that fails to parse (exhaustive locale attempt). It is paid **once per process** (warm calls add `+0.00 MiB`) and re-paid per fresh worker under `recycle:1`. `observed (runtime)` (§9.18).
+
 ### OBJ-2 — Copies and reference lifetime
 
 **Direct finding:** metadata handling does **not** create unnecessary copies of the content for small documents, and does **not** hold references longer than the call. The frequently-suspected `matching.py:63` is an **alias**, not a copy. The only genuine extra copies are **size-proportional and transient**. `observed (runtime)` (§9.6).
@@ -139,10 +152,11 @@ Stage decomposition of `Consumer.try_consume_file()` for `simple.txt` (21 bytes)
 - **Whoosh:** the consume path opens a **fresh** `AsyncWriter` per document and commits immediately (`index.py:118-120`) — bounded; the *batch* `index_reindex` uses **one** writer across all docs (`tasks.py:43-45`) and can buffer more (relevant to batch, not single-doc spikes). The per-consume writer's buffering is on the **Python heap** (attributable by `tracemalloc`), not native. `observed (runtime)` (§9.3, §9.7).
 - **ORM query log:** `connection.queries` measured `== 0` because `DEBUG=False` (`settings.py:50`) — the classic Django accumulation source is **absent** in the canonical config. `observed (runtime)` (§9.7).
 - **Batch behaviour:** 20 sequential consumes in one long-lived process → RSS **plateaus** (steady-state `+0.03`–`+0.11 MiB`/doc, i.e. reuse), `gc.garbage == 0`, tracked-object count flat. **No linear growth.** `observed (runtime)` (§9.7).
+- **Resource-level "not released" on failure paths (memory-adjacent).** Distinct from the RSS/allocator question, two *non-memory* resources are retained on error paths: a late `_write` failure leaves an **orphan Whoosh index entry** even though the DB row rolls back (§9.19), and a failed/broker-down REST upload leaves an **orphan `paperless-upload-*` scratch file** (§9.20). These are filesystem/index resources "not released" on failure — an analogue of the "not released" symptom at the resource level, not allocator retention. Remediation is **out of scope per AAP §0.5.2**; disclosed as observed for completeness. `observed (runtime)` (§9.19–§9.20).
 
 ### OBJ-4 — Spike vs. no-spike differentiation
 
-**Direct finding:** what distinguishes a spiking consume from a quiet one is, in order of magnitude: **(1) classifier model present vs. absent; (2) which parser runs (text vs. OCR) and the OCR mode; (3) barcode separation on vs. off; (4) first vs. subsequent (cold vs. warm).** Document byte-size is **not** the primary differentiator for small docs. `observed (runtime)` (§9.4, §9.8, §9.15).
+**Direct finding:** what distinguishes a spiking consume from a quiet one is, in order of magnitude: **(1) classifier model present vs. absent; (2) which parser runs (text vs. OCR) and the OCR mode; (3) barcode separation on vs. off; (4) date-shaped text present vs. absent (triggers a cold `dateparser` import); (5) first vs. subsequent (cold vs. warm).** Document byte-size is **not** the primary differentiator for small docs. `observed (runtime)` (§9.4, §9.8, §9.15, §9.18).
 
 | Differentiator | Quiet | Spiking | Δ (self / child) | Lens |
 |---|---|---|---|---|
@@ -150,6 +164,7 @@ Stage decomposition of `Consumer.try_consume_file()` for `simple.txt` (21 bytes)
 | Parser | text `.txt` → `+8–9 MiB` | OCR `.png` (skip) | child peak **`+48–80 MiB`** | child RSS |
 | OCR mode | `skip` child `+80` | `force`/`redo` | child **`+124–125 MiB`** (~1.5×) | child RSS |
 | Barcode | off (default) self `+33` | on (8-pg PDF) self `+140` | **`+~107 MiB`** transient (all-pages PIL) | RSS |
+| Date-shaped text (`parse_date`) | no date → `+0.00` | ambiguous numeric date → `+29.4` | **`+29.4 MiB` self** (once/process, cold `dateparser`) | RSS (native+Python) |
 | Cold vs warm | warm `+0.03–0.11/doc` | first consume | one-time import floors | RSS |
 
 ### OBJ-5 — Type and batch scaling
@@ -160,6 +175,7 @@ Stage decomposition of `Consumer.try_consume_file()` for `simple.txt` (21 bytes)
 - **Size scaling (text)** — clean, `tracemalloc`-**off** RSS peak on a fresh process (2× each): 1 MiB → `+37.66 / +36.48` (~37×, floor-dominated); 8 MiB → `+90.45 / +90.68` (~11.3×); 16 MiB → `+144.48 / +145.42` (~9.0×). The fixed ~35 MiB parser/interpreter **floor** amortizes as input grows, so **marginal** cost (8→16 MiB) ≈ **6.8× per MiB**; retained RSS after consume (pre-trim) was `+33.64/+32.48` (1 MiB), `+53.20/+53.93` (8 MiB), `+85.52/+86.43` (16 MiB). `observed (runtime)` (§9.5B).
 - **Barcode page scaling:** `~14.25 MiB/page` at 200 DPI, **linear** (self peak 4 pg `+83`, 8 pg `+140`, 16 pg `+254`) and **independent** of the 2–12 KiB file size; the OCR child stays `~+80` regardless (§9.8). `observed (runtime)`.
 - **Batch via the real Django-Q cluster** (§9.10): `recycle=1` → **6 tasks = 6 distinct worker PIDs**, each `VmHWM ≈ 78 MiB`, memory returned to OS at exit; `recycle=100` (non-default, labelled) → **1 PID**, `VmHWM` grows only `78.64 → 79.62 MiB` over 6 docs (`+0.98` total) — **no material accumulation**. `observed (runtime)`.
+- **`parse_date` is content-*pattern*-triggered, not content-*length*-proportional** (§9.18): the `dateparser` cold cost depends on whether — and what shape of — a `DATE_REGEX` token appears, **not** on how long the content is. A 21-byte file with `99/99/9999` pays `+29.4 MiB`; a multi-MiB file with no date-shaped token pays `+0.00`. It is a **fixed per-process** cost (paid once, re-paid per recycled worker), which refines the §5 "scales with content length" row. `observed (runtime)`.
 
 ---
 
@@ -171,7 +187,7 @@ Every row is anchored to file:line, the executing **process**, whether the alloc
 |---|---|---|---|---|---|---|
 | 1 | `load_classifier` → `DocumentClassifier.load` (7× `pickle.load`) | `classifier.py:30`, `:76-94` | task worker | **native** (sklearn/numpy/scipy) | `+52.02` in-consume; `~49` import floor + ~1:1 deserialize | observed |
 | 2 | `DocumentClassifier.predict_*` + `preprocess_content` | `classifier.py:251/264/277`, `:24-27` | task worker | native working set (Python-heap only KiB) | `< 1` Python-heap/call | observed |
-| 3 | `parse_date` regex over full text | `parsers.py:212`, `:261` | task worker | Python-heap | scales with content length | observed |
+| 3 | `parse_date` regex + lazy `import dateparser` | `parsers.py:212`, `:221`, `:30` | task worker | native (locale/lang data) + Python | **fixed cold cost, content-pattern-triggered**: `+0.00` no date; `+2.5` clean m/y; `+29.4` ambiguous (once/process) | observed |
 | 4 | Text parser whole-file read + fixed thumbnail (PIL+TTF) | `paperless_text/parsers.py:41-43` | task worker | native (PIL) + Python | `+8–9` floor (import+thumbnail) | observed |
 | 5 | OCR parser (`ocrmypdf`/`gs`/`tesseract`) | `paperless_tesseract/parsers.py:230` | **child procs** | native (child RSS) | skip `+48–80`; force/redo `+124–125` | observed |
 | 6 | `pre_check_duplicate` whole-file read + MD5 | `consumer.py:102-104` | task worker | native buffer + Python | size-proportional, transient | observed |
@@ -214,7 +230,7 @@ This subsection is the explicit arena-retention test (previously referenced but 
 
 ### 6.4 Overall determination
 
-**Narrowed, evidence-bounded conclusion:** The "not released" symptom is **normal CPython/glibc allocator behaviour**, amplified by process lifetime, **not** a defect:
+**Narrowed, evidence-bounded conclusion** (`observed (runtime)`; synthesized from §6.1–6.3 and the runs in §9.7, §9.9, §9.10, §9.13)**:** The "not released" symptom is **normal CPython/glibc allocator behaviour**, amplified by process lifetime, **not** a defect:
 
 - **No** uncollectable cycles (`gc.garbage == []` everywhere). `observed`
 - **No** Python reference leak (flat `tracemalloc` across identical iterations). `observed`
@@ -245,13 +261,17 @@ Legend: **OBS** = exercised with captured runtime output; **OBS(nc)** = exercise
 | Direct `consume_file` / `try_consume_file` | OBS | §9.2–§9.7 | primary path, ≥2× |
 | Directory watcher (`document_consumer --oneshot`) | OBS | §9.11 | real mgmt command → real cluster |
 | REST upload (`POST /api/documents/post_document/`) via real gunicorn+curl | OBS | §9.13 | replaces in-process APIClient |
-| Email (`process_mail_accounts`, scheduled) | OBS(nc) | §9.12 | ran in real recycle=1 worker; **no IMAP server** → payload buffering INF |
+| Email scheduled task (`process_mail_accounts`) | OBS(nc) | §9.12 | ran in real recycle=1 worker (0 accounts) |
+| Email attachment payload buffering (real `handle_message`) | OBS(nc) | §9.23 | full `att.payload` buffered; scratch bytes `identical=True`; IMAP transport OBS(nc); ≥2× |
+| Email broker-down scratch accumulation (P4-F5) | OBS(nc) | §9.23 | `paperless-mail-*` 0→1→2, no doc; ≥2× |
 | `document_importer` / `document_exporter` (real commands) | OBS | §9.14 | manifest load + reindex |
 | Metadata REST endpoint (original + archive pikepdf) | OBS | §9.13 | real gunicorn worker RSS sampled |
 | Classifier present vs absent | OBS | §9.4 | decisive differentiator |
 | OCR modes: skip / skip_noarchive / force / redo | OBS | §9.16 | ≥2× each |
 | OCR fallback (pdfminer text) success | OBS | §9.16 | image-only PDF consumed (24 chars) |
-| OCR force-fallback on NoTextFound → ParseError | INF | §9.16 | fallback did **not** fire; retry+ParseError-on-fail INF (labelled) |
+| Meaningful `skip_noarchive` (text-bearing PDF: no archive, lower peak) | OBS | §9.24 | `has_archive=False`, self ≈10 MiB lower than `skip`; ≥2× |
+| OCR force-OCR retry SUCCESS (NoTextFound → fallback yields text) | OBS | §9.24 | trigger injected (measurement-only); doc created; ≥2× |
+| OCR force-OCR retry FAILURE → ParseError, clean rollback | OBS | §9.24 | trigger+fallback-fail injected; count=0; ≥2× |
 | Barcode off (default) vs on vs on+separator | OBS | §9.8 | ~14.25 MiB/page; split path observed |
 | Duplicate rejection + SCRATCH_DIR cleanup | OBS | §9.17 | `It is a duplicate.`; 0 tempdirs left |
 | Invalid OCR mode → ConsumerError | OBS | §9.16 | `Invalid ocr mode: …` |
@@ -261,6 +281,13 @@ Legend: **OBS** = exercised with captured runtime output; **OBS(nc)** = exercise
 | Batch via real Django-Q cluster (recycle=1) | OBS | §9.10 | 6 tasks → 6 PIDs |
 | Raised recycle (non-default) | OBS(nc) | §9.10 | `recycle=100`, labelled non-default |
 | Size scaling (1/8/16 MiB text) | OBS | §9.5B | ~9–11× (marginal ~6.8×) |
+| `parse_date` / `dateparser` cold spike (no date / clean / ambiguous) | OBS | §9.18 | `+0.00`/`+2.5`/`+29.4` MiB; once/process; ≥2× |
+| Late `_write` failure (text write #2, PDF write #3) — DB rollback vs Whoosh/file orphan | OBS | §9.19 | DB=0 but whoosh=1 + orphan files; ≥2×; remediation out-of-scope |
+| REST upload broker-down (HTTP 500 + orphan scratch) | OBS | §9.20 | real gunicorn+curl; 1 orphan `paperless-upload-*`; ≥2× |
+| REST upload corrupt PDF (200 "OK", worker `InputFileError`, orphan scratch) | OBS | §9.20 | real gunicorn+curl + canonical worker step; ≥2× |
+| Alpha-PNG in-place mutation (stored≠submitted) + normalized-duplicate raw UNIQUE | OBS | §9.21 | 7913→6910, sha differ; UNIQUE constraint; ≥2× |
+| Importer partial state (missing thumbnail: `loaddata` commits rows + original copied before thumbnail `shutil.copy2` raises) | OBS | §9.22 | DB=1/originals=1 but thumbnails=0; ≥2×; remediation out-of-scope |
+| Importer path escape (`../` manifest traversal + in-bundle symlink) → imports bytes outside bundle | OBS | §9.22 | stored original = outside-bundle secret; remediation out-of-scope |
 | First vs subsequent (cold vs warm) | OBS | §9.4, §9.7 | cold floors vs steady reuse |
 | `malloc_trim` / `gc.garbage` discriminator | OBS | §9.7, §9.9 | normal-vs-problem test |
 
@@ -268,7 +295,7 @@ Legend: **OBS** = exercised with captured runtime output; **OBS(nc)** = exercise
 
 ## 9. Captured Evidence (commands + complete output)
 
-Every quantitative claim above is reproduced here with its exact command and its **complete** output. **Disclosed normalization (uniform across all blocks):** the terminal ANSI color escape codes and Django's one-time `migrate` thumbnail-migration banner have been removed from the captured stdout; **all measurement lines are otherwise verbatim and unedited** (the `None` line printed by the harness `banner()` helper is retained as-is). Each experiment was run **≥ 2×** (`_a`, `_b`) on identical input; both runs are shown (or, for long tables, run `_a` in full plus run `_b`'s summary lines). Every driver's full source and SHA-256 is in §10.
+Every quantitative claim above is reproduced here with its exact command and its **complete** output. **Disclosed normalization (uniform across all blocks):** the terminal ANSI color escape codes and Django's one-time `migrate` thumbnail-migration banner have been removed from the captured stdout; **all measurement lines are otherwise verbatim and unedited** (the `None` line printed by the harness `banner()` helper is retained as-is). **Most experiments were run ≥ 2×** (`_a`, `_b`) on identical input, with both runs shown (or, for long tables, run `_a` in full plus run `_b`'s summary lines). The exceptions — the five single-capture conditions bound to a non-byte-reproducible model artifact and/or serving as tracemalloc attribution diagnostics — are labelled inline where they appear and enumerated with their rationale in the **§9.25 repetition & duration ledger**, which also records per-run wall-clock timestamps and elapsed durations for the second-run confirmation set. Every driver's full source and SHA-256 is in §10.
 
 All commands assume these two shell helpers (the exact invocations used). `2>/dev/null` keeps stdout = the measurement stream:
 
@@ -292,6 +319,84 @@ DXI() { RUN=/tmp/memharness/run_$(date +%s%N); docker exec -w /app/src --user te
 ### 9.0 Environment, versions, pip-check disclosure, model provenance
 
 **observed (runtime).** Canonical container platform, exact pinned versions, the pre-existing `pip check` dev-tooling conflicts (finding #18 — not the runtime stack), and the SHA-256 of the locally-generated classifier models (finding #14). The model files are **placed input artifacts** whose SHA-256 authenticate the exact measured bytes; the **Model-provenance reproducibility** block below proves, at runtime, why they are integrity references rather than §10-regenerable outputs.
+
+**9.0.a Environment runnability — the base image alone cannot run the pipeline; the prepared runtime can (`observed (runtime)`).** The parent image named in §2 is a starting point, not a self-sufficient runtime. A fresh run of it fails the very first canonical step (`import documents.tasks`) because the native `zbar` shared library is absent and four CLI tools the pipeline shells out to are missing. The command and its **unedited** output:
+
+```bash
+# (A) Pristine BASE image (entrypoint overridden to bash), attempt the canonical import
+docker run --rm --network paperless-net --entrypoint /bin/bash \
+  ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_paperless-ngx_paperless-ngx_e233ae8334038a4b615ea2e4ce663e30_qna_1.01 \
+  -lc 'cd /app/src && (ldconfig -p | grep -i zbar || echo "zbar: NONE"); \
+       for b in pdftoppm pngquant gettext curl; do command -v $b >/dev/null && echo "$b PRESENT" || echo "$b MISSING"; done; \
+       DJANGO_SETTINGS_MODULE=paperless.settings python3 -c "import django; django.setup(); import documents.tasks; print(\"BASE_IMPORT_OK\")"'
+```
+
+Output — `p4f1_base.txt`:
+
+```text
+zbar: NONE
+pdftoppm MISSING
+pngquant MISSING
+gettext MISSING
+curl MISSING
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/app/src/documents/tasks.py", line 25, in <module>
+    from pyzbar import pyzbar
+  File "/usr/local/lib/python3.9/site-packages/pyzbar/pyzbar.py", line 7, in <module>
+    from .wrapper import (
+  File "/usr/local/lib/python3.9/site-packages/pyzbar/wrapper.py", line 151, in <module>
+    zbar_version = zbar_function(
+  File "/usr/local/lib/python3.9/site-packages/pyzbar/wrapper.py", line 148, in zbar_function
+    return prototype((fname, load_libzbar()))
+  File "/usr/local/lib/python3.9/site-packages/pyzbar/wrapper.py", line 127, in load_libzbar
+    libzbar, dependencies = zbar_library.load()
+  File "/usr/local/lib/python3.9/site-packages/pyzbar/zbar_library.py", line 65, in load
+    raise ImportError('Unable to find zbar shared library')
+ImportError: Unable to find zbar shared library
+```
+
+**Cause → effect:** `documents/tasks.py:25` (`from pyzbar import pyzbar`, for barcode support) imports `pyzbar` at module load; `pyzbar` dlopen's `libzbar.so.0`, which the base image does not ship — so the entire consume pipeline is unimportable there. The prepared runtime fixes this by installing five apt packages, migrating the DB, and creating runtime dirs. Both the **derived image** and the **running `paperless_app`** container then import cleanly:
+
+```bash
+# (B) Derived image paperless-ngx-setup:local as testuser
+docker run --rm --network paperless-net --entrypoint /bin/bash --user testuser \
+  -e PAPERLESS_REDIS=redis://paperless-broker:6379 -e PAPERLESS_DISABLE_DBHANDLER=true -e HOME=/home/testuser \
+  paperless-ngx-setup:local -lc 'cd /app/src && \
+    dpkg-query -W -f="${Package} ${Version}\n" libzbar0 poppler-utils pngquant gettext curl; \
+    DJANGO_SETTINGS_MODULE=paperless.settings python3 -c "import django; django.setup(); import documents.tasks; print(\"DERIVED_IMPORT_OK\", documents.tasks.__file__)"'
+# (C) The container actually used for all §9 measurements
+docker inspect paperless_app --format 'Image={{.Image}}'
+docker exec paperless_app bash -lc 'dpkg-query -W -f="${Package} ${Version}\n" libzbar0 poppler-utils pngquant gettext curl; ls -la /app/data/db.sqlite3; id testuser'
+docker exec -w /app/src --user testuser -e PAPERLESS_REDIS=redis://paperless-broker:6379 \
+  -e PAPERLESS_DISABLE_DBHANDLER=true -e HOME=/home/testuser -e DJANGO_SETTINGS_MODULE=paperless.settings \
+  paperless_app python3 -c 'import django; django.setup(); import documents.tasks; print("RUNNING_APP_IMPORT_OK", documents.tasks.__file__)'
+```
+
+Output — `p4f1_prepared.txt`:
+
+```text
+# (B) derived image paperless-ngx-setup:local (Id sha256:d769966f2f8ea5dfe0e732052af76766e04072d87d8dbe9110006d60c755a459)
+curl 7.74.0-1.3+deb11u16
+gettext 0.21-4
+libzbar0 0.23.90-1+deb11u1
+pngquant 2.13.1-1
+poppler-utils 20.09.0-3.1+deb11u2
+DERIVED_IMPORT_OK /app/src/documents/tasks.py
+
+# (C) running paperless_app (created from base 6e699f225ced, prepared at runtime)
+Image=sha256:6e699f225ced49182033cf995daf2a07d3628fe29bb573f5aa4c4188c253969f
+curl 7.74.0-1.3+deb11u16
+gettext 0.21-4
+libzbar0 0.23.90-1+deb11u1
+pngquant 2.13.1-1
+poppler-utils 20.09.0-3.1+deb11u2
+-rw-r--r-- 1 testuser testuser 101134336 /app/data/db.sqlite3
+uid=1000(testuser) gid=1000(testuser) groups=1000(testuser)
+RUNNING_APP_IMPORT_OK /app/src/documents/tasks.py
+```
+
+**Conclusion (`observed (runtime)`):** the base image `6e699f225ced` is **not** runnable as-is for this investigation; the runnable runtime is the base image **plus** the five apt packages (`libzbar0` being the critical one), a migrated SQLite DB, and runtime dirs owned by `testuser` — baked into `paperless-ngx-setup:local` (`d769966f2f8e`) and applied at runtime to the `paperless_app` container where all §9 numbers were measured. This corrects the earlier presentation of the parent image as the self-sufficient canonical runtime.
 
 ```bash
 docker inspect --format "Image Id : {{.Image}}" paperless_app
@@ -437,6 +542,8 @@ _write (non-chunked copy)                    +0.00     +0.00     +0.00     +0.00
 
 **observed (runtime).** Same 21-byte file, model **present**. End-to-end `+64.29 / +64.21 MiB`; **`load_classifier` is `+52.02 / +52.00 MiB` (~81%)** — the dominant, document-independent spike. The tracemalloc-ON run (RSS is profiler-inflated and labelled as such) gives the **Python-line** attribution: `load_classifier` Python-heap is only ~1.6 MiB at `classifier.py:90-92` (the `pickle.load` calls) while RSS is huge → the cost is **native**; the post-consume signal Python-heap is dominated by **`index.py` (Whoosh)** lines → the Whoosh per-consume writer is **Python-heap** (finding #12).
 
+**Repetition (P6-F9).** The two clean-RSS **magnitude** runs `stages_present_a/_b` (`load_classifier +52.02 / +52.00`) are the ≥2× confirmation of the dominant spike. The tracemalloc-ON `stages_present_tm` block below is a **single capture** and is labelled as such: it is a Python-line **attribution diagnostic** (its `+265 MiB` RSS is profiler-inflated — not a magnitude claim), and it is bound to the placed `model_small.pickle`, whose exact bytes are **not byte-reproducible** (§9.0 model-provenance facts (1)/(3): the published `gen_model` is fixed at ~696 KB and training sets no `random_state`). A re-run would therefore use a *different* artifact and would not be an unchanged-input repeat; per P6-F9's accepted alternative it is reported as exactly the captured single run and enumerated in the §9.25 ledger.
+
 ```bash
 DX drv_stages.py simple.txt                                   # tm OFF (clean RSS)
 MEMH_MODEL=/tmp/memharness/model_small.pickle DX drv_stages.py simple.txt      # tm OFF, model present
@@ -580,6 +687,8 @@ _write (non-chunked copy)                   +51.39    +51.39     +0.00     +0.00
 ### 9.4 Classifier decomposition: import floor vs deserialize; cold vs warm; native-vs-Python (OBJ-1/OBJ-4)
 
 **observed (runtime).** The `~49 MiB` cost splits into a **model-independent** sklearn/scipy import floor (`+48.61 / +49.84`) and a **model-dependent** deserialize (`+1.68–1.71` small, `+40.13` large — ~1:1 with pickle size). A **cold** small-model load totals `+51.29 MiB`; the **warm** second load in the same process is only `+1.65 MiB` (import paid once). Under tracemalloc, cold-load RSS is `+128 MiB` but the traced Python-heap is only ~30 MiB (dominated by importlib bytecode; `classifier.py:90-92` ~1.6 MiB) → **native, tracemalloc-blind**.
+
+**Repetition (P6-F9).** The decisive, **model-independent** import-floor-vs-deserialize split is confirmed **≥2×** by `clf_split_small_a/_b` (import `+48.61 / +49.84`; deserialize `+1.71 / +1.68`). The three remaining blocks in this subsection — `clf_split_large` (the 40 MB artifact), `clf_cold_small` and `clf_coldtm_small` (the 1.68 MB artifact) — are **single captures**, each **bound to a placed model artifact whose exact bytes are not byte-reproducible** (§9.0 model-provenance facts (1)/(3): `gen_model` is fixed at ~696 KB, so it cannot regenerate the 1.68 MB / 40 MB artifacts, and `MLPClassifier` sets no `random_state`). A second run would necessarily use a *different* artifact, so it would **not** be an unchanged-input repeat; per P6-F9's accepted alternative ("narrow claims to exactly captured evidence") they are reported as exactly the captured single run and enumerated in the §9.25 ledger. `clf_coldtm_small` is additionally a tracemalloc **attribution diagnostic** (its `+128 MiB` RSS is profiler-inflated). The load-bearing conclusions these blocks support — that deserialize scales ~1:1 with pickle size, and that cold-load RSS is native/tracemalloc-blind — do not depend on the exact artifact bytes.
 
 ```bash
 DX drv_classifier.py split /tmp/memharness/model_small.pickle
@@ -816,6 +925,8 @@ preprocess_content: id(result)==id(input): False  (creates a NEW string => copy;
 
 **observed (runtime).** 20 unique docs consumed sequentially in ONE process. RSS **plateaus** (steady per-doc `+0.036 MiB` absent / negligible present), `gc.garbage == 0`, object slope near zero, and `connection.queries == 0` (`DEBUG=False`). `malloc_trim(0)` reclaims arena pages; the residual equals the one-time cold import floor (absent `+21.17`, present includes the ~49 MiB classifier import) — a *cost paid once*, not a per-doc leak. The classifier-present run reloads the model every doc yet does **not** accumulate (import cached in `sys.modules`).
 
+**Repetition (P6-F9).** The decisive **no-accumulation** finding — steady per-doc increment ≈ 0, `gc.garbage == 0`, object slope ≈ 0, `connection.queries == 0` — is **model-independent** and is confirmed **≥2×** by `batch_absent_a/_b` below (both plateau; steady increments `+0.037` vs a near-zero slope). `batch_present` is a **single capture**: its one model-dependent quantity, the cold doc-0 floor (`+78.97 MiB`, which includes the ~49 MiB classifier import of the placed `model_small.pickle`), is **bound to a non-byte-reproducible artifact** (§9.0 facts (1)/(3)), so a second run would not be an unchanged-input repeat; the no-accumulation conclusion it demonstrates is already the ≥2× `batch_absent` result plus the per-doc slope inside this very run. Enumerated in the §9.25 ledger.
+
 ```bash
 DX drv_batch_cache.py 20 absent
 DX drv_batch_cache.py 20 present
@@ -995,6 +1106,18 @@ child before/after : 0.00 / 0.00 MiB   (poppler pdftoppm etc.)
 child peak(in win)  : 79.96 MiB   childPeakDelta=+79.96
 ```
 
+Output — `bc_on_4p_b.txt`:
+
+```text
+===== BARCODE mode=on pages=4 enable=True input=0.004 MiB =====
+None
+result             : Success. New document id 1 created
+self  before/after : 63.84 / 97.25 MiB   dSelf=+33.40
+self  peak(in win)  : 146.70 MiB   peakDelta=+82.86
+child before/after : 0.00 / 0.00 MiB   (poppler pdftoppm etc.)
+child peak(in win)  : 79.82 MiB   childPeakDelta=+79.82
+```
+
 Output — `bc_on_8p_a.txt`:
 
 ```text
@@ -1029,6 +1152,18 @@ self  before/after : 63.77 / 97.41 MiB   dSelf=+33.64
 self  peak(in win)  : 317.92 MiB   peakDelta=+254.15
 child before/after : 0.00 / 0.00 MiB   (poppler pdftoppm etc.)
 child peak(in win)  : 80.14 MiB   childPeakDelta=+80.14
+```
+
+Output — `bc_on_16p_b.txt`:
+
+```text
+===== BARCODE mode=on pages=16 enable=True input=0.012 MiB =====
+None
+result             : Success. New document id 1 created
+self  before/after : 63.87 / 97.89 MiB   dSelf=+34.02
+self  peak(in win)  : 318.20 MiB   peakDelta=+254.33
+child before/after : 0.00 / 0.00 MiB   (poppler pdftoppm etc.)
+child peak(in win)  : 79.96 MiB   childPeakDelta=+79.96
 ```
 
 Output — `bc_on_sep_8p_a.txt`:
@@ -1300,7 +1435,7 @@ INTERPRETATION (observed): the REAL document_consumer command enqueues via async
 
 ### 9.12 Canonical scheduled email task — corrects the process model (#2, #10)
 
-**observed (runtime).** `paperless_mail.tasks.process_mail_accounts` is a Django-Q **Schedule** row (migration 0002; `schedule_type='I'`=MINUTES, `minutes=10`, name 'Check all e-mail accounts'), so it runs inside a **recycle=1 worker** like any task — **not** a long-lived non-recycled process (correcting the prior claim). It executed in worker pid (distinct per run), `VmHWM ≈ 51 MiB`, returned 'No new documents were added.', then exited. Per-attachment payload buffering (`mail.py:317/327`) is **inferred** — no IMAP server is available (see Limitations §12).
+**observed (runtime).** `paperless_mail.tasks.process_mail_accounts` is a Django-Q **Schedule** row (migration 0002; `schedule_type='I'`=MINUTES, `minutes=10`, name 'Check all e-mail accounts'), so it runs inside a **recycle=1 worker** like any task — **not** a long-lived non-recycled process (correcting the prior claim). It executed in worker pid (distinct per run), `VmHWM ≈ 51 MiB`, returned 'No new documents were added.', then exited. Per-attachment payload buffering (`mail.py:317/327`) — described as *inferred* in the captured `drv_mail.py` output below because this scheduled-task run had zero mail accounts — is now exercised directly and **upgraded to observed in §9.23** (real `MailAccountHandler.handle_message` driven by a real `MailMessage`, IMAP transport OBS(nc)); §9.23 also captures the P4-F5 broker-down `paperless-mail-*` scratch accumulation.
 
 ```bash
 DXI drv_mail.py
@@ -1514,6 +1649,8 @@ importer cmd RSS before/after : 61.80 / 99.53 MiB  dSelf=+37.73  peakDelta=+37.7
    `document_index reindex` single-writer batch [tasks.py:43])
 ```
 
+**Atomicity and path-safety of the same importer path (cross-reference).** The measurement above exercises the *happy path*. The importer's **failure-path behaviour** — that `handle()` (`document_importer.py:57-93`) runs `loaddata` (`:87`) and `_import_files_from_manifest` (`:89`) with **no wrapping transaction**, so a mid-copy `FileNotFoundError` leaves committed DB rows plus a partially-copied file tree; and that `_check_manifest` (`:101-128`) validates the original and archive files but **not** the thumbnail, while `_import_files_from_manifest` (`:146-153`) joins manifest-supplied names onto the source directory with **no containment check** (accepting `../` traversal and in-bundle symlinks) — is disclosed as observed runtime behaviour in **§9.22** (findings P4-F3, P4-F4). Both are catalogued strictly as diagnostic observations; remediation is out-of-scope per AAP §0.5.2.
+
 ### 9.15 Document-type matrix + matched-page PDF control (OBJ-5, #11)
 
 **observed (runtime).** One document per fresh process. Self-RSS separates the types: text/PDF/matched-PDF ~`+22 MiB` (parser-import-floor dominated); image OCR (png/jpg) `+31–34 MiB` (in-process PIL handling). The **matched-page control** removes the page confound: a synthetic 1-page PDF (`ctrl1`) and 2-page PDF (`ctrl2`) both cost ~`+22 MiB` self, i.e. page count 1→2 does not move self-RSS for small text PDFs. NOTE: this matrix used the coarser 8 ms child sampler, which missed the short-lived OCR/thumbnail subprocesses for these tiny inputs (childPeak 0.00); the **authoritative** OCR child figures are the 3 ms-sampled §9.16.
@@ -1576,15 +1713,27 @@ Output — `type_ctrl1_a.txt`:
 ctrl1  input=1692B pages=1 contentLen=721 selfdRSS=+21.84 selfPeak=+21.84 childPeak=+0.00 MiB
 ```
 
+Output — `type_ctrl1_b.txt`:
+
+```text
+ctrl1  input=1692B pages=1 contentLen=721 selfdRSS=+22.05 selfPeak=+22.05 childPeak=+0.00 MiB
+```
+
 Output — `type_ctrl2_a.txt`:
 
 ```text
 ctrl2  input=2413B pages=2 contentLen=1444 selfdRSS=+22.23 selfPeak=+22.23 childPeak=+0.00 MiB
 ```
 
+Output — `type_ctrl2_b.txt`:
+
+```text
+ctrl2  input=2413B pages=2 contentLen=1444 selfdRSS=+22.61 selfPeak=+22.61 childPeak=+0.00 MiB
+```
+
 ### 9.16 OCR modes matrix + OCR fallback (#2)
 
-**observed (runtime).** `simple.pdf` through the OCR parser under each mode (self peak + 3 ms child-tree peak). `skip` (default) and `skip_noarchive` are equivalent here (self `+30–32`, child `+80`; the single page has no detectable text layer so no early return). `force` and `redo` push the OCR child to `+124–125 MiB` (~1.5× skip) and self peak to `+145`/`+102`. **Fallback:** an image-only PDF (built with img2pdf) consumes successfully under `skip` (OCR sidecar yields 24 chars), so the `NoTextFoundException` → force-OCR retry did **not** fire; that specific retry-then-`ParseError`-on-failure branch is therefore **inferred (from reading)** `paperless_tesseract/parsers.py:280-314`, not observed.
+**observed (runtime).** `simple.pdf` through the OCR parser under each mode (self peak + 3 ms child-tree peak). `skip` (default) and `skip_noarchive` are equivalent here (self `+30–32`, child `+80`; the single page has no detectable text layer so no early return). `force` and `redo` push the OCR child to `+124–125 MiB` (~1.5× skip) and self peak to `+145`/`+102`. **Fallback:** an image-only PDF (built with img2pdf) consumes successfully under `skip` (OCR sidecar yields 24 chars), so the `NoTextFoundException` → force-OCR retry did **not** fire naturally here. That retry branch — plus a *meaningful* `skip_noarchive` on a text-bearing PDF — is exercised and **upgraded to observed in §9.24** (`paperless_tesseract/parsers.py:241-244,277-309`): `skip_noarchive` skips OCRmyPDF entirely (no archive, ≈10 MiB lower self peak), the force-OCR retry succeeds (document created) and, with an injected fallback failure, rolls back cleanly to `ParseError`. Note also that `skip`/`skip_noarchive` on `simple.pdf` above are equivalent only because `simple.pdf` has no extractable text layer (`original_has_text` False); §9.24 uses a text-bearing PDF so the two modes diverge.
 
 ```bash
 PAPERLESS_OCR_MODE=skip           DX drv_consume_report.py simple.pdf
@@ -1707,6 +1856,31 @@ doc pk=1 mime=application/pdf has_archive=True contentLen=24
 self peak +24.99 MiB ; child peak +64.87 MiB
 ```
 
+Output — `ocrfallback_b.txt`:
+
+```text
+===== OCR FALLBACK PROBE  image-only PDF  OCR_MODE=skip  size=8983B =====
+None
+Consuming work_327787_04ed9d_imageonly.pdf
+Detected mime type: application/pdf
+Parser: RasterisedDocumentParser
+Parsing work_327787_04ed9d_imageonly.pdf...
+Extracted text from PDF file /tmp/tmpvmn6wo1g/work_327787_04ed9d_imageonly.pdf
+Calling OCRmyPDF with args: {'input_file': '/tmp/tmpvmn6wo1g/work_327787_04ed9d_imageonly.pdf', 'output_file': '/tmp/tmpvmn6wo1g/paperless-paam2nal/archive.pdf', 'use_threads': True, 'jobs': 11, 'language': 'eng', 'output_type': 'pdfa', 'progress_bar': False, 'skip_text': True, 'clean': True, 'deskew': True, 'rotate_pages': True, 'rotate_pages_threshold': 12.0, 'sidecar': '/tmp/tmpvmn6wo1g/paperless-paam2nal/sidecar.txt'}
+Using text from sidecar file
+Generating thumbnail for work_327787_04ed9d_imageonly.pdf...
+Execute: convert -density 300 -scale 500x5000> -alpha remove -strip -auto-orient /tmp/tmpvmn6wo1g/paperless-paam2nal/archive.pdf[0] /tmp/tmpvmn6wo1g/paperless-paam2nal/convert.png
+Execute: optipng -silent -o5 /tmp/tmpvmn6wo1g/paperless-paam2nal/convert.png -out /tmp/tmpvmn6wo1g/paperless-paam2nal/thumb_optipng.png
+Document classification model does not exist (yet), not performing automatic matching.
+Saving record to database
+Deleting file /tmp/tmpvmn6wo1g/work_327787_04ed9d_imageonly.pdf
+Deleting directory /tmp/tmpvmn6wo1g/paperless-paam2nal
+Document 2026-07-15 work_327787_04ed9d_imageonly consumption finished
+RESULT       : Success. New document id 1 created
+doc pk=1 mime=application/pdf has_archive=True contentLen=24
+self peak +24.41 MiB ; child peak +65.07 MiB
+```
+
 ### 9.17 Edge/error: duplicate rejection + cleanup, unavailable service, Tika/parser availability (#2)
 
 **observed (runtime).** (1) **Duplicate:** a second consume of identical content (same MD5) is rejected at `pre_check_duplicate` (`consumer.py:104`) with `It is a duplicate.`, the DB is unchanged, `+0.02 MiB`, and **0** `paperless-*` consumer tempdirs are left behind (interruption/temp cleanup OK). (2) **Unavailable service:** with the Redis channel layer pointed at an unreachable endpoint, the consume fails fast at the first progress send with `ConnectionRefusedError [Errno 111]`, `+11.94 MiB`, no Document. (3) **Tika/Office (default):** `PAPERLESS_TIKA_ENABLED=False`, `paperless_tika` not in `INSTALLED_APPS`; DOCX/ODT/DOC resolve to **no parser** (None) while txt/pdf/png/jpg resolve to a parser.
@@ -1785,9 +1959,510 @@ DEBUG                  : False
   application/msword                                                     -> None
 ```
 
+### 9.18 Content-pattern-triggered cold `parse_date` / `dateparser` spike (OBJ-1/OBJ-4/OBJ-5)
+
+**observed (runtime).** `parse_date(filename, text)` (`parsers.py:212`) is called from the consume path when the parser did not supply a date (`consumer.py:273-275`). Its nested `__parser()` performs a **lazy `import dateparser`** (`parsers.py:221`) that fires **only** when `DATE_REGEX` (`parsers.py:30`) matches a date-shaped substring in the filename or text. Consequently a document with **no** date-shaped text (the report's canonical `simple.txt`) pays essentially nothing here — the §9.2/§9.3 stage tables show `parse_date` at `+0.00` (with a lone `+0.15 MiB` sampling blip in one §9.3 run) because `dateparser` is **never imported** for it. But a document whose text contains date-shaped tokens pays a **fixed, document-independent cold working-set cost** the first time `dateparser` is imported and exercised in a process: modest (`~+2.5 MiB`) for a clean month-year that parses on the first try, and **large (`~+29 MiB`, ~3 s)** for an ambiguous numeric date-shaped token that fails to parse (dateparser loads far more locale/language data attempting every ordering). This is a **cold import cost, not a leak** — the warm loop below proves only the **first** call in a process pays it. Because the task worker is recycled per task (`recycle:1`, §9.10), each consume of a date-bearing document in a fresh worker re-pays this cost. This directly answers the QA finding that the report previously stated only that `parse_date` "scales with content length" and omitted this cold spike.
+
+Three payloads of the same length class differ only in the presence/shape of a `DATE_REGEX`-matching token: `nodate` (no match), `validmy` (`January 2020`, matches alt-5 `[^\W\d_]{3,9} [0-9]{4}`), `invalid` (`99/99/9999`, matches alt-1). Each fresh `docker exec` is a **cold** interpreter, so the same case run twice = two independent cold runs. Command:
+
+```bash
+# DX = in-process driver (hbootstrap creates a FRESH isolated DATA_DIR + migrates per run);
+# each `docker exec` is a fresh (cold) interpreter, so the same case run twice = two cold runs.
+for tag in a b; do DX drv_datescale.py nodate;  done
+for tag in a b; do DX drv_datescale.py validmy; done
+for tag in a b; do DX drv_datescale.py invalid; done
+DX drv_datescale.py invalid tm     # tracemalloc python-heap attribution (profiler-inflated RSS)
+DX drv_datescale.py warm           # same-process loop: only the first call pays the import
+```
+
+Output — `nodate_a` / `nodate_b` (no date-shaped text → dateparser never imported):
+
+```text
+===== PARSE_DATE COLD SPIKE  case=nodate  tm=OFF  pid=325253 =====
+dateparser preloaded after Django setup: False
+[nodate] dateparser_imported before=False after=False
+[nodate] parse_date result = None
+[nodate] dRSS=+0.00 MiB  stage_peak=+0.00 MiB  elapsed=0.0039s
+===== DONE =====
+===== PARSE_DATE COLD SPIKE  case=nodate  tm=OFF  pid=325273 =====
+dateparser preloaded after Django setup: False
+[nodate] dateparser_imported before=False after=False
+[nodate] parse_date result = None
+[nodate] dRSS=+0.00 MiB  stage_peak=+0.00 MiB  elapsed=0.0039s
+===== DONE =====
+```
+
+Output — `validmy_a` / `validmy_b` (clean month-year, parses on first try → modest cold cost):
+
+```text
+===== PARSE_DATE COLD SPIKE  case=validmy  tm=OFF  pid=325293 =====
+dateparser preloaded after Django setup: False
+[validmy] dateparser_imported before=False after=True
+[validmy] parse_date result = datetime.datetime(2020, 1, 1, 0, 0, tzinfo=<UTC>)
+[validmy] dRSS=+2.62 MiB  stage_peak=+2.62 MiB  elapsed=0.2998s
+===== DONE =====
+===== PARSE_DATE COLD SPIKE  case=validmy  tm=OFF  pid=325313 =====
+dateparser preloaded after Django setup: False
+[validmy] dateparser_imported before=False after=True
+[validmy] parse_date result = datetime.datetime(2020, 1, 1, 0, 0, tzinfo=<UTC>)
+[validmy] dRSS=+2.44 MiB  stage_peak=+2.44 MiB  elapsed=0.2979s
+===== DONE =====
+```
+
+Output — `invalid_a` / `invalid_b` (ambiguous numeric date-shaped token, fails to parse → **large cold spike**):
+
+```text
+===== PARSE_DATE COLD SPIKE  case=invalid  tm=OFF  pid=325333 =====
+dateparser preloaded after Django setup: False
+[invalid] dateparser_imported before=False after=True
+[invalid] parse_date result = None
+[invalid] dRSS=+29.39 MiB  stage_peak=+29.39 MiB  elapsed=2.9825s
+===== DONE =====
+===== PARSE_DATE COLD SPIKE  case=invalid  tm=OFF  pid=325353 =====
+dateparser preloaded after Django setup: False
+[invalid] dateparser_imported before=False after=True
+[invalid] parse_date result = None
+[invalid] dRSS=+29.47 MiB  stage_peak=+29.47 MiB  elapsed=2.9951s
+===== DONE =====
+```
+
+Output — `invalidtm` (tracemalloc ON — attributes the Python-heap portion; RSS/time are profiler-inflated):
+
+```text
+===== PARSE_DATE COLD SPIKE  case=invalid  tm=ON  pid=325373 =====
+dateparser preloaded after Django setup: False
+[invalid] dateparser_imported before=False after=True
+[invalid] parse_date result = None
+[invalid] dRSS=+85.18 MiB  stage_peak=+85.18 MiB  elapsed=24.2783s  py_heap=+32485.4 KiB (profiler-inflated RSS)
+===== DONE =====
+```
+
+Output — `warm` (same-process loop, identical invalid-date text — only the **first** call pays the import):
+
+```text
+===== PARSE_DATE COLD SPIKE  case=warm  tm=OFF  pid=325393 =====
+dateparser preloaded after Django setup: False
+WARM same-process loop (3 iterations, identical invalid-date-shaped text):
+[warm#0] dateparser_imported before=False after=True
+[warm#0] parse_date result = None
+[warm#0] dRSS=+29.21 MiB  stage_peak=+29.21 MiB  elapsed=2.9668s
+[warm#1] dateparser_imported before=True after=True
+[warm#1] parse_date result = None
+[warm#1] dRSS=+0.00 MiB  stage_peak=+0.00 MiB  elapsed=0.6162s
+[warm#2] dateparser_imported before=True after=True
+[warm#2] parse_date result = None
+[warm#2] dRSS=+0.00 MiB  stage_peak=+0.00 MiB  elapsed=0.6055s
+===== DONE =====
+```
+
+**Duration/RSS ledger (two cold runs each; wall-clock stage time from `time.perf_counter()`):**
+
+| Case | dateparser imported | Run a: dRSS / elapsed | Run b: dRSS / elapsed | parse_date result |
+|---|---|---|---|---|
+| `nodate` | **no** (regex no match) | `+0.00 MiB` / 0.0039 s | `+0.00 MiB` / 0.0039 s | `None` |
+| `validmy` (`January 2020`) | yes | `+2.62 MiB` / 0.2998 s | `+2.44 MiB` / 0.2979 s | `2020-01-01` |
+| `invalid` (`99/99/9999`) | yes | `+29.39 MiB` / 2.9825 s | `+29.47 MiB` / 2.9951 s | `None` |
+| `invalid` +tracemalloc | yes | `+85.18 MiB` / 24.2783 s (py-heap `+31.7 MiB`) | — (single attribution run) | `None` |
+| `warm` first call (cold) | yes | `+29.21 MiB` / 2.9668 s | — (in-process loop) | `None` |
+| `warm` calls 2–3 (warm) | already imported | `+0.00 MiB` / ~0.61 s each | — | `None` |
+
+**Cause → effect + classification (`observed (runtime)`).** The spike originates at the lazy `import dateparser` in `parse_date.__parser` (`parsers.py:221`), reachable only when `DATE_REGEX` (`parsers.py:30`) matches date-shaped text; the magnitude tracks how much locale/language data `dateparser` loads while attempting to parse the matched token (small for an unambiguous English month-year, ~`+29 MiB` for an ambiguous numeric token that provokes an exhaustive locale attempt). It is a **content-pattern-triggered, document-independent, fixed cold working-set cost — not a leak and not proportional to content length**: the warm loop shows calls 2–3 in the same process add `+0.00 MiB`, and under `recycle:1` each fresh task worker re-pays it once for any date-bearing document. My values (`+29.4 MiB`, ~3 s) are the same class as the QA-observed `+23.35/+23.05 MiB`, `1.7485/1.7637 s`; the absolute figure varies with the RSS baseline and the exact matched token, but the mechanism, the fresh-vs-warm split, and the no-date `+0.00` are stable and reproduced across two runs. This refines the prior report statement (`parse_date` "scales with content length"): the dominant `parse_date` cost is this **fixed cold import**, independent of content length.
+
+---
+
+### 9.19–9.21 Failure-path & input-integrity observations (correctness, not memory)
+
+The exhaustive edge/error-path coverage this investigation is required to exercise surfaced three **correctness/robustness** behaviors that are not memory defects but were observed at runtime and are disclosed here for completeness. **Scope note — remediation is OUT OF SCOPE per AAP §0.5.2** ("Any modification, fix, refactor, or optimization of source files … the task is diagnosis only; remediation … is not performed"). Each is reported as **observed (runtime)** with its file:line root cause and its captured, two-run evidence; no source change is proposed or made. Two of them (retained scratch/index entries) also touch the "not released" symptom at the **resource** level (filesystem/index rather than RSS), so they are cross-referenced from OBJ-2/OBJ-3.
+
+#### 9.19 Late `_write` failure: DB rolls back but the Whoosh entry and earlier files are orphaned (P4-F2)
+
+**observed (runtime).** Inside `Consumer.try_consume_file` the persistence sequence is: `with transaction.atomic():` (`consumer.py:298`) → `self._store(...)` creates the `Document` row (`consumer.py:301`) → `document_consumption_finished.send(...)` (`consumer.py:306-311`) which runs `add_to_index` (`handlers.py:428-431`) → `index.add_or_update_document` → an `AsyncWriter.commit()` (`index.py:65-74,118`) → then the file copies `self._write(...)` for original / thumbnail / archive (`consumer.py:319,321,333`). The Whoosh commit is **not** enrolled in the Django DB transaction, and the `_write` copies are plain filesystem writes. So if a `_write` raises, `transaction.atomic()` rolls the `Document` row back, but **the Whoosh index entry stays committed** and **any files written before the exception remain on disk** — an orphaned, inconsistent state. Injecting a failure at the Nth `_write` (a text doc → 2 writes; a PDF → 3 writes) and counting DB rows / Whoosh docs / on-disk files:
+
+```bash
+for c in control text2 pdf3; do DX drv_latewrite.py $c; DX drv_latewrite.py $c; done   # each case x2
+```
+
+```text
+===== LATE _write FAILURE  case=control  fail_at_write=#none  pid=325603 =====
+input: text (.txt -> 2 writes: original+thumbnail, no archive)
+pre-consume  : DB=0  whoosh=0  orig=0 thumb=0 arch=0
+outcome      : consume returned normally (no failure injected)
+_write calls actually made: 2
+post-consume : DB=1  whoosh=1  orig=1 thumb=1 arch=0
+VERDICT      : success baseline DB=1 whoosh=1 files_present=2
+===== DONE =====
+```
+
+```text
+===== LATE _write FAILURE  case=text2  fail_at_write=#2  pid=325665 =====
+input: text (.txt -> 2 writes: original+thumbnail, no archive)
+pre-consume  : DB=0  whoosh=0  orig=0 thumb=0 arch=0
+outcome      : consume RAISED (as injected)
+exception    : ConsumerError: lw.txt: The following error occured while consuming lw.txt: INJECTED _write failure at call #2 (target basename=0000001.png)
+_write calls actually made: 2
+post-consume : DB=0  whoosh=1  orig=1 thumb=0 arch=0
+VERDICT      : DB rolled back to 0; Whoosh retained 1 entr(y/ies); 1 orphan file(s) on disk  => inconsistency CONFIRMED
+===== DONE =====
+(run b, pid=325696: identical — DB=0 whoosh=1 orig=1 thumb=0 arch=0, CONFIRMED)
+```
+
+```text
+===== LATE _write FAILURE  case=pdf3  fail_at_write=#3  pid=325727 =====
+input: simple.pdf (has archive -> 3 writes)
+pre-consume  : DB=0  whoosh=0  orig=0 thumb=0 arch=0
+outcome      : consume RAISED (as injected)
+exception    : ConsumerError: work_..._simple.pdf: ... INJECTED _write failure at call #3
+_write calls actually made: 3
+post-consume : DB=0  whoosh=1  orig=1 thumb=1 arch=0
+VERDICT      : DB rolled back to 0; Whoosh retained 1 entr(y/ies); 2 orphan file(s) on disk  => inconsistency CONFIRMED
+===== DONE =====
+(run b, pid=325773: identical — DB=0 whoosh=1 orig=1 thumb=1 arch=0, CONFIRMED)
+```
+
+**Cause → effect.** The `Document` row is transactional (rolled back to `DB=0`), but the Whoosh `AsyncWriter.commit()` executed during the signal (`handlers.py:431`) is durable and independent of the DB transaction, so `whoosh=1` survives; and the non-atomic `_write` copies leave the already-written files (the original when write #2 fails; original+thumbnail when write #3 fails). **Both runs of each case are identical.** This is a **transactional-consistency** defect (orphan search entry + orphan files), not a memory defect; remediation (e.g., staging external writes until after the transaction, or using `transaction.on_commit`) is **out of scope per AAP §0.5.2**. Relevance to the memory question: the orphaned Whoosh entry is a *resource* that is "not released" on the failure path — an index-level analogue of the RSS "not released" symptom (OBJ-3), distinct from allocator retention.
+
+#### 9.20 REST upload failure paths: broker-down 500 and corrupt-PDF "200 OK then worker fails", both leaving orphan scratch (P4-F5, REST)
+
+**observed (runtime).** `PostDocumentView.post` (`views.py:499`) validates only the MIME type (`serialisers.py:451-454`), writes the payload to a `NamedTemporaryFile(prefix="paperless-upload-", dir=SCRATCH_DIR, delete=False)` (`views.py:512-517`) **before** enqueuing `async_task("documents.tasks.consume_file", …)` (`views.py:523`), then returns `Response("OK")` (`views.py:535`). Driven through a **real gunicorn** worker with `curl`:
+
+```bash
+# DXI = isolated DATA_DIR shared with the gunicorn child; MEMH_PORT picks the bind port
+MEMH_PORT=8032 DXI drv_restfail.py brokerdown   # x2
+MEMH_PORT=8034 DXI drv_restfail.py corruptpdf   # x2
+```
+
+Broker down → `async_task` (`views.py:523`) raises **after** the scratch file already exists (`delete=False`), so the request 500s and the scratch is orphaned:
+
+```text
+===== REST UPLOAD FAILURE  case=brokerdown  pid=325850 =====
+gunicorn PAPERLESS_REDIS = redis://127.0.0.1:6399  (DEAD broker; async_task will fail)
+gunicorn master pid=325867 bind=127.0.0.1:8032 workers=1
+server ready after 1.1s  (HTTP layer up regardless of broker)
+upload file: brokerdown.txt  (28 bytes)
+
+POST /api/documents/post_document/  ->  HTTP 500
+response body: '\n<!doctype html>\n<html lang="en">\n<head>\n  <title>Server Error (500)</title>\n</head>\n<body>\n  <h1>Server Error (500)</h1><p></p>\n</body>\n</html>\n'
+documents in DB after POST: 0
+orphan paperless-upload-* scratch files retained: 1
+   paperless-upload-hv9gwip8  (28 bytes)
+ephemeral token DELETED; gunicorn stopped
+(run b, pid=325890: identical — HTTP 500, DB=0, 1 orphan scratch (28 bytes))
+```
+
+Corrupt PDF (a `%PDF`-prefixed 70-byte file) passes the MIME allow-list, so the endpoint returns **200 "OK"** and enqueues — but the canonical worker (`consume_file` → OCR parser → pikepdf/qpdf) fails, and the scratch input is **not** unlinked on failure (the consumer unlinks only on success, `consumer.py:350`):
+
+```text
+===== REST UPLOAD FAILURE  case=corruptpdf  pid=325930 =====
+gunicorn PAPERLESS_REDIS = redis://paperless-broker:6379  (live broker)
+upload file: corrupt.pdf  (70 bytes)
+
+POST /api/documents/post_document/  ->  HTTP 200
+response body: '"OK"'
+documents in DB after POST: 0
+orphan paperless-upload-* scratch files retained: 1
+   paperless-upload-5qh6b16c  (70 bytes)
+canonical worker step: consume_file(<retained scratch copy>)  [what django-q worker runs]
+  worker outcome: ConsumerError: ... Error while consuming ...: InputFileError:
+  worker input retained on failure? True  (consumer unlinks only on success)
+  documents in DB after worker: 0
+(run b, pid=325993: identical — HTTP 200 "OK", scratch 70 bytes retained, worker ParseError: InputFileError, input retained)
+```
+
+Decisive worker-failure frames (the intervening ocrmypdf force-OCR retry frames are elided with `…`; the pikepdf root cause and the final `ParseError` are verbatim):
+
+```text
+pikepdf._qpdf.PdfError: /tmp/ocrmypdf.io.gkr9re10/origin.pdf (offset 70): unable to find /Root dictionary
+  … ocrmypdf.exceptions.InputFileError …
+  File "/app/src/documents/consumer.py", line 261, in try_consume_file
+    document_parser.parse(self.path, mime_type, self.filename)
+  File "/app/src/paperless_tesseract/parsers.py", line 310, in parse
+    raise ParseError(f"{e.__class__.__name__}: {str(e)}")
+documents.parsers.ParseError: InputFileError:
+```
+
+**Cause → effect.** In both modes a `paperless-upload-*` file is written to `SCRATCH_DIR` with `delete=False` (`views.py:515`) **before** the operation that can fail; neither failure path removes it, so scratch accumulates one orphan per failed upload. The broker-down case also surfaces as an opaque HTTP 500 (no domain error), and the corrupt-PDF case returns a success code (`"OK"`) for a file that cannot be processed — the REST layer validates MIME, not parseability. **Both runs of each case are identical.** (The QA report observed 39-byte and 67-byte scratch files; mine are 28 and 70 bytes — the sizes track the exact probe payloads, the mechanism and outcome are the same.) This is an **error-handling / resource-cleanup** matter, not a memory defect; remediation (cleaning scratch on the failure paths; returning a domain error when the broker is unreachable) is **out of scope per AAP §0.5.2**. Relevance to the memory question: the retained scratch files are a filesystem *resource* "not released" on the failure paths (OBJ-3, resource level) — distinct from the web worker's RSS retention documented in §9.13.
+
+#### 9.21 Alpha-channel PNG mutated in place: stored "original" ≠ submitted, and re-submission raises a raw UNIQUE error (P5-F7)
+
+**observed (runtime).** For an image with an alpha channel the OCR parser flattens it by **overwriting the input file in place** — `background.save(input_file, format=im.format)` (`paperless_tesseract/parsers.py:201`, guarded by `has_alpha` at `:191`, inside `parse()`), where `input_file` is the consumer's working path `self.path`. But `pre_check_duplicate` hashes `self.path` **before** parsing (`consumer.py:104`) while `_store` hashes it **after** (`consumer.py:397-402`) and `_write` copies the post-parse file into storage (`consumer.py:429-432`). Consuming the RGBA sample `simple.png` and comparing the submitted bytes to the stored original (`Document.source_path`, i.e. what `GET …/download/?original=true` serves):
+
+```bash
+DX drv_alpha.py     # x2 (fresh isolated DB each run)
+```
+
+```text
+===== ALPHA-PNG IN-PLACE MUTATION + NORMALIZED-DUPLICATE  pid=326064 =====
+submitted original: simple.png  mode=RGBA  size=(517, 147)  bytes=7913  sha256=1f29412fed222ae1...
+
+consume #1 outcome: success
+documents in DB: 1
+stored original (source_path, == ?original=true download):
+   mode=RGB  size=(517, 147)  bytes=6910  sha256=e00457eda267ee4d...
+   stored checksum (DB) = aa4e9abd6b0984532663b7291bbbd460
+VERDICT (integrity): submitted vs stored  bytes 7913 -> 6910  (+1003)   sha256 differ=True  mode RGBA -> RGB  => stored 'original' != submitted CONFIRMED
+
+consume #2 (same alpha original) outcome: ConsumerError: work_..._simple.png: The following error occured while consuming ...: UNIQUE constraint failed: documents_document.checksum
+documents in DB after #2: 1
+VERDICT (duplicate): raw 'UNIQUE constraint failed' surfaced=True  graceful-duplicate-message=False  => RAW DB ERROR (not graceful) CONFIRMED
+```
+
+```text
+(run b, pid=326148: identical — 7913 -> 6910, sha256 differ=True, RGBA -> RGB; consume #2 raises UNIQUE constraint failed: documents_document.checksum)
+```
+
+The decisive DB frame of consume #2 (verbatim):
+
+```text
+sqlite3.IntegrityError: UNIQUE constraint failed: documents_document.checksum
+  … File "/app/src/documents/consumer.py", line 301, in try_consume_file
+      document = self._store(text=text, date=date, mime_type=mime_type)
+django.db.utils.IntegrityError: UNIQUE constraint failed: documents_document.checksum
+```
+
+**Cause → effect.** The in-place `save()` (`parsers.py:201`) changes the original's bytes (RGBA→RGB, 7913→6910 bytes, different SHA-256), and because the stored file is copied from the post-parse path (`consumer.py:432`), the "original" a user can download is **not** the file they submitted. Separately, `pre_check_duplicate` hashes the *pre-flatten* bytes (`consumer.py:104`) while the stored checksum is the *post-flatten* hash (`consumer.py:402`), so re-submitting the identical alpha original is **not** recognized as a duplicate; it re-flattens to the same bytes and `Document.objects.create(checksum=…)` violates the `checksum` UNIQUE constraint, surfacing a raw `sqlite3.IntegrityError`/`django.db.utils.IntegrityError` (wrapped as `ConsumerError`) rather than the graceful "It is a duplicate" message. **Both runs are identical**, and the 7913→6910 figures match the QA-observed values exactly. This is a **data-fidelity / duplicate-handling** matter, not a memory defect; remediation (flatten to a copy rather than in place; normalize the dedup checksum) is **out of scope per AAP §0.5.2**.
+
+#### 9.22 Importer atomicity gap (missing thumbnail → partial state) and path-safety (`../`/symlink escape) (P4-F3, P4-F4)
+
+**observed (runtime).** `document_importer.handle` (`document_importer.py:57`) validates the manifest (`_check_manifest`, `:101-128`), then runs `call_command("loaddata", manifest_path)` (`:87`) — which **commits every `Document` row** — and only afterward copies files (`_import_files_from_manifest`, `:89,129`), with **no transaction wrapping the whole import**. `_check_manifest` checks the **original** (`:114-115`) and **archive** (`:121-123`) exist but **not the thumbnail** (`EXPORTER_THUMBNAIL_NAME`); and the copy loop writes the **original first** (`:165`) then the **thumbnail** (`:166`). File paths are built with `os.path.join(self.source, doc_file)` (`:115,:146`) with no containment check, and `shutil.copy2` (`:165`) follows symlinks. Driven through the REAL `document_exporter` + `document_importer` commands (export a valid bundle, reset the target to empty, tamper, import):
+
+```bash
+DX drv_importfail.py missing_thumbnail   # x2
+DX drv_importfail.py traversal
+DX drv_importfail.py symlink
+```
+
+P4-F3 — a bundle whose thumbnail file is missing passes validation, `loaddata` commits the row, the original is copied, then the thumbnail copy raises `FileNotFoundError`, leaving a partial DB+file state (**identical across both runs**):
+
+```text
+===== IMPORTER FAILURE/PATH-SAFETY  case=missing_thumbnail  pid=326313 =====
+consumed doc pk=1; DB docs=1
+exported bundle: original='2026-07-15 imp.txt' thumbnail='2026-07-15 imp.txt-thumbnail.png'  orig_sha=f3d770e33fc0887c
+target reset: DB docs=0  originals=0
+tamper: deleted thumbnail '2026-07-15 imp.txt-thumbnail.png' from bundle (manifest still references it)
+Installed 2 object(s) from 1 fixture(s)
+import outcome: FileNotFoundError: [Errno 2] No such file or directory: '/tmp/memharness/bundle_326313/2026-07-15 imp.txt-thumbnail.png'
+post-import   : DB docs=1  originals_on_disk=1  thumbnails_on_disk=0
+VERDICT (P4-F3): rows committed by loaddata (1) + original copied (1) but thumbnail missing (0) and import aborted => PARTIAL DB+FILE STATE CONFIRMED
+===== DONE =====
+(run b, pid=326345: identical — Installed 2 object(s); FileNotFoundError on thumbnail; DB=1, originals=1, thumbnails=0, CONFIRMED)
+```
+
+P4-F4 — a manifest `__exported_file_name__` of `../escape.txt` (path traversal) and an in-bundle symlink pointing outside both cause the importer to copy **outside-bundle bytes** into storage (the tqdm progress bar is elided):
+
+```text
+===== IMPORTER FAILURE/PATH-SAFETY  case=traversal  pid=326377 =====
+tamper: manifest __exported_file_name__ -> '../escape_326377.txt'; outside file at /tmp/memharness/escape_326377.txt (sha=3901a85f402e80e0) contains SECRET
+Installed 2 object(s) from 1 fixture(s)
+import outcome: completed normally
+post-import   : DB docs=1  originals_on_disk=1  thumbnails_on_disk=1
+stored original starts with: 'OUTSIDE_BUNDLE_SECRET_pid326377_DO_NOT_IMPORT\n'
+VERDICT (P4-F4 traversal): outside-bundle SECRET imported into storage=True => path escape CONFIRMED
+===== DONE =====
+```
+
+```text
+===== IMPORTER FAILURE/PATH-SAFETY  case=symlink  pid=326409 =====
+tamper: replaced bundle original '2026-07-15 imp.txt' with a symlink -> /tmp/memharness/escape_326409.txt (link points outside the bundle; content sha=940467db87d55f7a)
+Installed 2 object(s) from 1 fixture(s)
+import outcome: completed normally
+post-import   : DB docs=1  originals_on_disk=1  thumbnails_on_disk=1
+stored original starts with: 'OUTSIDE_BUNDLE_SECRET_pid326409_DO_NOT_IMPORT\n'
+VERDICT (P4-F4 symlink): outside-bundle SECRET imported into storage=True => path escape CONFIRMED
+===== DONE =====
+```
+
+**Cause → effect.** (P4-F3) Because `loaddata` (`:87`) commits before the non-transactional copy loop and `_check_manifest` never checks the thumbnail, a thumbnail-less bundle leaves the row committed and the original on disk when `:166` raises — a partial, inconsistent import. (P4-F4) Because paths are joined without containment and `shutil.copy2` follows symlinks, `../`/absolute manifest entries and in-bundle symlinks import bytes from **outside** the bundle. **Severity context:** `document_importer` is a privileged, operator-run management command (not a network-reachable surface), which is why the QA report rates the path-escape **MINOR**; the atomicity gap is **MAJOR**. Both are **correctness/robustness** matters, not memory defects; remediation (validate the thumbnail; wrap the import in a transaction / stage file copies; enforce `realpath` containment and reject symlinks) is **out of scope per AAP §0.5.2**. Disclosed as observed for completeness.
+
+#### 9.23 Email attachment payload buffering + broker-down scratch accumulation (P5-F8 label upgrade, P4-F5 email)
+
+**observed (runtime); IMAP transport OBS(nc).** This upgrades the payload-buffering claim in §9.12 from *inferred* to *observed*. No IMAP server is reachable offline, so **only** the IMAP transport (`get_mailbox` → `login`/`folder`/`fetch`, `mail.py:92-99`) is substituted by an in-memory fake that yields a **real** `imap_tools.MailMessage` built from raw RFC822 bytes; that substitution is labelled **OBS(nc)**. Everything downstream is the product's own code driven by a **real** `MailAccount` + `MailRule`: `MailAccountHandler.handle_mail_account` → `handle_mail_rule` → `handle_message`, the full-payload buffer `magic.from_buffer(att.payload)` (`mail.py:317`), the `paperless-mail-*` `mkstemp` + `f.write(att.payload)` scratch write with `delete=False` (`mail.py:322-327`), and the `consume_file` enqueue `async_task(...)` (`mail.py:336`).
+
+```bash
+# broker UP; MEMH_MAILPAD=8 is added to the DX environment to pad the attachment so
+# the in-memory payload buffering is measurable (canonical small text = 21 bytes otherwise)
+docker exec -w /tmp/memharness --user testuser -e PAPERLESS_REDIS=redis://paperless-broker:6379 \
+  -e PAPERLESS_DISABLE_DBHANDLER=true -e HOME=/home/testuser -e DJANGO_SETTINGS_MODULE=paperless.settings \
+  -e PYTHONPATH=/app/src:/tmp/memharness -e MEMH_MAILPAD=8 \
+  paperless_app python3 /tmp/memharness/drv_mailbuf.py buffer          # x2
+# broker DOWN: the driver sets PAPERLESS_REDIS -> redis://127.0.0.1:6399 (dead) itself
+DX drv_mailbuf.py brokerdown                                          # x2
+```
+
+**Payload buffering (broker up) — the FULL attachment is held in memory then written byte-identically to scratch (`observed`).** Output — `buffer_a`:
+
+```text
+===== EMAIL BUFFER/FAILURE PROBE  case=buffer  pid=326679  pad=8 MiB =====
+None
+OBS(nc): IMAP transport substituted (no offline IMAP server); handle_mail_account/handle_mail_rule/handle_message + att.payload buffering + mkstemp scratch + async_task enqueue are the product's REAL code
+attachment: filename='probe-attach.txt' content_disposition='attachment' payload_len=8388629 bytes  mime='text/plain'
+payload buffering (build MailMessage + hold att.payload) [mail.py:317]: RSS 69.66 -> 124.77 MiB (dSelf +55.11) for 8388629 bytes held in memory
+handle_mail_account processed_files = 1  (consume_file enqueue at mail.py:336 completed without error against the
+                                       LIVE broker; contrast the brokerdown case, where the same async_task RAISES)
+scratch paperless-mail-* : before=0 after=1  (mkstemp+write [mail.py:322-327], delete=False)
+scratch bytes vs att.payload : disk_sha=952adbff055e0a8b payload_sha=952adbff055e0a8b identical=True  (f.write(att.payload) wrote the FULL payload)
+Document.objects.count() : 0  (mail path only ENQUEUES; a recycle=1 worker consumes + deletes the scratch later)
+cleanup: purged broker queue -> True
+===== DONE =====
+[elapsed buffer_a: 3.59s]
+```
+
+Output — `buffer_b` (identical except sampled RSS and pid):
+
+```text
+===== EMAIL BUFFER/FAILURE PROBE  case=buffer  pid=326702  pad=8 MiB =====
+attachment: filename='probe-attach.txt' content_disposition='attachment' payload_len=8388629 bytes  mime='text/plain'
+payload buffering (build MailMessage + hold att.payload) [mail.py:317]: RSS 69.68 -> 125.05 MiB (dSelf +55.37) for 8388629 bytes held in memory
+handle_mail_account processed_files = 1
+scratch paperless-mail-* : before=0 after=1  (mkstemp+write [mail.py:322-327], delete=False)
+scratch bytes vs att.payload : disk_sha=952adbff055e0a8b payload_sha=952adbff055e0a8b identical=True
+Document.objects.count() : 0
+cleanup: purged broker queue -> True
+[elapsed buffer_b: 3.60s]
+```
+
+The `identical=True` line is the decisive proof: the scratch file written at `mail.py:327` is **byte-for-byte** `att.payload`, i.e. the full attachment is buffered in memory (`+55 MiB` for an 8 MiB attachment — the surplus is the base64-decode intermediates during `MailMessage.from_bytes`) and then written whole. `processed_files=1` confirms the `async_task` enqueue at `mail.py:336` completed against the live broker.
+
+**Broker-down scratch accumulation (P4-F5 email) — two polls of the same message leak two scratch files and create no document (`observed`).** Output — `brokerdown_a`:
+
+```text
+===== EMAIL BUFFER/FAILURE PROBE  case=brokerdown  pid=326727  pad=0 MiB =====
+None
+OBS(nc): IMAP transport substituted (no offline IMAP server); handle_mail_account/handle_mail_rule/handle_message + att.payload buffering + mkstemp scratch + async_task enqueue are the product's REAL code
+attachment: filename='probe-attach.txt' content_disposition='attachment' payload_len=21 bytes  mime='text/plain'
+payload buffering (build MailMessage + hold att.payload) [mail.py:317]: RSS 61.94 -> 61.94 MiB (dSelf +0.00) for 21 bytes held in memory
+PAPERLESS_REDIS = redis://127.0.0.1:6399  (dead port; broker unreachable)
+poll 1: handle_mail_account returned 0 (exit-0-equivalent; enqueue error logged+swallowed) -> paperless-mail-* count now 1
+poll 2: handle_mail_account returned 0 (exit-0-equivalent; enqueue error logged+swallowed) -> paperless-mail-* count now 2
+scratch progression      : 0 -> 1 -> 2  (0->1->2 accumulation)
+Document.objects.count() : 0  (no document created, no queued task)
+===== DONE =====
+[elapsed brokerdown_a: 2.62s]
+```
+
+Output — `brokerdown_b` (identical progression):
+
+```text
+===== EMAIL BUFFER/FAILURE PROBE  case=brokerdown  pid=326744  pad=0 MiB =====
+poll 1: handle_mail_account returned 0 (exit-0-equivalent; enqueue error logged+swallowed) -> paperless-mail-* count now 1
+poll 2: handle_mail_account returned 0 (exit-0-equivalent; enqueue error logged+swallowed) -> paperless-mail-* count now 2
+scratch progression      : 0 -> 1 -> 2  (0->1->2 accumulation)
+Document.objects.count() : 0  (no document created, no queued task)
+[elapsed brokerdown_b: 2.62s]
+```
+
+**Cause → effect.** `handle_message` writes the `paperless-mail-*` scratch file (`mail.py:322-327`, `delete=False`) **before** calling `async_task` (`mail.py:336`). When the broker is unreachable the `async_task` call raises; that exception propagates out of `handle_message` and is **logged and swallowed** by `handle_mail_rule`'s per-message `try/except` (`mail.py:262-270`), so the management command returns normally (exit-0-equivalent) while the scratch file is orphaned. Re-polling the same unchanged message repeats the write, so the `paperless-mail-*` count climbs `0 → 1 → 2` with no document created. Like the REST orphan in §9.20 this is a **resource-retention on a failure path**, folded into OBJ-3; the memory cost per poll is bounded by one attachment payload and is released when the process exits (recycle=1 for the scheduled worker). Remediation (clean up the scratch file when enqueue fails) is **out of scope per AAP §0.5.2**.
+
+#### 9.24 OCR meaningful `skip_noarchive` + force-OCR retry (success and injected failure) (P5-F8 label upgrade)
+
+**observed (runtime).** This upgrades the OCR branches left *inferred* in §9.16. `skip`/`skip_noarchive` are exercised **genuinely** (no injection) on a **text-bearing** PDF (a real embedded text layer via reportlab, so `original_has_text` is True, `parsers.py:236`). The force-OCR retry branch (`parsers.py:277-309`) is reached by an **injected** trigger — a measurement-only wrapper on `RasterisedDocumentParser.extract_text` that returns `""` for the first post-OCR sidecar read so `parse()` raises `NoTextFoundException`; this is the identical measurement technique used for `_write` in §9.19 and changes **no** source. Only the *trigger* is injected; the retry branch that executes is the product's own.
+
+```bash
+# GENUINE (no injection): text-bearing PDF; the driver sets settings.OCR_MODE in-process
+DX drv_ocrretry.py skip                 # x2
+DX drv_ocrretry.py skip_noarchive       # x2
+# INJECTED NoTextFound trigger (measurement-only wrapper); real force-OCR fallback
+DX drv_ocrretry.py retry_ok             # x2   (fallback succeeds -> document created)
+DX drv_ocrretry.py retry_fail           # x2   (fallback ocrmypdf.ocr raises -> ParseError, rollback)
+```
+
+**Meaningful `skip` vs `skip_noarchive` (`observed`).** Under `skip` the parser runs OCRmyPDF and writes an archive; under `skip_noarchive` the early-return at `parsers.py:241-244` fires (log line **"Document has text, skipping OCRmyPDF entirely."**), producing **no archive** and a materially lower self peak. Decisive lines (the intervening per-page OCRmyPDF debug lines are elided; branch markers, result, and peaks are verbatim):
+
+```text
+===== OCR RETRY/SKIP PROBE  case=skip  pid=326785  OCR_MODE=skip  (text-bearing PDF, GENUINE no-injection) =====
+Parser: RasterisedDocumentParser
+Calling OCRmyPDF with args: {... 'skip_text': True ...}
+RESULT        : Success. New document id 1 created
+Document.objects.count() : 1
+doc pk=1 mime=application/pdf has_archive=True contentLen=391
+self  peak    : +31.10 MiB (before 62.71 -> after 93.80, dSelf +31.10)
+child peak    : +79.90 MiB (OCR subprocess tree)
+[elapsed skip_a: 5.23s]   (skip_b: has_archive=True, self +30.95, child +79.96)
+
+===== OCR RETRY/SKIP PROBE  case=skip_noarchive  pid=326881  OCR_MODE=skip_noarchive  (text-bearing PDF, GENUINE no-injection) =====
+Parser: RasterisedDocumentParser
+Document has text, skipping OCRmyPDF entirely.
+RESULT        : Success. New document id 1 created
+Document.objects.count() : 1
+doc pk=1 mime=application/pdf has_archive=False contentLen=391
+self  peak    : +20.96 MiB (before 63.27 -> after 84.23, dSelf +20.96)
+child peak    : +79.86 MiB (OCR subprocess tree)
+[elapsed skip_noarchive_a: 4.86s]   (skip_noarchive_b: has_archive=False, self +21.14, child +79.86)
+```
+
+`skip_noarchive` yields `has_archive=False` and a self peak of `+20.96/+21.14` vs `skip`'s `+31.10/+30.95` — **≈10 MiB lower**, because the early-return skips the in-process OCRmyPDF orchestration. (The child-tree peak is unchanged because the PDF thumbnail is still rendered by a `gs`/`convert` subprocess in both modes.)
+
+**Force-OCR retry SUCCESS (`observed`; trigger injected).** The main OCR pass is forced to report no text, the retry fires, and the real force-OCR fallback yields text so the document is created:
+
+```text
+===== OCR RETRY/SKIP PROBE  case=retry_ok  pid=326951  retry SUCCESS (INJECTED NoTextFound trigger; real force-OCR fallback succeeds) =====
+Parser: RasterisedDocumentParser
+Calling OCRmyPDF with args: {... 'skip_text': True ...}
+Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+Fallback: Calling OCRmyPDF with args: {... 'force_ocr': True ...}
+RESULT        : Success. New document id 1 created
+Document.objects.count() : 1
+doc pk=1 mime=application/pdf has_archive=True contentLen=24
+self  peak    : +27.12 MiB (before 72.23 -> after 97.39, dSelf +25.16)
+child peak    : +65.18 MiB (OCR subprocess tree)
+[elapsed retry_ok_a: 5.37s]   (retry_ok_b: Success, count=1, self +24.89, child +64.83)
+```
+
+**Force-OCR retry FAILURE, injected ×2 (`observed`; trigger injected).** The same `NoTextFound` trigger plus a wrapper that makes the **fallback** `ocrmypdf.ocr` raise drives the inner `except Exception -> raise ParseError` (`parsers.py:307-309`); the consume rolls back cleanly with no document, both runs:
+
+```text
+===== OCR RETRY/SKIP PROBE  case=retry_fail  pid=327093  retry FAILURE (INJECTED NoTextFound + fallback ocrmypdf.ocr raises) -> ParseError =====
+Parser: RasterisedDocumentParser
+Calling OCRmyPDF with args: {... 'skip_text': True ...}
+Encountered an error while running OCR: No text was found in the original document. Attempting force OCR to get the text.
+Fallback: Calling OCRmyPDF with args: {... 'force_ocr': True ...}
+RESULT        : ConsumerError: work_327093_78470c_imageonly.pdf: Error while consuming document work_327093_78470c_imageonly.pdf: RuntimeError: injected fallback OCR failure (measurement-only)
+Document.objects.count() : 0
+self  peak    : +14.48 MiB (before 80.52 -> after 95.00, dSelf +14.47)
+child peak    : +52.37 MiB (OCR subprocess tree)
+[elapsed retry_fail_a: 3.94s]   (retry_fail_b: ConsumerError, count=0, self +13.93, child +49.43)
+```
+
+**Cause → effect.** For a text-bearing PDF, `original_has_text` is True; `skip_noarchive` returns early (`parsers.py:241`) and never launches the OCRmyPDF orchestration, so its self peak is ≈10 MiB below `skip`. When the main OCR pass produces no text, `parse()` raises `NoTextFoundException` and enters the force-OCR fallback (`parsers.py:277`): if the fallback yields text the document is created (retry SUCCESS); if the fallback itself raises, the inner handler converts it to `ParseError` (`parsers.py:307-309`) and the consume rolls back with **no partial document** (retry FAILURE). All four are steady, single-document memory profiles with no cross-document accumulation. Truly-unavailable Office/Tika remains **INF** (§9.17) — the services are genuinely absent and no mock is substituted.
+
+### 9.25 Repetition and duration ledger (P6-F9)
+
+**observed (runtime).** This ledger consolidates the two-run / single-run status of every **quantitative** magnitude/timing condition and records wall-clock timestamps and elapsed durations for the second-run confirmation set. It corrects the earlier blanket "every quantitative claim was run ≥ 2×" wording (§1 "Repetition discipline", §9 intro): most conditions are genuinely ≥ 2× with both outputs shown side by side, but **five** are single captures for the stated, non-negotiable reasons below — a placed classifier-model artifact whose exact bytes are not byte-reproducible (§9.0 model-provenance facts (1)/(3)) and/or a tracemalloc run that exists only for Python-line **attribution** (its RSS is profiler-inflated and is not itself a magnitude claim). Per P6-F9's accepted alternative, those are reported as **exactly the captured single run** and each has its decisive, *model-independent* conclusion confirmed ≥ 2× by a companion run.
+
+**Second-run confirmation set (formerly A-only → now A + B).** Re-run here on byte-stable inputs (the `simple.*` samples and the deterministic `synthetic_text` corpus); each fresh `docker exec` is an independent cold process. Commands (stdout-only capture, ANSI + `migrate` banner normalized exactly as §9):
+
+```bash
+DX drv_barcode.py on 4        # bc_on_4p_b
+DX drv_barcode.py on 16       # bc_on_16p_b
+DX drv_type_one.py ctrl1      # type_ctrl1_b
+DX drv_type_one.py ctrl2      # type_ctrl2_b
+DX drv_ocrfallback.py         # ocrfallback_b
+```
+
+| Condition | Driver + args | run `_a` (key metric) | run `_b` (this ledger) | `_b` timestamp (UTC) | `_b` elapsed | stable? |
+|-----------|---------------|-----------------------|------------------------|----------------------|--------------|---------|
+| `bc_on_4p` | `drv_barcode.py on 4` | self peak `+82.98` MiB | `+82.86` MiB | `2026-07-15T13:06:12Z` | `5.94 s` | ✓ (Δ 0.12) |
+| `bc_on_16p` | `drv_barcode.py on 16` | self peak `+254.15` MiB | `+254.33` MiB | `2026-07-15T13:06:18Z` | `7.37 s` | ✓ (Δ 0.18) |
+| `type_ctrl1` | `drv_type_one.py ctrl1` | selfdRSS `+21.84` MiB | `+22.05` MiB | `2026-07-15T13:06:26Z` | `5.48 s` | ✓ (Δ 0.21) |
+| `type_ctrl2` | `drv_type_one.py ctrl2` | selfdRSS `+22.23` MiB | `+22.61` MiB | `2026-07-15T13:06:31Z` | `5.55 s` | ✓ (Δ 0.38) |
+| `ocrfallback` | `drv_ocrfallback.py` | self `+24.99` / child `+64.87` MiB | self `+24.41` / child `+65.07` MiB | `2026-07-15T13:06:37Z` | `4.73 s` | ✓ (self Δ 0.58) |
+
+Full `_b` outputs are spliced adjacent to their `_a` blocks in §9.8 (`bc_on_4p_b`, `bc_on_16p_b`), §9.15 (`type_ctrl1_b`, `type_ctrl2_b`), and §9.16 (`ocrfallback_b`). The `ocrfallback_b` log path is identical to `_a` (pdfminer `Extracted text` → `Using text from sidecar` → `skip_text:True`), independently reconfirming that the image-only PDF is consumed via the sidecar and the `NoTextFoundException` force-OCR retry does **not** fire naturally here (the retry is exercised deliberately in §9.24).
+
+**Single-capture conditions (narrowed to captured evidence, with the ≥ 2× companion that carries the decisive claim).**
+
+| Condition | Why it is a single capture (non-reproducible / diagnostic) | Decisive claim it supports | Confirmed ≥ 2× by |
+|-----------|------------------------------------------------------------|----------------------------|--------------------|
+| `stages_present_tm` | tracemalloc **attribution diagnostic** (RSS `+265 MiB` profiler-inflated, not a magnitude); bound to the placed `model_small.pickle` (non-byte-reproducible) | *which* Python lines allocate (`classifier.py:90-92`, `index.py`) → native vs Python-heap | `stages_present_a/_b` (`load_classifier +52.02 / +52.00`) |
+| `clf_split_large` | bound to the **40 MB** artifact (sha `9799c5f9…`); `gen_model` is fixed at ~696 KB and cannot regenerate it (§9.0 fact (1)); training sets no `random_state` (fact (3)) | deserialize scales ~1:1 with pickle size (`+40.13` for 40 MB) | model-independent import floor via `clf_split_small_a/_b` (`+48.61 / +49.84`) |
+| `clf_cold_small` | bound to the **1.68 MB** artifact (sha `4751160b…`); non-regenerable as above | cold (`+51.29`) vs warm (`+1.65`) load split (import paid once) | `clf_split_small_a/_b` (same import-floor + deserialize split) |
+| `clf_coldtm_small` | tracemalloc **attribution diagnostic** (RSS `+128 MiB` profiler-inflated) **and** bound to the 1.68 MB artifact | RSS ≫ traced Python-heap → native (numpy/scipy) allocation | `clf_split_small_a/_b` |
+| `batch_present` (cold doc-0 floor) | the one model-dependent quantity (`+78.97`, includes the ~49 MiB classifier import of the placed `model_small.pickle`) is bound to a non-byte-reproducible artifact | **no cross-document accumulation** (steady increment ≈ 0, `gc.garbage == 0`, object slope ≈ 0) | `batch_absent_a/_b` (both plateau) **plus** the per-doc slope inside the `batch_present` run itself |
+
+**Scope note (`observed`/honest limitation).** The timestamps and elapsed durations above are for the second-run confirmation set captured specifically for this finding; the earlier `_a`/`_b` pairs throughout §9 were captured in prior runs **without** a per-run timestamp/duration record, and re-timing all ~40 groups would not change any reported magnitude (their two-run stability is already demonstrated by the side-by-side `_a`/`_b` values). Representative elapsed durations already appear inline elsewhere — e.g. `parse_date` ≈ `3 s` cold (§9.18), the OCR retry cases `3.9–5.4 s` (§9.24), and the email buffering cases `3.6 s` (§9.23). The mechanism, cold-vs-warm split, and directional trends are stable and reproduced; no timing claim in this report depends on a duration that was not captured. The only other single-output groups in §9 — `imp_export` (§9.14, the one-time `document_exporter` step that writes the manifest bundle consumed by the `imp_import_a/_b` runs) and `parseravail` (§9.17, a listing of which parser classes are registered) — are **non-quantitative structural probes** that assert **no** memory magnitude or timing value, so the two-run requirement does not apply to them.
+
 ## 10. Harness Source (complete, with SHA-256)
 
-The complete measurement harness is published here for reproducibility (finding #3). These scripts lived only in the container/host `/tmp/memharness` (outside the tracked repository) and are removed on completion — none is added to the source tree. To reproduce: recreate each file at `/tmp/memharness/<name>` in the container, place the **input model artifacts** described in §2 (the drivers copy one onto `settings.MODEL_FILE`), and run the commands in §9. **Safety (finding #14):** the harness generates its classifier model locally from synthetic non-PII fixtures via the product's own `DocumentClassifier.train()`/`save()`; it loads **no** external pickle. The compact `gen_model` yields a ~696 KB model; the larger placed artifacts in §2 were trained from an enriched vocabulary and are integrity-referenced by SHA-256, not regenerated (see §9.0). The REST driver creates and then **deletes** an ephemeral DRF token. All 23 files below `py_compile` cleanly on the container's Python 3.9.
+The complete measurement harness is published here for reproducibility (finding #3). These scripts lived only in the container/host `/tmp/memharness` (outside the tracked repository) and are removed on completion — none is added to the source tree. To reproduce: recreate each file at `/tmp/memharness/<name>` in the container, place the **input model artifacts** described in §2 (the drivers copy one onto `settings.MODEL_FILE`), and run the commands in §9. **Safety (finding #14):** the harness generates its classifier model locally from synthetic non-PII fixtures via the product's own `DocumentClassifier.train()`/`save()`; it loads **no** external pickle. The compact `gen_model` yields a ~696 KB model; the larger placed artifacts in §2 were trained from an enriched vocabulary and are integrity-referenced by SHA-256, not regenerated (see §9.0). The REST driver creates and then **deletes** an ephemeral DRF token. All 30 files below `py_compile` cleanly on the container's Python 3.9.
 
 #### `memlib.py` — SHA-256 `44eec6d0236a8cac304bda3ee43fbe7b9fe9d3b6c13964fd3fabb9455d8165b6` (325 lines)
 
@@ -4109,6 +4784,866 @@ for mime in ["text/plain","application/pdf","image/png","image/jpeg",
 H.teardown()
 ```
 
+#### `drv_datescale.py` — SHA-256 `bbe254647589e087a8350b7bbc8b3a3ff26a9ee65ca195e320923a119ff9acdc` (68 lines)
+
+```python
+"""
+drv_datescale.py -- P4-F6: measure the cold `import dateparser` working-set spike
+inside documents.parsers.parse_date (parsers.py:212). The import is LAZY, living
+inside the nested __parser() (parsers.py:221), so it fires ONLY when DATE_REGEX
+(parsers.py:30) matches a date-shaped substring in the filename or text. A document
+with no date-shaped text never imports dateparser and pays ~0; a document whose text
+contains date-shaped tokens pays a fixed, document-independent cold cost.
+
+Each invocation is a FRESH interpreter (cold): running the same case twice via two
+`docker exec` calls yields two independent cold runs. `warm` loops within one process
+to show only the first call pays the import.
+
+Usage: drv_datescale.py <case> [tm]
+  case in: nodate | validmy | invalid | warm      tm => tracemalloc python-heap attribution
+"""
+import sys, os, time
+sys.path.insert(0, "/tmp/memharness")
+import memlib as M
+import hbootstrap as H
+
+# All three payloads are the SAME length class (deterministic, non-PII). Only the
+# presence/shape of a DATE_REGEX-matching token differs between them.
+CASES = {
+    "nodate":  "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima " * 6,
+    "validmy": "invoice summary account January 2020 balance report vendor payment total " * 4,
+    "invalid": "reference ledger entry 99/99/9999 vendor amount total subtotal shipping " * 4,
+}
+
+
+def run_once(label, text, tm=False):
+    from documents.parsers import parse_date
+    pre = "dateparser" in sys.modules
+    s0 = None
+    if tm:
+        M.tm_start(25)
+        s0 = M.tm_snapshot()
+    b_cur, _ = M.mem()
+    t0 = time.perf_counter()
+    with M.PeakSampler(interval=0.003) as ps:
+        result = parse_date("", text)
+    elapsed = time.perf_counter() - t0
+    a_cur, _ = M.mem()
+    post = "dateparser" in sys.modules
+    tmline = ""
+    if tm:
+        heap = M.tm_diff_total(s0, M.tm_snapshot())
+        tmline = f"  py_heap=+{heap:.1f} KiB (profiler-inflated RSS)"
+    print(f"[{label}] dateparser_imported before={pre} after={post}")
+    print(f"[{label}] parse_date result = {result!r}")
+    print(f"[{label}] dRSS=+{a_cur-b_cur:.2f} MiB  stage_peak=+{ps.peak_rss-b_cur:.2f} MiB  elapsed={elapsed:.4f}s{tmline}")
+
+
+case = sys.argv[1] if len(sys.argv) > 1 else "invalid"
+TM = len(sys.argv) > 2 and sys.argv[2] == "tm"
+H.setup()
+M.banner(f"PARSE_DATE COLD SPIKE  case={case}  tm={'ON' if TM else 'OFF'}  pid={os.getpid()}")
+print(f"dateparser preloaded after Django setup: {'dateparser' in sys.modules}")
+
+if case == "warm":
+    text = CASES["invalid"]
+    print("WARM same-process loop (3 iterations, identical invalid-date-shaped text):")
+    for i in range(3):
+        run_once(f"warm#{i}", text, tm=False)
+else:
+    run_once(case, CASES[case], tm=TM)
+
+M.banner("DONE")
+H.teardown()
+```
+
+#### `drv_latewrite.py` — SHA-256 `2eed90671390faf540aaaf9fa778306cfefe5af8e10654cbf5f2ac8fda49413a` (98 lines)
+
+```python
+"""
+drv_latewrite.py -- P4-F2: observe the transactional inconsistency when a LATE
+Consumer._write() fails inside the atomic block. Sequence (consumer.py):
+  L298 with transaction.atomic():
+  L301   _store()                      -> Document row (rolled back on failure)
+  L306   document_consumption_finished.send(...)  -> handlers.py:431 add_to_index
+                                        -> index.py:118 add_or_update_document ->
+                                           AsyncWriter.commit()  (Whoosh, NON-transactional)
+  L319   _write(original)              write #1
+  L321   _write(thumbnail)             write #2
+  L333   _write(archive)              write #3 (PDF only)
+If _write raises, transaction.atomic() rolls the Document row back, but the Whoosh
+commit already happened and any earlier _write files are on disk -> orphans.
+We inject a failure at the Nth _write call and then count: DB rows, Whoosh docs,
+and orphan files in ORIGINALS/THUMBNAIL/ARCHIVE.
+
+REMEDIATION IS OUT OF SCOPE (AAP 0.5.2: read-only diagnosis; no source change).
+
+Usage: drv_latewrite.py <case>   case in: control | text2 | pdf3
+"""
+import sys, os
+sys.path.insert(0, "/tmp/memharness"); sys.path.insert(0, "/app/src")
+import memlib as M
+import hbootstrap as H
+H.setup()
+from django.conf import settings
+from documents.models import Document
+from documents.consumer import Consumer
+from documents import index
+
+case = sys.argv[1] if len(sys.argv) > 1 else "text2"
+FAIL_AT = {"control": 0, "text2": 2, "pdf3": 3}[case]
+
+def count_files(d):
+    n = 0
+    for dp, dn, fn in os.walk(d):
+        n += len(fn)
+    return n
+
+def whoosh_count():
+    ix = index.open_index()
+    with ix.searcher() as s:
+        return s.doc_count_all()
+
+# --- inject a failure at the Nth _write call ---
+_orig_write = Consumer._write
+_state = {"n": 0}
+def _failing_write(self, storage_type, source, target):
+    _state["n"] += 1
+    if FAIL_AT and _state["n"] == FAIL_AT:
+        raise OSError(f"INJECTED _write failure at call #{_state['n']} "
+                      f"(target basename={os.path.basename(target)})")
+    return _orig_write(self, storage_type, source, target)
+Consumer._write = _failing_write
+
+print(M.banner(f"LATE _write FAILURE  case={case}  fail_at_write=#{FAIL_AT or 'none'}  pid={os.getpid()}"))
+
+# choose input
+if case == "pdf3":
+    src = H.sample_copy("simple.pdf")
+    label = "simple.pdf (has archive -> 3 writes)"
+else:
+    src = os.path.join(settings.SCRATCH_DIR, "lw.txt")
+    open(src, "w").write("late write probe body " + ("alpha beta gamma delta " * 40))
+    label = "text (.txt -> 2 writes: original+thumbnail, no archive)"
+
+print(f"input: {label}")
+print(f"pre-consume  : DB={Document.objects.count()}  whoosh={whoosh_count()}  "
+      f"orig={count_files(settings.ORIGINALS_DIR)} thumb={count_files(settings.THUMBNAIL_DIR)} "
+      f"arch={count_files(settings.ARCHIVE_DIR)}")
+
+err = None
+try:
+    H.consume(src)
+    outcome = "consume returned normally (no failure injected)"
+except Exception as e:
+    err = f"{type(e).__name__}: {str(e)[:140]}"
+    outcome = "consume RAISED (as injected)"
+
+print(f"outcome      : {outcome}")
+if err:
+    print(f"exception    : {err}")
+print(f"_write calls actually made: {_state['n']}")
+print(f"post-consume : DB={Document.objects.count()}  whoosh={whoosh_count()}  "
+      f"orig={count_files(settings.ORIGINALS_DIR)} thumb={count_files(settings.THUMBNAIL_DIR)} "
+      f"arch={count_files(settings.ARCHIVE_DIR)}")
+
+db = Document.objects.count()
+wh = whoosh_count()
+orphans = count_files(settings.ORIGINALS_DIR) + count_files(settings.THUMBNAIL_DIR) + count_files(settings.ARCHIVE_DIR)
+if FAIL_AT:
+    print(f"VERDICT      : DB rolled back to {db}; Whoosh retained {wh} entr(y/ies); "
+          f"{orphans} orphan file(s) on disk  => inconsistency {'CONFIRMED' if (db==0 and (wh>0 or orphans>0)) else 'not observed'}")
+else:
+    print(f"VERDICT      : success baseline DB={db} whoosh={wh} files_present={orphans}")
+
+M.banner("DONE")
+H.teardown()
+```
+
+#### `drv_restfail.py` — SHA-256 `801b6a74794b7dc445f93ac12de3faef7e8b682c1cfacea1bdca5779a826637f` (131 lines)
+
+```python
+"""
+drv_restfail.py -- P4-F5 (REST): observe REST upload failure paths through a REAL
+gunicorn worker hit with curl. PostDocumentView.post (views.py:499):
+  L500 serializer.is_valid()               (validates MIME only, serialisers.py:451-454)
+  L512 NamedTemporaryFile(prefix=paperless-upload-, dir=SCRATCH_DIR, delete=False)
+  L517 f.write(doc_data)                    scratch written to disk BEFORE enqueue
+  L523 async_task(consume_file, temp)       enqueue to django-q/Redis
+  L535 return Response("OK")
+
+Two failure modes:
+  brokerdown : broker unreachable -> async_task (L523) raises AFTER the scratch file
+               (delete=False, L512-517) is already on disk -> HTTP 500 + orphan scratch.
+  corruptpdf : a %PDF-garbage file passes the MIME allow-list (magic sniffs %PDF) so the
+               endpoint returns 200 "OK", writes scratch, enqueues -- but the canonical
+               worker (consume_file -> pikepdf) fails later; the scratch input is NOT
+               unlinked on failure (consumer.py unlink only on success) -> retained.
+
+REMEDIATION IS OUT OF SCOPE (AAP 0.5.2: read-only diagnosis; no source change).
+
+Usage: drv_restfail.py <case>   case in: brokerdown | corruptpdf
+"""
+import sys, os, time, subprocess, signal, shutil, glob, urllib.request, urllib.error
+sys.path.insert(0, "/tmp/memharness"); sys.path.insert(0, "/app/src")
+import memlib as M
+case = sys.argv[1] if len(sys.argv) > 1 else "brokerdown"
+PORT = int(os.environ.get("MEMH_PORT", "8024"))
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import django; django.setup()
+from django.conf import settings
+from django.core.management import call_command
+for d in [settings.DATA_DIR, settings.MEDIA_ROOT, settings.ORIGINALS_DIR, settings.ARCHIVE_DIR,
+          settings.THUMBNAIL_DIR, settings.INDEX_DIR, settings.SCRATCH_DIR, settings.CONSUMPTION_DIR]:
+    os.makedirs(d, exist_ok=True)
+call_command("migrate", run_syncdb=True, verbosity=0, interactive=False)
+from django.contrib.auth.models import User
+from rest_framework.authtoken.models import Token
+from documents.models import Document
+
+def upload_scratch():
+    return sorted(glob.glob(os.path.join(settings.SCRATCH_DIR, "paperless-upload-*")))
+
+print(M.banner(f"REST UPLOAD FAILURE  case={case}  pid={os.getpid()}"))
+
+u, _ = User.objects.get_or_create(username="memh_rf", defaults={"is_superuser": True, "is_staff": True})
+u.is_superuser = True; u.is_staff = True; u.save()
+Token.objects.filter(user=u).delete()
+tok = Token.objects.create(user=u).key
+print(f"ephemeral DRF Token created (len={len(tok)}, deleted at end)")
+
+genv = dict(os.environ)
+genv["PAPERLESS_WEBSERVER_WORKERS"] = "1"
+genv["PAPERLESS_PORT"] = str(PORT)
+if case == "brokerdown":
+    genv["PAPERLESS_REDIS"] = "redis://127.0.0.1:6399"   # nothing listening -> async_task fails
+    print("gunicorn PAPERLESS_REDIS = redis://127.0.0.1:6399  (DEAD broker; async_task will fail)")
+else:
+    print(f"gunicorn PAPERLESS_REDIS = {genv.get('PAPERLESS_REDIS')}  (live broker)")
+
+gproc = subprocess.Popen(
+    ["gunicorn", "-c", "/app/gunicorn.conf.py", "paperless.asgi:application"],
+    cwd="/app/src", env=genv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+base = f"http://127.0.0.1:{PORT}"
+print(f"gunicorn master pid={gproc.pid} bind=127.0.0.1:{PORT} workers=1")
+
+def _ready():
+    try:
+        req = urllib.request.Request(base + "/api/", headers={"Authorization": f"Token {tok}"})
+        urllib.request.urlopen(req, timeout=2); return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+t0 = time.time()
+while time.time() - t0 < 40 and not _ready():
+    time.sleep(0.5)
+print(f"server ready after {time.time()-t0:.1f}s  (HTTP layer up regardless of broker)")
+
+# build payload
+if case == "corruptpdf":
+    payload = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF corrupted-not-a-real-pdf\n"
+    fname = "corrupt.pdf"
+else:
+    payload = b"broker down probe body text\n"
+    fname = "brokerdown.txt"
+up = os.path.join(settings.SCRATCH_DIR, fname)
+open(up, "wb").write(payload)
+print(f"upload file: {fname}  ({len(payload)} bytes)")
+
+before = upload_scratch()
+cmd = ["curl", "-s", "-w", "\nHTTP_CODE=%{http_code}", "-H", f"Authorization: Token {tok}",
+       "-F", f"document=@{up};filename={fname}", base + "/api/documents/post_document/"]
+out = subprocess.run(cmd, capture_output=True, text=True).stdout
+time.sleep(0.6)
+after = upload_scratch()
+new = [f for f in after if f not in before]
+
+body = out.split("\nHTTP_CODE=")[0]
+code = out.split("\nHTTP_CODE=")[-1].strip()
+print("")
+print(f"POST /api/documents/post_document/  ->  HTTP {code}")
+print(f"response body: {body!r}")
+print(f"documents in DB after POST: {Document.objects.count()}")
+print(f"orphan paperless-upload-* scratch files retained: {len(new)}")
+for f in new:
+    print(f"   {os.path.basename(f)}  ({os.path.getsize(f)} bytes)")
+
+# for corruptpdf: run the CANONICAL worker step on the retained scratch to show it fails later
+if case == "corruptpdf" and new:
+    print("")
+    print("canonical worker step: consume_file(<retained scratch copy>)  [what django-q worker runs]")
+    from documents.tasks import consume_file
+    work = os.path.join(settings.SCRATCH_DIR, "worker_" + os.path.basename(new[0]) + ".pdf")
+    shutil.copy(new[0], work)
+    werr = None
+    try:
+        consume_file(work)
+    except Exception as e:
+        werr = f"{type(e).__name__}: {str(e)[:160]}"
+    print(f"  worker outcome: {werr or 'returned normally'}")
+    print(f"  worker input retained on failure? {os.path.isfile(work)}  (consumer unlinks only on success)")
+    print(f"  documents in DB after worker: {Document.objects.count()}")
+
+gproc.send_signal(signal.SIGTERM)
+try: gproc.wait(timeout=15)
+except subprocess.TimeoutExpired: gproc.kill()
+Token.objects.filter(user=u).delete()
+print("")
+print("ephemeral token DELETED; gunicorn stopped")
+M.banner("DONE")
+```
+
+#### `drv_alpha.py` — SHA-256 `6ccfc92c05af0888fc7908442a04524767b554be5bb9e4df94436325891e4e15` (81 lines)
+
+```python
+"""
+drv_alpha.py -- P5-F7: an alpha-channel PNG is MUTATED IN PLACE during parse, so the
+stored/downloadable "original" differs from the bytes the user submitted, and a
+re-submission of the same original raises a RAW DB UNIQUE-constraint error instead of
+being rejected gracefully.
+
+Mechanism (canonical consume path documents.tasks.consume_file -> Consumer.try_consume_file):
+  consumer.py:104  pre_check_duplicate -> md5(self.path)          # md5 of the ORIGINAL bytes
+  consumer.py:261  document_parser.parse(self.path, ...)          # OCR parser
+    paperless_tesseract/parsers.py:191 has_alpha -> True
+    :197-201  Image.open(input_file) ... background.save(input_file, ...)  # OVERWRITES original in place
+  consumer.py:397-402  _store md5(self.path)                      # md5 of the FLATTENED bytes -> stored checksum
+  consumer.py:429-432  _write(self.path -> source_path)           # stored "original" is the FLATTENED file
+
+Effect 1 (integrity): stored original (== what GET .../download/?original=true serves) != submitted bytes.
+Effect 2 (duplicate): re-submitting the same alpha PNG is NOT caught by pre_check_duplicate
+  (md5(alpha) != stored md5(flattened)); it re-flattens and _store hits the DB UNIQUE
+  constraint on documents_document.checksum -> raw IntegrityError surfaced as ConsumerError.
+
+REMEDIATION IS OUT OF SCOPE (AAP 0.5.2: read-only diagnosis; no source change).
+
+Usage: drv_alpha.py
+"""
+import sys, os, hashlib, shutil
+sys.path.insert(0, "/tmp/memharness"); sys.path.insert(0, "/app/src")
+import memlib as M
+import hbootstrap as H
+H.setup()
+from django.conf import settings
+from documents.models import Document
+from PIL import Image
+
+def sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+SAMPLE = "/app/src/documents/tests/samples/simple.png"
+im = Image.open(SAMPLE)
+print(M.banner(f"ALPHA-PNG IN-PLACE MUTATION + NORMALIZED-DUPLICATE  pid={os.getpid()}"))
+print(f"submitted original: simple.png  mode={im.mode}  size={im.size}  "
+      f"bytes={os.path.getsize(SAMPLE)}  sha256={sha(SAMPLE)[:16]}...")
+up_bytes = os.path.getsize(SAMPLE); up_sha = sha(SAMPLE)
+
+# ---- consume #1: succeeds; stored original is the FLATTENED file ----
+work1 = H.working_copy(SAMPLE)
+r1 = None; e1 = None
+try:
+    r1 = H.consume(work1)
+except Exception as e:
+    e1 = f"{type(e).__name__}: {str(e)[:160]}"
+print(f"\nconsume #1 outcome: {e1 or 'success'}")
+print(f"documents in DB: {Document.objects.count()}")
+if Document.objects.count():
+    doc = Document.objects.latest("id")
+    sp = doc.source_path
+    st_bytes = os.path.getsize(sp); st_sha = sha(sp)
+    st_im = Image.open(sp)
+    print(f"stored original (source_path, == ?original=true download):")
+    print(f"   mode={st_im.mode}  size={st_im.size}  bytes={st_bytes}  sha256={st_sha[:16]}...")
+    print(f"   stored checksum (DB) = {doc.checksum}")
+    print(f"VERDICT (integrity): submitted vs stored  bytes {up_bytes} -> {st_bytes}  "
+          f"({up_bytes-st_bytes:+d})   sha256 differ={up_sha != st_sha}  "
+          f"mode {im.mode} -> {st_im.mode}  => stored 'original' != submitted "
+          f"{'CONFIRMED' if up_sha != st_sha else 'not observed'}")
+
+# ---- consume #2: SAME alpha original again -> normalized duplicate raises raw UNIQUE ----
+work2 = H.working_copy(SAMPLE)
+r2 = None; e2 = None
+try:
+    r2 = H.consume(work2)
+except Exception as e:
+    e2 = f"{type(e).__name__}: {str(e)[:200]}"
+print(f"\nconsume #2 (same alpha original) outcome: {e2 or ('success -> ' + str(r2))}")
+print(f"documents in DB after #2: {Document.objects.count()}")
+is_unique = bool(e2 and "UNIQUE constraint failed" in e2)
+is_graceful_dup = bool(e2 and "duplicate" in e2.lower())
+print(f"VERDICT (duplicate): raw 'UNIQUE constraint failed' surfaced={is_unique}  "
+      f"graceful-duplicate-message={is_graceful_dup}  "
+      f"=> {'RAW DB ERROR (not graceful) CONFIRMED' if is_unique else 'not observed'}")
+
+M.banner("DONE")
+H.teardown()
+```
+
+#### `drv_importfail.py` — SHA-256 `3844f9d3ec2bafed916108220ac64d10d7e3d788c6bdce8576c622fe999d04bc` (122 lines)
+
+```python
+"""
+drv_importfail.py -- P4-F3 (importer atomicity) & P4-F4 (importer path-safety),
+driven through the REAL document_exporter / document_importer management commands.
+
+P4-F3: _check_manifest (document_importer.py:101-128) validates the ORIGINAL
+(EXPORTER_FILE_NAME, :114-115) and ARCHIVE (EXPORTER_ARCHIVE_NAME, :121-123) exist,
+but NOT the THUMBNAIL (EXPORTER_THUMBNAIL_NAME). handle() (:57) runs
+call_command("loaddata") (:87) -- which COMMITS all Document rows -- and only THEN
+copies files (:89) with NO wrapping transaction; _import_files_from_manifest copies
+the original (:165) BEFORE the thumbnail (:166). So a bundle missing its thumbnail
+passes validation, the rows are committed, the original is copied, and then :166
+raises FileNotFoundError -> partial DB+file state (rows present, original present,
+thumbnail missing, command aborted).
+
+P4-F4: doc paths are built with os.path.join(self.source, doc_file) (:115,:146) with
+no containment check, so a manifest whose __exported_file_name__ is "../escape.txt"
+(or an absolute path) resolves OUTSIDE the bundle and os.path.exists passes; shutil.copy2
+(:165) then imports those outside bytes. shutil.copy2 also FOLLOWS symlinks, so an
+in-bundle symlink pointing outside imports the link target's bytes.
+
+REMEDIATION IS OUT OF SCOPE (AAP 0.5.2: read-only diagnosis; no source change).
+
+Usage: drv_importfail.py <case>   case in: missing_thumbnail | traversal | symlink
+"""
+import sys, os, json, shutil, hashlib
+sys.path.insert(0, "/tmp/memharness"); sys.path.insert(0, "/app/src")
+import memlib as M
+import hbootstrap as H
+H.setup()
+from django.conf import settings
+from django.core.management import call_command
+from documents.models import Document
+
+case = sys.argv[1] if len(sys.argv) > 1 else "missing_thumbnail"
+SECRET = f"OUTSIDE_BUNDLE_SECRET_pid{os.getpid()}_DO_NOT_IMPORT\n"
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
+
+print(M.banner(f"IMPORTER FAILURE/PATH-SAFETY  case={case}  pid={os.getpid()}"))
+
+# --- produce a REAL export bundle from a consumed text doc (original+thumbnail, no archive) ---
+src = os.path.join(settings.SCRATCH_DIR, "imp.txt")
+open(src, "w").write("importer probe body " + ("alpha beta gamma delta " * 30))
+H.consume(src)
+doc = Document.objects.latest("id")
+print(f"consumed doc pk={doc.pk}; DB docs={Document.objects.count()}")
+
+bundle = os.path.join("/tmp/memharness", f"bundle_{os.getpid()}")
+shutil.rmtree(bundle, ignore_errors=True); os.makedirs(bundle, exist_ok=True)
+call_command("document_exporter", bundle, "--no-progress-bar")
+manifest_path = os.path.join(bundle, "manifest.json")
+manifest = json.load(open(manifest_path))
+rec = next(r for r in manifest if r["model"] == "documents.document")
+orig_name = rec["__exported_file_name__"]
+thumb_name = rec["__exported_thumbnail_name__"]
+print(f"exported bundle: original={orig_name!r} thumbnail={thumb_name!r}  "
+      f"orig_sha={sha(os.path.join(bundle, orig_name))}")
+
+# --- reset target to a fresh/empty install (import expects to fill an empty DB) ---
+Document.objects.all().delete()
+for d in [settings.ORIGINALS_DIR, settings.THUMBNAIL_DIR, settings.ARCHIVE_DIR]:
+    shutil.rmtree(d, ignore_errors=True); os.makedirs(d, exist_ok=True)
+print(f"target reset: DB docs={Document.objects.count()}  originals={len(os.listdir(settings.ORIGINALS_DIR))}")
+
+# --- tamper the bundle per case ---
+if case == "missing_thumbnail":
+    tp = os.path.join(bundle, thumb_name)
+    os.remove(tp)
+    print(f"tamper: deleted thumbnail {thumb_name!r} from bundle (manifest still references it)")
+elif case == "traversal":
+    outside = os.path.abspath(os.path.join(bundle, "..", f"escape_{os.getpid()}.txt"))
+    open(outside, "w").write(SECRET)
+    rec["__exported_file_name__"] = os.path.join("..", os.path.basename(outside))
+    json.dump(manifest, open(manifest_path, "w"))
+    print(f"tamper: manifest __exported_file_name__ -> {rec['__exported_file_name__']!r}; "
+          f"outside file at {outside} (sha={sha(outside)}) contains SECRET")
+elif case == "symlink":
+    outside = os.path.abspath(os.path.join(bundle, "..", f"escape_{os.getpid()}.txt"))
+    open(outside, "w").write(SECRET)
+    op = os.path.join(bundle, orig_name)
+    os.remove(op); os.symlink(outside, op)
+    print(f"tamper: replaced bundle original {orig_name!r} with a symlink -> {outside} "
+          f"(link points outside the bundle; content sha={sha(outside)})")
+
+# --- run the REAL importer ---
+err = None
+try:
+    call_command("document_importer", bundle, "--no-progress-bar")
+except Exception as e:
+    err = f"{type(e).__name__}: {str(e)[:180]}"
+
+db = Document.objects.count()
+n_orig = len(os.listdir(settings.ORIGINALS_DIR)) if os.path.isdir(settings.ORIGINALS_DIR) else 0
+n_thumb = len(os.listdir(settings.THUMBNAIL_DIR)) if os.path.isdir(settings.THUMBNAIL_DIR) else 0
+print("")
+print(f"import outcome: {err or 'completed normally'}")
+print(f"post-import   : DB docs={db}  originals_on_disk={n_orig}  thumbnails_on_disk={n_thumb}")
+
+if case == "missing_thumbnail":
+    print(f"VERDICT (P4-F3): rows committed by loaddata ({db}) + original copied ({n_orig}) but "
+          f"thumbnail missing ({n_thumb}) and import aborted "
+          f"=> PARTIAL DB+FILE STATE {'CONFIRMED' if (db>=1 and n_orig>=1 and err) else 'not observed'}")
+else:
+    imported = ""
+    if db >= 1:
+        d2 = Document.objects.latest("id")
+        sp = d2.source_path
+        if os.path.isfile(sp):
+            imported = open(sp, "rb").read().decode("utf-8", "replace")
+    got_secret = SECRET.strip() in imported
+    print(f"stored original starts with: {imported[:52]!r}")
+    print(f"VERDICT (P4-F4 {case}): outside-bundle SECRET imported into storage={got_secret} "
+          f"=> path escape {'CONFIRMED' if got_secret else 'not observed'}")
+
+shutil.rmtree(bundle, ignore_errors=True)
+try:
+    os.remove(os.path.abspath(os.path.join(bundle, "..", f"escape_{os.getpid()}.txt")))
+except OSError:
+    pass
+M.banner("DONE")
+H.teardown()
+```
+
+#### `drv_mailbuf.py` — SHA-256 `46fef3866aa40737996094adccd3d6e9020c48f5fd46f1ce84eb52b10e36d3f1` (174 lines)
+
+```python
+#!/usr/bin/env python3
+"""
+drv_mailbuf.py -- P4-F5 (email failure-path scratch accumulation) & P5-F8 (email
+payload-buffering label upgrade INF -> observed).
+
+Drives the REAL paperless_mail.mail.MailAccountHandler.handle_mail_account against a
+REAL MailAccount + MailRule (isolated migrated DB) and a REAL imap_tools.MailMessage
+built from raw RFC822 bytes. ONLY the IMAP transport (get_mailbox -> login/folder/fetch)
+is substituted by an in-memory fake mailbox, because no IMAP server is reachable offline;
+that substitution is labelled OBS(nc) (non-canonical transport). Everything downstream is
+the product's REAL code: att.payload buffering [mail.py:317], the paperless-mail-* mkstemp
+scratch write [mail.py:322-327] (delete=False), the consume_file enqueue [mail.py:336],
+and handle_mail_rule's swallow-and-continue per-message error handling [mail.py:262-270].
+
+Cases:
+  buffer     : broker UP -> observe the FULL attachment payload buffered in memory, the
+               paperless-mail-* scratch file written with bytes identical to att.payload,
+               and the consume_file task enqueued (queue_size 0->1); then purge the queue.
+               MEMH_MAILPAD (MiB) pads the attachment to show buffering is proportional.
+  brokerdown : broker DOWN (PAPERLESS_REDIS -> dead port) -> two polls of the SAME message;
+               observe paperless-mail-* scratch accumulating 0->1->2, no Document created,
+               and handle_mail_account returning normally (command-level exit 0 -- the
+               enqueue failure is swallowed by handle_mail_rule).
+
+Usage: drv_mailbuf.py <buffer|brokerdown>
+"""
+import sys, os, glob, hashlib
+
+sys.path.insert(0, "/tmp/memharness")
+sys.path.insert(0, "/app/src")
+
+case = sys.argv[1] if len(sys.argv) > 1 else "buffer"
+pad_mib = int(os.environ.get("MEMH_MAILPAD", "0"))
+
+# Control broker reachability BEFORE settings/Q_CLUSTER is imported.
+if case == "brokerdown":
+    os.environ["PAPERLESS_REDIS"] = "redis://127.0.0.1:6399"  # dead port
+
+import memlib as M
+import hbootstrap as H
+H.setup()
+
+from django.conf import settings
+import paperless_mail.mail as mailmod
+from paperless_mail.mail import MailAccountHandler
+from paperless_mail.models import MailAccount, MailRule
+from documents.models import Document
+from imap_tools import MailMessage
+from django_q.brokers import get_broker
+import email.message
+import magic
+
+
+def scratch_mail_count():
+    return len(glob.glob(os.path.join(settings.SCRATCH_DIR, "paperless-mail-*")))
+
+
+def build_message(payload: bytes, filename: str):
+    m = email.message.EmailMessage()
+    m["Subject"] = "probe-subject"
+    m["From"] = "sender@example.com"
+    m["To"] = "rx@example.com"
+    m["Message-ID"] = "<probe-mailbuf@example.com>"
+    m.set_content("probe body text")
+    m.add_attachment(payload, maintype="application", subtype="octet-stream",
+                     filename=filename)
+    return MailMessage.from_bytes(m.as_bytes())
+
+
+# --- fake IMAP transport: the ONLY substitution (OBS(nc)) ---
+class _FakeFolder:
+    def set(self, name):
+        pass
+
+    def list(self):
+        return []
+
+
+class _FakeMailbox:
+    def __init__(self, msgs):
+        self._msgs = list(msgs)
+        self.folder = _FakeFolder()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def login(self, u, p):
+        return self
+
+    def fetch(self, *a, **k):
+        return list(self._msgs)
+
+    def flag(self, *a, **k):
+        pass
+
+    def move(self, *a, **k):
+        pass
+
+    def delete(self, *a, **k):
+        pass
+
+
+print(M.banner(f"EMAIL BUFFER/FAILURE PROBE  case={case}  pid={os.getpid()}  pad={pad_mib} MiB"))
+print("OBS(nc): IMAP transport substituted (no offline IMAP server); handle_mail_account/"
+      "handle_mail_rule/handle_message + att.payload buffering + mkstemp scratch + async_task"
+      " enqueue are the product's REAL code")
+
+# real MailAccount + MailRule rows (all product defaults except maximum_age=0)
+acct = MailAccount.objects.create(
+    name="probe-acct", imap_server="imap.invalid", imap_port=993,
+    imap_security=MailAccount.ImapSecurity.NONE, username="u", password="p",
+    character_set="UTF-8",
+)
+rule = MailRule.objects.create(name="probe-rule", account=acct, order=0,
+                               folder="INBOX", maximum_age=0)
+
+# build a REAL MailMessage: canonical simple.txt bytes + optional synthetic pad
+base = open(os.path.join(H.SAMPLES, "simple.txt"), "rb").read()
+payload = base + (b"X" * (pad_mib * 1024 * 1024))
+
+r0 = M.rss_mib()
+msg = build_message(payload, "probe-attach.txt")
+att = list(msg.attachments)[0]
+_ = att.payload  # force materialization of the buffered bytes
+r1 = M.rss_mib()
+print(f"attachment: filename={att.filename!r} content_disposition={att.content_disposition!r} "
+      f"payload_len={len(att.payload)} bytes  mime={magic.from_buffer(att.payload, mime=True)!r}")
+print(f"payload buffering (build MailMessage + hold att.payload) [mail.py:317]: "
+      f"RSS {r0:.2f} -> {r1:.2f} MiB (dSelf {r1 - r0:+.2f}) for {len(att.payload)} bytes held in memory")
+
+# substitute ONLY the IMAP transport
+mailmod.get_mailbox = lambda server, port, security: _FakeMailbox([msg])
+handler = MailAccountHandler()
+
+if case == "buffer":
+    sc0 = scratch_mail_count()
+    n = handler.handle_mail_account(acct)  # FULL real path
+    sc1 = scratch_mail_count()
+    print(f"handle_mail_account processed_files = {n}  "
+          f"(consume_file enqueue at mail.py:336 completed without error against the")
+    print(f"                                       LIVE broker; contrast the brokerdown case, "
+          f"where the same async_task RAISES)")
+    print(f"scratch paperless-mail-* : before={sc0} after={sc1}  "
+          f"(mkstemp+write [mail.py:322-327], delete=False)")
+    files = glob.glob(os.path.join(settings.SCRATCH_DIR, "paperless-mail-*"))
+    if files:
+        disk = open(files[0], "rb").read()
+        print(f"scratch bytes vs att.payload : disk_sha={hashlib.sha256(disk).hexdigest()[:16]} "
+              f"payload_sha={hashlib.sha256(att.payload).hexdigest()[:16]} "
+              f"identical={disk == att.payload}  (f.write(att.payload) wrote the FULL payload)")
+    print(f"Document.objects.count() : {Document.objects.count()}  "
+          f"(mail path only ENQUEUES; a recycle=1 worker consumes + deletes the scratch later)")
+    try:
+        print(f"cleanup: purged broker queue -> {get_broker().purge_queue()}")
+    except Exception as e:
+        print(f"cleanup purge err: {e}")
+
+elif case == "brokerdown":
+    print(f"PAPERLESS_REDIS = {os.environ.get('PAPERLESS_REDIS')}  (dead port; broker unreachable)")
+    counts = [scratch_mail_count()]
+    for poll in (1, 2):
+        n = handler.handle_mail_account(acct)  # async_task raises -> swallowed in handle_mail_rule
+        counts.append(scratch_mail_count())
+        print(f"poll {poll}: handle_mail_account returned {n} "
+              f"(exit-0-equivalent; enqueue error logged+swallowed) "
+              f"-> paperless-mail-* count now {counts[-1]}")
+    print(f"scratch progression      : {counts[0]} -> {counts[1]} -> {counts[2]}  (0->1->2 accumulation)")
+    print(f"Document.objects.count() : {Document.objects.count()}  (no document created, no queued task)")
+
+print("===== DONE =====")
+H.teardown()
+```
+
+#### `drv_ocrretry.py` — SHA-256 `99ee71370bf5d82d8f5a0431bc04e0e210a70e873b78aca4135f41b40119524f` (151 lines)
+
+```python
+#!/usr/bin/env python3
+"""
+drv_ocrretry.py -- P5-F8 OCR branch label upgrades. Exercises three OCR branches in
+paperless_tesseract/parsers.py that the report previously left INF/inferred:
+
+  skip / skip_noarchive  (GENUINE, no injection -> observed): a text-bearing PDF (real
+      embedded text layer via reportlab, so original_has_text=True [parsers.py:236]).
+      Under OCR_MODE=skip the parser still runs OCRmyPDF and writes an archive
+      (has_archive=True). Under OCR_MODE=skip_noarchive the meaningful early-return fires
+      [parsers.py:241-244] -> self.text=text_original, NO OCRmyPDF, NO archive
+      (has_archive=False) and a materially lower self peak.
+
+  retry_ok  (retry SUCCESS): the NoTextFoundException -> force-OCR fallback branch
+      [parsers.py:277-305]. The trigger (main OCR pass yielding no text) is INJECTED by a
+      measurement-only wrapper on RasterisedDocumentParser.extract_text (NOT a source
+      change; identical technique to drv_latewrite's _write wrapper): the first post-OCR
+      sidecar read returns "" so parse() raises NoTextFoundException, then the real
+      force-OCR fallback runs and yields text -> document IS created.
+
+  retry_fail  (retry FAILURE, injected x2): same injected NoTextFound trigger, and the
+      fallback ocrmypdf.ocr is wrapped to raise on its 2nd (fallback) invocation, so the
+      inner `except Exception -> raise ParseError` [parsers.py:307-309] fires -> consume
+      rolls back cleanly, NO document.
+
+Only the *trigger* is injected; the branch code executed is the product's own. Usage:
+  drv_ocrretry.py <skip|skip_noarchive|retry_ok|retry_fail>
+"""
+import sys, os, logging
+sys.path.insert(0, "/tmp/memharness")
+sys.path.insert(0, "/app/src")
+import memlib as M
+import hbootstrap as H
+H.setup()
+from django.conf import settings
+
+case = sys.argv[1] if len(sys.argv) > 1 else "skip"
+
+# capture the paperless parser log so the retry branch is directly visible
+h = logging.StreamHandler(sys.stdout)
+h.setLevel(logging.DEBUG)
+logging.getLogger("paperless").addHandler(h)
+logging.getLogger("paperless").setLevel(logging.DEBUG)
+
+FIXED_TEXT = (
+    "This is a text-bearing PDF used to exercise the skip_noarchive early-return "
+    "branch. It contains a genuine embedded text layer produced by reportlab so that "
+    "the tesseract parser's pdfminer extract_text yields more than fifty characters "
+    "and original_has_text evaluates True. Invoice total amount balance vendor receipt "
+    "statement ledger fiscal quarter summary account payment shipping subtotal."
+)
+
+
+def make_text_pdf(path):
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    c = canvas.Canvas(path, pagesize=letter)
+    t = c.beginText(40, 750)
+    words = FIXED_TEXT.split()
+    row = []
+    for w in words:
+        row.append(w)
+        if len(row) >= 10:
+            t.textLine(" ".join(row)); row = []
+    if row:
+        t.textLine(" ".join(row))
+    c.drawText(t)
+    c.showPage()
+    c.save()
+    return path
+
+
+def make_image_only_pdf(path):
+    import img2pdf
+    with open(path, "wb") as f:
+        f.write(img2pdf.convert("/app/src/documents/tests/samples/simple.png"))
+    return path
+
+
+# ---- injection for the retry branches (measurement-only wrappers) ----
+import paperless_tesseract.parsers as PP
+_orig_extract = PP.RasterisedDocumentParser.extract_text
+_sidecar_calls = {"n": 0}
+
+
+def _extract_force_notext(self, sidecar_file, pdf_file):
+    # sidecar_file is None only for the pre-OCR text_original read [parsers.py:234] -> keep real
+    if sidecar_file is None:
+        return _orig_extract(self, sidecar_file, pdf_file)
+    _sidecar_calls["n"] += 1
+    if _sidecar_calls["n"] == 1:
+        return ""  # main OCR pass -> "no text" -> triggers NoTextFoundException
+    return _orig_extract(self, sidecar_file, pdf_file)  # fallback read -> real text
+
+
+def _extract_always_empty(self, sidecar_file, pdf_file):
+    if sidecar_file is None:
+        return _orig_extract(self, sidecar_file, pdf_file)
+    return ""  # every post-OCR read empty
+
+
+if case in ("skip", "skip_noarchive"):
+    settings.OCR_MODE = case
+    src = make_text_pdf(os.path.join(settings.SCRATCH_DIR, "textbearing.pdf"))
+    label = f"OCR_MODE={case}  (text-bearing PDF, GENUINE no-injection)"
+elif case == "retry_ok":
+    settings.OCR_MODE = "skip"
+    PP.RasterisedDocumentParser.extract_text = _extract_force_notext
+    src = make_image_only_pdf(os.path.join(settings.SCRATCH_DIR, "imageonly.pdf"))
+    label = "retry SUCCESS (INJECTED NoTextFound trigger; real force-OCR fallback succeeds)"
+elif case == "retry_fail":
+    settings.OCR_MODE = "skip"
+    import ocrmypdf
+    _orig_ocr = ocrmypdf.ocr
+    _ocr_calls = {"n": 0}
+
+    def _ocr_fail_on_fallback(**kw):
+        _ocr_calls["n"] += 1
+        if _ocr_calls["n"] >= 2:
+            raise RuntimeError("injected fallback OCR failure (measurement-only)")
+        return _orig_ocr(**kw)
+
+    ocrmypdf.ocr = _ocr_fail_on_fallback
+    PP.RasterisedDocumentParser.extract_text = _extract_always_empty
+    src = make_image_only_pdf(os.path.join(settings.SCRATCH_DIR, "imageonly.pdf"))
+    label = "retry FAILURE (INJECTED NoTextFound + fallback ocrmypdf.ocr raises) -> ParseError"
+else:
+    print(f"unknown case {case!r}"); H.teardown(); sys.exit(2)
+
+print(M.banner(f"OCR RETRY/SKIP PROBE  case={case}  pid={os.getpid()}  {label}"))
+print(f"input pdf size={os.path.getsize(src)}B  OCR_MODE={settings.OCR_MODE}")
+
+b = M.rss_mib(); cb = M.child_rss_mib()
+res = None; err = None
+with M.PeakSampler(0.003) as ps, M.ChildPeakSampler(interval=0.003) as cps:
+    try:
+        res = H.consume(H.working_copy(src))
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+a = M.rss_mib()
+
+from documents.models import Document
+doc = Document.objects.latest("id") if Document.objects.exists() else None
+print(f"RESULT        : {err or res}")
+print(f"Document.objects.count() : {Document.objects.count()}")
+if doc:
+    print(f"doc pk={doc.pk} mime={doc.mime_type} has_archive={doc.has_archive_version} "
+          f"contentLen={len(doc.content or '')}")
+print(f"self  peak    : +{ps.peak_rss - b:.2f} MiB (before {b:.2f} -> after {a:.2f}, dSelf {a - b:+.2f})")
+print(f"child peak    : +{cps.peak_child - cb:.2f} MiB (OCR subprocess tree)")
+print("===== DONE =====")
+H.teardown()
+```
+
 #### Frozen environment — `pip freeze` (122 lines)
 
 ```text
@@ -4248,8 +5783,8 @@ These sources were consulted to correctly interpret the "memory not released to 
 
 ## 12. Limitations (honest scope of the evidence)
 
-- **Email is partially inferred.** No IMAP server is available in the environment, so `process_mail_accounts` was run against zero accounts. The **scheduled-task process model** (recycle=1 worker, Schedule row) is **observed** (§9.12); the **per-attachment payload buffering** (`mail.py:317` `magic.from_buffer(att.payload)`, `:327` `f.write(att.payload)`) is **inferred (from reading code)**.
-- **OCR force-fallback branch is inferred.** The image-only PDF consumed successfully under `skip` (ocrmypdf produced sidecar text), so the `NoTextFoundException` → force-OCR retry → `ParseError`-on-failure branch (`paperless_tesseract/parsers.py:280-314`) did **not** fire and is **inferred**, not observed (§9.16).
+- **Email: only the IMAP transport is non-canonical.** No IMAP server is available in the environment. The **scheduled-task process model** (recycle=1 worker, Schedule row) is **observed** (§9.12), and the **per-attachment payload buffering** (`mail.py:317`/`:327`) plus the **broker-down `paperless-mail-*` scratch accumulation** (P4-F5) are now **observed** in §9.23 by driving the real `MailAccountHandler.handle_message` with a real `MailMessage`; only the IMAP fetch transport is substituted (labelled **OBS(nc)**). The full end-to-end fetch-from-a-live-mailbox remains the sole un-run email step.
+- **OCR force-fallback branch is now observed (trigger injected).** On a naturally image-only PDF the `skip` pass produced sidecar text, so `NoTextFoundException` did not fire on its own (§9.16). §9.24 reaches the branch with a measurement-only injected trigger (no source change) and observes both outcomes — force-OCR retry **success** (document created) and injected retry **failure** → `ParseError` clean rollback — plus a *meaningful* `skip_noarchive` (no archive, ≈10 MiB lower self peak) on a text-bearing PDF (`paperless_tesseract/parsers.py:241-244,277-309`).
 - **`tracemalloc` is blind to native memory.** The classifier (scikit-learn/NumPy/SciPy) and PDF-metadata (pikepdf/qpdf) costs are attributed to "native" by the RSS-present / tracemalloc-absent rule (§3, §9.4), not by a Python line — because no Python-line profiler can see those bytes.
 - **RSS sampling is blind to zero-byte filesystem leaks.** A resource can leak without moving RSS: the metadata endpoint leaks one **empty** `paperless-*` tempdir per parseable file per request (`views.py:266` → `parsers.py:293` `mkdtemp`, with no `cleanup()` — `parsers.py:348-350`), which the RSS-flat reading in §9.13 did not surface because empty dirs cost ≈ 0 RSS. Counting `SCRATCH_DIR` directly (§9.13) exposes it — a reminder that the memory lens, while sufficient for the OBJ-1..OBJ-5 memory questions, does not capture every resource lifecycle.
 - **Sampling granularity.** RSS peaks come from a 3 ms threaded sampler; very short-lived subprocesses for tiny inputs can be under-sampled (the §9.15 type-matrix child column reads 0.00 for this reason). Authoritative OCR child figures use the 3 ms-sampled dedicated runs (§9.16).
