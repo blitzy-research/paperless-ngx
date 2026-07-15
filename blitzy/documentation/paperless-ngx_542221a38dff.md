@@ -1039,8 +1039,8 @@ EXIT=0
 ## Q4 — For barcode splitting: (a) how many document records are created from a single input, (b) which barcode values trigger a split, (c) where is the decision made, and (d) does this change the effective training data during the run?
 
 **Direct answer.**
-- **(a) A single input file splits into `separators + 1` output *segments*, and those segments become `Document` *records* only when subsequently consumed — `consume_file` itself creates zero records.** The split is performed by `separate_pages` (`src/documents/tasks.py:L113-L161`): it writes `{fname}_document_0.pdf` for the pages before the first separator, then one file per subsequent separator, **dropping each separator page** via `for page in range(page_number + 1, next_page)` (`src/documents/tasks.py:L148-L149`). Observed directly: a single-separator input `[1]` on a 3-page PDF → **2 segments** with page counts `[1, 1]` (1 page dropped); a two-separator input `[2, 5]` on a 7-page PDF → **3 segments** with page counts `[2, 2, 1]` (2 pages dropped). `consume_file` (`src/documents/tasks.py:L184-L233`) writes those segments to the consumption directory and returns the literal string `"File successfully split"` (`src/documents/tasks.py:L233`) while creating **zero `Document` rows** (observed `0` before and `0` after). With the gate **off** (the default), no split occurs and the single input becomes exactly **one** `Document` (observed `"Success. New document id 1 created"`, rows `0 → 1`). When the segments *are* consumed, each distinct segment becomes one `Document` record (observed 2 segments → 1 record and 3 segments → 2 records, because paperless rejects the byte-identical **segment files** — the repeated no-barcode body pages, since the `PATCHT` separator pages are dropped rather than consumed — as duplicates at `pre_check_duplicate`, `src/documents/consumer.py:L110`). Observed directly: for `patch-code-t-middle.pdf` the two emitted segments both decode to no barcodes and are byte-identical (same `md5`), and the dropped page is exactly the `PATCHT`-bearing page.
-- **(b) The trigger is the decoded barcode *value* `"PATCHT"`** — the default of `settings.CONSUMER_BARCODE_STRING` (`src/paperless/settings.py:L506`). A page becomes a separator when a decoded barcode's value **equals** that string; the match is **symbology-agnostic**, observed triggering across **Code 39** (`barcode-39-PATCHT.png`), **Code 128** (`barcode-128-PATCHT.png`), and **QR** (`qr-code-PATCHT.png`), all decoding to `PATCHT`. Distorted Code 39 variants (`barcode-39-PATCHT-distorsion.png`, `barcode-39-PATCHT-distorsion2.png`) still decode to `PATCHT`; an **unreadable** barcode (`barcode-39-PATCHT-unreadable.png`) and a page with **no barcode** (`simple.png`) both decode to `[]` and do **not** trigger a split. The value is configurable: with `CONSUMER_BARCODE_STRING="CUSTOM BARCODE"`, the three `*-custom` fixtures (Code 39 / QR / Code 128) trigger, whereas the default `"PATCHT"` does **not** match them. The whole feature is gated by `CONSUMER_ENABLE_BARCODES` (`src/paperless/settings.py:L502`, default `False`).
+- **(a) A single input file mechanically splits into `separators + 1` output *segments*, but the number of persistent `Document` *records* can be lower — including zero — because `consume_file` itself creates no records and later consumption can reject empty or duplicate segments.** The split is performed by `separate_pages` (`src/documents/tasks.py:L113-L161`): it writes `{fname}_document_0.pdf` for the pages before the first separator, then one file per subsequent separator, **dropping each separator page** via `for page in range(page_number + 1, next_page)` (`src/documents/tasks.py:L148-L149`). Observed directly: a single-separator input `[1]` on a 3-page PDF → **2 segments** with page counts `[1, 1]` (1 page dropped); a two-separator input `[2, 5]` on a 7-page PDF → **3 segments** with page counts `[2, 2, 1]` (2 pages dropped). `consume_file` (`src/documents/tasks.py:L184-L233`) writes those segments to the consumption directory and returns the literal string `"File successfully split"` (`src/documents/tasks.py:L233`) while creating **zero `Document` rows** (observed `0` before and `0` after). With the gate **off** (the default), no split occurs and the single input becomes exactly **one** `Document` (observed `"Success. New document id 1 created"`, rows `0 → 1`). When emitted segments are subsequently consumed, only distinct, consumable segments become records: the normal committed cases produced **2 segments → 1 record** and **3 segments → 2 records** because paperless rejected byte-identical body segments as duplicates at `pre_check_duplicate` (`src/documents/consumer.py:L102-L113`). **Boundary exception, reproduced identically twice:** when the only separator is page `0` of a one-page PDF (`patch-code-t.pdf`, `patch-code-t-qr.pdf`, or custom-value `barcode-39-custom.pdf`), `separate_pages` saves both the pre-separator and post-separator outputs even though neither loop appends a page (`src/documents/tasks.py:L129-L159`), yielding **2 zero-page segments**. The real `Consumer.try_consume_file` path rejects both with a `ConsumerError` whose message ends in `ValueError: max_workers must be greater than 0`, so the result is **2 emitted segments but 0 `Document` records**.
+- **(b) The trigger is the decoded barcode *value* `"PATCHT"`** — the default of `settings.CONSUMER_BARCODE_STRING` (`src/paperless/settings.py:L506`). A page becomes a separator when a decoded barcode's value **equals** that string; the match is **symbology-agnostic**, observed triggering across **Code 39** (`barcode-39-PATCHT.png`), **Code 128** (`barcode-128-PATCHT.png`), and **QR** (`qr-code-PATCHT.png`), all decoding to `PATCHT`. Distorted Code 39 variants (`barcode-39-PATCHT-distorsion.png`, `barcode-39-PATCHT-distorsion2.png`) still decode to `PATCHT`; an **unreadable** barcode (`barcode-39-PATCHT-unreadable.png`) and a page with **no barcode** (`simple.png`) both decode to `[]` and do **not** trigger a split. The value is configurable: with `CONSUMER_BARCODE_STRING="CUSTOM BARCODE"`, the three `*-custom` fixtures (Code 39 / QR / Code 128) trigger, whereas the default `"PATCHT"` does **not** match them. The whole feature is gated by `CONSUMER_ENABLE_BARCODES` (`src/paperless/settings.py:L502`, default `False`). A successful `[0]` trigger on a one-page file does **not** imply a consumable output; it is the zero-page/zero-record boundary described in (a).
 - **(c) The split decision is made in `scan_file_for_separating_barcodes`** — specifically `if separator_barcode in current_barcodes:` → `separator_page_numbers.append(current_page_number)` at **`src/documents/tasks.py:L108-L109`**. That function's return value is the list of separator page numbers observed below (`[0]`, `[1]`, `[2, 5]`, `[]`).
 - **(d) Yes — indirectly.** Splitting does not itself create records, but consuming the resulting segments adds `Document` rows, which changes the effective training data. Observed the full real chain: trained-eligible rows (`Document.objects.exclude(tags__is_inbox_tag=True)`, inbox rows excluded per `src/documents/classifier.py:L125-L127`) grew `0 → 1 → 3` as split segments were consumed; `DocumentClassifier.train()` returned `True` (retrain) on first fit, `False` (reuse) when re-run on unchanged data, then `True` again (retrain) once new consumed segments changed the SHA-1 `data_hash` — the exact reuse/retrain mechanism established in Q1 (`src/documents/classifier.py:L163-L164`).
 
@@ -1203,7 +1203,9 @@ class Q4Probe(DirectoriesMixin, TestCase):
             duplicates = 0
             for s in segs:
                 try:
-                    Consumer().try_consume_file(s)  # each segment -> one Document row
+                    # Each segment is offered to the real Consumer; only a
+                    # non-empty, non-duplicate segment creates a Document row.
+                    Consumer().try_consume_file(s)
                     consumed += 1
                 except ConsumerError as e:
                     # repeated no-barcode body-page segments share a checksum -> pre_check_duplicate
@@ -1393,6 +1395,212 @@ PYTEST_EXIT=0
 ```
 
 The single-separator PDF (3 pages, `[1]`) yields 2 segments of 1 page each (1 page — the separator — dropped); the multi-separator PDF (7 pages, `[2, 5]`) yields 3 segments of `[2, 2, 1]` pages (2 separator pages dropped). An empty separator list logs `No pages to split on!` and returns `[]`. Gate-on: `"File successfully split"`, rows `0 → 0`. Gate-off (default `CONSUMER_ENABLE_BARCODES = False`): `"Success. New document id 1 created"`, rows `0 → 1`. (The `convert-im6.q16 … not allowed by the security policy 'PDF'` line is the ImageMagick thumbnail step being denied and falling back to Ghostscript — the same benign fallback documented in Q3, `src/documents/parsers.py:L158`; consumption still succeeds.)
+
+### (a) First-page-only separator boundary — two empty segments, zero records
+
+**Observed direct result.** A one-page PDF whose only page is a matching separator is a boundary exception to any simple “segments become records” rule. For each committed fixture below, scanning returned `[0]`; `separate_pages` mechanically returned `separators + 1 = 2` PDFs, but both had **zero pages**. This follows the two unconditional saves in `separate_pages`: no page satisfies `n < pages_to_split_on[0]` when the first separator is `0`, and no page satisfies `range(page_number + 1, next_page)` when both values are `1` (`src/documents/tasks.py:L129-L159`). The real `Consumer.try_consume_file` path rejected both empty PDFs with `ConsumerError` wrapping `ValueError: max_workers must be greater than 0`, and `Document` rows remained **`0 → 0`**.
+
+The condition was exercised with the unchanged committed fixtures `patch-code-t.pdf` (default Code 39 `PATCHT`), `patch-code-t-qr.pdf` (default QR `PATCHT`), and `barcode-39-custom.pdf` under `CONSUMER_BARCODE_STRING="CUSTOM BARCODE"`. The same self-contained command was run twice in independent databases/runtime directories. It also repeated the normal Q4(d) flow so the normal counts and hashes could be compared against the edge result. The probe and every runtime directory were created under quoted `mktemp -d` paths in `/tmp` and removed by a trap.
+
+```
+set -o pipefail
+docker exec -i --user testuser -e HOME=/tmp/th paperless-canon bash -s <<'BASH'
+set -euo pipefail
+probe_root="$(mktemp -d "/tmp/q4-page0-probe.XXXXXX")"
+chmod 700 "$probe_root"
+runtime_roots=()
+cleanup(){
+  if ((${#runtime_roots[@]})); then rm -rf -- "${runtime_roots[@]}"; fi
+  rm -rf -- "$probe_root"
+}
+trap cleanup EXIT
+cat > "$probe_root/probe.py" <<'PY'
+# Q4 repeat + first-page separator edge probe (temporary; deleted after use).
+# Uses the REAL scan/split/Consumer/classifier paths with committed fixtures.
+import logging
+import os
+import sys
+
+sys.path.insert(0, "/app/src")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import django
+django.setup()
+
+import pikepdf
+from django.core.management import call_command
+from django.test import override_settings
+from documents import tasks
+from documents.classifier import DocumentClassifier
+from documents.consumer import Consumer
+from documents.models import Document
+
+BC = "/app/src/documents/tests/samples/barcodes"
+logging.disable(logging.CRITICAL)  # complete output is the caught/printed behavior below
+call_command("migrate", interactive=False, verbosity=0)
+CHANNELS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
+
+print("===== Q4(a) FIRST-PAGE-ONLY SEPARATOR EDGE (real scan/split/Consumer) =====", flush=True)
+for filename, custom_value in [
+    ("patch-code-t.pdf", None),
+    ("patch-code-t-qr.pdf", None),
+    ("barcode-39-custom.pdf", "CUSTOM BARCODE"),
+]:
+    source = os.path.join(BC, filename)
+    setting = override_settings(CONSUMER_BARCODE_STRING=custom_value) if custom_value else None
+    if setting:
+        setting.enable()
+    try:
+        separators = tasks.scan_file_for_separating_barcodes(source)
+        segments = tasks.separate_pages(source, separators)
+    finally:
+        if setting:
+            setting.disable()
+    page_counts = [len(pikepdf.open(path).pages) for path in segments]
+    rows_before = Document.objects.count()
+    outcomes = []
+    with override_settings(CHANNEL_LAYERS=CHANNELS):
+        for path in segments:
+            try:
+                document = Consumer().try_consume_file(path)
+                outcomes.append((os.path.basename(path), "CREATED", document.pk))
+            except Exception as exc:
+                outcomes.append((os.path.basename(path), "ERROR", type(exc).__name__, str(exc)))
+    print(
+        f"fixture={filename} input_pages={len(pikepdf.open(source).pages)} "
+        f"separators={separators} segment_count={len(segments)} "
+        f"segment_page_counts={page_counts}",
+        flush=True,
+    )
+    print(f"consume_outcomes={outcomes}", flush=True)
+    print(f"Document rows BEFORE={rows_before} AFTER={Document.objects.count()}", flush=True)
+
+def split_and_consume(filename):
+    source = os.path.join(BC, filename)
+    separators = tasks.scan_file_for_separating_barcodes(source)
+    segments = tasks.separate_pages(source, separators)
+    outcomes = []
+    with override_settings(CHANNEL_LAYERS=CHANNELS):
+        for path in segments:
+            try:
+                document = Consumer().try_consume_file(path)
+                outcomes.append((os.path.basename(path), "CREATED", document.pk))
+            except Exception as exc:
+                outcomes.append((os.path.basename(path), "ERROR", type(exc).__name__, str(exc)))
+    return separators, len(segments), outcomes
+
+classifier = DocumentClassifier()
+round1 = split_and_consume("patch-code-t-middle.pdf")
+rows1 = Document.objects.exclude(tags__is_inbox_tag=True).count()
+train1 = classifier.train()
+hash1 = classifier.data_hash.hex()
+reuse1 = classifier.train()
+round2 = split_and_consume("several-patcht-codes.pdf")
+rows2 = Document.objects.exclude(tags__is_inbox_tag=True).count()
+train2 = classifier.train()
+hash2 = classifier.data_hash.hex()
+print("===== Q4(d) NORMAL SPLIT->CONSUME->TRAIN REPEAT =====", flush=True)
+print(f"round1={round1} eligible_rows={rows1} train={train1} hash={hash1} unchanged_train={reuse1}", flush=True)
+print(f"round2={round2} eligible_rows={rows2} train={train2} hash={hash2} hash_changed={hash1 != hash2}", flush=True)
+print("PROBE_LOGIC_COMPLETE=True", flush=True)
+PY
+run_once(){
+  run="$1"
+  root="$(mktemp -d "/tmp/q4-acceptance-run${run}.XXXXXX")"
+  runtime_roots+=("$root")
+  chmod 700 "$root"
+  mkdir -p "$root"/data "$root"/media "$root"/consume "$root"/scratch "$root"/log
+  echo "=== Q4 ACCEPTANCE RUN ${run} ==="
+  set +e
+  PAPERLESS_DATA_DIR="$root/data" \
+  PAPERLESS_MEDIA_ROOT="$root/media" \
+  PAPERLESS_CONSUMPTION_DIR="$root/consume" \
+  PAPERLESS_SCRATCH_DIR="$root/scratch" \
+  PAPERLESS_LOGGING_DIR="$root/log" \
+  DJANGO_SETTINGS_MODULE=paperless.settings \
+  timeout --signal=TERM --kill-after=2 45 python3 -u "$probe_root/probe.py" 2>&1
+  rc=$?
+  set -e
+  echo "RUN_${run}_EXIT=$rc"
+  rm -rf -- "$root"
+  echo "RUN_${run}_RUNTIME_ROOT_REMOVED=$([[ ! -e "$root" ]] && echo yes || echo no)"
+}
+cd /app/src
+run_once 1
+run_once 2
+BASH
+probe_command_exit=$?
+echo "DOCKER_PROBE_EXIT=$probe_command_exit"
+docker exec --user testuser -e HOME=/tmp/th paperless-canon bash -lc '
+printf "LEFTOVER_PROBE_ROOTS="; find /tmp -maxdepth 1 -type d -name "q4-page0-probe.*" -print | wc -l
+printf "LEFTOVER_RUNTIME_ROOTS="; find /tmp -maxdepth 1 -type d -name "q4-acceptance-run*" -print | wc -l
+'
+cleanup_scan_exit=$?
+echo "CLEANUP_SCAN_EXIT=$cleanup_scan_exit"
+if [[ "$probe_command_exit" -eq 0 && "$cleanup_scan_exit" -eq 0 ]]; then
+  echo "OVERALL_EXIT=0"
+else
+  echo "OVERALL_EXIT=1"
+  exit 1
+fi
+```
+
+Complete combined stdout/stderr:
+
+```
+=== Q4 ACCEPTANCE RUN 1 ===
+===== Q4(a) FIRST-PAGE-ONLY SEPARATOR EDGE (real scan/split/Consumer) =====
+fixture=patch-code-t.pdf input_pages=1 separators=[0] segment_count=2 segment_page_counts=[0, 0]
+consume_outcomes=[('patch-code-t_document_0.pdf', 'ERROR', 'ConsumerError', 'patch-code-t_document_0.pdf: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0'), ('patch-code-t_document_1.pdf', 'ERROR', 'ConsumerError', 'patch-code-t_document_1.pdf: Error while consuming document patch-code-t_document_1.pdf: ValueError: max_workers must be greater than 0')]
+Document rows BEFORE=0 AFTER=0
+fixture=patch-code-t-qr.pdf input_pages=1 separators=[0] segment_count=2 segment_page_counts=[0, 0]
+consume_outcomes=[('patch-code-t-qr_document_0.pdf', 'ERROR', 'ConsumerError', 'patch-code-t-qr_document_0.pdf: Error while consuming document patch-code-t-qr_document_0.pdf: ValueError: max_workers must be greater than 0'), ('patch-code-t-qr_document_1.pdf', 'ERROR', 'ConsumerError', 'patch-code-t-qr_document_1.pdf: Error while consuming document patch-code-t-qr_document_1.pdf: ValueError: max_workers must be greater than 0')]
+Document rows BEFORE=0 AFTER=0
+fixture=barcode-39-custom.pdf input_pages=1 separators=[0] segment_count=2 segment_page_counts=[0, 0]
+consume_outcomes=[('barcode-39-custom_document_0.pdf', 'ERROR', 'ConsumerError', 'barcode-39-custom_document_0.pdf: Error while consuming document barcode-39-custom_document_0.pdf: ValueError: max_workers must be greater than 0'), ('barcode-39-custom_document_1.pdf', 'ERROR', 'ConsumerError', 'barcode-39-custom_document_1.pdf: Error while consuming document barcode-39-custom_document_1.pdf: ValueError: max_workers must be greater than 0')]
+Document rows BEFORE=0 AFTER=0
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/q4-acceptance-run1.sBToyf/scratch/paperless-653lj6qn/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/q4-acceptance-run1.sBToyf/scratch/paperless-r6bstuoa/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/q4-acceptance-run1.sBToyf/scratch/paperless-pf2zjozr/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+===== Q4(d) NORMAL SPLIT->CONSUME->TRAIN REPEAT =====
+round1=([1], 2, [('patch-code-t-middle_document_0.pdf', 'CREATED', 1), ('patch-code-t-middle_document_1.pdf', 'ERROR', 'ConsumerError', 'patch-code-t-middle_document_1.pdf: Not consuming patch-code-t-middle_document_1.pdf: It is a duplicate.')]) eligible_rows=1 train=True hash=830d95cd34da09d336aaf422fbcc4845874dd255 unchanged_train=False
+round2=([2, 5], 3, [('several-patcht-codes_document_0.pdf', 'CREATED', 2), ('several-patcht-codes_document_1.pdf', 'ERROR', 'ConsumerError', 'several-patcht-codes_document_1.pdf: Not consuming several-patcht-codes_document_1.pdf: It is a duplicate.'), ('several-patcht-codes_document_2.pdf', 'CREATED', 3)]) eligible_rows=3 train=True hash=ebeaf0efec86affe3ea5b14844ce2b71ffccdfe9 hash_changed=True
+PROBE_LOGIC_COMPLETE=True
+RUN_1_EXIT=124
+RUN_1_RUNTIME_ROOT_REMOVED=yes
+=== Q4 ACCEPTANCE RUN 2 ===
+===== Q4(a) FIRST-PAGE-ONLY SEPARATOR EDGE (real scan/split/Consumer) =====
+fixture=patch-code-t.pdf input_pages=1 separators=[0] segment_count=2 segment_page_counts=[0, 0]
+consume_outcomes=[('patch-code-t_document_0.pdf', 'ERROR', 'ConsumerError', 'patch-code-t_document_0.pdf: Error while consuming document patch-code-t_document_0.pdf: ValueError: max_workers must be greater than 0'), ('patch-code-t_document_1.pdf', 'ERROR', 'ConsumerError', 'patch-code-t_document_1.pdf: Error while consuming document patch-code-t_document_1.pdf: ValueError: max_workers must be greater than 0')]
+Document rows BEFORE=0 AFTER=0
+fixture=patch-code-t-qr.pdf input_pages=1 separators=[0] segment_count=2 segment_page_counts=[0, 0]
+consume_outcomes=[('patch-code-t-qr_document_0.pdf', 'ERROR', 'ConsumerError', 'patch-code-t-qr_document_0.pdf: Error while consuming document patch-code-t-qr_document_0.pdf: ValueError: max_workers must be greater than 0'), ('patch-code-t-qr_document_1.pdf', 'ERROR', 'ConsumerError', 'patch-code-t-qr_document_1.pdf: Error while consuming document patch-code-t-qr_document_1.pdf: ValueError: max_workers must be greater than 0')]
+Document rows BEFORE=0 AFTER=0
+fixture=barcode-39-custom.pdf input_pages=1 separators=[0] segment_count=2 segment_page_counts=[0, 0]
+consume_outcomes=[('barcode-39-custom_document_0.pdf', 'ERROR', 'ConsumerError', 'barcode-39-custom_document_0.pdf: Error while consuming document barcode-39-custom_document_0.pdf: ValueError: max_workers must be greater than 0'), ('barcode-39-custom_document_1.pdf', 'ERROR', 'ConsumerError', 'barcode-39-custom_document_1.pdf: Error while consuming document barcode-39-custom_document_1.pdf: ValueError: max_workers must be greater than 0')]
+Document rows BEFORE=0 AFTER=0
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/q4-acceptance-run2.cGaWVu/scratch/paperless-9ns3vxd6/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/q4-acceptance-run2.cGaWVu/scratch/paperless-l48qvlin/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+convert-im6.q16: no images defined `/tmp/q4-acceptance-run2.cGaWVu/scratch/paperless-q15uqjul/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+===== Q4(d) NORMAL SPLIT->CONSUME->TRAIN REPEAT =====
+round1=([1], 2, [('patch-code-t-middle_document_0.pdf', 'CREATED', 1), ('patch-code-t-middle_document_1.pdf', 'ERROR', 'ConsumerError', 'patch-code-t-middle_document_1.pdf: Not consuming patch-code-t-middle_document_1.pdf: It is a duplicate.')]) eligible_rows=1 train=True hash=830d95cd34da09d336aaf422fbcc4845874dd255 unchanged_train=False
+round2=([2, 5], 3, [('several-patcht-codes_document_0.pdf', 'CREATED', 2), ('several-patcht-codes_document_1.pdf', 'ERROR', 'ConsumerError', 'several-patcht-codes_document_1.pdf: Not consuming several-patcht-codes_document_1.pdf: It is a duplicate.'), ('several-patcht-codes_document_2.pdf', 'CREATED', 3)]) eligible_rows=3 train=True hash=ebeaf0efec86affe3ea5b14844ce2b71ffccdfe9 hash_changed=True
+PROBE_LOGIC_COMPLETE=True
+RUN_2_EXIT=124
+RUN_2_RUNTIME_ROOT_REMOVED=yes
+DOCKER_PROBE_EXIT=0
+LEFTOVER_PROBE_ROOTS=0
+LEFTOVER_RUNTIME_ROOTS=0
+CLEANUP_SCAN_EXIT=0
+OVERALL_EXIT=0
+```
+
+The application-level values are identical across both runs: every page-zero case yielded `2` empty segments, two `ConsumerError` outcomes, and `0` rows; the normal flow repeated rows `0 → 1 → 3`, hash `830d95cd34da09d336aaf422fbcc4845874dd255` then `ebeaf0efec86affe3ea5b14844ce2b71ffccdfe9`, and train results `True → False → True`. A post-edit replay produced the same nonvolatile lines; only the declared `mktemp`/scratch suffixes changed. `PROBE_LOGIC_COMPLETE=True` appeared before each `RUN_n_EXIT=124`: **observed limitation**, the standalone process did not exit on its own after completing the probe, so the documented 45-second timeout terminated it. The containing Docker command handled those expected child timeouts and exited `0`; the cleanup scan also exited `0`, giving `OVERALL_EXIT=0`. The safe trap and post-command scans show zero retained probe/runtime directories. `logging.disable(logging.CRITICAL)` is visible in the embedded probe and affects log emission only; it does not replace or mock any scan, split, consume, ORM, or classifier call, and every caught outcome is printed verbatim. The `convert-im6.q16` lines belong only to successful normal-segment thumbnail generation and the real Ghostscript fallback described above; they occur after the empty-segment outcomes and do not create records for the page-zero cases.
 
 ### (c) Where the split decision is made
 
