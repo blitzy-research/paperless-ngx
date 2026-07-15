@@ -165,16 +165,18 @@ The runtime is canonical Python 3.9, the checkout is exactly the pinned commit, 
 ```
 $ docker exec paperless-inv-app python3 --version
 Python 3.9.23
-$ docker exec paperless-inv-app git -C /app -c safe.directory=/app rev-parse HEAD
+$ docker exec paperless-inv-app git --version
+git version 2.30.2
+$ docker exec -u paperless paperless-inv-app git -C /app rev-parse HEAD
 542221a38dff06361e07976452f9aea24d210542
-$ docker exec paperless-inv-app git -C /app -c safe.directory=/app status --porcelain
+$ docker exec -u paperless paperless-inv-app git -C /app status --porcelain
 $ docker exec paperless-inv-broker redis-server --version
 Redis server v=6.0.20 sha=00000000:0 malloc=jemalloc-5.1.0 bits=64 build=dbdcb1f5eaf1bc2
 $ docker exec paperless-inv-app python3 -c "import redis,os; print('PING', redis.from_url(os.environ['PAPERLESS_REDIS']).ping())"
 PING True
 ```
 
-The third command (`git … status --porcelain`) prints **no output at all** — the blank line before the next `$` prompt is the entire result, confirming the runtime `/app` checkout is byte-for-byte clean (the `data/`, `media/` and index artifacts created at boot are git-ignored). The inline `-c safe.directory=/app` is required only because the container process runs as `root` while `/app` is owned by uid 1000 (`paperless`); it changes no repository state.
+The `git … status --porcelain` command prints **no output at all** — the blank line before the next `$` prompt is the entire result, confirming the runtime `/app` checkout is byte-for-byte clean (the `data/`, `media/` and index artifacts created at boot are git-ignored). Both `git` commands are run **as the `paperless` user** (`docker exec -u paperless`, uid 1000 — the owner of `/app`), because the git 2.30.2 shipped in the image (shown above) enforces the *dubious-ownership* safety check (CVE-2022-24765): run as the default `root` exec user, the same commands abort with `fatal: detected dubious ownership in repository at '/app'` (exit 128). That backported check honors `safe.directory` **only from persisted system/global git config, not from a command-line `-c safe.directory=…` override**, so owner-invocation — not an inline `-c` flag — is what lets them succeed. Reading git state as the unprivileged owner changes no repository state.
 
 **Immutable base-image identity (for exact reproduction).** The `ARG BASE_IMAGE` tag embedded in `Dockerfile.canonical` ([§2.1](#21-canonical-build-and-run-reproducible-commands)) pins the human-readable tag; the byte-immutable content is pinned by the local image ID and the registry digest below, so a re-run resolves the *exact* same base image rather than whatever the tag might later point to:
 
