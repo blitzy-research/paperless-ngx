@@ -64,7 +64,7 @@ gs 9.53.3
 pdftoppm version 20.09.0
 Version: ImageMagick 6.9.11-60 Q16 x86_64 2021-01-25 https://imagemagick.org
 qpdf version 10.1.0
-libzbar0 0.23.90-1+deb11u1
+libzbar0:amd64 0.23.90-1+deb11u1
 ```
 
 ### pytest configuration and CI command
@@ -79,6 +79,7 @@ env =
 
 $ docker exec --user testuser paperless-canon bash -lc "grep -nE 'python-version:|pipenv run pytest' /app/.github/workflows/reusable-ci-backend.yml"
 55:        python-version: ['3.8', '3.9', '3.10']
+70:          python-version: "${{ matrix.python-version }}"
 86:          pipenv run pytest
 ```
 
@@ -1038,7 +1039,7 @@ EXIT=0
 ## Q4 — For barcode splitting: (a) how many document records are created from a single input, (b) which barcode values trigger a split, (c) where is the decision made, and (d) does this change the effective training data during the run?
 
 **Direct answer.**
-- **(a) A single input file splits into `separators + 1` output *segments*, and those segments become `Document` *records* only when subsequently consumed — `consume_file` itself creates zero records.** The split is performed by `separate_pages` (`src/documents/tasks.py:L113-L161`): it writes `{fname}_document_0.pdf` for the pages before the first separator, then one file per subsequent separator, **dropping each separator page** via `for page in range(page_number + 1, next_page)` (`src/documents/tasks.py:L148-L149`). Observed directly: a single-separator input `[1]` on a 3-page PDF → **2 segments** with page counts `[1, 1]` (1 page dropped); a two-separator input `[2, 5]` on a 7-page PDF → **3 segments** with page counts `[2, 2, 1]` (2 pages dropped). `consume_file` (`src/documents/tasks.py:L184-L233`) writes those segments to the consumption directory and returns the literal string `"File successfully split"` (`src/documents/tasks.py:L233`) while creating **zero `Document` rows** (observed `0` before and `0` after). With the gate **off** (the default), no split occurs and the single input becomes exactly **one** `Document` (observed `"Success. New document id 1 created"`, rows `0 → 1`). When the segments *are* consumed, each distinct segment becomes one `Document` record (observed 2 segments → 1 record and 3 segments → 2 records, because paperless rejects byte-identical patch pages as duplicates at `pre_check_duplicate`, `src/documents/consumer.py:L110`).
+- **(a) A single input file splits into `separators + 1` output *segments*, and those segments become `Document` *records* only when subsequently consumed — `consume_file` itself creates zero records.** The split is performed by `separate_pages` (`src/documents/tasks.py:L113-L161`): it writes `{fname}_document_0.pdf` for the pages before the first separator, then one file per subsequent separator, **dropping each separator page** via `for page in range(page_number + 1, next_page)` (`src/documents/tasks.py:L148-L149`). Observed directly: a single-separator input `[1]` on a 3-page PDF → **2 segments** with page counts `[1, 1]` (1 page dropped); a two-separator input `[2, 5]` on a 7-page PDF → **3 segments** with page counts `[2, 2, 1]` (2 pages dropped). `consume_file` (`src/documents/tasks.py:L184-L233`) writes those segments to the consumption directory and returns the literal string `"File successfully split"` (`src/documents/tasks.py:L233`) while creating **zero `Document` rows** (observed `0` before and `0` after). With the gate **off** (the default), no split occurs and the single input becomes exactly **one** `Document` (observed `"Success. New document id 1 created"`, rows `0 → 1`). When the segments *are* consumed, each distinct segment becomes one `Document` record (observed 2 segments → 1 record and 3 segments → 2 records, because paperless rejects the byte-identical **segment files** — the repeated no-barcode body pages, since the `PATCHT` separator pages are dropped rather than consumed — as duplicates at `pre_check_duplicate`, `src/documents/consumer.py:L110`). Observed directly: for `patch-code-t-middle.pdf` the two emitted segments both decode to no barcodes and are byte-identical (same `md5`), and the dropped page is exactly the `PATCHT`-bearing page.
 - **(b) The trigger is the decoded barcode *value* `"PATCHT"`** — the default of `settings.CONSUMER_BARCODE_STRING` (`src/paperless/settings.py:L506`). A page becomes a separator when a decoded barcode's value **equals** that string; the match is **symbology-agnostic**, observed triggering across **Code 39** (`barcode-39-PATCHT.png`), **Code 128** (`barcode-128-PATCHT.png`), and **QR** (`qr-code-PATCHT.png`), all decoding to `PATCHT`. Distorted Code 39 variants (`barcode-39-PATCHT-distorsion.png`, `barcode-39-PATCHT-distorsion2.png`) still decode to `PATCHT`; an **unreadable** barcode (`barcode-39-PATCHT-unreadable.png`) and a page with **no barcode** (`simple.png`) both decode to `[]` and do **not** trigger a split. The value is configurable: with `CONSUMER_BARCODE_STRING="CUSTOM BARCODE"`, the three `*-custom` fixtures (Code 39 / QR / Code 128) trigger, whereas the default `"PATCHT"` does **not** match them. The whole feature is gated by `CONSUMER_ENABLE_BARCODES` (`src/paperless/settings.py:L502`, default `False`).
 - **(c) The split decision is made in `scan_file_for_separating_barcodes`** — specifically `if separator_barcode in current_barcodes:` → `separator_page_numbers.append(current_page_number)` at **`src/documents/tasks.py:L108-L109`**. That function's return value is the list of separator page numbers observed below (`[0]`, `[1]`, `[2, 5]`, `[]`).
 - **(d) Yes — indirectly.** Splitting does not itself create records, but consuming the resulting segments adds `Document` rows, which changes the effective training data. Observed the full real chain: trained-eligible rows (`Document.objects.exclude(tags__is_inbox_tag=True)`, inbox rows excluded per `src/documents/classifier.py:L125-L127`) grew `0 → 1 → 3` as split segments were consumed; `DocumentClassifier.train()` returned `True` (retrain) on first fit, `False` (reuse) when re-run on unchanged data, then `True` again (retrain) once new consumed segments changed the SHA-1 `data_hash` — the exact reuse/retrain mechanism established in Q1 (`src/documents/classifier.py:L163-L164`).
@@ -1205,8 +1206,8 @@ class Q4Probe(DirectoriesMixin, TestCase):
                     Consumer().try_consume_file(s)  # each segment -> one Document row
                     consumed += 1
                 except ConsumerError as e:
-                    # identical patch pages share a checksum -> pre_check_duplicate
-                    # (src/documents/consumer.py:L110) rejects the repeat; real behavior
+                    # repeated no-barcode body-page segments share a checksum -> pre_check_duplicate
+                    # (src/documents/consumer.py:L110) rejects the repeat (PATCHT pages were dropped)
                     duplicates += 1
                     print(f"    segment {os.path.basename(s)}: ConsumerError -> {e}")
             return seps, len(segs), consumed, duplicates
@@ -1571,14 +1572,14 @@ PYTEST_EXIT=0
 
 ```
 docker exec --user testuser -e HOME=/tmp/th paperless-canon bash -lc '
- cd /app/src && DJANGO_SETTINGS_MODULE=paperless.settings \
+ mkdir -p /tmp/th/work && cd /app/src && DJANGO_SETTINGS_MODULE=paperless.settings \
  python3 -m pytest documents/tests/test_classifier.py documents/tests/test_tasks.py documents/tests/test_matchables.py \
- --no-cov -p no:cacheprovider -o addopts="" -n auto -v'
+ --no-cov -p no:cacheprovider -o addopts="" -n auto -v > /tmp/th/work/q6_xdist_v.txt 2>&1'
 ```
 
 ```
-$ # (full -v log is 196 lines; showing the collection + xdist worker header and the final summary line)
-$ head -8 <full-run-log>
+$ # the saved -v log /tmp/th/work/q6_xdist_v.txt is 195 lines; showing the collection + xdist worker header (head -8) and the final summary line (tail -1)
+$ head -8 /tmp/th/work/q6_xdist_v.txt
 ============================= test session starts ==============================
 platform linux -- Python 3.9.23, pytest-8.4.2, pluggy-1.6.0 -- /usr/local/bin/python3
 django: version: 4.0.4, settings: paperless.settings (from env)
@@ -1587,8 +1588,8 @@ configfile: setup.cfg
 plugins: xdist-3.8.0, django-4.11.1, env-1.1.5, sugar-1.1.1, Faker-37.12.0, cov-7.0.0, anyio-3.5.0
 created: 128/128 workers
 128 workers [78 items]
-$ tail -1 <full-run-log>
-================= 77 passed, 1 skipped, 774 warnings in 26.50s =================
+$ tail -1 /tmp/th/work/q6_xdist_v.txt
+================= 77 passed, 1 skipped, 774 warnings in 27.09s =================
 ```
 
 **2. Repeated identical runs — STABLE; non-determinism did NOT reproduce (observed).** Running the three classification modules together five times under the default `--numprocesses auto`, then three times pinned serial (`-n0`, labelled non-default), produced an identical `77 passed, 1 skipped` every time (reproduce-by-repetition, not stabilize-by-variant). Each line below is the verbatim final summary line of an independent full run:
