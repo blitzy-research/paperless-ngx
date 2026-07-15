@@ -183,7 +183,7 @@ Every row is anchored to file:line, the executing **process**, whether the alloc
 | 12 | `match_*` `.objects.all()` materialization | `matching.py:27/40/53` | task worker | Python-heap | transient per call | observed |
 | 13 | Whoosh per-consume `AsyncWriter.update_document` | `index.py:87-107`, `:118-120` | task worker | **Python-heap** (tm-visible) | bounded, committed per doc | observed |
 | 14 | Whoosh **batch** single writer (reindex) | `tasks.py:43-45` | task worker | Python-heap | buffers across docs (batch only) | observed |
-| 15 | Metadata endpoint `pikepdf.open` (original + archive) | `views.py:295/302`, `paperless_tesseract/parsers.py:34` | **gunicorn web** | native (qpdf) | one-time `+12.7` retained (§9.13) | observed |
+| 15 | Metadata endpoint `pikepdf.open` (original + archive) | `views.py:295/302`, `paperless_tesseract/parsers.py:34` | **gunicorn web** | native (qpdf) | one-time `+12.7` retained; also leaks 1 empty `paperless-*` tempdir/parse (`views.py:266`→`parsers.py:293`, no `cleanup()`; §9.13) | observed |
 | 16 | Upload buffering `document.file.read()` + `magic.from_buffer` | `serialisers.py:451`, `views.py:497-519` | **gunicorn web** | native + Python | 8 MiB upload → peak `+86–88` (~10.8×), `+15–16` retained | observed |
 | 17 | Email attachment payload buffering | `paperless_mail/mail.py:317/327` | **task worker (scheduled)** | native + Python | inferred (no IMAP server) | inferred |
 | 18 | `document_importer` `json.load` whole manifest + `list(filter)` | `document_importer.py:73`, `:137-140` | management cmd | Python-heap | manifest `json.load` `+13.8 KiB`; full cmd peak `+37` | observed |
@@ -1358,7 +1358,7 @@ non-recycled mail process' conclusion.
 
 ### 9.13 Metadata endpoint + REST upload via a REAL gunicorn worker (#2, #8)
 
-**observed (runtime).** A real gunicorn (1 worker) serves the API; the worker PID's RSS is sampled externally while `curl` hits endpoints with a **safe ephemeral** DRF token (created then DELETED). **Metadata** `GET /api/documents/1/metadata/` (has_archive → opens original + archive via pikepdf/qpdf): the **cold** first request is `+12.7 MiB` (one-time native qpdf), and requests 1–5 are **flat** (`+0.13` total → no per-request leak; HTTP 200, 1946 bytes). **Upload** `POST /api/documents/post_document/` of 8 MiB: worker peak `+86–88 MiB` (~10.8× the payload; `serialisers.py:451` reads the whole file + `magic.from_buffer`), settling to `+15–16 MiB` retained. This long-lived web worker is the genuine 'not released promptly' candidate — it is not recycled per request. This REPLACES the earlier in-process APIClient measurement (#8).
+**observed (runtime).** A real gunicorn (1 worker) serves the API; the worker PID's RSS is sampled externally while `curl` hits endpoints with a **safe ephemeral** DRF token (created then DELETED). **Metadata** `GET /api/documents/1/metadata/` (has_archive → opens original + archive via pikepdf/qpdf): the **cold** first request is `+12.7 MiB` (one-time native qpdf), and requests 1–5 are **flat in RSS** (`+0.13` total → no per-request **RSS** growth; HTTP 200, 1946 bytes) — but this endpoint **does** leak one empty `paperless-*` tempdir per parseable file per request (**2 per archived doc**: original + archive), an unbounded *filesystem*-resource leak that is invisible to the RSS sampler (empty dirs cost ≈ 0 RSS); see the **tempdir-leak note** and evidence below. **Upload** `POST /api/documents/post_document/` of 8 MiB: worker peak `+86–88 MiB` (~10.8× the payload; `serialisers.py:451` reads the whole file + `magic.from_buffer`), settling to `+15–16 MiB` retained. This long-lived web worker is the genuine 'not released promptly' candidate — it is not recycled per request. This REPLACES the earlier in-process APIClient measurement (#8).
 
 ```bash
 DXI drv_metadata.py 6 8   # 6 metadata GETs + one 8 MiB upload; MEMH_PORT selects the port
@@ -1419,6 +1419,48 @@ POST http://127.0.0.1:8022/api/documents/post_document/  upload=8.01 MiB (real g
 
 ephemeral token DELETED; gunicorn stopped
 ```
+
+**Tempdir-leak note (`observed (runtime)`).** The metadata action `UnifiedSearchViewSet.metadata` (`views.py:283`) calls `get_metadata()` for the original (`views.py:295`) and, when `has_archive_version`, again for the archive (`views.py:302`). Each call that resolves a parser class instantiates it — `parser = parser_class(progress_callback=None, logging_group=None)` (`views.py:266`) — and `DocumentParser.__init__` runs `self.tempdir = tempfile.mkdtemp(prefix="paperless-", dir=settings.SCRATCH_DIR)` (`parsers.py:293`); `get_metadata` then returns `parser.extract_metadata(...)` (`views.py:269`) **without ever calling `parser.cleanup()`** (`parsers.py:348-350`, `shutil.rmtree(self.tempdir)`). **Cause → effect:** one empty `paperless-*` tempdir is leaked **per parseable file per request** — **2 per request** for an archived PDF (original + archive both resolve the tesseract parser), 1 per request for an original-only parseable doc. `extract_metadata` writes nothing into `tempdir`, so the leaked dirs are **empty** and cost ≈ 0 RSS — which is precisely why the RSS-flat measurement above did **not** surface them — yet they **persist** (no scheduled task cleans `SCRATCH_DIR`) and accumulate **unbounded** in the long-lived, **non-recycled** gunicorn web worker. So the metadata endpoint's "not released promptly" character is twofold: a one-time `+12.7 MiB` native qpdf RSS cost (measured above) **plus** a genuine per-request *filesystem*-resource leak (inodes/dentries). **Contrast — the consume path is clean:** `Consumer` calls `document_parser.cleanup()` in a `finally` (`consumer.py:368-369`), so a successful consume leaves **0** `paperless-*` tempdirs (§9.17); the leak is specific to the metadata endpoint, which never cleans up. Reproduced below through the **real gunicorn worker + curl** (canonical, isolated `DATA_DIR`+`SCRATCH_DIR`), counting `paperless-*` dirs in `SCRATCH_DIR` before and after each metadata GET on a consumed `simple.pdf` (`has_archive=True`); run ≥2× with byte-identical results.
+
+```bash
+DXI drv_metatmp.py 3   # consume simple.pdf (has_archive) -> real gunicorn -> 3 metadata GETs; count paperless-* tempdirs
+```
+
+Output — `metatmp_a.txt`:
+
+```text
+===== METADATA ENDPOINT PER-REQUEST TEMPDIR LEAK (real gunicorn + curl) =====
+consumed doc pk=1 mime=application/pdf has_archive=True
+SCRATCH_DIR = /tmp/metatmp_a/scratch
+paperless-* tempdirs BEFORE any metadata request : 0
+real gunicorn worker up on http://127.0.0.1:8031 after 1.2s
+  req  http size  paperless-* tempdirs AFTER
+    0  200 1946   2
+    1  200 1946   4
+    2  200 1946   6
+leaked paperless-* tempdirs total = 6  (empty = 6)  => 2 per request
+paperless-* tempdirs after 3s wait (persist => not async-cleaned) : 6
+gunicorn stopped; ephemeral token deleted
+```
+
+Output — `metatmp_b.txt`:
+
+```text
+===== METADATA ENDPOINT PER-REQUEST TEMPDIR LEAK (real gunicorn + curl) =====
+consumed doc pk=1 mime=application/pdf has_archive=True
+SCRATCH_DIR = /tmp/metatmp_b/scratch
+paperless-* tempdirs BEFORE any metadata request : 0
+real gunicorn worker up on http://127.0.0.1:8032 after 1.2s
+  req  http size  paperless-* tempdirs AFTER
+    0  200 1946   2
+    1  200 1946   4
+    2  200 1946   6
+leaked paperless-* tempdirs total = 6  (empty = 6)  => 2 per request
+paperless-* tempdirs after 3s wait (persist => not async-cleaned) : 6
+gunicorn stopped; ephemeral token deleted
+```
+
+The count is deterministic (`0 → 2 → 4 → 6`, exactly `+2` per request, identical across both runs) and the dirs remain after a wait, confirming an unbounded per-request leak rather than a sampling artifact. This refines the RSS-only "flat" reading (`+0.13`) above: **flat in RSS, not flat in filesystem resources.**
 
 ### 9.14 Canonical document_exporter / document_importer (#2)
 
@@ -1745,7 +1787,7 @@ DEBUG                  : False
 
 ## 10. Harness Source (complete, with SHA-256)
 
-The complete measurement harness is published here for reproducibility (finding #3). These scripts lived only in the container/host `/tmp/memharness` (outside the tracked repository) and are removed on completion — none is added to the source tree. To reproduce: recreate each file at `/tmp/memharness/<name>` in the container, place the **input model artifacts** described in §2 (the drivers copy one onto `settings.MODEL_FILE`), and run the commands in §9. **Safety (finding #14):** the harness generates its classifier model locally from synthetic non-PII fixtures via the product's own `DocumentClassifier.train()`/`save()`; it loads **no** external pickle. The compact `gen_model` yields a ~696 KB model; the larger placed artifacts in §2 were trained from an enriched vocabulary and are integrity-referenced by SHA-256, not regenerated (see §9.0). The REST driver creates and then **deletes** an ephemeral DRF token. All 22 files below `py_compile` cleanly on the container's Python 3.9.
+The complete measurement harness is published here for reproducibility (finding #3). These scripts lived only in the container/host `/tmp/memharness` (outside the tracked repository) and are removed on completion — none is added to the source tree. To reproduce: recreate each file at `/tmp/memharness/<name>` in the container, place the **input model artifacts** described in §2 (the drivers copy one onto `settings.MODEL_FILE`), and run the commands in §9. **Safety (finding #14):** the harness generates its classifier model locally from synthetic non-PII fixtures via the product's own `DocumentClassifier.train()`/`save()`; it loads **no** external pickle. The compact `gen_model` yields a ~696 KB model; the larger placed artifacts in §2 were trained from an enriched vocabulary and are integrity-referenced by SHA-256, not regenerated (see §9.0). The REST driver creates and then **deletes** an ephemeral DRF token. All 23 files below `py_compile` cleanly on the container's Python 3.9.
 
 #### `memlib.py` — SHA-256 `44eec6d0236a8cac304bda3ee43fbe7b9fe9d3b6c13964fd3fabb9455d8165b6` (325 lines)
 
@@ -3640,6 +3682,131 @@ print("")
 print("ephemeral token DELETED; gunicorn stopped")
 ```
 
+#### `drv_metatmp.py` — SHA-256 `25c6e7cfebd905479a38a2e6c9bedfeb5b50aeb02ba09656e2595718f369af4a` (120 lines)
+
+```python
+"""
+drv_metatmp.py -- reproduces the per-request empty-tempdir leak in the CANONICAL
+metadata REST endpoint (UnifiedSearchViewSet.metadata -> get_metadata, views.py:260-274),
+driven through a REAL gunicorn worker + curl (same canonical path as drv_metadata.py, #8).
+
+Mechanism under test (cause -> effect): metadata calls get_metadata TWICE for an archived
+doc -- once for the original (views.py:295) and once for the archive (views.py:302). Each
+call, when a parser class resolves, instantiates a DocumentParser whose __init__ runs
+tempfile.mkdtemp(prefix="paperless-", dir=SCRATCH_DIR) (parsers.py:293), and get_metadata
+returns parser.extract_metadata(...) WITHOUT ever calling parser.cleanup() (parsers.py:348-350).
+=> one empty paperless-* tempdir is leaked per parseable file per request (2 per archived doc).
+Contrast: the consume path calls document_parser.cleanup() in a finally (consumer.py:368-369),
+so it leaves 0 tempdirs (see 9.17).
+
+Uses an isolated DATA_DIR + SCRATCH_DIR (DXI env) so the count is clean and the shared DB is
+never touched. Counts paperless-* dirs in SCRATCH_DIR before + after each metadata GET, then
+shows they are empty and persist (no async cleanup). Ephemeral DRF token, created then DELETED.
+
+Usage: <n_requests>
+"""
+import sys, os, io, time, contextlib, subprocess, signal, glob, shutil, urllib.request, urllib.error
+
+K = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+PORT = int(os.environ.get("MEMH_PORT", "8031"))
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import django
+django.setup()
+from django.conf import settings
+from django.core.management import call_command
+
+for d in [settings.DATA_DIR, settings.MEDIA_ROOT, settings.ORIGINALS_DIR, settings.ARCHIVE_DIR,
+          settings.THUMBNAIL_DIR, settings.INDEX_DIR, settings.SCRATCH_DIR, settings.CONSUMPTION_DIR]:
+    os.makedirs(d, exist_ok=True)
+# migration 0012 emits a one-time thumbnail banner via raw print() on stdout; it is
+# pre-measurement setup noise, so redirect stdout during migrate to keep output clean.
+with contextlib.redirect_stdout(io.StringIO()):
+    call_command("migrate", run_syncdb=True, verbosity=0, interactive=False)
+
+from documents.models import Document
+from documents.tasks import consume_file
+from django.contrib.auth.models import User
+from rest_framework.authtoken.models import Token
+
+SCRATCH = settings.SCRATCH_DIR
+
+
+def count_tmp():
+    return len(glob.glob(os.path.join(SCRATCH, "paperless-*")))
+
+
+print("===== METADATA ENDPOINT PER-REQUEST TEMPDIR LEAK (real gunicorn + curl) =====")
+
+# consume a PDF so the doc has BOTH an original and an archive (metadata parses both)
+src = os.path.join(SCRATCH, "meta_probe.pdf")
+shutil.copy("/app/src/documents/tests/samples/simple.pdf", src)
+consume_file(src)
+doc = Document.objects.latest("id")
+print(f"consumed doc pk={doc.pk} mime={doc.mime_type} has_archive={doc.has_archive_version}")
+
+# the consume path cleans its own parser tempdir (consumer.py:368-369) -> baseline should be 0
+for p in glob.glob(os.path.join(SCRATCH, "paperless-*")):
+    shutil.rmtree(p, ignore_errors=True)
+print(f"SCRATCH_DIR = {SCRATCH}")
+print(f"paperless-* tempdirs BEFORE any metadata request : {count_tmp()}")
+
+u, _ = User.objects.get_or_create(username="memh_metatmp", defaults={"is_superuser": True, "is_staff": True})
+u.is_superuser = True
+u.is_staff = True
+u.save()
+Token.objects.filter(user=u).delete()
+tok = Token.objects.create(user=u).key
+
+genv = dict(os.environ)
+genv["PAPERLESS_WEBSERVER_WORKERS"] = "1"
+genv["PAPERLESS_PORT"] = str(PORT)
+gproc = subprocess.Popen(
+    ["gunicorn", "-c", "/app/gunicorn.conf.py", "paperless.asgi:application"],
+    cwd="/app/src", env=genv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+base = f"http://127.0.0.1:{PORT}"
+
+
+def ready():
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(base + "/api/", headers={"Authorization": f"Token {tok}"}), timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+t0 = time.time()
+while time.time() - t0 < 40 and not ready():
+    time.sleep(0.5)
+print(f"real gunicorn worker up on {base} after {time.time()-t0:.1f}s")
+
+print(f"  {'req':>3}  http size  paperless-* tempdirs AFTER")
+for i in range(K):
+    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
+           "-H", f"Authorization: Token {tok}", base + f"/api/documents/{doc.pk}/metadata/"]
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    time.sleep(0.2)
+    print(f"  {i:>3}  {out}   {count_tmp()}")
+
+dirs = sorted(glob.glob(os.path.join(SCRATCH, "paperless-*")))
+empties = sum(1 for d in dirs if not os.listdir(d))
+print(f"leaked paperless-* tempdirs total = {len(dirs)}  (empty = {empties})  => {len(dirs)/K:.0f} per request")
+time.sleep(3)
+print(f"paperless-* tempdirs after 3s wait (persist => not async-cleaned) : {count_tmp()}")
+
+gproc.send_signal(signal.SIGTERM)
+try:
+    gproc.wait(timeout=15)
+except subprocess.TimeoutExpired:
+    gproc.kill()
+Token.objects.filter(user=u).delete()
+print("gunicorn stopped; ephemeral token deleted")
+```
+
 #### `drv_importer.py` — SHA-256 `76ca94706b8e94ac30d57c0005f7a4c7ce80fc435af93d842f1b96be8f7b6d2d` (76 lines)
 
 ```python
@@ -4084,6 +4251,7 @@ These sources were consulted to correctly interpret the "memory not released to 
 - **Email is partially inferred.** No IMAP server is available in the environment, so `process_mail_accounts` was run against zero accounts. The **scheduled-task process model** (recycle=1 worker, Schedule row) is **observed** (§9.12); the **per-attachment payload buffering** (`mail.py:317` `magic.from_buffer(att.payload)`, `:327` `f.write(att.payload)`) is **inferred (from reading code)**.
 - **OCR force-fallback branch is inferred.** The image-only PDF consumed successfully under `skip` (ocrmypdf produced sidecar text), so the `NoTextFoundException` → force-OCR retry → `ParseError`-on-failure branch (`paperless_tesseract/parsers.py:280-314`) did **not** fire and is **inferred**, not observed (§9.16).
 - **`tracemalloc` is blind to native memory.** The classifier (scikit-learn/NumPy/SciPy) and PDF-metadata (pikepdf/qpdf) costs are attributed to "native" by the RSS-present / tracemalloc-absent rule (§3, §9.4), not by a Python line — because no Python-line profiler can see those bytes.
+- **RSS sampling is blind to zero-byte filesystem leaks.** A resource can leak without moving RSS: the metadata endpoint leaks one **empty** `paperless-*` tempdir per parseable file per request (`views.py:266` → `parsers.py:293` `mkdtemp`, with no `cleanup()` — `parsers.py:348-350`), which the RSS-flat reading in §9.13 did not surface because empty dirs cost ≈ 0 RSS. Counting `SCRATCH_DIR` directly (§9.13) exposes it — a reminder that the memory lens, while sufficient for the OBJ-1..OBJ-5 memory questions, does not capture every resource lifecycle.
 - **Sampling granularity.** RSS peaks come from a 3 ms threaded sampler; very short-lived subprocesses for tiny inputs can be under-sampled (the §9.15 type-matrix child column reads 0.00 for this reason). Authoritative OCR child figures use the 3 ms-sampled dedicated runs (§9.16).
 - **In-process vs. recycled worker.** Direct in-process drivers (§9.2–§9.9) do not reflect the `recycle:1` reset; the real cluster (§9.10) does. Both are reported and the difference is itself evidence.
 - **Profiler-inflated figures are labelled.** tracemalloc-ON RSS (§9.3, §9.4 `cold_tm`) is inflated by the profiler's per-allocation frame tracking and is used only for Python-line attribution, never as a clean RSS magnitude.
