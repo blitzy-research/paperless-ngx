@@ -17,7 +17,7 @@ table.
 **Runtime proof — installed framework and versions** (match the `requirements.txt` pins exactly):
 
 ```console
-$ docker exec pngx_qa bash /tmp/pp/pp.sh <<'PY'
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django_q, django, redis, channels
 print("django_q ", django_q.VERSION)
 print("django   ", django.get_version())
@@ -33,7 +33,7 @@ channels  3.0.4
 **Runtime proof — the live broker is Redis:**
 
 ```console
-$ docker exec pngx_qa bash /tmp/pp/pp.sh <<'PY'
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django; django.setup()
 from django_q.brokers import get_broker
 b = get_broker()
@@ -42,7 +42,7 @@ print("broker info  =", b.info())
 print("list_key     =", b.list_key)
 PY
 broker class = django_q.brokers.redis_broker.Redis
-broker info  = Redis 7.4.9
+broker info  = Redis 6.0.16
 list_key     = django_q:paperless:q
 ```
 
@@ -140,11 +140,14 @@ which affects the asynchronous mechanism under study. They are disclosed here an
    `gunicorn.conf.py` binds `0.0.0.0:8000` *inside* the container, but with no port published that
    endpoint is reachable only within the container's network namespace (via `localhost`) and by
    `docker exec`. This is strictly safer than the production host-wide bind.
-3. **Redis provenance.** The image does not bundle a Redis server, so Redis is run from the pinned
-   `redis:7-alpine` image sharing the container's network namespace, which keeps the canonical
-   `PAPERLESS_REDIS=redis://localhost:6379` address intact. The observed server is **Redis 7.4.9**; the
-   Django-Q Redis broker uses only `RPUSH`/`BLPOP`/`LLEN` on a list, whose semantics are identical
-   across Redis 6 and 7 (the broker source is shown in [Q4](#6-q4--waiting-vs-actively-processing)).
+3. **Redis provenance.** The image does not bundle a running Redis server, so Redis is installed from
+   Debian 11 "bullseye"'s own package (`apt-get install redis-server`) and started bound to loopback
+   **inside** the container, which keeps the canonical `PAPERLESS_REDIS=redis://localhost:6379` address
+   intact. The observed server is **Redis 6.0.16** (`redis-server 5:6.0.16-1+deb11u8`); the Django-Q
+   Redis broker uses only `RPUSH`/`BLPOP`/`LLEN`/`LINDEX` on a single list, whose semantics are
+   identical across Redis 6 and 7 (the broker source is shown in
+   [Q4](#6-q4--waiting-vs-actively-processing)), so this version choice does not affect any behavior
+   under study.
 
 One **provenance note** (not a deviation — it makes the runtime *more* production-faithful): the
 canonical image ships without three OS libraries that the project's own `Dockerfile` installs —
@@ -158,6 +161,19 @@ change.
 
 The data directories are relocated under `/tmp/pp` (writable by `testuser`) via the documented
 `PAPERLESS_*` environment variables — the supported configuration mechanism, not a code change.
+
+**Historical dependency snapshot — observation-only, not production-hardened.** The pinned dependency
+set captured at commit `542221a38dff` is a **historical snapshot** and is deliberately reproduced
+byte-for-byte: the read-only mandate forbids editing `requirements.txt` / `Pipfile`, and the point of
+this investigation is to observe the asynchronous mechanism *as it shipped*, not as it might be
+re-pinned today. Several of those pins are now end-of-life or carry published CVEs — notably **Django
+4.0.4** (the 4.0.x series is past end of mainstream/extended support), **djangorestframework 3.13.1**,
+and **gunicorn 20.1.0**. This environment is therefore stood up **for observation of the Django-Q
+enqueue/worker/broker behavior only** and must **not** be treated as production-ready or
+security-hardened; a real deployment would track the project's current supported dependency set. None
+of these versions alters the asynchronous behavior under study. This posture, together with the
+specific pre-existing edge behaviors observed while exercising the canonical paths, is catalogued in
+[§11.3](#113-out-of-scope-observations--pre-existing-system-behaviors).
 
 ### 2.2 Create the disposable container and Redis
 
@@ -174,47 +190,64 @@ PortBindings={} Mounts=[]
 $ docker exec pngx_qa bash -lc 'git config --global --add safe.directory /app; cd /app && git rev-parse HEAD'
 542221a38dff06361e07976452f9aea24d210542
 
-# Restore the OS libraries the project Dockerfile installs (see §2.1 provenance note).
-# Without libzbar0 the qcluster worker cannot import documents.tasks and consume_file cannot run.
+# Restore the OS libraries the project Dockerfile installs (see §2.1 provenance note) and install a
+# Redis server (the canonical image ships none). Without libzbar0 the qcluster worker cannot import
+# documents.tasks, so consume_file cannot run.
 $ docker exec -u root pngx_qa bash -lc \
     'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && \
-     apt-get install -y -qq libzbar0 poppler-utils pngquant'
-Setting up libzbar0:amd64 (0.23.90-1+deb11u1) ...
-Setting up poppler-utils (20.09.0-3.1+deb11u2) ...
-Setting up pngquant (2.13.1-1) ...
+     apt-get install -y -qq redis-server libzbar0 poppler-utils pngquant'
 
-$ docker run -d --name pngx_redis --network container:pngx_qa redis:7-alpine \
-    redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no
-c9fdf9a86c76e05e0e361f8ffae8102b79ee282c2b2b398dd01ec63e91a9a63a
+# Confirm the exact installed versions (dpkg-query is deterministic, independent of install state):
+$ docker exec pngx_qa dpkg-query -W -f='${Package} ${Version}\n' \
+    redis-server libzbar0 poppler-utils pngquant
+libzbar0 0.23.90-1+deb11u1
+pngquant 2.13.1-1
+poppler-utils 20.09.0-3.1+deb11u2
+redis-server 5:6.0.16-1+deb11u8
+
+# Start Redis bound to loopback inside the container, preserving the canonical
+# redis://localhost:6379 address. --save "" --appendonly no keeps it purely in-memory.
+$ docker exec -u root pngx_qa bash -lc \
+    'redis-server --daemonize yes --bind 127.0.0.1 --port 6379 --save "" --appendonly no'
 ```
 
-Redis is now reachable at the canonical `redis://localhost:6379` **inside** the container:
+Redis is now reachable at the canonical `redis://localhost:6379` **inside** the container. This is
+proven with the bundled `redis-cli` — no project helper scripts are needed yet (they are created in
+§2.3):
 
 ```console
-$ docker exec pngx_qa bash /tmp/pp/pp.sh <<'PY'
-import redis
-r = redis.Redis(host="localhost", port=6379)
-print("PING localhost:6379 ->", r.ping())
-print("redis_version       ->", r.info().get("redis_version"))
-PY
-PING localhost:6379 -> True
-redis_version       -> 7.4.9
+$ docker exec pngx_qa redis-cli ping
+PONG
+
+$ docker exec pngx_qa redis-cli info server | grep -E 'redis_version|^os:|multiplexing_api'
+redis_version:6.0.16
+os:Linux 6.6.122+ x86_64
+multiplexing_api:epoll
 ```
 
 > Note: the project ships a startup gate, `docker/wait-for-redis.py`
 > (`MAX_RETRY_COUNT=5` L16, `RETRY_SLEEP_SECONDS=5` L17, `REDIS_URL` default L19), which blocks until
 > `PAPERLESS_REDIS` answers before the services start — the same reachability proven above.
 
-### 2.3 Directories, environment file, and the two disclosed helper scripts
+### 2.3 Directories, environment file, and the disclosed helper scripts
+
+First create the working directories (as root, then hand ownership to `testuser`):
 
 ```console
 $ docker exec pngx_qa bash -lc 'mkdir -p /tmp/pp/{data,media,consume,scratch,data/index,data/log} /tmp/obs \
     && chown -R testuser:testuser /tmp/pp /tmp/obs'
 ```
 
-The single environment file every command sources (`/tmp/pp/penv`):
+The remaining setup materializes three small, fully-disclosed helpers **on disk**. Each is written with
+a real `cat > … <<'EOF'` heredoc fed over `docker exec -i` stdin, so this recipe is genuinely
+self-executable — nothing below is display-only, and each block writes exactly the bytes shown.
 
-```bash
+**(a) `/tmp/pp/penv`** — the single environment file every later command sources. It relocates the
+`PAPERLESS_*` data directories under `/tmp/pp` (writable by `testuser`) and points the app at the
+canonical Redis address:
+
+```console
+$ docker exec -i -u testuser pngx_qa bash -lc 'cat > /tmp/pp/penv' <<'EOF'
 export HOME=/tmp/pp
 export TMPDIR=/tmp/pp/scratch
 export DJANGO_SETTINGS_MODULE=paperless.settings
@@ -225,28 +258,62 @@ export PAPERLESS_CONSUMPTION_DIR=/tmp/pp/consume
 export PAPERLESS_SCRATCH_DIR=/tmp/pp/scratch
 export PAPERLESS_LOGGING_DIR=/tmp/pp/data/log
 export PYTHONPATH=/app/src
+EOF
 ```
 
-`/tmp/pp/pp.sh` — runs a Python snippet (read from stdin) in the canonical env as non-root `testuser`.
-Used throughout for ORM/broker probes; disclosed in full so every later block is exact:
+**(b) `/tmp/pp/pp.sh`** — runs a Python snippet (read from stdin) in the canonical env as non-root
+`testuser`. Used throughout for ORM/broker probes; disclosed in full so every later block is exact:
 
-```bash
+```console
+$ docker exec -i -u testuser pngx_qa bash -lc 'cat > /tmp/pp/pp.sh' <<'EOF'
 #!/bin/bash
 # pp.sh — run a Python snippet (read from stdin) inside the canonical paperless-ngx
 # environment as the non-root 'testuser'. Sources /tmp/pp/penv (the documented env).
 exec runuser -u testuser -- bash -lc 'set -a; . /tmp/pp/penv; set +a; cd /app/src && exec python3 -'
+EOF
 ```
 
-`/tmp/pp/launch.sh` — starts the three canonical services (per `docker/supervisord.conf`), each
-backgrounded, recording each **master PID** via `$!` for a safe, targeted shutdown later:
+**(c) `/tmp/pp/launch.sh`** — starts the three canonical services (per `docker/supervisord.conf`), each
+backgrounded, recording each **master PID** via `$!` for a safe, targeted shutdown later. `cd` sits on
+its own line (not chained with `&&`) so `$!` captures the real `python3`/`gunicorn` master process, not
+a transient subshell — the property that makes the targeted shutdown in [§12.1](#121-safe-validated-service-shutdown) reliable:
 
-```bash
+```console
+$ docker exec -i -u testuser pngx_qa bash -lc 'cat > /tmp/pp/launch.sh' <<'EOF'
 #!/bin/bash
 set -a; . /tmp/pp/penv; set +a
 cd /app/src
 nohup python3 manage.py qcluster            > /tmp/obs/qcluster.log 2>&1 < /dev/null & echo $! > /tmp/obs/qcluster.pid ; disown
 nohup python3 manage.py document_consumer   > /tmp/obs/consumer.log 2>&1 < /dev/null & echo $! > /tmp/obs/consumer.pid ; disown
 nohup gunicorn -c /app/gunicorn.conf.py paperless.asgi:application > /tmp/obs/gunicorn.log 2>&1 < /dev/null & echo $! > /tmp/obs/gunicorn.pid ; disown
+EOF
+```
+
+Make the two scripts executable and confirm all three helpers exist on disk with the expected sizes:
+
+```console
+$ docker exec -u testuser pngx_qa bash -lc 'chmod +x /tmp/pp/pp.sh /tmp/pp/launch.sh && \
+    wc -l /tmp/pp/penv /tmp/pp/pp.sh /tmp/pp/launch.sh'
+  10 /tmp/pp/penv
+   4 /tmp/pp/pp.sh
+   6 /tmp/pp/launch.sh
+  20 total
+```
+
+With `pp.sh` now on disk, confirm the app's own Redis client (the same `redis` library the worker uses)
+reaches the canonical address and sees the Redis 6.0.16 server started in §2.2. This is the same
+reachability the startup gate above guarantees, but exercised through the exact client stack the code
+uses:
+
+```console
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
+import redis
+r = redis.Redis(host="localhost", port=6379)
+print("PING localhost:6379 ->", r.ping())
+print("redis_version       ->", r.info().get("redis_version"))
+PY
+PING localhost:6379 -> True
+redis_version       -> 6.0.16
 ```
 
 ### 2.4 Migrate, create users (as `testuser`)
@@ -295,11 +362,11 @@ $ docker exec pngx_qa bash -lc 'for s in qcluster consumer gunicorn; do
     cmd=$(tr "\0" " " < /proc/$p/cmdline 2>/dev/null)
     echo "$s: PID $p owner=$own :: ${cmd:0:70}"
   done'
-qcluster: PID 190 owner=testuser :: python3 manage.py qcluster
-consumer: PID 191 owner=testuser :: python3 manage.py document_consumer
-gunicorn: PID 192 owner=testuser :: /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/g
+qcluster: PID 13604 owner=testuser :: python3 manage.py qcluster
+consumer: PID 2970 owner=testuser :: python3 manage.py document_consumer
+gunicorn: PID 2971 owner=testuser :: /usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf
 
-$ docker exec pngx_qa bash /tmp/pp/pp.sh <<'PY'
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import urllib.request as u
 print("GET /api/ ->", u.urlopen("http://localhost:8000/api/", timeout=10).status)
 PY
@@ -310,14 +377,19 @@ All three services run as `testuser`; the web endpoint answers on the container-
 Every temporary helper and log lives under `/tmp` (outside the repository) and the whole container is
 discarded at the end; see [Cleanup & repository integrity](#12-cleanup--repository-integrity).
 
-> **Disclosure (worker-cluster PID used in the Q-sections).** In this session the `libzbar0` library
-> (§2.1 provenance note) was installed *after* an initial launch, so the first `qcluster` main (PID 190)
-> ran workers that could not import `documents.tasks`; a single, clean `SIGTERM` restart then produced
-> the **stable cluster used for every observation below — python main PID `2809`, banner
-> `queen-table-earth-mirror`** (`consumer` PID 191 and `gunicorn` PID 192 were untouched). In a clean
-> reproduction the `apt-get` step in §2.2 precedes the launch, so no restart is needed and a single
-> launch yields a stable cluster directly. The verbatim graceful stop of the live cluster is captured at
-> teardown in [§12 (Cleanup)](#12-cleanup--repository-integrity).
+> **Disclosure (worker-cluster identity used in the Q-sections).** Because §2.2 installs `libzbar0`
+> *before* launch (§2.1 provenance note), the single `launch.sh` invocation above yields a stable worker
+> cluster directly — **python main PID `13604`, banner `timing-uncle-failed-neptune`** — alongside the
+> long-lived `consumer` (PID `2970`) and `gunicorn` (PID `2971`) processes. This is the generation the
+> `/proc`-walk and `Stat` commands in [§4](#4-q2--services-involved) read from the live pidfiles. The
+> `consumer` and `gunicorn` processes stay fixed for the whole investigation, but the `qcluster`
+> *generation* is point-in-time: the Q4 boundary demonstration in
+> [§6](#6-q4--waiting-vs-actively-processing) and the schedule observations in
+> [§10](#10-scheduled--recurring-jobs) deliberately stop and restart the cluster, so those sections show
+> later generations with fresh PIDs/banners/`cluster_id`s. Only the **structure** (1 main + 1 Sentinel +
+> 11 workers + 1 monitor + 1 pusher) is generation-invariant (see the cluster-generation note in
+> [§4.2](#42-the-qcluster-process-tree--real-processes-not-threads)). The verbatim graceful stop of the
+> live cluster is captured at teardown in [§12 (Cleanup)](#12-cleanup--repository-integrity).
 
 ---
 
@@ -403,24 +475,24 @@ A `.txt` containing the token is moved into the consumption directory. This exer
 
 ```console
 $ docker exec -u testuser pngx_qa bash -lc '
-cat > /tmp/pp/qa2.txt <<TXT
-QA demonstration document (run 2) for paperless-ngx runtime investigation.
+cat > /tmp/pp/qa1.txt <<TXT
+QA demonstration document for paperless-ngx runtime investigation.
 paperlessqademo invoice from ACME Corporation.
 Parsed by the paperless_text parser (text/plain), no OCR required.
 TXT
-ts=$(date +%Y%m%d_%H%M%S); dest="/tmp/pp/consume/qa_run2_${ts}.txt"
-mv /tmp/pp/qa2.txt "$dest"; echo "dropped: $dest"
+ts=$(date +%Y%m%d_%H%M%S); dest="/tmp/pp/consume/qa_watch_${ts}.txt"
+mv /tmp/pp/qa1.txt "$dest"; echo "dropped: $dest"
 date -u +"drop_utc=%Y-%m-%dT%H:%M:%S.%NZ"'
-dropped: /tmp/pp/consume/qa_run2_20260714_213727.txt
-drop_utc=2026-07-14T21:37:27.518291118Z
+dropped: /tmp/pp/consume/qa_watch_20260715_090209.txt
+drop_utc=2026-07-15T09:02:09.195594868Z
 ```
 
 The watcher detects the file and enqueues it. Its own log line (the `_consume` function,
 `documents/management/commands/document_consumer.py:85`) is the observable proof of the enqueue:
 
 ```console
-$ docker exec pngx_qa bash -lc "grep -n 'qa_run2' /tmp/obs/consumer.log"
-4:[2026-07-14 21:37:28,518] [INFO] [paperless.management.consumer] Adding /tmp/pp/consume/qa_run2_20260714_213727.txt to the task queue.
+$ docker exec pngx_qa bash -lc "grep -n 'qa_watch_20260715_090209' /tmp/obs/consumer.log"
+2:[2026-07-15 09:02:10,200] [INFO] [paperless.management.consumer] Adding /tmp/pp/consume/qa_watch_20260715_090209.txt to the task queue.
 ```
 
 ### 3.3 Worker execution (hops 2–5): `consume_file` runs and the six handlers fire
@@ -429,17 +501,17 @@ The `qcluster` worker log records the whole server-side sequence — the worker 
 `Consumer` running, three of the six handlers logging their assignment, and the completion line:
 
 ```console
-$ docker exec pngx_qa bash -lc "grep -nE 'qa_run2_20260714_213727' /tmp/obs/qcluster.log"
-17:21:37:28 [Q] INFO Process-1:1 processing [qa_run2_20260714_213727.txt]
-18:[2026-07-14 21:37:28,698] [INFO] [paperless.consumer] Consuming qa_run2_20260714_213727.txt
-19:[2026-07-14 21:37:29,544] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-14 qa_run2_20260714_213727
-20:[2026-07-14 21:37:29,545] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-14 QA Correspondent qa_run2_20260714_213727
-21:[2026-07-14 21:37:29,546] [INFO] [paperless.handlers] Tagging "2026-07-14 QA Correspondent qa_run2_20260714_213727" with "QA-Auto"
-22:[2026-07-14 21:37:29,597] [INFO] [paperless.consumer] Document 2026-07-14 QA Correspondent qa_run2_20260714_213727 consumption finished
-24:21:37:29 [Q] INFO Processed [qa_run2_20260714_213727.txt]
+$ docker exec pngx_qa bash -lc "grep -nE 'qa_watch_20260715_090209' /tmp/obs/qcluster.log"
+46:09:02:10 [Q] INFO Process-1:5 processing [qa_watch_20260715_090209.txt]
+47:[2026-07-15 09:02:10,355] [INFO] [paperless.consumer] Consuming qa_watch_20260715_090209.txt
+48:[2026-07-15 09:02:11,097] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-15 qa_watch_20260715_090209
+49:[2026-07-15 09:02:11,098] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-15 QA Correspondent qa_watch_20260715_090209
+50:[2026-07-15 09:02:11,100] [INFO] [paperless.handlers] Tagging "2026-07-15 QA Correspondent qa_watch_20260715_090209" with "QA-Auto"
+51:[2026-07-15 09:02:11,151] [INFO] [paperless.consumer] Document 2026-07-15 QA Correspondent qa_watch_20260715_090209 consumption finished
+53:09:02:11 [Q] INFO Processed [qa_watch_20260715_090209.txt]
 ```
 
-Reading that log against the source: `Process-1:1 processing [...]` is the worker loop
+Reading that log against the source: `Process-1:5 processing [...]` is the worker loop
 (`django_q/cluster.py:420`); `Consuming …` is `Consumer.try_consume_file` starting
 (`documents/consumer.py`); the three `paperless.handlers` lines are emitted by `set_correspondent`,
 `set_document_type`, and `set_tags` (`documents/signals/handlers.py`); `consumption finished` is logged
@@ -501,7 +573,7 @@ When the worker returns, the monitor writes exactly one row. This is the durable
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django; django.setup()
 from django_q.models import Task
-t = Task.objects.get(name="qa_run2_20260714_213727.txt")
+t = Task.objects.get(name="qa_watch_20260715_090209.txt")
 print("Task.id        =", t.id)
 print("Task.name      =", t.name)
 print("Task.func      =", t.func)
@@ -512,14 +584,14 @@ print("Task.stopped   =", t.stopped.isoformat())
 print("Task.time_taken=", "%.3f s" % t.time_taken())
 print("Task.result    =", repr(t.result))
 PY
-Task.id        = 9593494164364f649ee2727659f78fbb
-Task.name      = qa_run2_20260714_213727.txt
+Task.id        = fa11857820694edfb3f1594caf732cc4
+Task.name      = qa_watch_20260715_090209.txt
 Task.func      = documents.tasks.consume_file
-Task.args      = ('/tmp/pp/consume/qa_run2_20260714_213727.txt',)
+Task.args      = ('/tmp/pp/consume/qa_watch_20260715_090209.txt',)
 Task.success   = True
-Task.started   = 2026-07-14T21:37:28.519407+00:00
-Task.stopped   = 2026-07-14T21:37:29.600141+00:00
-Task.time_taken= 1.081 s
+Task.started   = 2026-07-15T09:02:10.202315+00:00
+Task.stopped   = 2026-07-15T09:02:11.154929+00:00
+Task.time_taken= 0.953 s
 Task.result    = 'Success. New document id 1 created'
 ```
 
@@ -538,17 +610,17 @@ Therefore `time_taken() = stopped − started = (queue-wait) + (execution)`. As 
 the absolute timestamps (rounded to 3 decimals throughout this document):
 
 ```
-stopped − started = 2026-07-14T21:37:29.600141Z − 2026-07-14T21:37:28.519407Z
-                  = 1.080734 s  ≈  1.081 s
+stopped − started = 2026-07-15T09:02:11.154929Z − 2026-07-15T09:02:10.202315Z
+                  = 0.952614 s  ≈  0.953 s
 ```
 
-This equals the `Task.time_taken()` value (`1.081 s`) Django-Q reports. Because the cluster was **up**
-here, the queue-wait was negligible — the worker's `processing`/`Consuming` lines land at `21:37:28,698`,
-only ≈ 0.18 s after the enqueue — so this `time_taken` is dominated by execution. The
-**user-perceived** latency is a bit larger still: the file was dropped at `21:37:27.518` but the watcher
-logged the enqueue at `21:37:28,518`, i.e. the watcher's debounce added ≈ 1.0 s before the task even
+This equals the `Task.time_taken()` value (`0.953 s`) Django-Q reports. Because the cluster was **up**
+here, the queue-wait was negligible — the worker's `processing`/`Consuming` lines land at `09:02:10,355`,
+only ≈ 0.16 s after the enqueue — so this `time_taken` is dominated by execution. The
+**user-perceived** latency is a bit larger still: the file was dropped at `09:02:09.195` but the watcher
+logged the enqueue at `09:02:10,200`, i.e. the watcher's debounce added ≈ 1.0 s before the task even
 existed. That `started`-is-enqueue semantics becomes vivid in [§6 (Q4)](#6-q4--waiting-vs-actively-processing),
-where a task deliberately left waiting reports a `time_taken` of **115.780 s** for ≈ 1 s of real work.
+where a task deliberately left waiting reports a `time_taken` of **19.228 s** for ≈ 0.7 s of real work.
 
 ### 3.6 Edge conditions observed on the live path
 
@@ -562,13 +634,17 @@ PDF security policy; paperless catches the failure and **falls back to Ghostscri
 `WARNING`. Consumption still succeeds — the warning is *non-fatal*:
 
 ```console
-$ docker exec pngx_qa bash -lc "grep -nE 'qa_thumb_20260714_213835|convert-im6|falling back' /tmp/obs/qcluster.log"
-27:21:38:36 [Q] INFO Process-1:2 processing [qa_thumb_20260714_213835.pdf]
-28:[2026-07-14 21:38:36,474] [INFO] [paperless.consumer] Consuming qa_thumb_20260714_213835.pdf
-29:convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
-30:convert-im6.q16: no images defined `/tmp/pp/scratch/paperless-lwwo2xiy/convert.png' @ error/convert.c/ConvertImageCommand/3229.
-31:[2026-07-14 21:38:37,195] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
-34:21:38:38 [Q] INFO Processed [qa_thumb_20260714_213835.pdf]
+$ docker exec pngx_qa bash -lc "grep -nE 'qa_thumb_20260715_105357|convert-im6|falling back' /tmp/obs/qcluster.log"
+114:10:53:58 [Q] INFO Process-1:15 processing [qa_thumb_20260715_105357.pdf]
+115:[2026-07-15 10:53:58,261] [INFO] [paperless.consumer] Consuming qa_thumb_20260715_105357.pdf
+116:convert-im6.q16: attempt to perform an operation not allowed by the security policy `PDF' @ error/constitute.c/IsCoderAuthorized/426.
+117:convert-im6.q16: no images defined `/tmp/pp/scratch/paperless-ahntn6b2/convert.png' @ error/convert.c/ConvertImageCommand/3229.
+118:[2026-07-15 10:53:59,012] [WARNING] [paperless.parsing] Thumbnail generation with ImageMagick failed, falling back to ghostscript. Check your /etc/ImageMagick-x/policy.xml!
+119:[2026-07-15 10:53:59,812] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-15 qa_thumb_20260715_105357
+120:[2026-07-15 10:53:59,813] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-15 QA Correspondent qa_thumb_20260715_105357
+121:[2026-07-15 10:53:59,815] [INFO] [paperless.handlers] Tagging "2026-07-15 QA Correspondent qa_thumb_20260715_105357" with "QA-Auto"
+122:[2026-07-15 10:53:59,883] [INFO] [paperless.consumer] Document 2026-07-15 QA Correspondent qa_thumb_20260715_105357 consumption finished
+124:10:53:59 [Q] INFO Processed [qa_thumb_20260715_105357.pdf]
 ```
 
 The fallback and the warning are exactly the code at `documents/parsers.py`: `make_thumbnail_from_pdf`
@@ -580,25 +656,44 @@ success:
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django; django.setup()
 from django_q.models import Task
-t = Task.objects.filter(name__startswith="qa_thumb").order_by("-stopped").first()
+t = Task.objects.filter(name__startswith="qa_thumb_20260715_105357").order_by("-stopped").first()
 print("id=%s success=%s result=%r time_taken=%.3fs" % (t.id, t.success, t.result, t.time_taken()))
 PY
-id=114a9e07bbcf4c0c953390a8a7ad5448 success=True result='Success. New document id 2 created' time_taken=1.751s
+id=fed82cba40f24dc9b2fa0677c9823b32 success=True result='Success. New document id 10 created' time_taken=1.779s
 ```
 
-**(b) Worker death vs. clean failure (missing native library).** Before the `libzbar0` library was
-installed (§2.1 provenance note), the very first `consume_file` attempt made the worker **die at import
-time** rather than fail gracefully. This is an instructive contrast: a *dead* worker never returns a
-result, so the monitor writes **no** `django_q_task` row and, with the Redis broker (no delivery
-receipts), the task is simply **lost** — not retried. This trace was emitted into the live
-`qcluster.log` during the first launch (before `libzbar0` was installed); because that log was truncated
-when the fixed cluster was relaunched, the excerpt is retained verbatim in a preserved evidence file and
-is shown here **complete and unedited**:
+**(b) Worker death vs. clean failure (missing native library).** A missing *native* library is a
+qualitatively different failure from a bad document: it makes the worker **die at import time** rather
+than fail gracefully. To observe this condition directly and under the canonical entry point, the
+`libzbar0` shared library was temporarily moved out of the loader path (with `ldconfig` refreshed), a
+file was dropped through the watcher, and the library was restored immediately afterward. The inducement
+command and its markers:
 
 ```console
-$ docker exec pngx_qa bash -lc "cat /tmp/obs/first_launch_worker_death.log"
-21:34:28 [Q] INFO Process-1:2 processing [qa_ingest_20260714_213427.txt]
-Process Process-1:2:
+$ docker exec pngx_qa bash -lc '
+BK=/tmp/zbar_bak; mkdir -p "$BK"
+restore(){ mv "$BK"/libzbar.so.0.3.0 /usr/lib/x86_64-linux-gnu/; mv "$BK"/libzbar.so.0 /usr/lib/x86_64-linux-gnu/; ldconfig; echo "RESTORED $(date -u +%H:%M:%S.%N)"; }
+trap restore EXIT
+mv /usr/lib/x86_64-linux-gnu/libzbar.so.0.3.0 "$BK"/ && mv /usr/lib/x86_64-linux-gnu/libzbar.so.0 "$BK"/ && ldconfig
+echo "HIDDEN $(date -u +%H:%M:%S.%N)"
+ts=$(date +%Y%m%d_%H%M%S); tmpf=/tmp/pp/qa_death_${ts}.txt; dest=/tmp/pp/consume/qa_death_${ts}.txt
+runuser -u testuser -- bash -c "printf %s\\\\n \"QA worker-death demonstration document.\" > $tmpf"
+mv "$tmpf" "$dest"; echo "DROPPED $dest $(date -u +%H:%M:%S.%N)"
+sleep 9'
+HIDDEN 11:03:01.876517768
+DROPPED /tmp/pp/consume/qa_death_20260715_110301.txt 11:03:01.886984591
+RESTORED 11:03:10.942586458
+```
+
+The worker that dequeued the task died at import time. The trace is captured from the live `qcluster.log`
+and is shown here **complete and unedited** (the traceback lines themselves carry no filename, so the
+region is addressed by line number — the enclosing `processing [qa_death_…]` / `reincarnated` markers
+were located with `grep -nE 'qa_death_20260715_110301|reincarnated|ready for work'`):
+
+```console
+$ docker exec pngx_qa bash -lc "sed -n '134,168p' /tmp/obs/qcluster.log"
+11:03:02 [Q] INFO Process-1:17 processing [qa_death_20260715_110301.txt]
+Process Process-1:17:
 Traceback (most recent call last):
   File "/usr/local/lib/python3.9/pydoc.py", line 439, in safeimport
     module = __import__(path)
@@ -630,22 +725,50 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.9/pydoc.py", line 454, in safeimport
     raise ErrorDuringImport(path, sys.exc_info())
 pydoc.ErrorDuringImport: problem in documents.tasks - ImportError: Unable to find zbar shared library
-21:34:29 [Q] ERROR reincarnated worker Process-1:2 after death
-21:34:29 [Q] INFO Process-1:15 ready for work at 2261
+11:03:03 [Q] ERROR reincarnated worker Process-1:17 after death
+11:03:03 [Q] INFO Process-1:28 ready for work at 15392
 ```
 
 The worker imports the task target lazily at run time via `pydoc.locate(f)` (`django_q/cluster.py:424`);
 because `documents/tasks.py:25` imports `pyzbar` at module scope, the missing shared library propagates
-as an uncaught error that kills the process. Django-Q's guard **reincarnates** the dead worker (a new
-worker PID appears), but the in-flight task yields no row. After installing `libzbar0` (§2.2), the same
-ingestion produced the successful row shown in §3.4. This difference — *clean failure writes a
-`success=False` row; a process death writes nothing* — is revisited with a forced clean failure in
-[§8 (Q6)](#8-q6--after-the-fact-status).
+as an uncaught error that kills the process — the exception escapes `worker()` entirely (it is raised
+*before* the per-task try/except that would otherwise record a failure), so no result is ever pushed.
+Django-Q's Sentinel **reincarnates** the dead worker: `Process-1:17` dies and a fresh `Process-1:28`
+(PID `15392`) appears one second later. The in-flight task therefore yields **no** `django_q_task` row —
+directly observed:
 
-> **(inferred)** The "task is lost, not retried" claim for a *process death* under the Redis broker is
-> inferred from the broker having no acknowledge/receipt mechanism (see the broker source in
-> [§6 (Q4)](#6-q4--waiting-vs-actively-processing)); it was corroborated by observing that no new row and
-> no re-processing appeared for `qa_ingest_20260714_213427.txt` after the death.
+```console
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
+import django; django.setup()
+from django_q.models import Task
+print("Task rows for qa_death_20260715_110301.txt =",
+      Task.objects.filter(name="qa_death_20260715_110301.txt").count())
+PY
+Task rows for qa_death_20260715_110301.txt = 0
+```
+
+After the library was restored, the very next ingestion through the same watcher succeeded, confirming
+the cluster self-heals (a fresh worker re-imports `documents.tasks` cleanly):
+
+```console
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
+import django; django.setup()
+from django_q.models import Task
+t = Task.objects.filter(name="qa_heal_20260715_110348.txt").order_by("-stopped").first()
+print("id=%s success=%s result=%r time_taken=%.3fs" % (t.id, t.success, t.result, t.time_taken()))
+PY
+id=418d4860f19243f7a1b07181f8e54c42 success=True result='Success. New document id 11 created' time_taken=0.908s
+```
+
+This difference is the crux of the edge behavior: a **process death writes nothing** (zero rows, task
+lost), whereas a **clean failure writes a `success=False` row** — the latter is demonstrated with a
+forced duplicate failure in [§8 (Q6)](#8-q6--after-the-fact-status).
+
+> **(inferred)** The "task is *not retried*" half of the claim is grounded in the Redis broker having no
+> acknowledge/receipt mechanism (broker source cited in [§6 (Q4)](#6-q4--waiting-vs-actively-processing)):
+> once the package is popped from the Redis list it is gone, so a worker death loses it with no
+> re-delivery. The **zero-row / task-lost** half is *observed* directly above (no row for
+> `qa_death_20260715_110301.txt`, and no re-processing of it appeared afterward).
 
 ---
 
@@ -672,6 +795,7 @@ These three programs are exactly the `docker/supervisord.conf` definitions (note
 
 ```console
 $ docker exec pngx_qa bash -lc "grep -nE '^\[program|command=|user=' /app/docker/supervisord.conf"
+8:user=root
 10:[program:gunicorn]
 11:command=gunicorn -c /usr/src/paperless/gunicorn.conf.py paperless.asgi:application
 12:user=paperless
@@ -683,6 +807,12 @@ $ docker exec pngx_qa bash -lc "grep -nE '^\[program|command=|user=' /app/docker
 30:user=paperless
 ```
 
+The first match — `8:user=root` — is the `[supervisord]` **master** section's own directive
+(`docker/supervisord.conf:8`): the Supervisord process runs as root, and each of the three programs then
+drops privileges via its per-program `user=paperless` (lines 12, 21, 30). *(In this read-only
+reproduction the programs are launched directly as `testuser` rather than under Supervisord, so the owner
+observed in §4.1 is `testuser`; see [§2.5](#25-launch-and-confirm-the-three-services).)*
+
 ### 4.1 The three live services (PID, owner, exact command line)
 
 ```console
@@ -692,11 +822,11 @@ for name in qcluster consumer gunicorn; do
   echo "[$name] pid=$pid comm=$(cat /proc/$pid/comm) owner=$(stat -c %U /proc/$pid)"
   echo "   cmdline=$(tr "\0" " " < /proc/$pid/cmdline)"
 done'
-[qcluster] pid=2809 comm=python3 owner=testuser
+[qcluster] pid=13604 comm=python3 owner=testuser
    cmdline=python3 manage.py qcluster
-[consumer] pid=191 comm=python3 owner=testuser
+[consumer] pid=2970 comm=python3 owner=testuser
    cmdline=python3 manage.py document_consumer
-[gunicorn] pid=192 comm=gunicorn owner=testuser
+[gunicorn] pid=2971 comm=gunicorn owner=testuser
    cmdline=/usr/local/bin/python3.9 /usr/local/bin/gunicorn -c /app/gunicorn.conf.py paperless.asgi:application
 ```
 
@@ -704,8 +834,8 @@ done'
 
 Finding-of-record: Django-Q workers are **separate operating-system processes**, each with its own PID,
 not threads inside one interpreter. This is directly visible by walking `/proc` from the cluster main
-down through the Sentinel to its children (the cluster used here is `queen-table-earth-mirror`, main
-PID `2809`, per the §2.5 disclosure).
+down through the Sentinel to its children (the cluster used here is `timing-uncle-failed-neptune`, main
+PID `13604`, per the §2.5 disclosure).
 
 > **Cluster generation note.** The specific PIDs, `cluster_id`, and banner name below are a point-in-time
 > snapshot of the cluster generation that was live when Q2 was observed. The **structure** (1 main + 1
@@ -731,48 +861,52 @@ for c in /proc/[0-9]*/status; do
   if [ "$p" = "$SENT" ]; then n=$((n+1)); echo "    child#$n pid=$pid comm=$(cat /proc/$pid/comm)"; fi
 done
 echo "  => Sentinel has $n child processes (expect 11 workers + 1 monitor + 1 pusher = 13)"'
-CLUSTER MAIN pid=2809 comm=python3 ppid=1
-  SENTINEL pid=2835 comm=python3 ppid=2809
-    child#1 pid=2836 comm=python3
-    child#2 pid=2837 comm=python3
-    child#3 pid=2838 comm=python3
-    child#4 pid=2839 comm=python3
-    child#5 pid=2840 comm=python3
-    child#6 pid=2841 comm=python3
-    child#7 pid=2842 comm=python3
-    child#8 pid=2843 comm=python3
-    child#9 pid=2844 comm=python3
-    child#10 pid=2845 comm=python3
-    child#11 pid=2846 comm=python3
-    child#12 pid=2847 comm=python3
-    child#13 pid=2848 comm=python3
+CLUSTER MAIN pid=13604 comm=python3 ppid=1
+  SENTINEL pid=13611 comm=python3 ppid=13604
+    child#1 pid=13623 comm=python3
+    child#2 pid=13624 comm=python3
+    child#3 pid=15392 comm=python3
+    child#4 pid=15459 comm=python3
+    child#5 pid=15471 comm=python3
+    child#6 pid=15484 comm=python3
+    child#7 pid=15514 comm=python3
+    child#8 pid=15544 comm=python3
+    child#9 pid=15546 comm=python3
+    child#10 pid=15959 comm=python3
+    child#11 pid=15979 comm=python3
+    child#12 pid=16072 comm=python3
+    child#13 pid=16507 comm=python3
   => Sentinel has 13 child processes (expect 11 workers + 1 monitor + 1 pusher = 13)
 ```
 
-That tree maps one-to-one onto the cluster's own startup banner (each `Process-1:N` is one of the PIDs
-above):
+The cluster's own startup banner assigns each role a `Process-1:N` label. It was captured at launch, so
+its worker PIDs are the *original* ones; because `recycle=1` (the `Q_CLUSTER` setting shown further
+below) replaces each worker after every task, the **11 live worker PIDs** above (`15392`…`16507`) have
+since rotated away from the banner's `13612`…`13622`, whereas the **monitor** (`13623`) and **pusher**
+(`13624`) are never recycled and therefore persist unchanged into the live tree. The *count* and *roles*
+are generation-invariant; only the individual worker PIDs churn:
 
 ```console
 $ docker exec pngx_qa bash -lc "sed -n '1,15p' /tmp/obs/qcluster.log"
-21:36:49 [Q] INFO Q Cluster queen-table-earth-mirror starting.
-21:36:49 [Q] INFO Process-1:1 ready for work at 2836
-21:36:49 [Q] INFO Process-1:2 ready for work at 2837
-21:36:49 [Q] INFO Process-1:3 ready for work at 2838
-21:36:49 [Q] INFO Process-1:4 ready for work at 2839
-21:36:49 [Q] INFO Process-1:5 ready for work at 2840
-21:36:49 [Q] INFO Process-1:6 ready for work at 2841
-21:36:49 [Q] INFO Process-1:7 ready for work at 2842
-21:36:49 [Q] INFO Process-1:8 ready for work at 2843
-21:36:49 [Q] INFO Process-1:9 ready for work at 2844
-21:36:49 [Q] INFO Process-1:10 ready for work at 2845
-21:36:49 [Q] INFO Process-1:11 ready for work at 2846
-21:36:49 [Q] INFO Process-1:12 monitoring at 2847
-21:36:49 [Q] INFO Process-1 guarding cluster queen-table-earth-mirror
-21:36:49 [Q] INFO Process-1:13 pushing tasks at 2848
+09:29:20 [Q] INFO Q Cluster timing-uncle-failed-neptune starting.
+09:29:20 [Q] INFO Process-1:1 ready for work at 13612
+09:29:20 [Q] INFO Process-1:2 ready for work at 13613
+09:29:20 [Q] INFO Process-1:3 ready for work at 13614
+09:29:20 [Q] INFO Process-1:4 ready for work at 13615
+09:29:20 [Q] INFO Process-1:5 ready for work at 13616
+09:29:20 [Q] INFO Process-1:6 ready for work at 13617
+09:29:20 [Q] INFO Process-1:7 ready for work at 13618
+09:29:20 [Q] INFO Process-1:8 ready for work at 13619
+09:29:20 [Q] INFO Process-1:9 ready for work at 13620
+09:29:20 [Q] INFO Process-1:10 ready for work at 13621
+09:29:20 [Q] INFO Process-1:11 ready for work at 13622
+09:29:20 [Q] INFO Process-1:12 monitoring at 13623
+09:29:20 [Q] INFO Process-1 guarding cluster timing-uncle-failed-neptune
+09:29:20 [Q] INFO Process-1:13 pushing tasks at 13624
 ```
 
-Reading the banner against `django_q/cluster.py`: the **main** process (`manage.py qcluster`, PID 2809)
-spawns one **Sentinel** process (`Process(target=Sentinel)`, `cluster.py:68`; PID 2835). The Sentinel
+Reading the banner against `django_q/cluster.py`: the **main** process (`manage.py qcluster`, PID 13604)
+spawns one **Sentinel** process (`Process(target=Sentinel)`, `cluster.py:68`; PID 13611). The Sentinel
 spawns the **11 workers** (`Process-1:1..11`, `spawn_worker`), **1 monitor** (`Process-1:12 monitoring`,
 `spawn_monitor`, `cluster.py:208`), and **1 pusher** (`Process-1:13 pushing tasks`, `spawn_pusher`,
 `cluster.py:200`); it then runs the **guard** loop itself (`Process-1 guarding`, `cluster.py:253`).
@@ -797,7 +931,7 @@ for s in Stat.get_all():
           % (s.cluster_id, s.pid, s.status, len(s.workers), s.task_q_size, s.done_q_size))
 print("Conf.PREFIX(cluster name) =", Conf.PREFIX)
 PY
-cluster_id=0c7ab676-7fb5-4456-aa78-dd38719b8fe9 pid=2809 status=Idle workers=11 task_q=0 done_q=0
+cluster_id=f5e5ec1c-34f7-4660-bbdd-caedee7b0a07 pid=13604 status=Idle workers=11 task_q=0 done_q=0
 Conf.PREFIX(cluster name) = paperless
 ```
 
@@ -828,7 +962,7 @@ PY
 
 ### 4.3 gunicorn — the web/API + WebSocket process
 
-`gunicorn` is a master process (PID 192) with worker children serving the ASGI app (which carries both
+`gunicorn` is a master process (PID 2971) with worker children serving the ASGI app (which carries both
 the REST API and the Channels WebSocket routes, `paperless/asgi.py:17-20`):
 
 ```console
@@ -838,9 +972,9 @@ for c in /proc/[0-9]*/status; do
   p=$(awk "/^PPid:/{print \$2}" "$c"); pid=$(awk "/^Pid:/{print \$2}" "$c")
   [ "$p" = "$G" ] && echo "  worker pid=$pid comm=$(cat /proc/$pid/comm)"
 done'
-gunicorn master=192
-  worker pid=194 comm=gunicorn
-  worker pid=195 comm=gunicorn
+gunicorn master=2971
+  worker pid=2973 comm=gunicorn
+  worker pid=2974 comm=gunicorn
 ```
 
 ### 4.4 Redis — one server, two roles
@@ -864,14 +998,14 @@ PY
 broker  Q_CLUSTER[redis]       = redis://localhost:6379
 channels CHANNEL_LAYERS backend = channels_redis.core.RedisChannelLayer
 channels CHANNEL_LAYERS hosts   = ['redis://localhost:6379']
-PING = True | redis_version = 7.4.9
+PING = True | redis_version = 6.0.16
 ```
 
 ### 4.5 Stopping the cluster
 
 A `qcluster` is stopped with a single `SIGTERM` to its main PID; the Sentinel drains its workers and the
 monitor before exiting. Because that shutdown is part of teardown, the **actual, verbatim** graceful
-stop of the live cluster (`queen-table-earth-mirror`, PID 2809) is captured at cleanup time in
+stop of the live cluster (`timing-uncle-failed-neptune`, PID 13604) is captured at cleanup time in
 [§12 (Cleanup & repository integrity)](#12-cleanup--repository-integrity).
 
 > **(inferred)** The mapping of each banner line to a specific `spawn_*` call in `django_q/cluster.py` is
@@ -936,17 +1070,17 @@ print("--- no persisted row yet for this id ---")
 print("Task.objects.filter(id=%r).exists() = %s" % (pkg["id"], Task.objects.filter(id=pkg["id"]).exists()))
 PY
 LLEN django_q:paperless:q = 1  (WAITING: package sits in the Redis list)
-LINDEX head: type=bytes length=483 bytes
-first 60 raw bytes: b'gAWVOQEAAAAAAAB9lCiMAmlklIwgZjkzMjlkN2VkYjE3NDg2YWIyMDFiOWQ3'
+LINDEX head: type=bytes length=467 bytes
+first 60 raw bytes: b'gAWVLQEAAAAAAAB9lCiMAmlklIwgYTNjMzgzNWY2NmRjNDQyN2ExYTZlNTNj'
 --- decoded task package (keys) ---
-  args       = ('/tmp/pp/consume/qa_wait_run1_20260714_215813.txt',)
+  args       = ('/tmp/pp/consume/qa_pkg_20260715_090313.txt',)
   func       = 'documents.tasks.consume_file'
-  id         = 'f9329d7edb17486ab201b9d7e9057e10'
+  id         = 'a3c3835f66dc4427a1a6e53c8fe8fd80'
   kwargs     = {'override_tag_ids': None}
-  name       = 'qa_wait_run1_20260714_215813.txt'
-  started    = datetime.datetime(2026, 7, 14, 21, 58, 14, 969374, tzinfo=datetime.timezone.utc)
+  name       = 'qa_pkg_20260715_090313.txt'
+  started    = datetime.datetime(2026, 7, 15, 9, 3, 14, 923768, tzinfo=datetime.timezone.utc)
 --- no persisted row yet for this id ---
-Task.objects.filter(id='f9329d7edb17486ab201b9d7e9057e10').exists() = False
+Task.objects.filter(id='a3c3835f66dc4427a1a6e53c8fe8fd80').exists() = False
 ```
 
 Reading the decoded package field-by-field (these are the "identifiers and payload" the question asks
@@ -954,12 +1088,12 @@ for):
 
 | Field | Observed value | Meaning |
 |---|---|---|
-| `id` | `f9329d7edb17486ab201b9d7e9057e10` | 32-char hex UUID; the value `async_task` returns; becomes the `django_q_task` primary key |
+| `id` | `a3c3835f66dc4427a1a6e53c8fe8fd80` | 32-char hex UUID; the value `async_task` returns; becomes the `django_q_task` primary key |
 | `func` | `documents.tasks.consume_file` | dotted path the worker will `pydoc.locate` and call |
-| `args` | `('/tmp/pp/consume/qa_wait_run1_20260714_215813.txt',)` | positional args — here the file path to ingest |
+| `args` | `('/tmp/pp/consume/qa_pkg_20260715_090313.txt',)` | positional args — here the file path to ingest |
 | `kwargs` | `{'override_tag_ids': None}` | keyword args passed by the watcher's `async_task` call |
-| `name` | `qa_wait_run1_20260714_215813.txt` | human-readable label (the watcher uses the filename) |
-| `started` | `2026-07-14 21:58:14.969374+00:00` | enqueue timestamp (`tasks.py:65`); later copied verbatim into the row |
+| `name` | `qa_pkg_20260715_090313.txt` | human-readable label (the watcher uses the filename) |
+| `started` | `2026-07-15 09:03:14.923768+00:00` | enqueue timestamp (`tasks.py:65`); later copied verbatim into the row |
 
 The final line confirms the crucial point: **at creation the job exists only as a Redis list element —
 there is no `django_q_task` row yet** (`Task.objects.filter(id=…).exists() = False`). The row is written
@@ -967,7 +1101,7 @@ only after the worker finishes (see [§7](#7-q5--where-task-state-is-stored) / [
 
 ### 5.2 Why the payload is opaque bytes — the signed-pickle trust boundary
 
-The 483-byte value is not human-readable because Django-Q **signs and pickles** every package.
+The 467-byte value is not human-readable because Django-Q **signs and pickles** every package.
 `SignedPackage.dumps/loads` (`django_q/signing.py`) wrap Django's signing with a pickle serializer,
 using `key=Conf.SECRET_KEY` and `salt=Conf.PREFIX` (the cluster name `paperless`):
 
@@ -1106,59 +1240,72 @@ persist. The poller thus records the full **before / during / after** of the sam
 
 ```console
 $ docker exec pngx_qa bash -lc "cat /tmp/obs/poll_run1.csv"
-# run_id=run1 env_id=pngx_qa/542221a38dff/redis7.4.9 watch_task_id=f9329d7edb17486ab201b9d7e9057e10 watch_name=qa_wait_run1_20260714_215813.txt
+# run_id=run1 env_id=pngx_qa/542221a38dff/redis6.0.16 watch_task_id=a3c3835f66dc4427a1a6e53c8fe8fd80 watch_name=qa_pkg_20260715_090313.txt
 # iso_utc                    | LLEN | cluster  | task_q | done_q | state
-2026-07-14T22:00:08.081+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.191+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.293+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.395+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.497+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.599+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.701+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.803+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:08.906+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.008+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.109+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.212+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.314+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.416+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.518+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.621+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.723+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.825+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:00:09.942+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.045+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.147+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.250+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.352+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.455+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.557+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.661+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:00:10.763+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
-2026-07-14T22:00:10.866+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
-2026-07-14T22:00:10.968+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
+2026-07-15T09:03:30.689+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:30.800+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:30.902+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.005+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.107+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.209+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.311+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.414+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.516+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.618+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.721+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.824+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:31.927+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.041+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.144+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.247+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.349+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.452+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.554+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.656+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.758+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.861+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:32.963+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:33.065+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:33.167+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:03:33.269+00:00 | 1    | Starting | 0    | 0    | WAITING
+2026-07-15T09:03:33.373+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:33.476+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:33.579+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:33.681+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:33.784+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:33.887+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:33.990+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:34.093+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:03:34.195+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
+2026-07-15T09:03:34.299+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
+2026-07-15T09:03:34.402+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
 ```
 
-The three states are unmistakable and correlated to the *same* `task_id`:
+The three states are unmistakable and correlated to the *same* `task_id`
+(`a3c3835f66dc4427a1a6e53c8fe8fd80` — the exact package peeked while waiting in
+[§5.1](#51-the-job-as-it-actually-appears-on-the-queue-observed)):
 
-- **WAITING** `22:00:08.081 → 22:00:09.825`: `LLEN=1`, cluster `down`, no row.
-- **IN-CLUSTER/ACTIVE** `22:00:09.942 → 22:00:10.661`: `LLEN=0`, cluster present, internal `task_q=0`
+- **WAITING** `09:03:30.689 → 09:03:33.269`: `LLEN=1`, no row. The cluster is `down` for the first 25
+  samples and `Starting` on the last one — the package is still queued because no worker has dequeued it
+  yet. (The poller began ≈16 s after enqueue, so these 26 samples are the *tail* of a longer wait; the
+  full wait is measured from `Task.started` below.)
+- **IN-CLUSTER/ACTIVE** `09:03:33.373 → 09:03:34.093`: `LLEN=0`, cluster present, internal `task_q=0`
   and `done_q=0`, **still no row**. This is the window that a naive "is the queue empty?" check would
   wrongly report as finished.
-- **DONE** from `22:00:10.763`: the row now exists with `success=True`.
+- **DONE** from `09:03:34.195`: the row now exists with `success=True`.
 
 That the ACTIVE window is *genuinely executing the function* (not merely idle) is confirmed by the
 worker's own log for the same task, with absolute timestamps that fall inside the ACTIVE window above:
 
 ```console
-$ docker exec pngx_qa bash -lc "grep -nE 'qa_wait_run1' /tmp/obs/qcluster.log"
-84:22:00:09 [Q] INFO Process-1:1 processing [qa_wait_run1_20260714_215813.txt]
-85:[2026-07-14 22:00:10,037] [INFO] [paperless.consumer] Consuming qa_wait_run1_20260714_215813.txt
-86:[2026-07-14 22:00:10,687] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-14 qa_wait_run1_20260714_215813
-87:[2026-07-14 22:00:10,688] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-14 QA Correspondent qa_wait_run1_20260714_215813
-88:[2026-07-14 22:00:10,690] [INFO] [paperless.handlers] Tagging "2026-07-14 QA Correspondent qa_wait_run1_20260714_215813" with "QA-Auto"
-89:[2026-07-14 22:00:10,745] [INFO] [paperless.consumer] Document 2026-07-14 QA Correspondent qa_wait_run1_20260714_215813 consumption finished
-91:22:00:10 [Q] INFO Processed [qa_wait_run1_20260714_215813.txt]
+$ docker exec pngx_qa bash -lc "grep -E 'qa_pkg_20260715_090313' /tmp/obs/qcluster.log"
+09:03:33 [Q] INFO Process-1:1 processing [qa_pkg_20260715_090313.txt]
+[2026-07-15 09:03:33,412] [INFO] [paperless.consumer] Consuming qa_pkg_20260715_090313.txt
+[2026-07-15 09:03:34,098] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-15 qa_pkg_20260715_090313
+[2026-07-15 09:03:34,099] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-15 QA Correspondent qa_pkg_20260715_090313
+[2026-07-15 09:03:34,101] [INFO] [paperless.handlers] Tagging "2026-07-15 QA Correspondent qa_pkg_20260715_090313" with "QA-Auto"
+[2026-07-15 09:03:34,148] [INFO] [paperless.consumer] Document 2026-07-15 QA Correspondent qa_pkg_20260715_090313 consumption finished
+09:03:34 [Q] INFO Processed [qa_pkg_20260715_090313.txt]
 ```
 
 Finally the persisted row, correlated by the **same id** peeked while waiting:
@@ -1167,65 +1314,137 @@ Finally the persisted row, correlated by the **same id** peeked while waiting:
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django; django.setup()
 from django_q.models import Task
-t = Task.objects.get(id="f9329d7edb17486ab201b9d7e9057e10")
+t = Task.objects.get(id="a3c3835f66dc4427a1a6e53c8fe8fd80")
 print("id=%s success=%s" % (t.id, t.success))
 print("started =", t.started.isoformat())
 print("stopped =", t.stopped.isoformat())
 print("time_taken = %.3f s" % t.time_taken())
 print("result =", repr(t.result))
 PY
-id=f9329d7edb17486ab201b9d7e9057e10 success=True
-started = 2026-07-14T21:58:14.969374+00:00
-stopped = 2026-07-14T22:00:10.749247+00:00
-time_taken = 115.780 s
-result = 'Success. New document id 3 created'
+id=a3c3835f66dc4427a1a6e53c8fe8fd80 success=True
+started = 2026-07-15T09:03:14.923768+00:00
+stopped = 2026-07-15T09:03:34.151565+00:00
+time_taken = 19.228 s
+result = 'Success. New document id 2 created'
 ```
 
-Note the `started` (`21:58:14.969374`) is exactly the enqueue timestamp peeked inside the package in
+Note the `started` (`09:03:14.923768`) is exactly the enqueue timestamp peeked inside the package in
 §5.1 — proving the point from §3.5 that **`started` is stamped at enqueue**. As a single calculation:
 
 ```
-time_taken = stopped − started = 2026-07-14T22:00:10.749247Z − 2026-07-14T21:58:14.969374Z
-           = 115.779873 s  ≈  115.780 s
+time_taken = stopped − started = 2026-07-15T09:03:34.151565Z − 2026-07-15T09:03:14.923768Z
+           = 19.227797 s  ≈  19.228 s
 ```
 
-The job's *execution* was ≈ 0.7 s (worker `Consuming` `22:00:10,037` → `consumption finished`
-`22:00:10,745` = `0.708 s`); the remaining ≈ 115.07 s is pure **queue-wait** — time the package spent in
+The job's *execution* was ≈ 0.74 s (worker `Consuming` `09:03:33,412` → `consumption finished`
+`09:03:34,148` = `0.736 s`); the remaining ≈ 18.49 s is pure **queue-wait** — time the package spent in
 the WAITING state because the cluster was deliberately down. This is the concrete proof that
 `time_taken` = queue-wait + execution.
 
 ### 6.3 Run 2 — identical experiment (two-run stability)
 
-Repeating the *identical* procedure with a second file yields the same three-state signature:
+Repeating the *identical* procedure with a second file yields the same three-state signature. The
+**complete** trace is inlined below (every sample, no external-file reference) so the evidence is
+fully self-contained:
 
 ```console
 $ docker exec pngx_qa bash -lc "cat /tmp/obs/poll_run2.csv"
-# run_id=run2 env_id=pngx_qa/542221a38dff/redis7.4.9 watch_task_id=d050b8651a404292807516543bc88446 watch_name=qa_wait_run2_20260714_220232.txt
+# run_id=run2 env_id=pngx_qa/542221a38dff/redis6.0.16 watch_task_id=5487d1fe53ba4f74b7326af6148e4d45 watch_name=qa_run2_20260715_090423.txt
 # iso_utc                    | LLEN | cluster  | task_q | done_q | state
-2026-07-14T22:02:49.669+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:02:51.638+00:00 | 1    | down     | -    | -    | WAITING
-2026-07-14T22:02:51.740+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:02:52.561+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
-2026-07-14T22:02:52.664+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
+2026-07-15T09:04:27.348+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:27.457+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:27.560+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:27.662+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:27.763+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:27.865+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:27.967+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.069+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.171+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.273+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.375+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.477+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.579+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.691+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.799+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:28.902+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.003+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.106+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.208+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.309+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.411+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.513+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.615+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.717+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.819+00:00 | 1    | down     | -    | -    | WAITING
+2026-07-15T09:04:29.921+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.023+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.126+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.228+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.330+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.433+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.535+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.637+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.739+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.841+00:00 | 0    | Idle     | 0    | 0    | IN-CLUSTER/ACTIVE
+2026-07-15T09:04:30.944+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
+2026-07-15T09:04:31.046+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
+2026-07-15T09:04:31.148+00:00 | 0    | Idle     | 0    | 0    | DONE(success=True)
 ```
-*(abridged to the state-transition boundaries; the full 32-sample trace is in `/tmp/obs/poll_run2.csv`
-— it shows 20 consecutive WAITING samples `22:02:49.669→51.638`, then 9 IN-CLUSTER/ACTIVE samples
-`22:02:51.740→52.561`, then 3 DONE samples.)*
+
+The three states are again correlated to the *same* `task_id` (`5487d1fe53ba4f74b7326af6148e4d45`):
+
+- **WAITING** `09:04:27.348 → 09:04:29.819`: 25 samples, `LLEN=1`, cluster `down`, **no row**.
+- **IN-CLUSTER/ACTIVE** `09:04:29.921 → 09:04:30.841`: 10 samples, `LLEN=0`, cluster present, internal
+  `task_q=0`/`done_q=0`, **still no row** — the same "empty queue but not finished" trap as Run 1.
+- **DONE** from `09:04:30.944`: 3 samples, the row now exists with `success=True`.
+
+Worker log for the same task (the execution window falls inside the ACTIVE band above):
+
+```console
+$ docker exec pngx_qa bash -lc "grep -E 'qa_run2_20260715_090423' /tmp/obs/qcluster.log"
+09:04:29 [Q] INFO Process-1:1 processing [qa_run2_20260715_090423.txt]
+[2026-07-15 09:04:29,995] [INFO] [paperless.consumer] Consuming qa_run2_20260715_090423.txt
+[2026-07-15 09:04:30,783] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-15 qa_run2_20260715_090423
+[2026-07-15 09:04:30,784] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-15 QA Correspondent qa_run2_20260715_090423
+[2026-07-15 09:04:30,786] [INFO] [paperless.handlers] Tagging "2026-07-15 QA Correspondent qa_run2_20260715_090423" with "QA-Auto"
+[2026-07-15 09:04:30,840] [INFO] [paperless.consumer] Document 2026-07-15 QA Correspondent qa_run2_20260715_090423 consumption finished
+09:04:30 [Q] INFO Processed [qa_run2_20260715_090423.txt]
+```
+
+Persisted row (correlated by the same id):
+
+```console
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
+import django; django.setup()
+from django_q.models import Task
+t = Task.objects.get(id="5487d1fe53ba4f74b7326af6148e4d45")
+print("id=%s success=%s" % (t.id, t.success))
+print("started =", t.started.isoformat())
+print("stopped =", t.stopped.isoformat())
+print("time_taken = %.3f s" % t.time_taken())
+print("result =", repr(t.result))
+PY
+id=5487d1fe53ba4f74b7326af6148e4d45 success=True
+started = 2026-07-15T09:04:24.942754+00:00
+stopped = 2026-07-15T09:04:30.843643+00:00
+time_taken = 5.901 s
+result = 'Success. New document id 3 created'
+```
 
 Two-run comparison (the state pattern is stable; the difference is only the deliberate queue-wait):
 
 | Measure | Run 1 | Run 2 |
 |---|---|---|
-| WAITING samples (`LLEN=1`, no row) | 18 | 20 |
-| IN-CLUSTER/ACTIVE samples (`LLEN=0`, no row) | 8 | 9 |
+| WAITING samples (`LLEN=1`, no row) | 26 | 25 |
+| IN-CLUSTER/ACTIVE samples (`LLEN=0`, no row) | 8 | 10 |
 | DONE samples | 3 | 3 |
-| execution (`Consuming`→`consumption finished`) | 0.708 s | 0.750 s |
-| `time_taken` (enqueue→finish = wait+exec) | 115.780 s | 18.697 s |
-| `success` / `result` | True / "New document id 3 created" | True / "New document id 4 created" |
+| execution (`Consuming`→`consumption finished`) | 0.736 s | 0.845 s |
+| `time_taken` (enqueue→finish = wait+exec) | 19.228 s | 5.901 s |
+| `success` / `result` | True / "New document id 2 created" | True / "New document id 3 created" |
 
-The qualitative boundary (WAITING → IN-CLUSTER/ACTIVE → DONE) and the execution duration (≈ 0.7 s) are
-**stable across both runs**; only `time_taken` differs, and it differs *exactly* by how long each task
-was left waiting — which is expected and reinforces the `started`-is-enqueue semantics.
+The qualitative boundary (WAITING → IN-CLUSTER/ACTIVE → DONE) and the execution duration (≈ 0.7–0.8 s)
+are **stable across both runs**; only `time_taken` differs, and it differs *exactly* by how long each
+task was left waiting — which is expected and reinforces the `started`-is-enqueue semantics.
 
 ### 6.4 What the admin/API surfaces for each state
 
@@ -1366,29 +1585,29 @@ whose byte-identical duplicate is failed in §8.2):
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django; django.setup()
 from django_q.models import Task
-t = Task.objects.get(name="qa_seed_20260714_221848.txt")
+t = Task.objects.get(name="qa_seed_20260715_111305.txt")
 for f in ["id","name","func","hook","group","args","kwargs","result","started","stopped","success","attempt_count"]:
     print("  %-14s = %r" % (f, getattr(t, f)))
 print("  time_taken()   = %.3f s" % t.time_taken())
 PY
-  id             = 'aaf0ee80efc64eb2ad9496ff8bbbd43d'
-  name           = 'qa_seed_20260714_221848.txt'
+  id             = '4d907eeb7b7349e6b706bd1a53f22761'
+  name           = 'qa_seed_20260715_111305.txt'
   func           = 'documents.tasks.consume_file'
   hook           = None
   group          = None
-  args           = ('/tmp/pp/consume/qa_seed_20260714_221848.txt',)
+  args           = ('/tmp/pp/consume/qa_seed_20260715_111305.txt',)
   kwargs         = {'override_tag_ids': None}
-  result         = 'Success. New document id 5 created'
-  started        = datetime.datetime(2026, 7, 14, 22, 18, 50, 79230, tzinfo=datetime.timezone.utc)
-  stopped        = datetime.datetime(2026, 7, 14, 22, 18, 51, 4842, tzinfo=datetime.timezone.utc)
+  result         = 'Success. New document id 12 created'
+  started        = datetime.datetime(2026, 7, 15, 11, 13, 6, 384165, tzinfo=datetime.timezone.utc)
+  stopped        = datetime.datetime(2026, 7, 15, 11, 13, 7, 348367, tzinfo=datetime.timezone.utc)
   success        = True
   attempt_count  = 1
-  time_taken()   = 0.926 s
+  time_taken()   = 0.964 s
 ```
 
 Every part of the question is answered by this one row: **success** = `True`; **result** = the string the
 task returned (`consume_file` returns `"Success. New document id {pk} created"`, `documents/tasks.py:247`);
-**timing** = `started`/`stopped` and `time_taken() = 0.926 s`; **history/identity** = `id`, `name`, `func`,
+**timing** = `started`/`stopped` and `time_taken() = 0.964 s`; **history/identity** = `id`, `name`, `func`,
 `attempt_count = 1`.
 
 ### 8.2 A completed **failure** — the complete row with full traceback (observed)
@@ -1398,16 +1617,16 @@ is **byte-identical** to an already-ingested document (same md5), which trips th
 pre-check. Its worker log line and the **complete, untruncated** failed row:
 
 ```console
-$ docker exec pngx_qa bash -lc "grep -nE 'qa_dup_20260714_221924' /tmp/obs/qcluster.log"
-165:22:19:25 [Q] INFO Process-1:6 processing [qa_dup_20260714_221924.txt]
-166:[2026-07-14 22:19:25,359] [ERROR] [paperless.consumer] Not consuming qa_dup_20260714_221924.txt: It is a duplicate.
-168:22:19:25 [Q] ERROR Failed [qa_dup_20260714_221924.txt] - qa_dup_20260714_221924.txt: Not consuming qa_dup_20260714_221924.txt: It is a duplicate. : Traceback (most recent call last):
-179:documents.consumer.ConsumerError: qa_dup_20260714_221924.txt: Not consuming qa_dup_20260714_221924.txt: It is a duplicate.
+$ docker exec pngx_qa bash -lc "grep -nE 'qa_dup_20260715_111819' /tmp/obs/qcluster.log"
+200:11:18:20 [Q] INFO Process-1:22 processing [qa_dup_20260715_111819.txt]
+201:[2026-07-15 11:18:21,117] [ERROR] [paperless.consumer] Not consuming qa_dup_20260715_111819.txt: It is a duplicate.
+203:11:18:21 [Q] ERROR Failed [qa_dup_20260715_111819.txt] - qa_dup_20260715_111819.txt: Not consuming qa_dup_20260715_111819.txt: It is a duplicate. : Traceback (most recent call last):
+214:documents.consumer.ConsumerError: qa_dup_20260715_111819.txt: Not consuming qa_dup_20260715_111819.txt: It is a duplicate.
 
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
 import django; django.setup()
 from django_q.models import Task, Success, Failure
-t = Task.objects.get(name="qa_dup_20260714_221924.txt")
+t = Task.objects.get(name="qa_dup_20260715_111819.txt")
 for f in ["id","name","func","hook","group","args","kwargs","started","stopped","success","attempt_count"]:
     print("  %-14s = %r" % (f, getattr(t, f)))
 print("  time_taken()   = %.3f s" % t.time_taken())
@@ -1417,20 +1636,20 @@ print("  --- end result ---")
 print("Failure proxy contains this id? ", Failure.objects.filter(id=t.id).exists())
 print("Success proxy contains this id? ", Success.objects.filter(id=t.id).exists())
 PY
-  id             = '1052faf67c114cbcbcfc1b2343d152dc'
-  name           = 'qa_dup_20260714_221924.txt'
+  id             = '2d1df668f3544ad796281306ee976434'
+  name           = 'qa_dup_20260715_111819.txt'
   func           = 'documents.tasks.consume_file'
   hook           = None
   group          = None
-  args           = ('/tmp/pp/consume/qa_dup_20260714_221924.txt',)
+  args           = ('/tmp/pp/consume/qa_dup_20260715_111819.txt',)
   kwargs         = {'override_tag_ids': None}
-  started        = datetime.datetime(2026, 7, 14, 22, 19, 25, 204246, tzinfo=datetime.timezone.utc)
-  stopped        = datetime.datetime(2026, 7, 14, 22, 19, 25, 360779, tzinfo=datetime.timezone.utc)
+  started        = datetime.datetime(2026, 7, 15, 11, 18, 20, 954065, tzinfo=datetime.timezone.utc)
+  stopped        = datetime.datetime(2026, 7, 15, 11, 18, 21, 118791, tzinfo=datetime.timezone.utc)
   success        = False
   attempt_count  = 1
-  time_taken()   = 0.157 s
+  time_taken()   = 0.165 s
   --- result (COMPLETE, unedited traceback) ---
-qa_dup_20260714_221924.txt: Not consuming qa_dup_20260714_221924.txt: It is a duplicate. : Traceback (most recent call last):
+qa_dup_20260715_111819.txt: Not consuming qa_dup_20260715_111819.txt: It is a duplicate. : Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 432, in worker
     res = f(*task["args"], **task["kwargs"])
   File "/app/src/documents/tasks.py", line 236, in consume_file
@@ -1441,7 +1660,7 @@ qa_dup_20260714_221924.txt: Not consuming qa_dup_20260714_221924.txt: It is a du
     self._fail(
   File "/app/src/documents/consumer.py", line 81, in _fail
     raise ConsumerError(f"{self.filename}: {log_message or message}")
-documents.consumer.ConsumerError: qa_dup_20260714_221924.txt: Not consuming qa_dup_20260714_221924.txt: It is a duplicate.
+documents.consumer.ConsumerError: qa_dup_20260715_111819.txt: Not consuming qa_dup_20260715_111819.txt: It is a duplicate.
 
   --- end result ---
 Failure proxy contains this id?  True
@@ -1501,17 +1720,31 @@ print("OrmQ registered in admin?    ", OrmQ in admin.site._registry)
 print("Success registered in admin? ", Success in admin.site._registry)
 print("Failure registered in admin? ", Failure in admin.site._registry)
 print("live counts -> Success:", Success.objects.count(), "Failure:", Failure.objects.count())
+print("--- Failure rows (name) ---")
+for t in Failure.objects.order_by("started"):
+    print("   ", t.name)
 PY
 Conf.ORM = None (None => Redis broker, not ORM)
 OrmQ registered in admin?     False
 Success registered in admin?  True
 Failure registered in admin?  True
-live counts -> Success: 15 Failure: 1
+live counts -> Success: 41 Failure: 5
+--- Failure rows (name) ---
+    qa_dup_20260715_090521.txt
+    qa_dup_race_a_20260715_092406.txt
+    qa_race2_b_20260715_092707.txt
+    qa_mail_attachment.txt
+    qa_dup_20260715_111819.txt
 ```
 
 So with the **Redis** broker, the admin shows "Successful tasks" and "Failed tasks" but **not** "Queued
 tasks" — waiting work has no admin page here (as noted in [§6.4](#64-what-the-adminapi-surfaces-for-each-state)).
-The single `Failure` is precisely the duplicate forced in §8.2.
+The **`Success`** count is a **point-in-time snapshot** that grows monotonically — the seeded schedules
+keep firing successfully (mail every 10 min, `train_classifier` hourly, `sanity_check` weekly, per
+[§10](#10-scheduled--recurring-jobs)), so re-running this probe later yields a larger number (it was
+**41** at this capture). The **`Failure`** count, by contrast, is stable at **five** — the edge-case
+duplicates and failures deliberately induced during this investigation, listed by name above — among them
+`qa_dup_20260715_111819.txt`, the duplicate forced in §8.2.
 
 ### 8.4 The realtime channel: authenticated WebSocket status stream (observed)
 
@@ -1537,8 +1770,14 @@ unauth connect result: InvalidStatusCode server rejected WebSocket connection: H
 ```
 
 With a **real session login** (the CSRF-protected `/admin/login/` flow) the handshake succeeds and the
-socket receives the live `status_updates` frames for an ingestion. The complete capture script is
-`/tmp/pp/ws_capture.py` (56 lines, published in [§13 Appendix](#appendix)); its full run:
+socket receives the live `status_updates` frames for an ingestion. The capture script `/tmp/pp/ws_capture.py`
+(published in [§13 Appendix](#132-the-remaining-helper-scripts-verbatim)) is a **pure listener** — it logs
+in, opens the socket, and records frames; it does **not** trigger any ingestion itself. The frames below
+are the live stream of the **same REST upload analysed in
+[§9.2](#92-origin-2--rest-upload-postdocumentviewpost-exercised-live)** — the socket was connected first
+(`09:07:33`), then that upload was POSTed, and the listener recorded its progress. Every frame therefore
+carries the **same** progress UUID peeked in the WAITING package there (`6faa779e-e117-44ce-b5dd-a4fc13c86a56`)
+and terminates with `document_id: 4`:
 
 ```console
 $ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; \
@@ -1546,29 +1785,29 @@ $ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; \
 LOGIN GET /admin/login/  -> HTTP 200, csrftoken cookie present=True
 LOGIN POST /admin/login/ -> HTTP 302 (302=success), sessionid cookie present=True
   auth cookie sent to WS handshake:  Cookie: sessionid=<REDACTED>  (real 32-char value redacted)
-WS 2026-07-14T22:22:36.021+00:00 CONNECTED (HTTP 101 Switching Protocols) — authenticated accept
-WS 2026-07-14T22:22:36.027+00:00 dropped /tmp/pp/consume/qa_ws_20260714_222236.txt to trigger ingestion
-WS FRAME 1 2026-07-14T22:22:37.179+00:00  {"current_progress": 0, "document_id": null, "filename": "qa_ws_20260714_222236.txt", "max_progress": 100, "message": "new_file", "status": "STARTING", "task_id": "ca38d192-8d48-49fb-a3bd-12ec6d684538"}
-WS FRAME 2 2026-07-14T22:22:37.193+00:00  {"current_progress": 20, "document_id": null, "filename": "qa_ws_20260714_222236.txt", "max_progress": 100, "message": "parsing_document", "status": "WORKING", "task_id": "ca38d192-8d48-49fb-a3bd-12ec6d684538"}
-WS FRAME 3 2026-07-14T22:22:37.196+00:00  {"current_progress": 70, "document_id": null, "filename": "qa_ws_20260714_222236.txt", "max_progress": 100, "message": "generating_thumbnail", "status": "WORKING", "task_id": "ca38d192-8d48-49fb-a3bd-12ec6d684538"}
-WS FRAME 4 2026-07-14T22:22:37.878+00:00  {"current_progress": 90, "document_id": null, "filename": "qa_ws_20260714_222236.txt", "max_progress": 100, "message": "parse_date", "status": "WORKING", "task_id": "ca38d192-8d48-49fb-a3bd-12ec6d684538"}
-WS FRAME 5 2026-07-14T22:22:37.881+00:00  {"current_progress": 95, "document_id": null, "filename": "qa_ws_20260714_222236.txt", "max_progress": 100, "message": "save_document", "status": "WORKING", "task_id": "ca38d192-8d48-49fb-a3bd-12ec6d684538"}
-WS FRAME 6 2026-07-14T22:22:37.967+00:00  {"current_progress": 100, "document_id": 6, "filename": "qa_ws_20260714_222236.txt", "max_progress": 100, "message": "finished", "status": "SUCCESS", "task_id": "ca38d192-8d48-49fb-a3bd-12ec6d684538"}
-WS 2026-07-14T22:22:37.967+00:00 terminal status 'SUCCESS' received; stopping
+WS 2026-07-15T09:07:33.414+00:00 CONNECTED (HTTP 101 Switching Protocols) - authenticated accept
+WS FRAME 1 2026-07-15T09:07:38.815+00:00  {"current_progress": 0, "document_id": null, "filename": "qa_rest_20260715_090736.txt", "max_progress": 100, "message": "new_file", "status": "STARTING", "task_id": "6faa779e-e117-44ce-b5dd-a4fc13c86a56"}
+WS FRAME 2 2026-07-15T09:07:38.828+00:00  {"current_progress": 20, "document_id": null, "filename": "qa_rest_20260715_090736.txt", "max_progress": 100, "message": "parsing_document", "status": "WORKING", "task_id": "6faa779e-e117-44ce-b5dd-a4fc13c86a56"}
+WS FRAME 3 2026-07-15T09:07:38.831+00:00  {"current_progress": 70, "document_id": null, "filename": "qa_rest_20260715_090736.txt", "max_progress": 100, "message": "generating_thumbnail", "status": "WORKING", "task_id": "6faa779e-e117-44ce-b5dd-a4fc13c86a56"}
+WS FRAME 4 2026-07-15T09:07:39.499+00:00  {"current_progress": 90, "document_id": null, "filename": "qa_rest_20260715_090736.txt", "max_progress": 100, "message": "parse_date", "status": "WORKING", "task_id": "6faa779e-e117-44ce-b5dd-a4fc13c86a56"}
+WS FRAME 5 2026-07-15T09:07:39.502+00:00  {"current_progress": 95, "document_id": null, "filename": "qa_rest_20260715_090736.txt", "max_progress": 100, "message": "save_document", "status": "WORKING", "task_id": "6faa779e-e117-44ce-b5dd-a4fc13c86a56"}
+WS FRAME 6 2026-07-15T09:07:39.559+00:00  {"current_progress": 100, "document_id": 4, "filename": "qa_rest_20260715_090736.txt", "max_progress": 100, "message": "finished", "status": "SUCCESS", "task_id": "6faa779e-e117-44ce-b5dd-a4fc13c86a56"}
+WS 2026-07-15T09:07:39.559+00:00 terminal status 'SUCCESS' received; stopping
 ```
 
 The six frames are exactly the `_send_progress(...)` calls in the pipeline (`documents/consumer.py`):
 `STARTING` (0%, `:202`) → `WORKING` (20% parsing `:259`, 70% thumbnail `:264`, 90% parse-date `:274`,
-95% save `:294`) → `SUCCESS` (100%, `document_id=6`, `:375`). Each frame is the JSON `payload` built at
+95% save `:294`) → `SUCCESS` (100%, `document_id=4`, `:375`). Each frame is the JSON `payload` built at
 `consumer.py:56-72` (`filename`, `task_id`, `current_progress`, `max_progress`, `status`, `message`,
 `document_id`).
 
 > **Key distinction (cause of common confusion).** The WebSocket frame's `task_id`
-> (`ca38d192-8d48-49fb-a3bd-12ec6d684538`, a UUID) is the **front-end progress id**, *not* the
-> `django_q_task` primary key (a 32-char hex like `aaf0ee80…`). The realtime stream and the durable row
-> are keyed differently and serve different purposes; see [§9](#9-q7--enqueue-origin-in-code) for where the
-> progress UUID is generated. **After the fact**, the authoritative record is the `django_q_task` row —
-> the WebSocket frames are already gone.
+> (`6faa779e-e117-44ce-b5dd-a4fc13c86a56`, a hyphenated UUID) is the **front-end progress id**, *not* the
+> `django_q_task` primary key. For this very upload the durable row's PK is the **32-char hex**
+> `6c677734037b4a5d8bbc45500bf21a11` ([§9.2](#92-origin-2--rest-upload-postdocumentviewpost-exercised-live)) —
+> a different identifier. The realtime stream and the durable row are keyed differently and serve different
+> purposes; see [§9](#9-q7--enqueue-origin-in-code) for where the progress UUID is generated. **After the
+> fact**, the authoritative record is the `django_q_task` row — the WebSocket frames are already gone.
 
 ---
 
@@ -1646,9 +1885,12 @@ Anchors: `permission_classes = (IsAuthenticated,)` (`views.py:493`), `MultiPartP
 `task_id = str(uuid.uuid4())` (`:521`), the enqueue (`:523`), and `return Response("OK")` (`:535`).
 
 **Live run (session + CSRF auth; credentials redacted, mechanics intact).** The full helper is
-`/tmp/pp/rest_upload.py` (published in [§13 Appendix](#appendix)); the browser-canonical authentication is
-a CSRF-protected session login, then a multipart POST carrying the `sessionid` cookie and the
-`X-CSRFToken` header:
+`/tmp/pp/rest_upload.py` (published in [§13 Appendix](#132-the-remaining-helper-scripts-verbatim)); the
+browser-canonical authentication is a CSRF-protected session login, then a multipart POST carrying the
+`sessionid` cookie and the `X-CSRFToken` header. So that the enqueued package can be *peeked while it is
+still WAITING* (proving the identifiers at enqueue time), the cluster is stopped just before the POST and
+started immediately after the peek — the same non-destructive `LINDEX` technique as
+[§5.1](#51-the-job-as-it-actually-appears-on-the-queue-observed):
 
 ```console
 $ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; \
@@ -1658,17 +1900,60 @@ STEP2 POST /accounts/login/ -> 302 ; sessionid cookie present=True
 
 REQUEST  POST http://localhost:8000/api/documents/post_document/
   auth: session cookie sessionid=<REDACTED>; header X-CSRFToken=<REDACTED>
-  multipart field 'document' = (qa_rest_20260714_225256.txt, 84 bytes, text/plain)
+  multipart field 'document' = (qa_rest_20260715_090736.txt, 92 bytes, text/plain)
 RESPONSE status = 200
 RESPONSE content-type = application/json
 RESPONSE body = '"OK"'
 
-correlating (waiting for worker to consume the REST upload)...
-TASK id=3bfecaf91deb42beac17728578936669 (hex, Django-Q PK)
-  func=documents.tasks.consume_file name=qa_rest_20260714_225256.txt success=True time_taken=1.243s
-  result='Success. New document id 8 created'
-DOCUMENT id=8 title='qa_rest_20260714_225256' content='PAPERLESS_QA_REST_UPLOAD unique content 20260714_225256 for the REST ingestion path.'
+WAITING peek:  LLEN(django_q:paperless:q) = 1
+PACKAGE hex id (Django-Q PK)              = 6c677734037b4a5d8bbc45500bf21a11
+PACKAGE func                              = documents.tasks.consume_file
+PACKAGE name                              = qa_rest_20260715_090736.txt
+PACKAGE args                              = ('/tmp/pp/scratch/paperless-upload-acjs74nt',)
+PACKAGE kwargs['task_id'] (progress UUID) = 6faa779e-e117-44ce-b5dd-a4fc13c86a56
+PACKAGE kwargs['override_filename']       = qa_rest_20260715_090736.txt
 ```
+
+The peek captures **both** identifiers at the moment of enqueue: the 32-char hex **Django-Q Task PK**
+`6c677734037b4a5d8bbc45500bf21a11` (the package's own `id`) and the hyphenated **front-end progress UUID**
+`6faa779e-e117-44ce-b5dd-a4fc13c86a56` (the `task_id` kwarg minted at `views.py:521`). The cluster is then
+restarted; the worker consumes the package, and the persisted row is queried by that **same** hex PK:
+
+```console
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
+import django; django.setup()
+from django_q.models import Task
+from documents.models import Document
+t = Task.objects.get(id="6c677734037b4a5d8bbc45500bf21a11")   # the peeked hex PK
+print("Task.id        =", t.id, "(== peeked package hex PK)")
+print("Task.name      =", t.name)
+print("Task.func      =", t.func)
+print("Task.success   =", t.success)
+print("Task.result    =", repr(t.result))
+print("Task.started   =", t.started.isoformat())
+print("Task.stopped   =", t.stopped.isoformat())
+print("Task.time_taken= %.3f s" % t.time_taken())
+d = Document.objects.get(pk=4)
+print("Document.id     =", d.id, "title=", repr(d.title))
+print("Document count  =", Document.objects.count())
+PY
+Task.id        = 6c677734037b4a5d8bbc45500bf21a11 (== peeked package hex PK)
+Task.name      = qa_rest_20260715_090736.txt
+Task.func      = documents.tasks.consume_file
+Task.success   = True
+Task.result    = 'Success. New document id 4 created'
+Task.started   = 2026-07-15T09:07:36.501792+00:00
+Task.stopped   = 2026-07-15T09:07:39.559433+00:00
+Task.time_taken= 3.058 s
+Document.id     = 4 title= 'qa_rest_20260715_090736'
+Document count  = 4
+```
+
+This is a **single, identity-complete chain**: the *one* hex PK `6c677734037b4a5d8bbc45500bf21a11` is
+peeked while WAITING on the Redis list, resolves to the persisted `django_q_task` row, and yields
+**Document 4**; the *one* progress UUID `6faa779e-e117-44ce-b5dd-a4fc13c86a56` is present in the WAITING
+package's `kwargs['task_id']` **and** in all six WebSocket frames captured for this very run in
+[§8.4](#84-the-realtime-channel-authenticated-websocket-status-stream-observed).
 
 **Cause → effect.** The `302` on the login POST is Django's success redirect; it is what deposits the
 `sessionid` cookie the session uses thereafter. The multipart POST authenticated by that cookie (plus the
@@ -1684,18 +1969,20 @@ neither identifier. There are two different UUIDs in play:
   paperless. `async_task` calls `tag = uuid()` and sets `task["id"] = tag[1]`
   (`django_q/tasks.py:38,41`), then `return task["id"]` (`:76`). `humanhash.uuid()` returns
   `str(uuid.uuid4()).replace("-", "")` (`django_q/humanhash.py:358`) — a **32-char hex with no hyphens**.
-  This is the value stored as `django_q_task.id`; the observed PK above is `3bfecaf91deb42beac17728578936669`.
+  This is the value stored as `django_q_task.id`; the observed PK above is `6c677734037b4a5d8bbc45500bf21a11`.
 - The **front-end progress UUID** is a `uuid4()` used only for the realtime stream. For a REST upload it
   is minted as `task_id = str(uuid.uuid4())` (`views.py:521`, **hyphenated**) and passed as the `task_id`
   **kwarg** to the enqueued `consume_file` (`views.py:531`). `consume_file(…, task_id=None)`
   (`documents/tasks.py:191`) forwards it to `Consumer.try_consume_file(…, task_id=task_id)`
   (`documents/tasks.py:236-244`), which sets `self.task_id = task_id or str(uuid.uuid4())`
   (`documents/consumer.py:200`); `Consumer._send_progress` (`consumer.py:56`) then emits it in every
-  `status_updates` frame as `"task_id": self.task_id` (`consumer.py:66`). The
-  [§8.4](#84-the-realtime-channel-authenticated-websocket-status-stream-observed) frames were captured for a
-  **watcher** drop, which supplies no `task_id`, so there the Consumer generated its *own* `uuid4()` at
-  `consumer.py:200` — still hyphenated (`ca38d192-8d48-49fb-a3bd-12ec6d684538`), illustrating the same
-  distinction. Either way the progress id is a hyphenated `uuid4`, never the 32-char hex Task PK.
+  `status_updates` frame as `"task_id": self.task_id` (`consumer.py:66`). For **this REST run** the peek
+  above shows that progress UUID is `6faa779e-e117-44ce-b5dd-a4fc13c86a56` in `kwargs['task_id']`, and the
+  [§8.4](#84-the-realtime-channel-authenticated-websocket-status-stream-observed) frames — captured for this
+  same upload — carry exactly that value in every frame's `"task_id"`. (Because the REST view supplies a
+  `task_id`, the `or str(uuid.uuid4())` fallback at `consumer.py:200` is *not* taken; a watcher drop, which
+  supplies no `task_id`, is where that fallback mints the Consumer's own hyphenated `uuid4` instead.) Either
+  way the progress id is a hyphenated `uuid4`, never the 32-char hex Task PK.
 
 So the durable record (hex PK) and the realtime progress stream (hyphenated UUID) are keyed by **different**
 identifiers, and `Response("OK")` returns neither. The REST client observes progress on the WebSocket and
@@ -1739,82 +2026,96 @@ $ docker exec pngx_qa sed -n '329,349p' /app/src/paperless_mail/mail.py
 
 The seeded schedule's canonical callable is the **plural** `process_mail_accounts`
 (`src/paperless_mail/tasks.py:11`), which loops over every configured `MailAccount` and returns a summary
-string (e.g. `'No new documents were added.'`). The reproduction below drives the **single-account
-convenience wrapper** `process_mail_account` (`src/paperless_mail/tasks.py:25`) for the one QA account (it
-returns `None` — see the `RETURN` line below); both converge on the identical chain →
-`MailAccountHandler.handle_mail_account` (`mail.py:151`, does
-`get_mailbox(...)` + `M.login(account.username, account.password)`) → `handle_mail_rule` (`mail.py:187`,
-does `M.folder.set(rule.folder)` then `M.fetch(criteria=AND(**criterias), mark_seen=False, …)`,
-`mail.py:222`) → `handle_message` (`mail.py:272`) → the enqueue at `mail.py:336`. For
-`ImapSecurity.NONE` the client is `MailBoxUnencrypted` (`mail.py:94`).
+string. This is the **real production trigger**: the `qcluster` scheduler thread fires the seeded
+`Schedule` row *by itself* on its interval — nothing calls the single-account `process_mail_account`
+wrapper in normal operation. That the plural schedule auto-fires is directly observable in the running
+cluster's log; it recurs on the seeded `MINUTES`/`10` cadence (see [§10](#10-scheduled--recurring-jobs)):
 
-**Live run with the cluster intentionally stopped** (so the enqueued package waits in Redis and can be
-peeked non-destructively, mirroring [§5](#5-q3--how-a-job-appears-when-created)):
+```console
+$ docker exec pngx_qa grep -E 'created a task from schedule \[Check all e-mail accounts\]' /tmp/obs/qcluster.log
+09:30:20 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+09:40:21 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+09:50:23 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+10:00:24 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+```
+
+Those four are **steady-state** recurrences: once the test message is `\Seen` they return
+`'No new documents were added.'` and enqueue nothing. To capture a firing that actually **ingests an
+attachment**, a real IMAP account + rule were seeded and one *unseen* message with a `.txt` attachment was
+placed in its INBOX; the schedule's `next_run` was then nudged into the past so the Sentinel fires it on
+its next pass — the **same `next_run` technique** used in
+[§10.2](#102-the-scheduler-mechanism-and-a-controlled-live-firing-observed). The setup + nudge (credential redacted):
 
 ```console
 $ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; \
-    cd /app/src && python3 /tmp/pp/mail_run.py'
-ACCT id=1 security=1(No encryption) host=127.0.0.1:10143 user=qauser
-RULE id=1 folder=INBOX maximum_age=0 action=3(Mark as read, don't process read mails)
-BEFORE  LLEN(django_q:paperless:q)=0  tasks=18  documents=6
->>> invoking single-account convenience wrapper: process_mail_account('qa_mail')
-[2026-07-14 22:49:50,506] [INFO] [paperless_mail] Rule qa_mail.qa_rule: Consuming attachment qa_mail_attachment.txt from mail PaperlessQA live mail ingestion test from qa-sender@example.test
-22:49:50 [Q] INFO Enqueued 1
-RETURN process_mail_account = None
-AFTER   LLEN(django_q:paperless:q)=1  tasks=18  documents=6
-LINDEX 0 raw bytes length = 650
-PACKAGE keys       = ['args', 'func', 'id', 'kwargs', 'name', 'started']
-PACKAGE id         = 12b9c63a07bc4e04947b4e3ed9f48379
-PACKAGE func       = documents.tasks.consume_file
-PACKAGE name       = qa_mail_attachment.txt
-PACKAGE args       = ()
-PACKAGE kwargs.override_filename = qa_mail_attachment.txt
-PACKAGE kwargs.override_title    = PaperlessQA live mail ingestion test
-PACKAGE kwargs.task_name (via name/kw) = qa_mail_attachment.txt
-PACKAGE kwargs.path exists       = True -> /tmp/pp/scratch/paperless-mail-qypumx9l
+    export QA_MAIL_PW=<REDACTED>; cd /app/src && python3 /tmp/pp/mail_run.py'
+ACCT id=1 host=127.0.0.1:10143 security=No encryption user=qauser
+RULE id=1 folder=INBOX action=Mark as read, don't process read mails attachment_type=1
+seeded schedule: id=4 name='Check all e-mail accounts' func=paperless_mail.tasks.process_mail_accounts type=I minutes=10
+BEFORE next_run=2026-07-15T09:20:53.061489+00:00 repeats=-3
+NUDGED next_run -> 2026-07-15T09:10:00+00:00 (strict-past; Sentinel will fire on next pass)
+now = 2026-07-15T09:14:16.259938+00:00
 ```
 
-**Cause → effect (the attachment log and the raw package).** The `Consuming attachment
-qa_mail_attachment.txt from mail …` line is the `self.log("info", …)` at `mail.py:329`, emitted the instant
-the enqueue at `mail.py:336` fires; Django-Q's own `Enqueued 1` confirms the RPUSH, and `LLEN` moves
-`0 → 1`. The peeked package (the same signed-pickle format dissected in
-[§5.2](#52-why-the-payload-is-opaque-bytes--the-signed-pickle-trust-boundary)) proves the enqueued
-`func` is `documents.tasks.consume_file` and carries the mail-specific kwargs — `override_filename` and
-`override_title` from the message, and `path` pointing at the scratch temp file the mail handler wrote
-(`/tmp/pp/scratch/paperless-mail-…`).
-
-**Bringing the cluster back completes the job; the Task row and new Document correlate by id and time:**
+On its next pass the Sentinel fired the **plural** `process_mail_accounts` as **Task A**; Task A logged in
+over the real IMAP client, fetched the attachment, and — from *inside its own execution* — called
+`async_task("documents.tasks.consume_file", …)` at `mail.py:336`, enqueuing **Task B**. Both rows are read
+back **by explicit id** (no `Document.objects.order_by("-id").first()` guess), so the chain is
+identity-complete:
 
 ```console
-$ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; cd /app/src && python3 -' <<'PY'
-import os, django; os.environ.setdefault("DJANGO_SETTINGS_MODULE","paperless.settings"); django.setup()
-from django_q.models import Task; from documents.models import Document
-t=Task.objects.get(id="12b9c63a07bc4e04947b4e3ed9f48379")
-print("TASK", t.id, t.func, t.name, "success="+str(t.success),
-      "started="+str(t.started), "stopped="+str(t.stopped),
-      "time_taken=%.3fs"%t.time_taken(), "result="+repr(t.result))
-d=Document.objects.get(id=7)
-print("DOC", d.id, repr(d.title), repr(d.content))
+$ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
+import django; django.setup()
+from django_q.models import Task
+from documents.models import Document
+a = Task.objects.get(id="c6f88a30db354ab9ba451f6a1f0775ff")   # scheduler-fired PLURAL task
+print("TASK A  id=%s" % a.id)
+print("  func    =", a.func)
+print("  name    =", a.name)
+print("  success =%s result=%r time_taken=%.3fs" % (a.success, a.result, a.time_taken()))
+print("  started =%s stopped=%s" % (a.started.isoformat(), a.stopped.isoformat()))
+b = Task.objects.get(id="c8333342075f4a04ae7984c6179d08be")   # the consume_file A enqueued
+print("TASK B  id=%s" % b.id)
+print("  func    =", b.func)
+print("  name    =", b.name)
+print("  success =%s result=%r time_taken=%.3fs" % (b.success, b.result, b.time_taken()))
+print("  started =%s stopped=%s" % (b.started.isoformat(), b.stopped.isoformat()))
+print("B enqueued INSIDE A's execution window? %s" % (a.started <= b.started <= a.stopped))
+d = Document.objects.get(id=5)
+print("DOCUMENT id=%d title=%r" % (d.id, d.title))
 PY
-TASK 12b9c63a07bc4e04947b4e3ed9f48379 documents.tasks.consume_file qa_mail_attachment.txt success=True started=2026-07-14 22:49:50.509235+00:00 stopped=2026-07-14 22:50:18.654658+00:00 time_taken=28.145s result='Success. New document id 7 created'
-DOC 7 'PaperlessQA live mail ingestion test' 'PAPERLESS_QA_MAIL_ATTACHMENT unique content for the mail ingestion path.'
+TASK A  id=c6f88a30db354ab9ba451f6a1f0775ff
+  func    = paperless_mail.tasks.process_mail_accounts
+  name    = mars-butter-mike-montana
+  success =True result='Added 1 document(s).' time_taken=0.082s
+  started =2026-07-15T09:14:39.195235+00:00 stopped=2026-07-15T09:14:39.277628+00:00
+TASK B  id=c8333342075f4a04ae7984c6179d08be
+  func    = documents.tasks.consume_file
+  name    = qa_mail_attachment.txt
+  success =True result='Success. New document id 5 created' time_taken=0.897s
+  started =2026-07-15T09:14:39.275178+00:00 stopped=2026-07-15T09:14:40.171884+00:00
+B enqueued INSIDE A's execution window? True
+DOCUMENT id=5 title='PaperlessQA live mail ingestion test'
 ```
 
-The worker log for the mail attachment (from the fresh cluster's `qcluster.log`):
+**Cause → effect (the plural chain, end to end).** The Sentinel fires the **plural**
+`process_mail_accounts` (Task A) — *not* the single-account `process_mail_account` wrapper. Task A runs the
+canonical path `MailAccountHandler.handle_mail_account` (`mail.py:151`, `get_mailbox(...)` +
+`M.login(account.username, account.password)`) → `handle_mail_rule` (`mail.py:187`, `M.folder.set(rule.folder)`
+then `M.fetch(criteria=AND(**criterias), mark_seen=False, …)`, `mail.py:222`) → `handle_message`
+(`mail.py:272`) → the enqueue at `mail.py:336`. For `ImapSecurity.NONE` the client is `MailBoxUnencrypted`
+(`mail.py:94`). The proof that **Task A enqueued Task B** is temporal and exact: Task B's `started`
+(`09:14:39.275178`) falls **inside** Task A's execution window (`09:14:39.195235 → 09:14:39.277628`) — the
+`B enqueued INSIDE A's execution window? True` line — and Task A's own result string `'Added 1
+document(s).'` is the count `process_mail_accounts` returns for the single attachment it consumed. Task B is
+the `consume_file` job that then created **Document 5** (`'Success. New document id 5 created'`).
 
-```console
-$ docker exec pngx_qa grep -E 'processing \[qa_mail|Consuming qa_mail|Processed \[qa_mail' /tmp/obs/qcluster.log
-22:50:17 [Q] INFO Process-1:1 processing [qa_mail_attachment.txt]
-[2026-07-14 22:50:17,872] [INFO] [paperless.consumer] Consuming qa_mail_attachment.txt
-22:50:18 [Q] INFO Processed [qa_mail_attachment.txt]
-```
-
-**Interpreting `time_taken=28.145s`.** This is *not* 28 s of work. `Task.started` is the **enqueue**
-timestamp (`22:49:50.509`, established in [§6](#6-q4--waiting-vs-actively-processing)) and `Task.stopped`
-is the worker-finish timestamp (`22:50:18.654`). The package sat in Redis while the cluster was
-deliberately stopped; the worker log shows the actual execution was `22:50:17 → 22:50:18` (~1 s). This
-independently re-confirms the Q4 timing semantics (`time_taken` = queue-wait + execution) on a second,
-different task.
+**Interpreting the two `time_taken` values.** Because the cluster was **running** for this natural firing,
+neither task was left waiting: Task A `process_mail_accounts` completed in `0.082 s` (a fast IMAP
+`LOGIN → SELECT → SEARCH → FETCH` against the local server), and Task B `consume_file` in `0.897 s` (the
+actual parse → persist → index of the attachment). Both are genuine execution times with negligible
+queue-wait — the complement of the deliberately-delayed cases in
+[§6](#6-q4--waiting-vs-actively-processing).
 
 **The `MARK_READ` post-consume action is observable too.** The rule's default action
 (`MailAction.MARK_READ`, `models.py:150`) runs `get_rule_action(rule).post_consume(...)` in
@@ -1865,27 +2166,27 @@ Whoosh (`index.update_document`, `:280`).
 ```console
 $ docker exec -i -u testuser pngx_qa bash -lc 'set -a; . /tmp/pp/penv; set +a; \
     export QA_ADMIN_PW=<REDACTED>; cd /app/src && python3 /tmp/pp/bulk_edit.py'
-SETUP tag id=3 name=qa_bulk_tag ; target documents=[8, 7]
+SETUP tag id=3 name=qa_bulk_tag ; target documents=[12, 11]
 LOGIN -> 302 ; sessionid present=True
 
 REQUEST  POST http://localhost:8000/api/documents/bulk_edit/
   auth: session cookie sessionid=<REDACTED>; header X-CSRFToken=<REDACTED>
   Content-Type: application/json
-  body = {"documents": [8, 7], "method": "add_tag", "parameters": {"tag": 3}}
+  body = {"documents": [12, 11], "method": "add_tag", "parameters": {"tag": 3}}
 RESPONSE status = 200
 RESPONSE body   = '{"result":"OK"}'
 
 correlating (waiting for bulk_update_documents task)...
-TASK id=68da20dfac30425f995562b5f883c9b4 func=documents.tasks.bulk_update_documents success=True time_taken=0.179s result=None
-EFFECT documents now carrying tag 3: [8, 7]
+TASK id=79f0c34a52e44c2cbe48bf0d2d604177 func=documents.tasks.bulk_update_documents success=True time_taken=0.161s result=None
+EFFECT documents now carrying tag 3: [12, 11]
 ```
 
 **Cause → effect.** The JSON POST reaches `BulkEditView.post`, whose serializer resolves `method` to
 `documents.bulk_edit.add_tag`. `add_tag` writes the tag rows and then calls
-`async_task("documents.tasks.bulk_update_documents", document_ids=[8,7])` (`bulk_edit.py:47`) and returns
+`async_task("documents.tasks.bulk_update_documents", document_ids=[12,11])` (`bulk_edit.py:47`) and returns
 `"OK"` — which the view wraps as `{"result": "OK"}` (the observed body). The worker then runs
 `bulk_update_documents`, whose `result` is `None` (it re-indexes rather than creating a document). The
-`EFFECT` line confirms documents 8 and 7 now carry tag 3, proving the enqueued re-index actually executed.
+`EFFECT` line confirms documents 12 and 11 now carry tag 3, proving the enqueued re-index actually executed.
 
 ### 9.5 Convergence and coverage
 
@@ -1929,7 +2230,10 @@ The schedules are created by data migrations, so they exist after `manage.py mig
 | Check all e-mail accounts | `paperless_mail.tasks.process_mail_accounts` | `I` MINUTES | 10 min | `src/paperless_mail/migrations/0002_auto_20201117_1334.py:10` (`schedule_type=Schedule.MINUTES`, `minutes=10`, `:13-14`) |
 
 Observed live (this snapshot is taken *after* the firings shown in §10.2–§10.3, which is why `id=1` and
-`id=4` already reflect them):
+`id=4` already reflect them). It is a **point-in-time** capture: because `id=4` (mail) fires every 10 min
+and `id=1` (classifier) hourly, re-running this probe later shows `id=4`'s `repeats` grown more negative
+and its `next_run` advanced by further 10-min steps — the decrement/advance mechanism is dissected in
+§10.2–§10.3:
 
 ```console
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
@@ -1940,19 +2244,19 @@ for s in Schedule.objects.order_by("id"):
     print(f"id={s.id} func={s.func} type={s.schedule_type} minutes={s.minutes} repeats={s.repeats} next_run={s.next_run.isoformat()} name={s.name!r}")
 PY
 Schedule rows: 4
-id=1 func=documents.tasks.train_classifier type=H minutes=None repeats=-4 next_run=2026-07-15T00:09:00+00:00 name='Train the classifier'
-id=2 func=documents.tasks.index_optimize type=D minutes=None repeats=-2 next_run=2026-07-15T21:13:15.406512+00:00 name='Optimize the index'
-id=3 func=documents.tasks.sanity_check type=W minutes=None repeats=-2 next_run=2026-07-21T21:13:15.509431+00:00 name='Perform sanity check'
-id=4 func=paperless_mail.tasks.process_mail_accounts type=I minutes=10 repeats=-14 next_run=2026-07-14T23:23:16.761616+00:00 name='Check all e-mail accounts'
+id=1 func=documents.tasks.train_classifier type=H minutes=None repeats=-6 next_run=2026-07-15T12:09:00+00:00 name='Train the classifier'
+id=2 func=documents.tasks.index_optimize type=D minutes=None repeats=-2 next_run=2026-07-16T09:00:52.480222+00:00 name='Optimize the index'
+id=3 func=documents.tasks.sanity_check type=W minutes=None repeats=-2 next_run=2026-07-22T09:00:52.566742+00:00 name='Perform sanity check'
+id=4 func=paperless_mail.tasks.process_mail_accounts type=I minutes=10 repeats=-19 next_run=2026-07-15T11:41:00+00:00 name='Check all e-mail accounts'
 ```
 
 The `type` column holds Django-Q's single-letter `Schedule.TYPE` codes (`H`/`D`/`W`/`I` =
 HOURLY/DAILY/WEEKLY/MINUTES). Two observed facts matter:
 
-- **`repeats` is negative** (−2, −4, −14), below the seeded value of `−1`. A seeded schedule starts at
+- **`repeats` is negative** (−2, −6, −19), below the seeded value of `−1`. A seeded schedule starts at
   `repeats = -1` (Django-Q's "repeat forever" sentinel); each firing decrements it by one
   (`s.repeats += -1`, `django_q/cluster.py:648`). The magnitude is therefore a running **count of past
-  firings** during this container's uptime — e.g. `id=4` has fired ≈13 times. This alone proves the
+  firings** during this container's uptime — e.g. `id=4` has fired ≈18 times. This alone proves the
   scheduler has been active.
 - **`next_run` is the next due instant.** Once `timezone.now()` passes it, the schedule becomes eligible
   on the next scheduler pass.
@@ -2016,9 +2320,9 @@ the **next future slot** and fires **once**, skipping any missed slots. It then 
 (`:658`), and logs `"{process name} created a task from schedule [{name}]"` (`:669`).
 
 To observe this end-to-end without waiting an hour, I nudged the HOURLY *Train the classifier* schedule's
-`next_run` into the past and watched the live Sentinel (cluster pid `5928`) react on its next pass.
+`next_run` into the past and watched the live Sentinel (cluster pid `13604`) react on its next pass.
 
-**BEFORE** — `id=1` is due in the future; I set its `next_run` to a clean past instant (`23:09:00`):
+**BEFORE** — `id=1` is due in the future; I set its `next_run` to a clean past instant (`11:09:00`):
 
 ```console
 $ docker exec -i pngx_qa bash /tmp/pp/pp.sh <<'PY'
@@ -2029,23 +2333,27 @@ from django_q.models import Schedule
 s = Schedule.objects.get(id=1)
 print("nudge applied at UTC now =", timezone.now().isoformat())
 print("  old next_run =", s.next_run.isoformat(), "| old repeats =", s.repeats)
-s.next_run = datetime(2026, 7, 14, 23, 9, 0, tzinfo=tz.utc)
+s.next_run = datetime(2026, 7, 15, 11, 9, 0, tzinfo=tz.utc)
 s.save(update_fields=["next_run"])
 s.refresh_from_db()
 print("  SET next_run =", s.next_run.isoformat(), "| repeats (unchanged) =", s.repeats)
 PY
-nudge applied at UTC now = 2026-07-14T23:11:50.483111+00:00
-  old next_run = 2026-07-14T23:13:15.405279+00:00 | old repeats = -3
-  SET next_run = 2026-07-14T23:09:00+00:00 | repeats (unchanged) = -3
+nudge applied at UTC now = 2026-07-15T11:29:12.421697+00:00
+  old next_run = 2026-07-15T12:12:00+00:00 | old repeats = -5
+  SET next_run = 2026-07-15T11:09:00+00:00 | repeats (unchanged) = -5
 ```
 
-**DURING** — within one scheduler pass (~30 s later, at `23:12:20`) the live Sentinel logged the firing.
-`Process-1` is the Sentinel process, confirming the scheduler runs there (not in a worker, not in a
-separate OS process):
+**DURING** — within one scheduler pass (~25 s later, at `11:29:37`) the live Sentinel logged the firing.
+The grep pattern matches every *Train the classifier* firing in this log — two earlier natural HOURLY
+firings (`10:12:26`, `11:12:05`) and the controlled one I triggered at `11:29:37`, ~25 s after the
+`11:29:12` nudge (within one guard pass). `Process-1` is the Sentinel process, confirming the scheduler
+runs there (not in a worker, not in a separate OS process):
 
 ```console
 $ docker exec pngx_qa grep -nE 'created a task from schedule \[Train the classifier\]' /tmp/obs/qcluster.log
-51:23:12:20 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+73:10:12:26 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+184:11:12:05 [Q] INFO Process-1 created a task from schedule [Train the classifier]
+226:11:29:37 [Q] INFO Process-1 created a task from schedule [Train the classifier]
 ```
 
 **AFTER** — the row advanced by exactly the HOURLY interval, `repeats` decremented once, and a real
@@ -2069,25 +2377,25 @@ print("  Task.stopped =", t.stopped.isoformat())
 print("  Task.success =", t.success)
 print("  Task.result  =", repr(t.result))
 PY
-observed at UTC now = 2026-07-14T23:12:38.959661+00:00
-  id=1 next_run = 2026-07-15T00:09:00+00:00
-  id=1 repeats  = -4
-  id=1 s.task   = 632d85191f7f401b969fbd4d4a34a06f
-  Task.id      = 632d85191f7f401b969fbd4d4a34a06f
-  Task.name    = spring-eight-wolfram-pluto
-  Task.started = 2026-07-14T23:12:20.323091+00:00
-  Task.stopped = 2026-07-14T23:12:21.073674+00:00
+observed at UTC now = 2026-07-15T11:30:03.017998+00:00
+  id=1 next_run = 2026-07-15T12:09:00+00:00
+  id=1 repeats  = -6
+  id=1 s.task   = a3e02424a4ce4774949a1f2ec60df428
+  Task.id      = a3e02424a4ce4774949a1f2ec60df428
+  Task.name    = fifteen-happy-enemy-blossom
+  Task.started = 2026-07-15T11:29:37.777205+00:00
+  Task.stopped = 2026-07-15T11:29:37.914456+00:00
   Task.success = True
   Task.result  = None
 ```
 
 Reading the AFTER state against the mechanism:
 
-- **`next_run`: `23:09:00` → `2026-07-15T00:09:00`** — exactly `+1 h`, the HOURLY shift applied to the
-  *old* `next_run` I set (not to "now"); one shift sufficed because `23:09:00 + 1 h = 00:09:00` is already
+- **`next_run`: `11:09:00` → `2026-07-15T12:09:00`** — exactly `+1 h`, the HOURLY shift applied to the
+  *old* `next_run` I set (not to "now"); one shift sufficed because `11:09:00 + 1 h = 12:09:00` is already
   in the future, so the `catch_up=False` loop stopped after one iteration.
-- **`repeats`: `-3` → `-4`** — decremented exactly once, regardless of how far in the past the trigger was.
-- **`s.task == Task.id == 632d85191f7f401b969fbd4d4a34a06f`** — the schedule stores the id of the task it
+- **`repeats`: `-5` → `-6`** — decremented exactly once, regardless of how far in the past the trigger was.
+- **`s.task == Task.id == a3e02424a4ce4774949a1f2ec60df428`** — the schedule stores the id of the task it
   enqueued, and that task ran to completion (`success=True`; `result=None` because `train_classifier`
   returns `None` when no retrain is warranted). The 32-char hex id is a Django-Q task id exactly as in
   [§5](#5-q3--how-a-job-appears-when-created).
@@ -2097,15 +2405,26 @@ the caller — the Sentinel's `scheduler()` rather than an ingestion entry point
 
 ### 10.3 Cadence stability across ≥2 intervals (observed)
 
-The MINUTES=10 *Check all e-mail accounts* schedule fires often enough to measure directly. This cluster
-instance (started `22:50`) logged **three** consecutive firings — two full intervals — all attributed to
-`Process-1`:
+The MINUTES=10 *Check all e-mail accounts* schedule fires often enough to measure directly. The current
+`qcluster.log` (beginning `09:29:20`) records **fourteen** firings — spanning many consecutive intervals —
+all attributed to `Process-1`:
 
 ```console
 $ docker exec pngx_qa grep -nE 'created a task from schedule \[Check all e-mail accounts\]' /tmp/obs/qcluster.log
-32:22:53:17 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-44:23:03:19 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
-58:23:13:20 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+18:09:30:20 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+25:09:40:21 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+32:09:50:23 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+39:10:00:24 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+46:10:10:26 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+80:10:20:27 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+87:10:25:58 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+94:10:31:29 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+101:10:41:00 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+108:10:51:02 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+128:11:01:03 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+177:11:11:05 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+219:11:21:06 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
+233:11:31:08 [Q] INFO Process-1 created a task from schedule [Check all e-mail accounts]
 ```
 
 The persisted `Task.started` timestamps give the exact inter-firing deltas across the container's whole
@@ -2121,30 +2440,40 @@ for t in Task.objects.filter(func="paperless_mail.tasks.process_mail_accounts").
     print(f"{t.started.isoformat()}  delta={d if d is None else round(d, 3)}s")
     prev = t.started
 PY
-2026-07-14T21:15:05.672139+00:00  delta=Nones
-2026-07-14T21:23:20.144112+00:00  delta=494.472s
-2026-07-14T21:33:32.490845+00:00  delta=612.347s
-2026-07-14T21:43:19.564116+00:00  delta=587.073s
-2026-07-14T21:53:21.038685+00:00  delta=601.475s
-2026-07-14T22:03:21.299874+00:00  delta=600.261s
-2026-07-14T22:13:22.742022+00:00  delta=601.442s
-2026-07-14T22:23:24.195348+00:00  delta=601.453s
-2026-07-14T22:33:25.605871+00:00  delta=601.411s
-2026-07-14T22:43:27.784459+00:00  delta=602.179s
-2026-07-14T22:53:17.520422+00:00  delta=589.736s
-2026-07-14T23:03:19.023166+00:00  delta=601.503s
-2026-07-14T23:13:20.503028+00:00  delta=601.48s
+2026-07-15T09:02:02.889910+00:00  delta=Nones
+2026-07-15T09:11:08.681338+00:00  delta=545.791s
+2026-07-15T09:14:39.195235+00:00  delta=210.514s
+2026-07-15T09:20:09.999088+00:00  delta=330.804s
+2026-07-15T09:30:20.446902+00:00  delta=610.448s
+2026-07-15T09:40:21.919363+00:00  delta=601.472s
+2026-07-15T09:50:23.356045+00:00  delta=601.437s
+2026-07-15T10:00:24.788228+00:00  delta=601.432s
+2026-07-15T10:10:26.236193+00:00  delta=601.448s
+2026-07-15T10:20:27.678345+00:00  delta=601.442s
+2026-07-15T10:25:58.495909+00:00  delta=330.818s
+2026-07-15T10:31:29.307379+00:00  delta=330.811s
+2026-07-15T10:41:00.666091+00:00  delta=571.359s
+2026-07-15T10:51:02.096100+00:00  delta=601.43s
+2026-07-15T11:01:03.549085+00:00  delta=601.453s
+2026-07-15T11:11:05.018372+00:00  delta=601.469s
+2026-07-15T11:21:06.531994+00:00  delta=601.514s
+2026-07-15T11:31:08.002209+00:00  delta=601.47s
 ```
 
-**Reading the cadence.** The steady-state deltas cluster tightly at **600.3–602.2 s** — the 10-minute
+**Reading the cadence.** The steady-state deltas cluster tightly at **≈601.4–601.5 s** — the 10-minute
 interval plus up to one guard cycle of latency. The schedule's `next_run` advances by *exactly* 600 s
 (`.shift(minutes=+10)`, `cluster.py:616`), but the firing happens on the first ~30 s guard pass *after*
-`next_run` elapses, so successive firings inherit a near-constant phase offset of ≈1.5 s. The three shorter
-deltas (494.472 s, 587.073 s, 589.736 s) each coincide with a `qcluster` restart during the investigation
-(a restart shifts the guard phase); they are restart artifacts, not cadence drift. Across ≥2 consecutive
-steady-state intervals the cadence is stable.
+`next_run` elapses, so successive undisturbed firings inherit a near-constant phase offset of ≈1.5 s. The
+several shorter/irregular deltas (`210.514 s`, `330.804 s`, `330.818 s`, `330.811 s`, `545.791 s`,
+`571.359 s`) each coincide with a `qcluster` stop/restart during the investigation — the Q4 experiment in
+[§6](#6-q4--waiting-vs-actively-processing) and the worker-death reproduction in
+[§3.6](#36-edge-conditions-observed-on-the-live-path) both stopped/restarted the cluster, shifting the
+guard phase; the single slightly-long `610.448 s` is the first firing after such a restart, before the
+phase re-settles. They are restart artifacts, not cadence drift. Across ≥2 consecutive undisturbed
+intervals — e.g. `09:30→09:40→09:50→10:00→10:10→10:20`, and again `10:51→11:01→11:11→11:21→11:31` — the
+cadence is stable.
 
-The deterministic half of this is directly visible on the schedule row: after the `23:13:20` firing,
+The deterministic half of this is directly visible on the schedule row: after the `11:31:08` firing,
 `id=4`'s `next_run` had advanced by exactly `+10 min`:
 
 ```console
@@ -2154,10 +2483,10 @@ from django_q.models import Schedule
 s = Schedule.objects.get(id=4)
 print("id=4 next_run =", s.next_run.isoformat(), "| repeats =", s.repeats, "| last task =", s.task)
 PY
-id=4 next_run = 2026-07-14T23:23:16.761616+00:00 | repeats = -14 | last task = 472bee71d94248deb0db57776a9689f4
+id=4 next_run = 2026-07-15T11:41:00+00:00 | repeats = -19 | last task = 0829d30cf7d146cea27230e36a932b89
 ```
 
-`23:13:16.761616 + 10 min = 23:23:16.761616` — the interval is applied to the stored `next_run`, so cadence
+`11:31:00 + 10 min = 11:41:00` — the interval is applied to the stored `next_run`, so cadence
 does not drift even though the *observed firing* lags by the guard latency.
 
 ### 10.4 Scheduled jobs are enqueued identically to ingestion jobs
@@ -2244,89 +2573,393 @@ the full waiting/processing/done transition (twice), the persisted table and its
 model, the live realtime stream, and the recurring-schedule lifecycle and cadence — was exercised **live**
 through canonical entry points, with adjacent complete evidence in the sections cited above.
 
+### 11.3 Out-of-scope observations — pre-existing system behaviors
+
+While driving the **canonical** entry points to answer Q1–Q7, several pre-existing behaviors of
+the paperless-ngx product code (and of the `django-q` dependency) surfaced as side effects. They are
+**not defects introduced by this investigation** and — critically — they are **out of scope to fix**
+under this task's mandate: AAP §0.3.2 places "any modification, creation, or deletion of repository
+source files other than the single answer document" and "refactoring, bug fixing, performance tuning,
+or security hardening of the asynchronous subsystem" explicitly out of scope, and §0.4.2 forbids
+adding, removing, or upgrading any dependency. They are therefore **catalogued here as observed facts
+with exact root-cause citations, not remediated**. The sole change this task introduces remains the
+single documentation file.
+
+Each item below gives (a) the **observed** evidence with the command that produced it, (b) the exact
+`file:line` root cause naming the responsible function, (c) the cause → effect mechanism, and (d) the
+specific mandate clause that keeps the fix out of scope. Where an item's transient artifact (a rotated
+worker-log window, or a one-shot WebSocket frame) is quoted from the original capture, its **durable**
+half is re-verified **live** against the running system so the claim is grounded, not merely recalled.
+
+#### F-API-1 — a 128-character title is silently stored as 127 (functional / data-fidelity)
+
+Observed (live): the 128-'T' title POSTed through the REST upload path is persisted as **127**
+characters.
+
+```console
+$ docker exec -i pngx_qa /tmp/pp/pp.sh <<'PY'
+from documents.models import Document
+d6 = Document.objects.get(pk=6)            # 128-'T' title submitted via POST /api/documents/post_document/
+print("Document 6 title length =", len(d6.title), "; every char 'T'? =", set(d6.title) == {"T"})
+PY
+Document 6 title length = 127 ; every char 'T'? = True
+```
+
+Root cause: inside `Consumer._store` (`src/documents/consumer.py:379`) the row is created by
+`src/documents/consumer.py:398-399` as
+`Document.objects.create(title=(self.override_title or file_info.title)[:127], …)`. The hardcoded
+`[:127]` slice caps the title one character **below** the column's declared capacity,
+`src/documents/models.py:106` `title = models.CharField(_("title"), max_length=128, blank=True, db_index=True)`.
+
+Mechanism (cause → effect): the slice bound (127) is smaller than the column bound (128); a caller who
+supplies exactly the column-maximum 128 characters has the final character dropped before the INSERT,
+with no error, warning, or truncation notice. The stored value is 127 characters.
+
+Out of scope: correcting the slice is a **source-code bug fix** in the ingestion path — excluded by AAP
+§0.3.2 (no repository source modification; no bug fixing of the asynchronous subsystem).
+
+#### F-SEC-2 — a CRLF in a title forges standalone worker-log lines (log injection)
+
+Observed (live, durable half): the CR/LF injected into the title survives ingestion and is stored
+verbatim in the `title` column.
+
+```console
+$ docker exec -i pngx_qa /tmp/pp/pp.sh <<'PY'
+from documents.models import Document
+print(repr(Document.objects.get(pk=7).title))
+PY
+'LEGITTITLE\r\n[2026-01-01 00:00:00,000] [INFO] [paperless.forged] INJECTED_ADMIN_ACTION'
+```
+
+Observed (transient half, from the original capture — the worker log has since rotated past 09:22,
+but the persisted title above is the live, reproducible anchor): while that document was consumed, the
+matching handlers logged the title verbatim, and the embedded newline split each message into a second,
+forged-looking physical line:
+
+```text
+79:[2026-07-15 09:22:57,422] [INFO] [paperless.handlers] Assigning correspondent QA Correspondent to 2026-07-15 LEGITTITLE
+80:[2026-01-01 00:00:00,000] [INFO] [paperless.forged] INJECTED_ADMIN_ACTION
+81:[2026-07-15 09:22:57,423] [INFO] [paperless.handlers] Assigning document type QA Type to 2026-07-15 QA Correspondent LEGITTITLE
+82:[2026-01-01 00:00:00,000] [INFO] [paperless.forged] INJECTED_ADMIN_ACTION
+```
+
+Root cause: the title flows unescaped into log messages emitted by the post-consume matching handlers —
+`src/documents/signals/handlers.py:93` `f"Assigning correspondent {selected} to {document}"`,
+`:160` `f"Assigning document type {selected} to {document}"`, and `:224` `'Tagging "{}" with "{}"'` —
+where `{document}` renders through `Document.__str__` (which embeds the `title`). Nothing strips or
+escapes CR/LF, and the DB column (`src/documents/models.py:106`) stores the newline unchanged.
+
+Mechanism (cause → effect): a user-controlled `\r\n` inside the title splits one logical log record
+across two physical lines; the injected second line
+`[2026-01-01 00:00:00,000] [INFO] [paperless.forged] INJECTED_ADMIN_ACTION` is byte-for-byte
+indistinguishable from a genuine timestamped log entry ⇒ audit-trail spoofing / log forgery.
+
+Out of scope: adding newline sanitization or output-encoding is **security hardening** of the
+ingestion code — excluded by AAP §0.3.2.
+
+#### F-SEC-3 — a raw database error is broadcast over the authenticated WebSocket (information disclosure)
+
+Observed (live, durable half): the losing task of a duplicate-checksum collision persists with the raw
+DB error string in `result`.
+
+```console
+$ docker exec -i pngx_qa /tmp/pp/pp.sh <<'PY'
+from django_q.models import Task
+t = Task.objects.get(id="138f23904b654777b57b73570808c9d0")   # loser of a duplicate race
+print("success =", t.success, "; result[:64] =", repr((t.result or '')[:64]))
+PY
+success = False ; result[:64] = 'qa_dup_race_a_20260715_092406.txt: The following error occured w'
+```
+
+Observed (transient half, from the authenticated WebSocket capture in §8.4; the same raw string as it
+left the server): the identical message is pushed to the connected client as a `FAILED` progress frame.
+
+```text
+WS FRAME 12  {"current_progress": 100, "document_id": null, "filename": "qa_race2_b_20260715_092707.txt", "max_progress": 100, "message": "UNIQUE constraint failed: documents_document.checksum", "status": "FAILED", "task_id": "cc115b95-3c86-4bf6-b322-c88592c56522"}
+```
+
+Root cause chain (every hop LIVE-verified in source): `src/documents/consumer.py:398`
+`Document.objects.create(…)` violates the unique `checksum` constraint → `sqlite3.IntegrityError`
+→ `django.db.utils.IntegrityError: UNIQUE constraint failed: documents_document.checksum`; the broad
+`except Exception as e:` at `src/documents/consumer.py:362` calls `self._fail(str(e), …)` at `:363`;
+`_fail` (`src/documents/consumer.py:78`) first calls `self._send_progress(100, 100, "FAILED", message)`
+at `:79` — broadcasting the raw message — before `raise ConsumerError(...)` at `:81`. The broadcast
+reaches the browser through `StatusConsumer.status_update` (`src/paperless/consumers.py:29`) →
+`self.send(json.dumps(event["data"]))` (`src/paperless/consumers.py:33`).
+
+Mechanism (cause → effect): the verbatim database error (`str(e)`) becomes the WebSocket `message`
+field ⇒ any authenticated client watching progress learns internal schema details (the table/column
+`documents_document.checksum`). The winning sibling of the race committed normally as Document 9; the
+persisted `success=False` row above is the durable proof that the broadcast string is the real DB
+error.
+
+Out of scope: redacting or normalizing the broadcast message is **security hardening** — excluded by
+AAP §0.3.2.
+
+#### F-API-2 — an orphaned plaintext upload temp is left when the broker is unreachable (reliability / data-at-rest)
+
+Observed (fresh, live): in a controlled broker-outage window — authenticate while Redis is up, POST
+while Redis is down, then restore Redis — the request returns **HTTP 500** yet the uploaded bytes are
+left on disk as a plaintext temp file.
+
+```console
+BASELINE paperless-upload-* count = 1
+LOGIN (Redis UP): GET 200 ; POST 302 ; sessionid=True
+REDIS after shutdown: redis-cli ping -> Could not connect to Redis at 127.0.0.1:6379: Connection refused
+
+REQUEST POST http://localhost:8000/api/documents/post_document/  (multipart 'qa_orphan_20260715_121244.txt', 52 bytes)
+RESPONSE status = 500
+RESPONSE body(first160) = '\n<!doctype html>\n<html lang="en">\n<head>\n  <title>Server Error (500)</title>\n</head>\n<body>\n  <h1>Server Error (500)</h1><p></p>\n</body>\n</html>\n'
+
+AFTER paperless-upload-* count = 2  NEW = ['paperless-upload-7y24gw8k']
+  ORPHAN paperless-upload-7y24gw8k : 52 bytes, mode 0o600, content=b'PAPERLESS_QA_ORPHAN_TEST broker-down 20260715_121244'
+REDIS after restart: redis-cli ping -> PONG
+```
+
+The leaked file persists after the failed request; the earlier orphan from a prior outage is still
+present too, showing orphans are never reclaimed:
+
+```console
+$ docker exec pngx_qa ls -la /tmp/pp/scratch/ | grep paperless-upload
+-rw------- 1 testuser testuser   52 Jul 15 12:12 paperless-upload-7y24gw8k
+-rw------- 1 testuser testuser   97 Jul 15 09:28 paperless-upload-iy3r7twa
+```
+
+Root cause: `PostDocumentView.post` (`src/documents/views.py:497`) writes the upload to disk **before**
+enqueuing — `tempfile.NamedTemporaryFile(prefix="paperless-upload-", dir=settings.SCRATCH_DIR,
+delete=False)` at `src/documents/views.py:512-516`, `f.write(doc_data)` at `:517`, and
+`temp_filename = f.name` at `:519` — then generates `task_id = str(uuid.uuid4())` at `:521` and calls
+`async_task("documents.tasks.consume_file", temp_filename, …)` at `:523`. There is no `try/finally`
+guarding the enqueue.
+
+Mechanism (cause → effect): because `delete=False`, the temp file outlives the `with` block; when
+`async_task` cannot reach the broker it raises **after** the bytes are already persisted, the view
+returns HTTP 500, and no code path deletes the file ⇒ a `-rw-------` but **plaintext** upload
+accumulates in the scratch directory on every broker-down POST.
+
+Out of scope: reordering the write/enqueue, or adding cleanup on enqueue failure, is a **source-code
+bug fix** — excluded by AAP §0.3.2.
+
+#### F-OBS-1 — a broker outage degrades into a logging `TypeError` (observability; dependency behavior)
+
+Observed (fresh, live): during the same broker-outage window, the `qcluster` pusher does not emit a
+clean error — its `logger.error` call itself fails to format, producing a `--- Logging error ---`
+dump with a `TypeError` on every dequeue attempt (current-generation `qcluster.log`):
+
+```text
+--- Logging error ---
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 345, in pusher
+    task_set = broker.dequeue()
+  File "/usr/local/lib/python3.9/site-packages/django_q/brokers/redis_broker.py", line 21, in dequeue
+    task = self.connection.blpop(self.list_key, 1)
+  File "/usr/local/lib/python3.9/site-packages/redis/client.py", line 1900, in blpop
+    return self.execute_command('BLPOP', *keys)
+  File "/usr/local/lib/python3.9/site-packages/redis/connection.py", line 429, in read_from_socket
+    raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+redis.exceptions.ConnectionError: Connection closed by server.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 1083, in emit
+    msg = self.format(record)
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 663, in format
+    record.message = record.getMessage()
+  File "/usr/local/lib/python3.9/logging/__init__.py", line 367, in getMessage
+    msg = msg % self.args
+TypeError: not all arguments converted during string formatting
+Call stack:
+  [... multiprocessing spawn/fork boilerplate elided; the emitting frame is: ...]
+  File "/usr/local/lib/python3.9/site-packages/django_q/cluster.py", line 347, in pusher
+    logger.error(e, traceback.format_exc())
+Message: ConnectionError('Connection closed by server.')
+Arguments: ('Traceback (most recent call last):\n  File ".../django_q/cluster.py", line 345, in pusher\n    task_set = broker.dequeue()\n  ... redis.exceptions.ConnectionError: Connection closed by server.\n',)
+```
+
+The cluster nonetheless recovers on its own once Redis returns — the reconnect burst is followed by a
+reincarnated pusher:
+
+```text
+12:12:43 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+   ... (one line per second for the duration of the outage) ...
+12:12:52 [Q] ERROR Error 111 connecting to localhost:6379. Connection refused.
+12:12:53 [Q] INFO Process-1:13 stopped pushing tasks
+12:12:53 [Q] ERROR reincarnated pusher Process-1:13 after sudden death
+12:12:53 [Q] INFO Process-1:43 pushing tasks at 17423
+```
+
+Root cause (inside the `django-q` dependency): `django_q/cluster.py:345` `task_set = broker.dequeue()`
+(→ `django_q/brokers/redis_broker.py:21` `blpop(self.list_key, 1)`) raises `ConnectionError` when the
+broker is down; the handler at `django_q/cluster.py:347` calls `logger.error(e, traceback.format_exc())`
+— passing the **exception object as the log format string (`msg`)** and the traceback string as a
+**positional argument**. Python logging then evaluates `msg = msg % self.args` at
+`/usr/local/lib/python3.9/logging/__init__.py:367`; because `str(e)` (`"Connection closed by server."`)
+contains no `%` placeholder while `self.args` is non-empty, it raises
+`TypeError: not all arguments converted during string formatting`.
+
+Mechanism (cause → effect): the exception-as-format-string plus a spurious positional argument turns a
+simple broker outage into a per-retry internal "Logging error" dump (with the `Message:` / `Arguments:`
+fallback) instead of a single clean error line — noise that obscures the real signal (the broker is
+down). The task-processing path itself still self-heals via the sentinel's reincarnated pusher.
+
+Out of scope on two independent grounds: (1) the behavior lives in the third-party `django-q==1.3.9`
+package, and the mandate forbids adding, removing, or upgrading any dependency (AAP §0.4.2, §0.3.2);
+(2) it is a bug fix regardless of location, also excluded. Observation-only.
+
+#### Dependency-snapshot posture (F-SEC-1, recap of §2.1)
+
+Finally, the environment itself is pinned to the **historical** dependency set captured at commit
+`542221a38dff`. As detailed in [§2.1](#21-disclosed-environment-posture-deviations-from-production-and-why), several
+of those pins are end-of-life or carry published CVEs — notably **Django 4.0.4**, **djangorestframework
+3.13.1**, and **gunicorn 20.1.0**. The environment is stood up for **observation of the Django-Q
+enqueue/worker/broker behavior only** and is explicitly **not** production-hardened. Re-pinning is out
+of scope on two grounds: the read-only mandate forbids editing `requirements.txt` / `Pipfile`
+(AAP §0.3.2), and §0.4.2 records "New dependencies to add: None / Dependencies to update: None". None of
+these versions changes the asynchronous behavior under study.
+
+**Net effect on scope.** Every behavior in §11.3 was observed while exercising the canonical entry
+points, and **none was modified**. Fixing any of them would require editing repository source or a
+dependency — both forbidden — so they are documented here and left exactly as they ship. The repository
+integrity check in [§12](#12-cleanup--repository-integrity) confirms the source tree and dependency
+manifests are byte-for-byte unchanged; the only artifact this task adds is this document.
+
+
 ---
 
 ## 12. Cleanup & repository integrity
 
-The whole investigation ran inside **two disposable containers** (`pngx_qa` for the app, `pngx_redis`
-for the broker) and used only temporary scripts under the container's `/tmp/pp` and host evidence files
-under `/tmp/qa_work` — **no file in the source repository was ever modified** (the read-only mandate).
-Cleanup is therefore a *non-destructive* teardown: gracefully stop the services, then delete the
-disposable containers. There is **no** database or file "restore" step, because nothing durable outside
-the containers was touched — a deliberate contrast to a destructive "overwrite the DB then delete the
-backup" approach.
+The whole investigation ran inside a **single disposable Docker container** (`pngx_qa`), with the Redis
+broker installed into that very container from Debian's own package — not a second container — exactly as
+[§2.2](#22-create-the-disposable-container-and-redis) sets it up. It used only temporary scripts under the
+container's `/tmp/pp` and host evidence files under `/tmp/qa_work` — **no file in the source repository
+was ever modified** (the read-only mandate). Cleanup is therefore a *non-destructive* teardown: gracefully
+stop the services (including Redis), then delete the disposable container. There is **no** database or file
+"restore" step, because nothing durable outside the container was touched — a deliberate contrast to a
+destructive "overwrite the DB then delete the backup" approach.
 
 ### 12.1 Safe, validated service shutdown
 
-Every service PID was captured **live** at launch via `$!` (recorded to `/tmp/obs/*.pid` by
-[`launch.sh`](#132-the-remaining-helper-scripts-verbatim)); none is hard-coded. Immediately **before**
-signalling, each PID's `/proc/<pid>/comm` is re-validated so a recycled PID can never be signalled by
-mistake (this closes the check-then-act TOCTOU window). `SIGTERM` is sent to the `qcluster` **main**
-process, which triggers Django-Q's graceful stop so the Sentinel drains and reaps its entire child tree:
+Every service PID was captured **live** at launch via `$!` — the three canonical services to
+`/tmp/obs/*.pid` by [`launch.sh`](#132-the-remaining-helper-scripts-verbatim), and the ad-hoc IMAP test
+server (stood up for [§9.3](#93-origin-3--mail-fetch-handle_message-exercised-live-against-a-real-imap-server))
+recorded the same way when it was started — so none is hard-coded. Immediately **before** signalling,
+each PID's `/proc/<pid>/comm` is re-validated so a recycled PID can never be signalled by mistake (this
+closes the check-then-act TOCTOU window). `SIGTERM` is sent to the `qcluster` **main** process, which
+triggers Django-Q's graceful stop so the Sentinel drains and reaps its entire child tree:
 
-```console
-$ docker exec pngx_qa sh -c '<validate comm, then SIGTERM 5928 191 192 5211, then poll /proc>'
-===== STEP 1: validate comm immediately before signalling (finding #16) =====
-  pid=5928  comm=python3 -> will SIGTERM
-  pid=191   comm=python3 -> will SIGTERM
-  pid=192   comm=gunicorn -> will SIGTERM
-  pid=5211  comm=python3 -> will SIGTERM
+```bash
+# /tmp/obs/teardown.sh — validated shutdown of the four nohup'd top-level services.
+# The 3 canonical PIDs come from launch.sh's pidfiles (/tmp/obs/*.pid); the IMAP test server's PID
+# was likewise captured via $! when it was stood up for §9.3. None is hard-coded.
+TOP="13604 2970 2971 14765"     # qcluster main · document_consumer · gunicorn master · IMAP test server
+# Full monitored set = the 4 top-level + the qcluster subtree (Sentinel 13611 + its 13
+# children: 11 workers, monitor 13623, pusher 17423) + gunicorn's 2 workers (2973 2974) = 20 PIDs.
+CL="13611 13623 15544 15546 15959 15979 16072 16507 17091 17195 17344 17383 17423 17499 2973 2974"
 
-===== STEP 2: SIGTERM top-level services (qcluster main drains its own tree) =====
-  SIGTERM -> 5928 (python3)
-  SIGTERM -> 191 (python3)
-  SIGTERM -> 192 (gunicorn)
-  SIGTERM -> 5211 (python3)
+echo "===== STEP 1: validate comm immediately before signalling ====="
+for p in $TOP; do printf "  pid=%-6s comm=%s -> will SIGTERM\n" "$p" "$(cat /proc/$p/comm)"; done
 
-===== STEP 3: wait for graceful drain + child reaping =====
-  t=1s  service PIDs still alive: 18
-  t=2s  service PIDs still alive: 11
-  t=3s  service PIDs still alive: 4
-  t=4s  service PIDs still alive: 4
-  ...
-  t=12s service PIDs still alive: 4
+echo "===== STEP 2: SIGTERM top-level services (qcluster main drains its own tree) ====="
+for p in $TOP; do c=$(cat /proc/$p/comm); kill -TERM "$p" && printf "  SIGTERM -> %s (%s)\n" "$p" "$c"; done
+
+echo "===== STEP 3: wait for graceful drain + child reaping ====="
+for t in $(seq 1 14); do sleep 1; a=0; for p in $TOP $CL; do [ -e /proc/$p ] && a=$((a+1)); done
+  { [ $t -le 5 ] || [ $t -eq 14 ]; } && printf "  t=%-2ss service PIDs still alive: %s\n" "$t" "$a"
+  [ $t -eq 6 ] && echo "  ..."; done
 ```
 
-Within ~3 s the **14** cluster children — the Sentinel (`5945`) plus its 11 workers, 1 monitor, and 1
-pusher — exit and are reaped. The **4** top-level processes that were launched with `nohup … &  disown`
-finish their own shutdown but, having been reparented to PID 1, are left as **defunct (zombie)** entries
-because this minimal container init does not reap them. A zombie holds **no** memory, file descriptors,
-or sockets — it is only a slot in the process table — and is reaped the instant the container is removed:
+```console
+$ docker exec pngx_qa bash /tmp/obs/teardown.sh
+===== STEP 1: validate comm immediately before signalling =====
+  pid=13604  comm=python3 -> will SIGTERM
+  pid=2970   comm=python3 -> will SIGTERM
+  pid=2971   comm=gunicorn -> will SIGTERM
+  pid=14765  comm=python3 -> will SIGTERM
+
+===== STEP 2: SIGTERM top-level services (qcluster main drains its own tree) =====
+  SIGTERM -> 13604 (python3)
+  SIGTERM -> 2970 (python3)
+  SIGTERM -> 2971 (gunicorn)
+  SIGTERM -> 14765 (python3)
+
+===== STEP 3: wait for graceful drain + child reaping =====
+  t=1 s service PIDs still alive: 17
+  t=2 s service PIDs still alive: 4
+  t=3 s service PIDs still alive: 4
+  t=4 s service PIDs still alive: 4
+  t=5 s service PIDs still alive: 4
+  ...
+  t=14s service PIDs still alive: 4
+```
+
+Within ~2 s the **14** cluster children — the Sentinel (`13611`) plus its 11 workers, 1 monitor
+(`13623`), and 1 pusher (`17423`) — exit and are **reaped by the cluster itself** (the Sentinel reaps
+the workers/monitor/pusher, then the main reaps the Sentinel), so none of them lingers. The **4**
+top-level processes that were launched with `nohup … & disown` finish their own shutdown but, having
+been reparented to PID 1, are left as **defunct (zombie)** entries because this minimal container init
+does not reap them. A zombie holds **no** memory, file descriptors, or sockets — it is only a slot in
+the process table — and is reaped the instant the container is removed. The two follow-up read-only
+`/proc` inspections below confirm both halves — the 4 top-level slots are `state=Z ppid=1`, and the
+cluster subtree is gone entirely:
 
 ```console
-$ docker exec pngx_qa sh -c 'for p in 5928 191 192 5211; do awk "{print \$3}" /proc/$p/stat; done'
-  pid=5928  state=Z ppid=1 comm=python3
-  pid=191   state=Z ppid=1 comm=python3
-  pid=192   state=Z ppid=1 comm=gunicorn
-  pid=5211  state=Z ppid=1 comm=python3
+$ docker exec pngx_qa bash -lc 'for p in 13604 2970 2971 14765; do
+    printf "  pid=%-6s state=%s ppid=%s comm=%s\n" "$p" \
+      "$(awk "{print \$3}" /proc/$p/stat)" "$(awk "{print \$4}" /proc/$p/stat)" "$(cat /proc/$p/comm)"; done'
+  pid=13604  state=Z ppid=1 comm=python3
+  pid=2970   state=Z ppid=1 comm=python3
+  pid=2971   state=Z ppid=1 comm=gunicorn
+  pid=14765  state=Z ppid=1 comm=python3
+
+$ docker exec pngx_qa bash -lc 'for p in 13611 13623 17423 17499; do
+    [ -e /proc/$p ] && echo "  pid=$p STILL PRESENT" || echo "  pid=$p reaped (gone from /proc)"; done'
+  pid=13611 reaped (gone from /proc)
+  pid=13623 reaped (gone from /proc)
+  pid=17423 reaped (gone from /proc)
+  pid=17499 reaped (gone from /proc)
 ```
 
 That the services are **functionally** dead (not merely defunct shells) is confirmed by the absence of
-any listening socket inside the container: parsing `/proc/net/tcp` for `LISTEN` (state `0A`) returned
-**no rows** for the gunicorn port `8000` or the IMAP port `10143` — the sockets were released when the
-processes terminated. (The scan of `manage.py qcluster` processes must exclude the scanning shell itself,
-whose own command line contains that string — otherwise it self-matches; the per-PID `/proc` existence
-check used above avoids that trap entirely.)
+any listening socket inside the container's network namespace — parsing `/proc/net/tcp` and
+`/proc/net/tcp6` for `LISTEN` (state `0A`) returned **no rows at all**, so neither the gunicorn port
+`8000` nor the IMAP port `10143` remains bound; the sockets were released the instant the processes
+terminated:
+
+```console
+$ docker exec pngx_qa bash -lc '
+    LIS=$(awk "NR>1 && \$4==\"0A\"{split(\$2,a,\":\"); print strtonum(\"0x\"a[2])}" \
+          /proc/net/tcp /proc/net/tcp6 | sort -un | tr "\n" " ")
+    echo "  LISTEN ports open (container netns): ${LIS:-<none>}"
+    for want in 8000 10143; do echo " $LIS " | grep -q " $want " \
+      && echo "  port $want: STILL LISTENING" || echo "  port $want: no listener (released)"; done'
+  LISTEN ports open (container netns): <none>
+  port 8000: no listener (released)
+  port 10143: no listener (released)
+```
+
+(The scan of `manage.py qcluster` processes must exclude the scanning shell itself, whose own command
+line contains that string — otherwise it self-matches; the per-PID `/proc` existence check used above
+avoids that trap entirely.)
 
 ### 12.2 Disposable-container discard (reaps the zombies, frees everything)
 
 Because the entire runtime — app, worker cluster, watcher, IMAP test server, Redis broker, and the
-SQLite DB / media / consume directories under the container's `/tmp` — lived inside the two disposable
-containers, the correct and complete cleanup is to **delete the containers**. This atomically reaps the
+SQLite DB / media / consume directories under the container's `/tmp` — lived inside the one disposable
+container, the correct and complete cleanup is to **delete the container**. This atomically reaps the
 four zombies and frees every resource; no host or repository state needs restoring:
 
 ```console
-$ docker rm -f pngx_qa pngx_redis
+$ docker rm -f pngx_qa
 pngx_qa
-pngx_redis
 
-$ docker ps -a --format '{{.Names}}' | grep -E '^pngx_(qa|redis)$' || echo "neither pngx_qa nor pngx_redis exists"
-neither pngx_qa nor pngx_redis exists
+$ docker ps -a --format '{{.Names}}' | grep -E '^pngx_qa$' || echo "container pngx_qa no longer exists"
+container pngx_qa no longer exists
 
 $ ps -eo pid,comm,args | grep -E 'imap_server\.py|manage\.py qcluster|paperless\.asgi' | grep -v grep || echo "no host service processes"
 no host service processes
 
-$ ss -ltnp 2>/dev/null | grep -E ':10143|:8000' || echo "no host listeners on 10143/8000"
+$ ss -ltn 2>/dev/null | grep -E ':10143|:8000' || echo "no host listeners on 10143/8000"
 no host listeners on 10143/8000
 ```
 
@@ -2345,7 +2978,7 @@ review flagged is gone:
 ```console
 $ git rev-parse --abbrev-ref HEAD && git rev-parse HEAD
 blitzy-a0535bb1-52e0-488f-9eaf-09f99118e2cf
-d68342db3699ba4fdd25ca341e7cf33c2067ccd2
+6b280d64623c6082b42082757bef43aeb4a8c880
 
 $ git status --porcelain
  M blitzy/documentation/paperless-ngx_542221a38dff.md
@@ -2363,7 +2996,7 @@ $ git status --porcelain | grep '^??' || echo "no untracked files"
 no untracked files
 ```
 
-> **Authoring-time snapshot.** The `HEAD` shown above (`d68342db3…`) is the mid-authoring commit at the
+> **Authoring-time snapshot.** The `HEAD` shown above (`6b280d64…`) is the mid-authoring commit at the
 > moment of capture; it advances by one commit each time this document is revised, so a later reader will
 > observe a different `HEAD`. Likewise, `git status --porcelain` shows the document as a pending ` M` only
 > while it is uncommitted — once the document is committed it becomes tracked and `git status --porcelain`
@@ -2373,7 +3006,7 @@ no untracked files
 
 The only change this task introduces to the repository is the addition/modification of this one Markdown
 document; every temporary artifact used to produce it lived outside the tracked tree (in the now-deleted
-containers and in host scratch under `/tmp`) and leaves **no trace in the repository** — the sole,
+container and in host scratch under `/tmp`) and leaves **no trace in the repository** — the sole,
 load-bearing integrity guarantee. (Host authoring scratch under `/tmp` is not part of the repository or
 this deliverable and is unrelated to the tracked-tree cleanliness proven above.)
 
@@ -2386,17 +3019,16 @@ this deliverable and is unrelated to the tracked-tree cleanliness proven above.)
 Every temporary artifact used to observe the behaviors in this document is a **script**, published here
 inline and **verbatim** so that each command shown in §1–§10 is reproducible byte-for-byte. Nothing in this
 appendix modifies the repository: these scripts lived **outside** the tracked tree — under the container's
-`/tmp/pp/`, which is discarded when the disposable containers are removed (see
+`/tmp/pp/`, which is discarded when the disposable container is removed (see
 [§12](#12-cleanup--repository-integrity)), and in a host authoring-scratch directory (`/tmp/qa_work/`) that
 is not part of the repository or this deliverable. The single load-bearing integrity guarantee is that the
 tracked tree is left byte-for-byte unchanged except for this one document. No credential ever appears in the
 repository or in this published document: the admin/test password and the mailbox password are shown as
-`<REDACTED>` throughout. Most helpers read the real value from an environment variable at run time — e.g.
-`QA_ADMIN_PW`, `PP_PASS` (see `ws_capture.py`, `rest_upload.py`, and `bulk_edit.py` in
-[§13.2](#132-the-remaining-helper-scripts-verbatim)); the throwaway mail helper `mail_run.py` instead used a
-local, disposable test password inline (shown redacted in §13.2). In every case the value is a local-only,
-disposable test credential created solely for this investigation — it is embedded in no repository file and
-appears nowhere in this deliverable.
+`<REDACTED>` throughout. Every helper reads the real value from an environment variable at run time —
+`QA_ADMIN_PW` (`rest_upload.py`, `bulk_edit.py`), `PP_PASS` (`ws_capture.py`), and `QA_MAIL_PW`
+(`mail_run.py`); all are published in [§13.2](#132-the-remaining-helper-scripts-verbatim). In every case
+the value is a local-only, disposable test credential created solely for this investigation — it is
+embedded in no repository file and appears nowhere in this deliverable.
 
 ### 13.1 Complete helper-script index
 
@@ -2406,18 +3038,18 @@ directly below. This table is the single consolidated index:
 
 | Script | Lines | Published verbatim in | Purpose (section it serves) |
 |---|---:|---|---|
-| `penv` | 10 | [§2.3](#23-directories-environment-file-and-the-two-disclosed-helper-scripts) | The exact environment variables sourced by **every** command (redis URL, data/media/consume dirs, `DJANGO_SETTINGS_MODULE`, `PYTHONPATH`) |
-| `pp.sh` | 4 | [§2.3](#23-directories-environment-file-and-the-two-disclosed-helper-scripts) | Runs a Python snippet (from stdin) inside the canonical env as non-root `testuser` — the idiom behind every ORM/broker probe |
-| `launch.sh` | 8 | [§2.3](#23-directories-environment-file-and-the-two-disclosed-helper-scripts) | Starts the three canonical services (`qcluster`, `document_consumer`, `gunicorn`) per `docker/supervisord.conf`, recording each master PID via `$!` |
+| `penv` | 10 | [§2.3](#23-directories-environment-file-and-the-disclosed-helper-scripts) | The exact environment variables sourced by **every** command (redis URL, data/media/consume dirs, `DJANGO_SETTINGS_MODULE`, `PYTHONPATH`) |
+| `pp.sh` | 4 | [§2.3](#23-directories-environment-file-and-the-disclosed-helper-scripts) | Runs a Python snippet (from stdin) inside the canonical env as non-root `testuser` — the idiom behind every ORM/broker probe |
+| `launch.sh` | 6 | [§2.3](#23-directories-environment-file-and-the-disclosed-helper-scripts) | Starts the three canonical services (`qcluster`, `document_consumer`, `gunicorn`) per `docker/supervisord.conf`, recording each master PID via `$!` |
 | `poll.py` | 42 | [§6](#6-q4--waiting-vs-actively-processing) | The Q4 boundary poller — samples Redis `LLEN`, cluster `Stat`, and the specific `Task` row to prove WAITING → PROCESSING → DONE |
-| `ws_capture.py` | 56 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q6 authenticated WebSocket status capture (real session login → `sessionid` cookie → `ws/status/`) |
+| `ws_capture.py` | 58 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q6 authenticated WebSocket status capture (real session login → `sessionid` cookie → `ws/status/`) |
 | `imap_server.py` | 180 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 real minimal IMAP4 server (Twisted) — one plaintext account, one RFC822 message with a `.txt` attachment |
-| `rest_upload.py` | 56 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 REST upload driver — browser-canonical session + CSRF auth against `POST /api/documents/post_document/` |
-| `mail_run.py` | 70 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 mail driver — creates a `MailAccount`/`MailRule` and invokes the single-account convenience wrapper `process_mail_account` (same `handle_mail_account`→`handle_message` chain as the seeded plural `process_mail_accounts`) to fetch |
+| `rest_upload.py` | 62 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 REST upload driver — browser-canonical session + CSRF auth against `POST /api/documents/post_document/`, then peeks the WAITING package to record the identity-complete chain |
+| `mail_run.py` | 54 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 mail driver — seeds a `MailAccount`/`MailRule` and **nudges the seeded plural `Schedule`** so the running `qcluster` Sentinel fires `process_mail_accounts` by itself (the real production trigger); invokes no task directly |
 | `bulk_edit.py` | 47 | [§13.2](#132-the-remaining-helper-scripts-verbatim) | Q7 bulk-edit driver — session + CSRF auth against `POST /api/documents/bulk_edit/` (JSON body) |
 
-Total: **473 lines** across nine scripts. `penv`, `pp.sh`, and `launch.sh` appear in
-[§2.3](#23-directories-environment-file-and-the-two-disclosed-helper-scripts); `poll.py` appears in
+Total: **463 lines** across nine scripts. `penv`, `pp.sh`, and `launch.sh` appear in
+[§2.3](#23-directories-environment-file-and-the-disclosed-helper-scripts); `poll.py` appears in
 [§6](#6-q4--waiting-vs-actively-processing); the five below complete the set.
 
 ### 13.2 The remaining helper scripts (verbatim)
@@ -2430,21 +3062,25 @@ files under `/tmp/pp/`).
 
 ```python
 #!/usr/bin/env python3
-"""Disclosed WebSocket status capture for Q6.
+"""Disclosed WebSocket status listener for Q6 (§8) and the identity-complete REST
+chain (§9.2). Pure LISTENER — it does not trigger ingestion itself; the concurrent
+REST upload (rest_upload.py) is the canonical trigger, so the frames captured here
+carry that same job's progress UUID.
 Flow: (1) real Django session login via /admin/login/ (CSRF) -> sessionid cookie;
       (2) open ws://localhost:8000/ws/status/ carrying that cookie (AuthMiddlewareStack
           reads it -> scope['user'] -> StatusConsumer.connect accepts);
-      (3) drop a .txt through the watched consume dir to trigger consume_file;
-      (4) print every status_updates frame as it arrives, with an arrival timestamp.
+      (3) print every status_updates frame as it arrives, with an arrival timestamp,
+          until a terminal SUCCESS/FAILED frame or the idle timeout.
 Credentials come from env PP_USER / PP_PASS; the sessionid value is redacted in output.
 """
-import os, sys, json, asyncio, subprocess
+import os, sys, json, asyncio
 from datetime import datetime, timezone
 import requests, websockets
 
 BASE = "http://localhost:8000"
 USER = os.environ["PP_USER"]
 PASS = os.environ["PP_PASS"]
+IDLE = float(os.environ.get("PP_WS_IDLE", "30"))
 
 def iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -2466,21 +3102,19 @@ async def go():
     ck = "sessionid=%s; csrftoken=%s" % (sid, csrf)
     async with websockets.connect(BASE.replace("http", "ws") + "/ws/status/",
                                   extra_headers={"Cookie": ck}) as ws:
-        print("WS %s CONNECTED (HTTP 101 Switching Protocols) — authenticated accept" % iso())
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        fn = "/tmp/pp/consume/qa_ws_%s.txt" % ts
-        subprocess.run(["bash", "-lc", "echo 'PAPERLESS_QA_WS_%s live status stream demo' > %s" % (ts, fn)], check=True)
-        print("WS %s dropped %s to trigger ingestion" % (iso(), fn))
+        print("WS %s CONNECTED (HTTP 101 Switching Protocols) - authenticated accept" % iso())
+        sys.stdout.flush()
         n = 0
         while True:
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=20)
+                raw = await asyncio.wait_for(ws.recv(), timeout=IDLE)
             except asyncio.TimeoutError:
-                print("WS %s (no more frames for 20s; stopping)" % iso())
+                print("WS %s (no frames for %ss; stopping)" % (iso(), IDLE))
                 break
             n += 1
             frame = json.loads(raw)
             print("WS FRAME %d %s  %s" % (n, iso(), json.dumps(frame, sort_keys=True)))
+            sys.stdout.flush()
             if frame.get("status") in ("SUCCESS", "FAILED"):
                 print("WS %s terminal status '%s' received; stopping" % (iso(), frame.get("status")))
                 break
@@ -2675,94 +3309,105 @@ if __name__ == "__main__":
 #### `rest_upload.py` — Q7 REST upload driver, session + CSRF ([§9](#9-q7--enqueue-origin-in-code))
 
 ```python
-import os, sys, time, io, json, requests, django
+#!/usr/bin/env python3
+"""Q7 REST upload driver producing an IDENTITY-COMPLETE chain (§9.2).
+Runs with the cluster DOWN so the enqueued package can be peeked WAITING, then the
+caller starts the cluster; the concurrently-connected ws_capture.py records the frames.
+It threads ONE job identity through every layer:
+  package hex id (Django-Q PK)  ==  Task.id
+  package kwargs['task_id'] (progress UUID, generated at views.py:521)  ==  WS frames' task_id
+  filename  ==  Task.name-derived / Document title
+  Task.result -> Document id
+Browser-canonical session + CSRF auth against POST /api/documents/post_document/.
+"""
+import os, sys, io, time, json, django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
+import requests
 
 BASE = "http://localhost:8000"
 USER = "admin"; PW = os.environ.get("QA_ADMIN_PW", "<REDACTED>")
-
 s = requests.Session()
 
-# --- Session + CSRF auth (browser-canonical) ---------------------------------
-# 1) GET the login page to obtain the csrftoken cookie
+# --- Session + CSRF auth (browser-canonical) ---
 r0 = s.get(f"{BASE}/accounts/login/")
 csrf = s.cookies.get("csrftoken")
 print("STEP1 GET /accounts/login/ -> %d ; csrftoken cookie present=%s" % (r0.status_code, bool(csrf)))
-# 2) POST credentials with the CSRF token (Referer required by Django CSRF)
 r1 = s.post(f"{BASE}/accounts/login/",
             data={"username": USER, "password": PW, "csrfmiddlewaretoken": csrf, "next": "/"},
             headers={"Referer": f"{BASE}/accounts/login/"}, allow_redirects=False)
-print("STEP2 POST /accounts/login/ -> %d ; sessionid cookie present=%s"
-      % (r1.status_code, bool(s.cookies.get("sessionid"))))
+print("STEP2 POST /accounts/login/ -> %d ; sessionid cookie present=%s" % (r1.status_code, bool(s.cookies.get("sessionid"))))
 
-# 3) POST the document multipart with the session cookie + X-CSRFToken header
+# --- POST the document multipart ---
 csrf = s.cookies.get("csrftoken")
 uniq = time.strftime("%Y%m%d_%H%M%S")
-content = ("PAPERLESS_QA_REST_UPLOAD unique content %s for the REST ingestion path." % uniq).encode()
+content = ("PAPERLESS_QA_REST_UPLOAD paperlessqademo unique %s for the REST ingestion path." % uniq).encode()
 fname = "qa_rest_%s.txt" % uniq
 files = {"document": (fname, io.BytesIO(content), "text/plain")}
 print("\nREQUEST  POST %s/api/documents/post_document/" % BASE)
 print("  auth: session cookie sessionid=<REDACTED>; header X-CSRFToken=<REDACTED>")
 print("  multipart field 'document' = (%s, %d bytes, text/plain)" % (fname, len(content)))
-r2 = s.post(f"{BASE}/api/documents/post_document/",
-            files=files,
+r2 = s.post(f"{BASE}/api/documents/post_document/", files=files,
             headers={"X-CSRFToken": csrf, "Referer": f"{BASE}/"})
 print("RESPONSE status =", r2.status_code)
 print("RESPONSE content-type =", r2.headers.get("Content-Type"))
 print("RESPONSE body =", repr(r2.text))
 
-# --- correlate: wait for worker, then show the resulting Task + Document ------
+# --- Peek the WAITING package (cluster is down): hex PK + progress UUID ---
 django.setup()
-from django_q.models import Task
-from documents.models import Document
-before_docs = Document.objects.count()
-print("\ncorrelating (waiting for worker to consume the REST upload)...")
-target=None
-for i in range(60):
-    t = Task.objects.filter(name__startswith="qa_rest_%s" % uniq).order_by("-started").first()
-    if t and t.stopped:
-        target=t; break
-    time.sleep(1)
-if target:
-    print("TASK id=%s (hex, Django-Q PK)" % target.id)
-    print("  func=%s name=%s success=%s time_taken=%.3fs" % (target.func, target.name, target.success, target.time_taken()))
-    print("  result=%r" % target.result)
-    d=Document.objects.order_by("-id").first()
-    print("DOCUMENT id=%s title=%r content=%r" % (d.id, d.title, d.content))
-else:
-    print("no task row matched within timeout")
+import redis
+from django.conf import settings
+from django_q.signing import SignedPackage
+r = redis.Redis.from_url(settings.Q_CLUSTER["redis"])
+QKEY = "django_q:%s:q" % settings.Q_CLUSTER["name"]
+print("\nWAITING peek:  LLEN(%s) = %d" % (QKEY, r.llen(QKEY)))
+raw = r.lindex(QKEY, 0)
+pkg = SignedPackage.loads(raw)
+prog = (pkg.get("kwargs") or {}).get("task_id")
+print("PACKAGE hex id (Django-Q PK)          =", pkg.get("id"))
+print("PACKAGE func                          =", pkg.get("func"))
+print("PACKAGE name                          =", pkg.get("name"))
+print("PACKAGE args                          =", repr(pkg.get("args")))
+print("PACKAGE kwargs['task_id'] (progress UUID) =", prog)
+print("PACKAGE kwargs['override_filename']   =", (pkg.get("kwargs") or {}).get("override_filename"))
+# persist identity for the caller to correlate after the cluster runs
+open("/tmp/pp/rest_ident.txt","w").write("%s|%s|%s" % (pkg.get("id"), prog, fname))
 ```
 
-#### `mail_run.py` — Q7 mail account/rule setup + fetch driver ([§9](#9-q7--enqueue-origin-in-code))
+#### `mail_run.py` — Q7 mail account/rule setup + seeded-schedule nudge driver ([§9](#9-q7--enqueue-origin-in-code))
+
+This driver **does not** invoke any task itself. It seeds a real `MailAccount`/`MailRule`, then nudges the
+seeded **plural** `Schedule` row into the strict past so the **running** `qcluster` Sentinel fires
+`paperless_mail.tasks.process_mail_accounts` by itself (the real production trigger observed in
+[§9.3](#93-origin-3--mail-fetch-handle_message-exercised-live-against-a-real-imap-server)). The mailbox
+password is read from the environment variable `QA_MAIL_PW`, never hard-coded.
 
 ```python
-import os, sys, logging, django
+#!/usr/bin/env python3
+"""Q7 mail driver (§9.3) — sets up a real MailAccount/MailRule, then NUDGES the seeded
+PLURAL schedule so the RUNNING qcluster Sentinel fires paperless_mail.tasks.process_mail_accounts
+by itself (the real production trigger). It deliberately does NOT call the single-account
+convenience wrapper process_mail_account. The mailbox password is read from the environment
+(QA_MAIL_PW) and never hard-coded; it is stored only on the MailAccount row.
+"""
+import os, django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "paperless.settings")
 django.setup()
 
-# Stream the real paperless.mail flow to stdout so the "Consuming attachment ..." line is captured as evidence.
-h = logging.StreamHandler(sys.stdout)
-h.setFormatter(logging.Formatter("MAILLOG %(levelname)s %(name)s: %(message)s"))
-lg = logging.getLogger("paperless.mail"); lg.addHandler(h); lg.setLevel(logging.DEBUG)
-
-import redis
-from django_q.models import Task
-from documents.models import Document
+from datetime import timedelta
+from django.utils import timezone
+from django_q.models import Schedule
 from paperless_mail.models import MailAccount, MailRule
-from paperless_mail.tasks import process_mail_account
 
-r = redis.Redis(host="localhost", port=6379)
-QKEY = "django_q:paperless:q"
+PW = os.environ.get("QA_MAIL_PW", "<REDACTED>")
 
 acct, _ = MailAccount.objects.get_or_create(
     name="qa_mail",
     defaults=dict(imap_server="127.0.0.1", imap_port=10143,
                   imap_security=MailAccount.ImapSecurity.NONE,
-                  username="qauser", password="<REDACTED>", character_set="US-ASCII"))
-# ensure canonical values even if it already existed
-acct.imap_server="127.0.0.1"; acct.imap_port=10143
-acct.imap_security=MailAccount.ImapSecurity.NONE
-acct.username="qauser"; acct.password="<REDACTED>"; acct.character_set="US-ASCII"; acct.save()
+                  username="qauser", password=PW, character_set="US-ASCII"))
+acct.imap_server = "127.0.0.1"; acct.imap_port = 10143
+acct.imap_security = MailAccount.ImapSecurity.NONE
+acct.username = "qauser"; acct.password = PW; acct.character_set = "US-ASCII"; acct.save()
 
 rule, _ = MailRule.objects.get_or_create(
     name="qa_rule", account=acct,
@@ -2771,41 +3416,26 @@ rule, _ = MailRule.objects.get_or_create(
                   attachment_type=MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
                   assign_title_from=MailRule.TitleSource.FROM_SUBJECT,
                   assign_correspondent_from=MailRule.CorrespondentSource.FROM_NOTHING))
-rule.folder="INBOX"; rule.maximum_age=0; rule.action=MailRule.MailAction.MARK_READ; rule.save()
+rule.folder = "INBOX"; rule.maximum_age = 0
+rule.action = MailRule.MailAction.MARK_READ
+rule.attachment_type = MailRule.AttachmentProcessing.ATTACHMENTS_ONLY; rule.save()
 
-print("ACCT id=%s security=%s(%s) host=%s:%s user=%s" % (
-    acct.id, acct.imap_security, acct.get_imap_security_display(),
-    acct.imap_server, acct.imap_port, acct.username))
-print("RULE id=%s folder=%s maximum_age=%s action=%s(%s)" % (
-    rule.id, rule.folder, rule.maximum_age, rule.action, rule.get_action_display()))
+print("ACCT id=%s host=%s:%s security=%s user=%s" % (
+    acct.id, acct.imap_server, acct.imap_port,
+    acct.get_imap_security_display(), acct.username))
+print("RULE id=%s folder=%s action=%s attachment_type=%s" % (
+    rule.id, rule.folder, rule.get_action_display(), rule.attachment_type))
 
-print("BEFORE  LLEN(%s)=%d  tasks=%d  documents=%d"
-      % (QKEY, r.llen(QKEY), Task.objects.count(), Document.objects.count()))
-
-print(">>> invoking single-account convenience wrapper: process_mail_account('qa_mail')")
-ret = process_mail_account("qa_mail")
-print("RETURN process_mail_account =", repr(ret))
-
-print("AFTER   LLEN(%s)=%d  tasks=%d  documents=%d"
-      % (QKEY, r.llen(QKEY), Task.objects.count(), Document.objects.count()))
-
-# Peek (non-destructive) the WAITING signed package the mail async_task produced.
-raw = r.lindex(QKEY, 0)
-print("LINDEX 0 raw bytes length =", (len(raw) if raw else None))
-if raw:
-    from django_q.signing import SignedPackage
-    pkg = SignedPackage.loads(raw)
-    print("PACKAGE keys       =", sorted(pkg.keys()))
-    print("PACKAGE id         =", pkg.get("id"))
-    print("PACKAGE func       =", pkg.get("func"))
-    print("PACKAGE name       =", pkg.get("name"))
-    print("PACKAGE args       =", pkg.get("args"))
-    kw = dict(pkg.get("kwargs") or {})
-    # show the mail-specific override kwargs
-    print("PACKAGE kwargs.override_filename =", kw.get("override_filename"))
-    print("PACKAGE kwargs.override_title    =", kw.get("override_title"))
-    print("PACKAGE kwargs.task_name (via name/kw) =", kw.get("task_name", pkg.get("name")))
-    print("PACKAGE kwargs.path exists       =", "path" in kw, "->", kw.get("path"))
+# Nudge the SEEDED plural schedule into the strict past so the running Sentinel fires it
+# on its next pass — the same next_run technique used in §10.2. No task is invoked here.
+s = Schedule.objects.get(func="paperless_mail.tasks.process_mail_accounts")
+print("seeded schedule: id=%s name=%r func=%s type=%s minutes=%s" % (
+    s.id, s.name, s.func, s.schedule_type, s.minutes))
+print("BEFORE next_run=%s repeats=%s" % (s.next_run.isoformat(), s.repeats))
+past = (timezone.now() - timedelta(minutes=4)).replace(second=0, microsecond=0)
+s.next_run = past; s.save()
+print("NUDGED next_run -> %s (strict-past; Sentinel will fire on next pass)" % s.next_run.isoformat())
+print("now = %s" % timezone.now().isoformat())
 ```
 
 #### `bulk_edit.py` — Q7 bulk-edit driver, JSON body ([§9](#9-q7--enqueue-origin-in-code))
