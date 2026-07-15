@@ -2356,8 +2356,10 @@ no untracked files
 ```
 
 The only change this task introduces to the repository is the addition/modification of this one Markdown
-document; every temporary artifact used to produce it lived outside the tree (in the now-deleted
-containers and under `/tmp`) and leaves no trace.
+document; every temporary artifact used to produce it lived outside the tracked tree (in the now-deleted
+containers and in host scratch under `/tmp`) and leaves **no trace in the repository** — the sole,
+load-bearing integrity guarantee. (Host authoring scratch under `/tmp` is not part of the repository or
+this deliverable and is unrelated to the tracked-tree cleanliness proven above.)
 
 ---
 
@@ -2367,12 +2369,18 @@ containers and under `/tmp`) and leaves no trace.
 
 Every temporary artifact used to observe the behaviors in this document is a **script**, published here
 inline and **verbatim** so that each command shown in §1–§10 is reproducible byte-for-byte. Nothing in this
-appendix modifies the repository: these scripts lived only under the container's `/tmp/pp/` and the host's
-`/tmp/qa_work/`, and are removed at teardown (see [§12](#12-cleanup--repository-integrity)); the tracked
-tree is left byte-for-byte unchanged except for this single document. Credentials never appear: the
-admin/test password and the mailbox password are shown as `<REDACTED>` (each script reads the real value
-from an environment variable at run time — e.g. `QA_ADMIN_PW`, `PP_PASS` — so no secret is embedded in
-source).
+appendix modifies the repository: these scripts lived **outside** the tracked tree — under the container's
+`/tmp/pp/`, which is discarded when the disposable containers are removed (see
+[§12](#12-cleanup--repository-integrity)), and in a host authoring-scratch directory (`/tmp/qa_work/`) that
+is not part of the repository or this deliverable. The single load-bearing integrity guarantee is that the
+tracked tree is left byte-for-byte unchanged except for this one document. No credential ever appears in the
+repository or in this published document: the admin/test password and the mailbox password are shown as
+`<REDACTED>` throughout. Most helpers read the real value from an environment variable at run time — e.g.
+`QA_ADMIN_PW`, `PP_PASS` (see `ws_capture.py`, `rest_upload.py`, and `bulk_edit.py` in
+[§13.2](#132-the-remaining-helper-scripts-verbatim)); the throwaway mail helper `mail_run.py` instead used a
+local, disposable test password inline (shown redacted in §13.2). In every case the value is a local-only,
+disposable test credential created solely for this investigation — it is embedded in no repository file and
+appears nowhere in this deliverable.
 
 ### 13.1 Complete helper-script index
 
